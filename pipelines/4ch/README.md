@@ -153,7 +153,7 @@ Array + sample beam helper  App   ArraySampleBeam (SRP-PHAT + BF)   AnrDenoiser 
                              |-- array_sample_anr_gain --> G_nr  (on v.error_spec)
                              |-- v.post_reset_serial moved: ac_istft_reset (array_sample_post_reset_due)
                              |-- aec_apply_gain ; aec_apply_cng ; ac_istft_push --> out (1 hop behind the input)
- cfg.residual = STATE        |-- no fuse (AEC_ERR_MODE), no gain; beam.spectrum (the analysis beam) --> ulcnet_nn_stage_begin_spec
+ cfg.residual = STATE        |-- no fuse (AEC_ERR_MODE), no gain; beam.spectrum (the analysis beam) --> ulcnet_stream_pre_process_freq
  refused / non-finite        |-- array_sample_beam_reset, anr_reset, ac_istft_reset
  teardown                    |-- array_sample_beam_destroy, aec_destroy, anr_destroy, then free the memory
 ```

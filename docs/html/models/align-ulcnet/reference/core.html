@@ -298,7 +298,7 @@ UlcnetAcceleratorAdapter *make_adapter(const UlcnetGrid *grid, void *runtime, Ul
     UlcnetAcceleratorAdapter *a = ulcnet_accelerator_adapter_init(
         mem, bytes, &amp;desc, NULL /* 不登錄 state：加速器自己持有 */, run_graph, runtime);
     if (!a) { free(mem); return NULL; }
-    *model = ulcnet_accelerator_adapter_model(a);   /* 交給 pipeline；adapter 與 pool 須活得比 pipeline 久 */
+    *model = ulcnet_accelerator_adapter_model(a);   /* 交給以 UlcnetModel 回呼驅動的呼叫端；adapter 與 pool 須活得比它久 */
     return a;
 }</pre>
 <p class="note">三段程式可在 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 下編譯；接替身加速器（mask 恆為 1）在 16 kHz／512 與 48 kHz／1024 各跑 40 hop，輸出等於 error 延後一個 hop。<code>npu_run</code>／<code>run_graph</code>／<code>npu_fill_state_with_quantized_zero</code> 由目標平台提供。<code>UlcnetModel.infer</code> 回非 0 或輸出非有限時，pipeline 會改走 identity（輸出 linear error；這是未經 guard 的 analysis residual，即 <code>formed_hop</code>／<code>error_spec</code>，在 lib/aec 渲染 guard 作用的 hop 上可能大於 capture）；<code>io_descriptor</code> 必須發布，且須比 pipeline 活得久（pipeline 只複製 struct）。</p>
@@ -351,7 +351,7 @@ UlcnetAcceleratorAdapter *make_adapter(const UlcnetGrid *grid, void *runtime, Ul
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
-<div class="note"><b>本節的流程圖與表格是單拍（N=1）stream。</b>封包 stream（<code>frames_per_call</code> N≥2，<code>ulcnet_stream_pre_process_packet_f32()</code>／<code>_freq()</code>）一包 N 個 hop 只做一次加速器呼叫。事件 hop 的模型 state 由 graph 內的 <code>frame_reset</code> 重設並直通該 hop，generation 不變，不是 BYPASS。PCM 入口（<code>_f32</code>）在該 hop 重啟自己的分析與 ISTFT，位置與 N=1 相同（<code>ulcnet_stream_restart_mask()</code> 回報哪些 hop），所以 N=8 的 PCM 與同樣事件的 N=1 逐樣本相同；頻譜入口（<code>_freq</code>、<code>ulcnet_nn_stage</code>）只重啟模型，呼叫端的分析器與 ISTFT 不重啟。</div>
+<div class="note"><b>本節的流程圖與表格是單拍（N=1）stream。</b>封包 stream（<code>frames_per_call</code> N≥2，<code>ulcnet_stream_pre_process_packet_f32()</code>／<code>_freq()</code>）一包 N 個 hop 只做一次加速器呼叫。事件 hop 的模型 state 由 graph 內的 <code>frame_reset</code> 重設並直通該 hop，generation 不變，不是 BYPASS。PCM 入口（<code>_f32</code>）在該 hop 重啟自己的分析與 ISTFT，位置與 N=1 相同（<code>ulcnet_stream_restart_mask()</code> 回報哪些 hop），所以 N=8 的 PCM 與同樣事件的 N=1 逐樣本相同；頻譜入口（<code>_freq</code>）只重啟模型，呼叫端的分析器與 ISTFT 不重啟。</div>
 <h3>流程圖（block diagram）</h3>
 <pre>
 PCM in (float AEC error, float raw far)
@@ -440,7 +440,7 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
 <tr><td>合成啟動</td><td>無首拍特例：hop 0 即為真實合成輸出（前半窗疊加的歷史為零）</td><td><code>ulcnet_stream.h</code> 檔頭</td></tr>
-<tr><td>reprime hop 數</td><td>1（<code>ULCNET_STREAM_REPRIME_FRAMES</code>）</td><td>同 <code>pipelines/ulcnet/ulcnet_nn_stage.h</code> 的 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code></td></tr>
+<tr><td>reprime hop 數</td><td>1（<code>ULCNET_STREAM_REPRIME_FRAMES</code>）</td><td><code>ulcnet_stream.h</code>；兩支桌面範例的脈衝標記測試量出同一個數</td></tr>
 </table></div>
 
 <h2 id="calibration">Far 分支與校正</h2><h2 id="section-14">far branch 與 PTQ calibration</h2>
@@ -502,8 +502,8 @@ D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或�
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
 （400 hop，真的跑 0/2/1 排程），所以是<b>實測</b>；hop 0 的 centered 排程 0 幀，兩者<b>自第二個
 hop 起</b>對得起來。<b>排程由建立 <code>AcStft</code> 時的 <code>center</code> 決定</b>，同一個物件不會混用兩種排程。
-centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>pipelines/ulcnet/</code> 的應用端 <code>AcStft</code>
-（mono 與 4ch 範例共用）以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
+centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>pipelines/mono/alignulcnet</code> 與 <code>pipelines/4ch/alignulcnet</code> 的應用端
+以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
 <code>ac_stft_push_planar()</code>；只剩上述 parity 測試還在用 <code>center</code> 1 當比對基準。</p>
 
 <h2 id="section-17">graph 內位移與就地綁定的驗證</h2>

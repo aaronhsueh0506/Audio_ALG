@@ -53,6 +53,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _ALG_DIR = os.path.dirname(_AIAEC_DIR)
 _ULCNET_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'ulcnet')
+_STREAM_ULCNET_DIR = os.path.join(_ALG_DIR, 'stream', 'aiaec', 'ulcnet')
 _PIPELINES_DIR = os.path.join(_ALG_DIR, 'pipelines')
 _LANE_MAIN = os.path.join(_PIPELINES_DIR, 'mono', 'alignulcnet', 'main.c')
 # Resolved as lib/deps.mk resolves them: the environment, else the sibling checkouts.
@@ -104,12 +105,11 @@ def lanes(tmp_path_factory, producer_libs):
         pytest.skip('no C compiler available')
     sources = [
         os.path.join(_THIS_DIR, 'deployed_lane_dump.c'),
-        os.path.join(_PIPELINES_DIR, 'ulcnet', 'ulcnet_nn_stage.c'),
+        os.path.join(_STREAM_ULCNET_DIR, 'ulcnet_stream.c'),
         *(os.path.join(_ULCNET_DIR, name) for name in (
-            'ulcnet_accelerator_adapter.c', 'ulcnet_prepost.c',
-            'ulcnet_process.c', 'ulcnet_model_io.c')),
+            'ulcnet_prepost.c', 'ulcnet_model_io.c')),
     ]
-    includes = [_PIPELINES_DIR, os.path.join(_PIPELINES_DIR, 'ulcnet'),
+    includes = [_PIPELINES_DIR, _STREAM_ULCNET_DIR, os.path.join(_ALG_DIR, 'stream', 'common'),
                 _ULCNET_DIR, os.path.join(_AEC_C_DIR, 'include'),
                 os.path.join(_AEC_C_DIR, 'include', 'internal'),
                 os.path.join(_AEC_C_DIR, 'example'),
@@ -159,22 +159,27 @@ def _process_hop_source():
     return re.sub(r'/\*.*?\*/|//[^\n]*', '', match.group(0), flags=re.DOTALL)
 
 
-def test_deployed_stage_reads_the_formed_seam():
-    """output_seam is the formed hop only if main.c hands that to the stage.
+def test_deployed_stream_reads_the_formed_seam():
+    """output_seam is the formed hop only if main.c hands that to the model stream.
 
     The error spectrum is the STFT of the AEC's analysis seam (AecResidualView.formed_hop), the far
-    spectrum the STFT of the raw reference, and those two spectra, in that order and after both
-    pushes, are what the stage is begun on. The rendering base is never read.
+    spectrum the STFT of the raw reference, and those two spectra, in that order (error planes, then
+    far planes) and after both pushes, are what the stream's hop is opened on. The rendering base is
+    never read.
     """
     body = _process_hop_source()
-    err = re.search(r'ac_stft_push\(\s*(\w+)->err_stft,\s*rctx\.formed_hop,\s*\1->err_spec\s*\)', body)
-    far = re.search(r'ac_stft_push\(\s*(\w+)->far_stft,\s*ref,\s*\1->far_spec\s*\)', body)
-    begin = re.search(r'ulcnet_nn_stage_begin_spec\(\s*stage,\s*(\w+)->err_spec,\s*\1->far_spec,', body)
+    err = re.search(r'ac_stft_push_planar\(\s*(\w+)->err_stft,\s*rctx\.formed_hop,\s*'
+                    r'\1->err_re,\s*\1->err_im\s*\)', body)
+    far = re.search(r'ac_stft_push_planar\(\s*(\w+)->far_stft,\s*ref,\s*\1->far_re,\s*\1->far_im\s*\)', body)
+    begin = re.search(r'ulcnet_stream_pre_process_freq\(\s*stream,\s*(\w+)->err_re,\s*\1->err_im,\s*'
+                      r'\1->far_re,\s*\1->far_im,', body)
     assert err, 'the error STFT is not fed rctx.formed_hop'
     assert far, 'the far STFT is not fed the raw reference'
-    assert begin, 'the stage is not begun on (err_spec, far_spec)'
+    assert begin, 'the stream hop is not opened on (err_re, err_im, far_re, far_im)'
     assert err.group(1) == far.group(1) == begin.group(1)
     assert err.end() < begin.start() and far.end() < begin.start()
+    assert len(re.findall(r'ulcnet_stream_pre_process_freq\(', body)) == 1
+    assert len(re.findall(r'ac_stft_push\w*\(', body)) == 2
     assert 'aec_get_residual(aec, &rctx)' in body
     assert 'base_spec' not in body
 

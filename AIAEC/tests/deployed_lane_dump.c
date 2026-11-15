@@ -10,7 +10,7 @@
  * option, `--sample-rate <rate>` (default 16000), passed to this driver.
  *
  * formed_hop_cng_invariant runs the deployed lane and the same lane with enable_cng = 0 on one
- * deterministic echo stimulus and reports whether formed_hop (the seam the stage feeds the
+ * deterministic echo stimulus and reports whether formed_hop (the seam the example feeds the
  * network) is byte-identical on every hop and comfort_noise is NULL; it is what allows the lane's
  * inherited enable_cng = 1 against the contract's False. */
 #define main mono_alignulcnet_example_main

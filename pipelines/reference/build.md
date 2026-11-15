@@ -27,8 +27,8 @@ BIN="$(make -s print-bin-dir)"
 # Mono chain test (the examples' pool carve vs heap, reset, switches, comfort noise, and both
 # mono programs run as black boxes against the hand-written oracle
 # mono/aec_nr_res/tests/conv_chain_mono.h; mono/aec_nr_res/tests/test_mono_chain.c)
-# plus the example_board_adapter smoke test (see "Board Integration" below), the DFN2 and
-# ULCNet stage tests and the mono DFN2 / ULCNet programs.
+# plus the example_board_adapter smoke test (see "Board Integration" below), the DFN2
+# stage tests and the mono DFN2 / ULCNet programs.
 # Four-channel tests live in 4ch/Makefile.
 make test
 

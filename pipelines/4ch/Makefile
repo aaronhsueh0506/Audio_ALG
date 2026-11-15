@@ -69,6 +69,10 @@ DFN2_DIR ?= $(ALG_DIR)/lib/ainr/dfn2
 BRIDGE_DIR ?= $(ALG_DIR)/stream/ainr/bridge
 STREAM_DFN2_DIR ?= $(ALG_DIR)/stream/ainr/dfn2
 STREAM_COMMON_DIR ?= $(ALG_DIR)/stream/common
+# The model stream (stream/aiaec/ulcnet) that alignulcnet/main.c drives on its spectrum entries.
+STREAM_ULCNET_DIR ?= $(ALG_DIR)/stream/aiaec/ulcnet
+# Include paths of every TU that includes ulcnet_stream.h.
+ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR)
 # Include paths of every TU that includes ../dfn/dfn_hop.h or ../dfn/dfn_hop_pool.h.
 DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
 # dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
@@ -283,7 +287,7 @@ SRCS := array_sample_beam.c \
         $(STREAM_DFN2_DIR)/dfn2_stream.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
-        ../ulcnet/ulcnet_nn_stage.c \
+        $(STREAM_ULCNET_DIR)/ulcnet_stream.c \
         4ch_raw.c array_sample_driver.c \
         4ch_external_static.c 4ch_static.c \
         tests/test_4ch_chain.c tests/test_array_sample_driver.c \
@@ -291,9 +295,8 @@ SRCS := array_sample_beam.c \
         aec_bf_dfn_res/main.c \
         tests/test_array_sample_beam.c tests/dump_delay_parity.c \
         alignulcnet/tests/test_4ch_ulcnet.c \
-        $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
         $(ULCNET_DIR)/ulcnet_prepost.c \
-        alignulcnet/main.c $(ULCNET_DIR)/ulcnet_process.c \
+        alignulcnet/main.c \
         $(ULCNET_DIR)/ulcnet_model_io.c
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
@@ -375,30 +378,23 @@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.
 	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
-# ULCNet NN stage example.
-$(OBJ_DIR)/ulcnet_nn_stage.o: ../ulcnet/ulcnet_nn_stage.c ../ulcnet/ulcnet_nn_stage.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+# Align-ULCNet model stream.
+$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) $(ULCNET_STREAM_INC) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-# ulcnet_prepost.o: the AIAEC-owned pre/post class the accelerator adapter
-# drives (the same third TU pipelines/Makefile links for the mono
-# application). Anything linking the adapter links this with it.
+# ulcnet_prepost.o: the AIAEC-owned pre/post class the model stream drives (the same TU
+# pipelines/Makefile links for the mono application).
 $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../common/example_cli.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../common/example_cli.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h ../ulcnet/ulcnet_nn_stage.h ../ulcnet/tests/ulcnet_test_fixture.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../tests/ulcnet_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_raw.o: 4ch_raw.c array_sample_beam.h array_sample_driver.h array_sample_post.h array_sample_unit.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
@@ -441,8 +437,8 @@ all: $(DFN_PIPELINE_LIB) \
      $(BIN_DIR)/4ch_raw $(BIN_DIR)/4ch_external_static $(BIN_DIR)/4ch_static \
      $(BIN_DIR)/4ch_aec_bf_dfn_res
 
-# The 4ch_alignulcnet application shares this Makefile (it composes the unit with the NN stage
-# example), so its acceptance test and board skeleton run here too: this directory's `make test`
+# The 4ch_alignulcnet application shares this Makefile (it composes the unit with the model
+# stream), so its acceptance test and board skeleton run here too: this directory's `make test`
 # is the one-stop gate, mirroring the mono arrangement in pipelines/Makefile. 4ch_raw has no run line of its
 # own here: test_array_sample_beam runs it (test_raw_runner_black_box, handed the bin directory).
 test: test-third-party test-array-sample-driver \
@@ -564,25 +560,16 @@ $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(CORE_LIBS) | _cfg
 $(BIN_DIR)/test_array_sample_beam: $(OBJ_DIR)/test_array_sample_beam.o $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_array_sample_beam.o $(UNIT_LIBS) $(LDLIBS)
 
-# The NN stage example and the ULCNet framing objects the stage links.
-ULCNET_4CH_OBJS := $(OBJ_DIR)/ulcnet_nn_stage.o \
-                   $(OBJ_DIR)/ulcnet_process.o
+# The model stream and the pre/post objects it drives.
+ULCNET_4CH_OBJS := $(OBJ_DIR)/ulcnet_stream.o \
+                   $(OBJ_DIR)/ulcnet_prepost.o \
+                   $(OBJ_DIR)/ulcnet_model_io.o
 
-# The stage itself needs no ulcnet_model_io symbol (it only READS the
-# descriptor a runtime published, so a board integrating the stage alone
-# gains no new link dependency); the test links it to BUILD descriptors for
-# the far-input contract gate.
-$(BIN_DIR)/test_4ch_ulcnet: $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/test_4ch_ulcnet: $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
-# The adapter drives the pre/post class, so the application links
-# ulcnet_prepost.o with it (the test above does not link the adapter).
-ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
-                       $(OBJ_DIR)/ulcnet_prepost.o \
-                       $(OBJ_DIR)/ulcnet_model_io.o
-
-$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
 
 # The 4-channel DFN2 example and its test compose the unit, so they link the DFN archive ahead of
 # the unit's archives.

@@ -2,7 +2,8 @@
 
 This is an application skeleton, not a new library. It composes the 4-channel linear AEC array
 (an `Aec` instance with `AecConfig.n_mics = AEC_ARRAY_MICS`, `aec.h`) and the sample SRP-PHAT/BF helper (`array_sample_beam.h`) with
-the example stage `ulcnet/ulcnet_nn_stage.{h,c}` and the Align-ULCNet C pre/post code, over their
+the spectrum entries of the Align-ULCNet model stream (`stream/aiaec/ulcnet/ulcnet_stream.{h,c}`:
+`ulcnet_stream_pre_process_freq()` / `ulcnet_stream_post_process_freq()`) and the Align-ULCNet C pre/post code, over their
 existing component libraries. The array builds its own four lanes and the shared estimator in one pool (`main.c` places it with
 `aec_get_mem_requirements()` + `aec_init_ex()`); the application supplies none of them. The array is initialized with
 `residual = AEC_RESIDUAL_STATE` (`ulcnet_example_unit_config()` in `main.c`: `array_sample_default_config(&cfg, grid.sample_rate)`
@@ -10,19 +11,19 @@ with `fft_size` = `grid.n_fft`; the grid is built with `ulcnet_grid_make()` from
 `UlcnetGridSpec` table), so the fusion buffers and the gain stage of the conventional post path are not allocated,
 there is no RES (this application has no gain stage) and `aec_process_residual()` /
 `array_sample_beam_fuse()` are unavailable (`AEC_ERR_MODE`). The array plus helper and the
-stage are two pools: `main.c` queries `aec_get_mem_requirements()`,
-`array_sample_beam_get_mem_size()` and `ulcnet_nn_stage_mem_size(&grid)`, cuts both blocks (the stage's
-block 16-byte aligned) and prints the sizes. The stage does no STFT or ISTFT: `main.c` owns an `AcStft` for the raw
-far hop and an `AcIstft` for the output spectrum, in a third block (the beam spectrum is already a spectrum, so there is
-no error analysis).
+stream are two pools: `main.c` queries `aec_get_mem_requirements()`,
+`array_sample_beam_get_mem_size()` and `ulcnet_stream_get_mem_size()`, cuts both blocks (the stream's
+block at its descriptor's alignment, 16 bytes) and prints the sizes. The spectrum entries do no STFT or ISTFT: `main.c` owns an `AcStft` for the raw
+far hop and an `AcIstft` for the output spectrum, in a third block with the six spectrum planes (the beam spectrum is already a
+spectrum, so there is no error analysis; it is copied into two planes).
 
 The model accelerator is intentionally left as the TODO in
 `run_accelerator()`. The K/V, logit and GRU state tensors belong to the application; on a board
-they live in the accelerator's own buffers, so the example registers none
-(`ulcnet_accelerator_adapter_init(..., NULL, ...)`).
+they live in the accelerator's own buffers (the stream registers none, so the state views in
+`UlcnetHopIO` are NULL).
 The runtime binds each `*_out` to the buffer of the state input of the same name; the graph shifts the windows itself, so the CPU neither copies nor shifts them.
 A fixed-point accelerator loads quantized zeros at start and whenever
-`ulcnet_accelerator_adapter_state_generation()` changes.
+`UlcnetHopIO.state_generation` changes.
 The default callback failure demonstrates the production fail-open path.
 
 The production far branch is fixed to the caller's raw reference, matching
@@ -30,13 +31,13 @@ training and the paper. The shared AEC ring supplies aligned far only to the
 four PBFDKF lanes that form the linear-error spectra; the model's TA block
 aligns the raw far to the beamformed error.
 At an AEC delay-regime boundary — including FIXED mode's first usable error — the
-stage does two things and nothing else: it calls `model->reset` (so the
+stream does two things and nothing else on its spectrum entries: it advances the state generation (so the
 runtime flushes its far attention ring and logit history) and it arms the
 identity reprime. It reads the boundary from the helper's `info.delay` (the `AecDelayState` of the
 front, fields `changed`, `solid`). No buffer is cleared; every C-side framing state keeps
 running across the switch. The frame whose analysis window still covers a pre-switch hop therefore
 emits the identity WITHOUT stepping the model:
-`ULCNET_NN_STAGE_REPRIME_FRAMES` = 1 frame, the same count as the
+`ULCNET_STREAM_REPRIME_FRAMES` = 1 frame, the same count as the
 mono example, because both branches are framed from the CURRENT input hop and
 each 50%-overlap frame spans two hops. The constant is derived and asserted
 by the straddle-derivation test (`tests/test_4ch_ulcnet.c`), not estimated.
@@ -64,8 +65,8 @@ IFFT plus one RFFT and one extra hop of latency per hop), so the pipeline has no
 reconstructed beam hop to hand out. The array's pool layout version
 (`AEC_LAYOUT_VERSION`) describes the array pool only; a descriptor
 whose layout version differs from the current build is refused by
-`aec_init_ex()`. The stage is example code: it has no
-descriptor and no layout version.
+`aec_init_ex()`. The stream's pool has its own descriptor (`UlcnetStreamMemReq`,
+`ULCNET_STREAM_LAYOUT_VERSION`), checked by `ulcnet_stream_init_ex()`.
 
 Spectrogram-consistency note: `bf_spectrum` is per-bin weighted, i.e. an
 inconsistent spectrogram, and a WOLA round trip would project it onto a
@@ -79,39 +80,37 @@ to both be raw far.
 
 ## One hop in phases
 
-`ulcnet_nn_stage_process()` is the sequence below with the model callback installed on the
-stage. A board that runs the network itself (the NPU between `nn_begin` and
-`nn_end`) calls the phases directly and needs no `infer` callback (`ulc_hop()` in `main.c`
-calls `ulcnet_nn_stage_process()` instead, which drives the same phases with the model
-callback):
+The network runs between the stream's two calls; there is no callback to install
+(`ulc_hop()` in `main.c` is this sequence):
 
 ```c
-UlcnetNnJob job;
+UlcnetHopIO io;
 ArraySampleBeamResult beam;  ArraySampleBeamInfo info;
+int ai_rc = -1;
 array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &beam, &info);  /* lanes, DOA, BF */
-UlcnetNnDelay delay = { info.delay.changed, info.delay.solid };
-ac_stft_push(far_stft, far, far_spec);                   /* the application's far analysis */
-ulcnet_nn_stage_begin_spec(stage, beam.spectrum, far_spec, delay);   /* reprime / model reset */
-if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {         /* 1 = a frame to run */
-    int rc = run_network(&job);                          /* write every bin of job.out_re/out_im */
-    ulcnet_nn_stage_nn_end(stage, rc);                   /* accepted only if rc == 0 and finite */
-}
-ulcnet_nn_stage_end_spec(stage, out_spec);               /* accepted model spectrum, else beam.spectrum */
-ac_istft_push(istft, out_spec, out);                     /* the application's WOLA, one hop */
+UlcnetStreamDelay delay = { info.delay.changed, info.delay.solid };
+ac_stft_push_planar(far_stft, far, far_re, far_im);      /* the application's far analysis */
+for (k = 0; k < grid.n_bins; ++k) { err_re[k] = beam.spectrum[k].r; err_im[k] = beam.spectrum[k].i; }
+pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);  /* reprime / model restart */
+if (pre == 1)                                            /* 1 = a frame to run, 0 = the reprime hop */
+    ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   /* write every value of io.outputs.output */
+ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* accepted only if ai_rc == 0 and finite, else beam.spectrum */
+ac_istft_push_planar(istft, out_re, out_im, out);        /* the application's WOLA, one hop */
 ```
 
-A frame left open or never fetched is the identity (fail-open); the reprime
-frame after an alignment boundary has no model frame (`nn_begin` returns 0).
+A hop closed with a non-zero `ai_rc`, a mask left unwritten or a non-finite mask or output is the identity
+(fail-open; the last three also restart the state generation); the reprime
+hop after an alignment boundary has no model frame (`pre_process_freq` returns 0).
 
 The network input is the analysis beam (`beam.spectrum`, the beam of the lanes' error spectra), as a network on
 one lane reads that lane's error spectrum; the lanes' output-guard rendering bases (`AecArrayView.lane_base_spec`)
 are not fed to it. The synthesis is the application's `AcIstft`; the lanes' post-chain reset counter
 (`AecArrayView.post_reset_serial`) moves only with an array reset here, which the recovery below already pairs with
-`ulcnet_nn_stage_reset()`.
+`ulcnet_stream_reset()`.
 
 Recovery is the integrator's: after any refused call (a negative return from the helper or the
-stage) call `array_sample_beam_reset(unit)`, `ulcnet_nn_stage_reset(stage)`, `ac_stft_reset(far_stft)` and
-`ac_istft_reset(istft)` together (the stage keeps no transform history);
+stream) call `array_sample_beam_reset(unit)`, `ulcnet_stream_reset(stream)`, `ac_stft_reset(far_stft)` and
+`ac_istft_reset(istft)` together (on the spectrum entries the transform history is the application's);
 `test_4ch_ulcnet.c` checks that the pair then equals a fresh pair byte for byte.
 
 ### Mask and VAD derived from the lane spectra
@@ -129,9 +128,9 @@ array_sample_beam_process_front(unit, mics, far, &front);   /* shared aligner an
 /* mask (n_freqs ints), vad_raw, vad_out from front.lane_error_spec[0] */
 array_sample_beam_process_beam(unit, &front, vad_raw, vad_out, mask, &beam, &info);   /* SRP-PHAT, BF */
 /* info: doa_raw/smooth/used in radians (NaN = none), bf_adaptive, delay */
-/* then ac_stft_push(far_stft, far, far_spec) and
-   ulcnet_nn_stage_begin_spec(stage, beam.spectrum, far_spec, {front.delay.changed, front.delay.solid}),
-   nn_begin / nn_end / end_spec / ac_istft_push as above */
+/* then ac_stft_push_planar(far_stft, far, far_re, far_im), the planes of beam.spectrum and
+   ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, {front.delay.changed, front.delay.solid}, &io),
+   the run / post_process_freq / ac_istft_push_planar as above */
 ```
 
 `mask[f]` nonzero: SRP uses bin `f`, BF freezes its adaptation on bin `f`;
@@ -144,15 +143,15 @@ no state to the helper: the pool sizes and the layout version are unchanged.
 ## Calling sequence and parameters
 
 ```
-App       Aec (array, residual = STATE)                   ArraySampleBeam      UlcnetNnStage + adapter       accelerator (board)
+App       Aec (array, residual = STATE)                   ArraySampleBeam      UlcnetStream (spectrum entries)   accelerator (board)
  |-- array_sample_default_config (ulcnet_example_unit_config()); aec_get_mem_requirements / aec_init_ex -->|
  |-- array_sample_beam_default_params; array_sample_beam_get_mem_size / _init(aec) -->|
- |-- ulcnet_grid_make(--sample-rate); ulcnet_nn_stage_mem_size(&grid) / ulcnet_nn_stage_init; ac_stft_init / ac_istft_init; adapter pool
+ |-- ulcnet_grid_make(--sample-rate); ulcnet_stream_get_mem_size(&cfg, &req) / ulcnet_stream_init_ex; ac_stft_init / ac_istft_init
  |   per hop: array_sample_beam_process_with_activity(mics, far, vad, vad, NULL, &beam, &info)   [or _process_front + mask/VAD + _process_beam]
- |            --> ac_stft_push(far) --> ulcnet_nn_stage_begin_spec(beam.spectrum, far_spec, {info.delay.changed, info.delay.solid})
- |            --> ulcnet_nn_stage_process(out_spec) (nn_begin == 1 --> run_accelerator(job) --> nn_end) --> ac_istft_push(out)
+ |            --> ac_stft_push_planar(far) --> ulcnet_stream_pre_process_freq(planes of beam.spectrum, far, {info.delay.changed, info.delay.solid}, &io)
+ |            --> returns 1 --> run_accelerator(io.inputs, io.outputs) --> ulcnet_stream_post_process_freq(ai_rc, out) --> ac_istft_push_planar(out)
  |   no array_sample_beam_fuse() here (AEC_ERR_MODE); no RES, no NR
- |   refused call: array_sample_beam_reset + ulcnet_nn_stage_reset + ac_stft_reset + ac_istft_reset
+ |   refused call: array_sample_beam_reset + ulcnet_stream_reset + ac_stft_reset + ac_istft_reset
  |-- array_sample_beam_destroy; aec_destroy; release the blocks
 ```
 
@@ -160,7 +159,7 @@ External parameters: the delay profile below, the grid (`--sample-rate 16000|480
 graph, and the helper's array geometry and `num_angles` (the example uses the default 35 mm UCA; a product
 sets the measured one through `ArraySampleBeamParams`). Internal: the helper's BF / DOA / VAD constants (section 0.3 of
 [SRP／BF helper](../../../docs/reference/array/beam.md)),
-`ULCNET_NN_STAGE_REPRIME_FRAMES`, the lane constants (derived inside the array).
+`ULCNET_STREAM_REPRIME_FRAMES`, the lane constants (derived inside the array).
 
 ## Delay profile
 
@@ -168,11 +167,11 @@ The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
 profile, that banner reads a 2,453,056 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
-6,320 B stage pool at 16 kHz and a 5,120,288 B unit pool plus a 12,464 B stage pool at 48 kHz
-(`--sample-rate 48000`); the application's framing line follows (47,808 B at 16 kHz, 93,888 B at 48 kHz: the far `AcStft`, the output
-`AcIstft` and two spectra); the adapter pool follows on its own line (14,864 B at 16 kHz,
-29,200 B at 48 kHz; it follows the grid, not `D`). Read it from your
-own build rather than copying it.
+103,312 B stream pool at 16 kHz and a 5,120,288 B unit pool plus a 202,640 B stream pool at 48 kHz
+(`--sample-rate 48000`); the application's framing line follows (49,920 B at 16 kHz, 98,048 B at 48 kHz: the far `AcStft`, the output
+`AcIstft` and six spectrum planes). The stream pool follows the grid, not `D`, and also holds the analysis and
+synthesis objects of the stream's PCM entries, which this example does not call. Read the numbers from your
+own build rather than copying them.
 `n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.
 
@@ -213,5 +212,5 @@ make SIMD=1 test
 
 `test` runs `test_4ch_ulcnet` (both grids from one binary), the skeleton at n=5 and n=1 on both
 grids and the malformed-number checks above.
-The array is part of `libaec.a`; the helper object, the stage
+The array is part of `libaec.a`; the helper object, the model stream
 and the ULCNet pre/post objects are linked into the program.

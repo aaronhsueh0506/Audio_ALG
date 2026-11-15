@@ -170,7 +170,7 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
     objects with their own size queries and inits: the sample helper array_sample_beam_get_mem_size /
     array_sample_beam_init (SRP-PHAT, BF), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init (the 4ch_static sample synthesis carries its own window table; optionally borrow aec_synthesis_window(a) as in mono),
-    ulcnet_nn_stage_mem_size(&grid) / ulcnet_nn_stage_init(mem, bytes, &grid) (grid from ulcnet_grid_make; the stage has no STFT, so an AcStft for the raw far hop and an AcIstft for the output come with ac_*_get_mem_size / init),
+    ulcnet_stream_get_mem_size(&cfg, &req) / ulcnet_stream_init_ex(&cfg, mem, bytes, &req) (cfg.grid from ulcnet_grid_make; the spectrum entries run no STFT, so an AcStft for the raw far hop and an AcIstft for the output come with ac_*_get_mem_size / init),
     for DFN2 the example tail of dfn/dfn_hop_pool.h: dfn_hop_pool_plan_init(&plan, &model_grid) / dfn_hop_pool_plan /
     dfn_hop_pool_bytes / dfn_hop_pool_build (the model stream dfn2_stream in memory mode, the conversion buffers, then the
     AinrBridge, or the synthesis when the host rate equals the model grid's; model_grid from dfn2_grid_make;
@@ -188,7 +188,7 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
             // before the CNG draw and the push: array_sample_post_reset_due(&handled, &v) -> ac_istft_reset(istft)
             // or the helper's process_front() / process_beam() with your own mask and VAD in between
 
-5. reset?   aec_reset(a);  anr_reset(nr);  ac_istft_reset(istft);  handled = aec_post_reset_serial(a);  [ulcnet_nn_stage_reset(stage); ac_stft_reset(far_stft); ac_istft_reset(ulc_istft);]
+5. reset?   aec_reset(a);  anr_reset(nr);  ac_istft_reset(istft);  handled = aec_post_reset_serial(a);  [ulcnet_stream_reset(stream); ac_stft_reset(far_stft); ac_istft_reset(ulc_istft);]
             // aec_reset() resets the four lanes, the estimator and the gain stage too (the level setting is kept).
             // after ANY refused call too: the integrator resets the array and its own stages together
 
@@ -199,27 +199,26 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
 ### Running the model on the NPU (NN applications)
 
 The ULCNet and DFN2 examples split the hop around the model call so the
-accelerator runs between `nn_begin` and `nn_end` (the model config then needs
-no `infer` callback). Both stages are fed the error (or beam) spectrum; the Align-ULCNet
-stage takes spectra only (the error or beam spectrum and the spectrum of the raw far hop, which
-the application analyses with its own `AcStft`) and returns one output spectrum for the
+accelerator runs between two calls (DFN2: `nn_begin` and `nn_end`, and the model config then needs
+no `infer` callback; Align-ULCNet: `ulcnet_stream_pre_process_freq` and `ulcnet_stream_post_process_freq`).
+Both are fed the error (or beam) spectrum; the Align-ULCNet
+stream's spectrum entries take spectra only (the error or beam spectrum and the spectrum of the raw far hop, which
+the application analyses with its own `AcStft`) and return one output spectrum for the
 application's `AcIstft`; the DFN2 stage emits one hop of samples. The model
 libraries behind them hold no framing, FFT or window (audiolib's `AcStft` / `AcIstft` do that).
-The ULCNet stage calls the model's `reset` callback on its own reset and on an alignment
+The ULCNet stream restarts the model state (its state generation advances) on its own reset and on an alignment
 event (a delay change, or the first transition to a solid alignment after the first hop);
 the DFN2 stage and bridge call `model.reset` (when present) on their own reset only, and an
 AEC delay change does not reset them:
 
 ```
-// ULCNet (ulcnet/ulcnet_nn_stage.h)
-ac_stft_push(far_stft, far, far_spec);                             // the application's analysis (mono: also err_stft on formed_hop)
-ulcnet_nn_stage_begin_spec(stage, beam.spectrum, far_spec, delay);
-if (ulcnet_nn_stage_nn_begin(stage, &job) > 0) {                   // 1 = a frame is open (UlcnetNnJob)
-    rc = run_npu(&job);                                            // job outputs are NaN-prefilled; write every one
-    ulcnet_nn_stage_nn_end(stage, rc);                             // rc != 0 or a non-finite output => identity
-}
-ulcnet_nn_stage_end_spec(stage, out_spec);                         // accepted model spectrum, else the error spectrum
-ac_istft_push(ulc_istft, out_spec, out);                           // the application's WOLA, exactly one hop
+// ULCNet (stream/aiaec/ulcnet/ulcnet_stream.h, the spectrum entries)
+ac_stft_push_planar(far_stft, far, far_re, far_im);                // the application's analysis (mono: also err_stft on formed_hop)
+pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);
+if (pre == 1)                                                      // 1 = a frame is open (UlcnetHopIO), 0 = the reprime hop
+    rc = run_npu(&io);                                             // io.outputs.output is NaN-prefilled; write every value
+ulcnet_stream_post_process_freq(stream, rc, out_re, out_im);       // rc != 0 or a non-finite mask / output => the error spectrum
+ac_istft_push_planar(ulc_istft, out_re, out_im, out);              // the application's WOLA, exactly one hop
 
 // DFN2 (dfn/dfn_hop.h): up to two frames per hop through the rate bridge
 dfn_hop_begin(&hop, e, p);               // P = E.G_res formed first (by the example main)
@@ -239,8 +238,8 @@ alignment state (`info.delay`). `array_sample_beam_process_with_activity(b, mics
 The recurrent state is the application's, not the library's. On a board the accelerator keeps it and nothing is registered with the
 library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
 that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
-and for Align-ULCNet the generation of the pre/post class or adapter the callback drives (`ulcnet_prepost_state_generation()`,
-`ulcnet_accelerator_adapter_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
+and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class or
+adapter a caller drives directly (`ulcnet_prepost_state_generation()`, `ulcnet_accelerator_adapter_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
 its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused
 commit (a non-finite head) of a real frame; a model failure on a real frame and a committed frame leave it alone. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
 compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config

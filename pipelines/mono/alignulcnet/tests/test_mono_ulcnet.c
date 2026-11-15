@@ -1,18 +1,20 @@
 /**
- * Composition tests of the mono linear AEC feeding the Align-ULCNet stage (lib/aec's Aec +
- * ulcnet/ulcnet_nn_stage.h + the caller's own AcStft / AcIstft), wired as mono/alignulcnet/main.c
- * wires them: one-hop STFT/WOLA latency, delay-event identity reprime on the real alignment state and the
- * model-callback policy on real framing. A contract test, not a DSP-quality test. The stage alone (synthetic
- * alignment events) is tested in ulcnet/tests/test_ulcnet_nn_stage.c; what needs the real AEC
+ * Composition tests of the mono linear AEC feeding the Align-ULCNet model stream (lib/aec's Aec + the
+ * spectrum entries of stream/aiaec/ulcnet/ulcnet_stream.h + the caller's own AcStft / AcIstft), wired as
+ * mono/alignulcnet/main.c wires them: one-hop STFT/WOLA latency, delay-event identity reprime on the real
+ * alignment state and the model-run policy on real framing. A contract test, not a DSP-quality test. The stream
+ * alone (synthetic alignment events) is tested in stream/aiaec/ulcnet/tests; what needs the real AEC
  * (FIXED and MATCHED delay states, the framing straddle derivation, acquisition of a known
  * delay) stays here. One binary runs every grid of k_grids.
  * Stimuli: a zero-delay echo (the delay state stays UNLOCKED) and a bulk-delay echo
  * (ECHO_DELAY is beyond the filter reach, so the matched filter locks and a model is
  * applied). Each test banner states its case. Build and run: `make test` in pipelines/.
+ * The stand-in models write the graph's mask (tests/ulcnet_test_fixture.h): a real mask g scales the
+ * spectrum by g^(1/0.3) up to the rounding of the compression, so "the model changed nothing" is a
+ * tolerance, and bit identity is asserted against the fixture's own copy of the mask arithmetic.
  */
 #include "aec.h"
-#include "ulcnet/ulcnet_nn_stage.h"
-#include "ulcnet/tests/ulcnet_test_fixture.h"
+#include "tests/ulcnet_test_fixture.h"
 #include "utility/mem_align.h"
 #include "../../../mono/aec_nr_res/tests/guard_scene.h"
 
@@ -28,29 +30,29 @@
 #define HOP_BYTES ((size_t)HOP * sizeof(float))
 
 /* ---------------------------------------------------------------------------------------
- * The composition under test: Aec (AEC_RESIDUAL_STATE lane) + UlcnetNnStage, as main.c builds
+ * The composition under test: Aec (AEC_RESIDUAL_STATE lane) + UlcnetStream, as main.c builds
  * them. A small test-local shim gives the pieces the shape the tests below drive.
  * --------------------------------------------------------------------------------------- */
 
 typedef struct MonoUlcnetConfig {
-    UlcnetGrid grid;              /* the stage's grid */
+    UlcnetGrid grid;              /* the stream's grid */
     int sample_rate, fft_size;    /* the lane's */
     AecDelayMode delay_mode;
     int delay_num_filters, fixed_delay_samples;
     AecLevel aec_level;
-    UlcnetModel model;            /* all-zero: identity */
+    UlcTestModel model;           /* all-zero: no graph runs, every hop is the error spectrum */
 } MonoUlcnetConfig;
 
 typedef struct MonoUlcnetMemReq { uint64_t bytes; } MonoUlcnetMemReq;
 
 typedef struct MonoUlcnet {
     Aec* aec;
-    UlcnetNnStage* stage;
+    UlcTestRig rig;               /* the stream and the stand-in model */
     /* The application's framing, as main.c owns it: the far and error analyses and the synthesis. */
     AcStft *far_stft, *err_stft;
     AcIstft* istft;
-    Complex far_spec[BINS_MAX], err_spec[BINS_MAX], out_spec[BINS_MAX];
-    void* heap_stage_mem;
+    float far_re[BINS_MAX], far_im[BINS_MAX], err_re[BINS_MAX], err_im[BINS_MAX], out_re[BINS_MAX], out_im[BINS_MAX];
+    void* heap_stream_mem;
     void* heap_frame_mem;
 } MonoUlcnet;
 
@@ -95,7 +97,7 @@ static MonoUlcnetConfig mu_default_config(int sample_rate) {
     return cfg;
 }
 
-/* The lane on the stage's grid, AEC_RESIDUAL_STATE; -1 for a lane whose rate or fft differs
+/* The lane on the stream's grid, AEC_RESIDUAL_STATE; -1 for a lane whose rate or fft differs
  * from the grid (fft_size 0 takes the grid's), a bad grid or an out-of-enum level (this
  * harness's policy; libaec refuses the rest when sizing). */
 static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
@@ -115,41 +117,41 @@ static int mu_lane(const MonoUlcnetConfig* cfg, AecConfig* aec_cfg) {
     return 0;
 }
 
-/* Pool bytes of the AEC, the stage and the application's STFT / ISTFT objects, -1 for a refused config. */
+/* Pool bytes of the AEC, the stream and the application's STFT / ISTFT objects, -1 for a refused config. */
 static int mu_get_mem_requirements(const MonoUlcnetConfig* cfg, MonoUlcnetMemReq* req) {
     AecConfig aec_cfg;
-    size_t aec_bytes, stage_bytes;
+    size_t aec_bytes, stream_bytes;
     if (!req || mu_lane(cfg, &aec_cfg) != 0) return -1;
-    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
+    stream_bytes = ulc_rig_stream_bytes(&cfg->grid);
     aec_bytes = aec_get_mem_size(&aec_cfg);
-    if (aec_bytes == 0 || stage_bytes == 0) return -1;
-    req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stage_bytes) + mu_frame_bytes(&cfg->grid));
+    if (aec_bytes == 0 || stream_bytes == 0) return -1;
+    req->bytes = (uint64_t)(ALIGN16(aec_bytes) + ALIGN16(stream_bytes) + mu_frame_bytes(&cfg->grid));
     return 0;
 }
 
-static MonoUlcnet* mu_wrap(Aec* aec, void* stage_mem, size_t stage_bytes, void* frame_mem, size_t frame_bytes,
+static MonoUlcnet* mu_wrap(Aec* aec, void* stream_mem, size_t stream_bytes, void* frame_mem, size_t frame_bytes,
                            const MonoUlcnetConfig* cfg, MonoUlcnet* p) {
     p->aec = aec;
-    p->stage = aec ? ulcnet_nn_stage_init(stage_mem, stage_bytes, &cfg->grid) : NULL;
-    if (!p->stage || mu_frame_init(p, frame_mem, frame_bytes, &cfg->grid) != 0 ||
-        ulcnet_nn_stage_set_model(p->stage, &cfg->model) != 0) return NULL;
+    if (!aec || ulc_rig_init(&p->rig, stream_mem, stream_bytes, &cfg->grid) != 0 ||
+        mu_frame_init(p, frame_mem, frame_bytes, &cfg->grid) != 0 ||
+        ulc_rig_set_model(&p->rig, &cfg->grid, &cfg->model) != 0) return NULL;
     return p;
 }
 
-/* A fresh instance in one block of `bytes` at `pool` (AEC first, then the stage, then the framing). */
+/* A fresh instance in one block of `bytes` at `pool` (AEC first, then the stream, then the framing). */
 static MonoUlcnet* mu_init(void* pool, size_t bytes, const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
     MonoUlcnetMemReq req;
     MonoUlcnet* p;
-    size_t aec_bytes, stage_bytes;
+    size_t aec_bytes, stream_bytes;
     if (!pool || mu_get_mem_requirements(cfg, &req) != 0 || bytes < req.bytes) return NULL;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
     aec_bytes = aec_get_mem_size(&aec_cfg);
-    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
+    stream_bytes = ulc_rig_stream_bytes(&cfg->grid);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
-    if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes), stage_bytes,
-                 (uint8_t*)pool + ALIGN16(aec_bytes) + ALIGN16(stage_bytes), mu_frame_bytes(&cfg->grid),
+    if (!mu_wrap(aec_init(pool, aec_bytes, &aec_cfg), (uint8_t*)pool + ALIGN16(aec_bytes), stream_bytes,
+                 (uint8_t*)pool + ALIGN16(aec_bytes) + ALIGN16(stream_bytes), mu_frame_bytes(&cfg->grid),
                  cfg, p)) {
         free(p);
         return NULL;
@@ -162,26 +164,26 @@ static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     AecConfig aec_cfg;
     Aec* aec;
     MonoUlcnet* p;
-    size_t stage_bytes, frame_bytes;
+    size_t stream_bytes, frame_bytes;
     if (mu_lane(cfg, &aec_cfg) != 0) return NULL;
-    stage_bytes = ulcnet_nn_stage_mem_size(&cfg->grid);
+    stream_bytes = ulc_rig_stream_bytes(&cfg->grid);
     frame_bytes = mu_frame_bytes(&cfg->grid);
     p = (MonoUlcnet*)calloc(1, sizeof(*p));
     if (!p) return NULL;
     aec = aec_create(&aec_cfg);
-    if (!aec || posix_memalign(&p->heap_stage_mem, 16, stage_bytes) != 0 ||
+    if (!aec || stream_bytes == 0 || posix_memalign(&p->heap_stream_mem, 16, stream_bytes) != 0 ||
         posix_memalign(&p->heap_frame_mem, 16, frame_bytes) != 0) {
-        free(p->heap_stage_mem);
-        p->heap_stage_mem = NULL;
+        free(p->heap_stream_mem);
+        p->heap_stream_mem = NULL;
         if (aec) aec_destroy(aec);
         free(p);
         return NULL;
     }
-    memset(p->heap_stage_mem, 0x5A, stage_bytes);
+    memset(p->heap_stream_mem, 0x5A, stream_bytes);
     memset(p->heap_frame_mem, 0x5A, frame_bytes);
-    if (!mu_wrap(aec, p->heap_stage_mem, stage_bytes, p->heap_frame_mem, frame_bytes, cfg, p)) {
+    if (!mu_wrap(aec, p->heap_stream_mem, stream_bytes, p->heap_frame_mem, frame_bytes, cfg, p)) {
         aec_destroy(aec);
-        free(p->heap_stage_mem);
+        free(p->heap_stream_mem);
         free(p->heap_frame_mem);
         free(p);
         return NULL;
@@ -189,16 +191,20 @@ static MonoUlcnet* mu_create(const MonoUlcnetConfig* cfg) {
     return p;
 }
 
+/* Contract violations the rigs of every destroyed instance saw (ulc_rig_begin / ulc_rig_end); main expects 0. */
+static long g_rig_broken = 0;
+
 static void mu_destroy(MonoUlcnet* p) {
     if (!p) return;
+    g_rig_broken += p->rig.broken;
     if (p->aec) aec_destroy(p->aec);
-    free(p->heap_stage_mem);
+    free(p->heap_stream_mem);
     free(p->heap_frame_mem);
     free(p);
 }
 
 static int mu_hop_size(const MonoUlcnet* p) {
-    return p && p->stage ? ulcnet_nn_stage_grid(p->stage)->hop : -1;
+    return p ? ulcnet_stream_hop_size(p->rig.stream) : -1;
 }
 static Aec* mu_get_aec(const MonoUlcnet* p) { return p ? p->aec : NULL; }
 
@@ -221,22 +227,22 @@ static AecLinearView mu_linear(const MonoUlcnet* p) {
 static void mu_reset(MonoUlcnet* p) {
     if (!p) return;
     aec_reset(p->aec);
-    ulcnet_nn_stage_reset(p->stage);
+    ulc_rig_reset(&p->rig);
     ac_stft_reset(p->far_stft);
     ac_stft_reset(p->err_stft);
     ac_istft_reset(p->istft);
 }
 
 /* Planted defect for the guard-hop test only: on a hop where the AEC's output guard fires, feed the
- * stage the rendering base (AecResidualView.base_spec) instead of the analysis seam. */
+ * stream the rendering base (AecResidualView.base_spec) instead of the analysis seam. */
 static int g_mu_feed_base = 0;
 
-/* AEC, then the caller's analyses of the raw reference and the lane's formed hop, then the stage's
- * begin_spec with the alignment events (changed = CHANGED, solid = not UNLOCKED). */
+/* AEC, then the caller's analyses of the raw reference and the lane's formed hop, then the stream's
+ * pre_process_freq with the alignment events (changed = CHANGED, solid = not UNLOCKED). */
 static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
     AecResidualView rv;
     AecLinearView lv;
-    UlcnetNnDelay delay;
+    UlcnetStreamDelay delay;
     if (!p || !mic || !ref) return -1;
     if (aec_process_linear(p->aec, mic, ref) != AEC_OK) return -1;
     if (aec_process_residual(p->aec, NULL) != AEC_OK) return -1;
@@ -244,45 +250,36 @@ static int mu_process_begin(MonoUlcnet* p, const float* mic, const float* ref) {
     lv = mu_linear(p);
     delay.changed = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
     delay.solid = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    (void)ac_stft_push(p->far_stft, ref, p->far_spec);
-    if (g_mu_feed_base && rv.guard_active && rv.base_spec)
-        return ulcnet_nn_stage_begin_spec(p->stage, rv.base_spec, p->far_spec, delay) == 0 ? 0 : -1;
-    (void)ac_stft_push(p->err_stft, rv.formed_hop, p->err_spec);
-    return ulcnet_nn_stage_begin_spec(p->stage, p->err_spec, p->far_spec, delay) == 0 ? 0 : -1;
+    (void)ac_stft_push_planar(p->far_stft, ref, p->far_re, p->far_im);
+    if (g_mu_feed_base && rv.guard_active && rv.base_spec) {
+        for (int k = 0; k < BINS; k++) { p->err_re[k] = rv.base_spec[k].r; p->err_im[k] = rv.base_spec[k].i; }
+    } else {
+        (void)ac_stft_push_planar(p->err_stft, rv.formed_hop, p->err_re, p->err_im);
+    }
+    return ulc_rig_begin(&p->rig, p->err_re, p->err_im, p->far_re, p->far_im, delay);
 }
 
-/* The stage without an AEC: the error as a time-domain hop and the raw far hop. */
-static int mu_stage_begin_time(MonoUlcnet* p, const float* err_hop, const float* far_hop, UlcnetNnDelay delay) {
-    (void)ac_stft_push(p->far_stft, far_hop, p->far_spec);
-    (void)ac_stft_push(p->err_stft, err_hop, p->err_spec);
-    return ulcnet_nn_stage_begin_spec(p->stage, p->err_spec, p->far_spec, delay) == 0 ? 0 : -1;
+/* The stream without an AEC: the error as a time-domain hop and the raw far hop. */
+static int mu_stream_begin_time(MonoUlcnet* p, const float* err_hop, const float* far_hop, UlcnetStreamDelay delay) {
+    (void)ac_stft_push_planar(p->far_stft, far_hop, p->far_re, p->far_im);
+    (void)ac_stft_push_planar(p->err_stft, err_hop, p->err_re, p->err_im);
+    return ulc_rig_begin(&p->rig, p->err_re, p->err_im, p->far_re, p->far_im, delay);
 }
 
-/* The caller's synthesis of the stage's output spectrum. */
+/* The caller's synthesis of the stream's output spectrum. */
 static int mu_synth(MonoUlcnet* p, float* out) {
-    return ac_istft_push(p->istft, p->out_spec, out) == mu_hop_size(p) ? 0 : -1;
-}
-
-static int mu_nn_begin(MonoUlcnet* p, UlcnetNnJob* job) {
-    int r;
-    if (!p || !job) return -1;
-    r = ulcnet_nn_stage_nn_begin(p->stage, job);
-    return r < 0 ? -1 : r;
-}
-
-static int mu_nn_end(MonoUlcnet* p, int model_rc) {
-    return p && ulcnet_nn_stage_nn_end(p->stage, model_rc) == 0 ? 0 : -1;
+    return ac_istft_push_planar(p->istft, p->out_re, p->out_im, out) == mu_hop_size(p) ? 0 : -1;
 }
 
 static int mu_process_end(MonoUlcnet* p, float* out) {
-    return p && out && ulcnet_nn_stage_end_spec(p->stage, p->out_spec) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
+    return p && out && ulc_rig_end(&p->rig, p->out_re, p->out_im) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
 }
 
-/* The whole hop with the installed model (identity when unset). */
+/* The whole hop with the installed model (the error spectrum when unset). */
 static int mu_process(MonoUlcnet* p, const float* mic, const float* ref, float* out) {
     if (!p || !mic || !ref || !out) return -1;
     if (mu_process_begin(p, mic, ref) != 0) return -1;
-    return ulcnet_nn_stage_process(p->stage, p->out_spec) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
+    return ulc_rig_process(&p->rig, p->out_re, p->out_im) == 0 && mu_synth(p, out) == 0 ? 0 : -1;
 }
 
 
@@ -363,7 +360,7 @@ static int frames_at_hop(void) { return 1; }
  * 1. identity E2E: NULL model, zero-delay echo. Every hop, BEFORE the next
  *    process call, the formed hop is recorded; out[hop p] must match
  *    formed_history[p-1] within 2e-4. Hop 0 is real output (the first half of the first
- *    frame's synthesis), which for an identity stage is the zero history: it stays ~0.
+ *    frame's synthesis), which without a model is the zero history: it stays ~0.
  * ========================================================================= */
 static void test_identity_e2e(void) {
     enum { N = 100 };
@@ -372,7 +369,7 @@ static void test_identity_e2e(void) {
     if (!p) { fprintf(stderr, "FAIL: setup (create) for identity E2E test\n"); g_failures++; return; }
 
     CHECK(mu_hop_size(p) == HOP,
-          fmt_msg("hop_size accessor reports the stage grid's hop (%d)", HOP));
+          fmt_msg("hop_size accessor reports the stream grid's hop (%d)", HOP));
 
     float mic[HOP_MAX], ref[HOP_MAX];
     static float out_hist[N][HOP_MAX], formed_hist[N][HOP_MAX];
@@ -414,10 +411,10 @@ static void test_identity_e2e(void) {
 }
 
 /* =========================================================================
- * 2. counting model, bulk-delay echo (UNLOCKED -> CHANGED -> LOCKED). infer is stepped
- *    for every emitted frame except the ULCNET_NN_STAGE_REPRIME_FRAMES identity
- *    frames after each CHANGED hop; model->reset fires once per CHANGED hop plus once
- *    per pipeline reset. The expectation is built hop by hop from that policy, so a
+ * 2. counting model (unit mask), bulk-delay echo (UNLOCKED -> CHANGED -> LOCKED). infer is stepped
+ *    for every emitted frame except the REPRIME_FRAMES identity
+ *    frames after each CHANGED hop; the model state is restarted (model->reset: the stream's state
+ *    generation moved before the frame) once per CHANGED hop plus once per pipeline reset. The expectation is built hop by hop from that policy, so a
  *    missing or an over-long reprime fails.
  * ========================================================================= */
 typedef struct {
@@ -430,10 +427,9 @@ static int counting_infer(void* user,
                           const float* far_re, const float* far_im,
                           float* out_re, float* out_im) {
     CountingModelState* st = (CountingModelState*)user;
-    (void)far_re; (void)far_im;
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
     st->infer_calls++;
-    memcpy(out_re, err_re, BINS * sizeof(float));
-    memcpy(out_im, err_im, BINS * sizeof(float));
+    mask_fill(out_re, out_im, 1.0f);
     return 0;
 }
 
@@ -468,7 +464,7 @@ static void test_counting_model(void) {
         mu_process(p, mic, ref, out);
         AecLinearDelayState ds = pipeline_delay_state(p);
         if (ds == AEC_LINEAR_DELAY_CHANGED)
-            armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            armed = REPRIME_FRAMES;
         frames = frames_at_hop();
         skipped_here = reprime_take(&armed, frames);
         skipped_total += skipped_here;
@@ -489,9 +485,9 @@ static void test_counting_model(void) {
           fmt_msg("counting model: one infer per emitted frame at every hop except the "
                   "%d reprime frames per alignment generation "
                   "(%d calls after %d hops, %d skipped, first bad hop %d [-1=none])",
-                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  (int)REPRIME_FRAMES,
                   st.infer_calls, N, skipped_total, first_bad_hop));
-    CHECK(skipped_total == n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES &&
+    CHECK(skipped_total == n_changed * REPRIME_FRAMES &&
           skipped_total > 0,
           fmt_msg("counting model: the reprime really ran (%d frames skipped over %d "
                   "generations) -- compute DROPS on those frames, never doubles",
@@ -615,11 +611,11 @@ static void test_fixed_first_alignment_resets_model(void) {
                   "raw to aligned far (got %d)", st.reset_calls));
     /* The transition suppresses inference for the identity reprime and for
      * nothing else: N hops emit N frames, of which exactly
-     * ULCNET_NN_STAGE_REPRIME_FRAMES straddle the switch. */
-    CHECK(st.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+     * REPRIME_FRAMES straddle the switch. */
+    CHECK(st.infer_calls == N - REPRIME_FRAMES,
           fmt_msg("FIXED transition suppresses inference for exactly the %d "
                   "straddling frames and no others (%d calls over %d emitted "
-                  "frames)", (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  "frames)", (int)REPRIME_FRAMES,
                   st.infer_calls, N));
     mu_destroy(p);
 }
@@ -629,8 +625,8 @@ static void test_fixed_first_alignment_resets_model(void) {
  *     infer() while unlocked, so its recurrent state spans an unvouched reference):
  *     LOCKED(V) -> forced UNLOCKED for several hops -> LOCKED(V) issues exactly one
  *     model->reset, on the relock hop. Same contract as the 4ch twin test.
- *     MUTATION: removing the `delay_state == AEC_LINEAR_DELAY_CHANGED` model reset in
- *     ulcnet/ulcnet_nn_stage.c turns this test red.
+ *     MUTATION: dropping `delay.changed` from the edge rule of
+ *     stream/aiaec/ulcnet/ulcnet_stream.c turns this test red.
  * ========================================================================= */
 static int pipeline_delay_samples(const MonoUlcnet* p) {
     return mu_linear(p).delay_samples;
@@ -729,9 +725,9 @@ static void test_relock_same_delay_resets_model(void) {
 
 /* The AEC's hard post-chain reset serial (aec_post_reset_serial()) also advances on the Path A / Path B
  * hard resets INSIDE a processing call. This program has no comfort noise and no synthesis of its own
- * beyond the stage, so the serial is not consumed here; the model is still tied to it. Every hop on
- * which the serial moved inside a processing call must also be a hop on which the stage reset the
- * model and spent the reprime (no inference that hop). A serial move that the stage did not follow
+ * beyond the stream's, so the serial is not consumed here; the model is still tied to it. Every hop on
+ * which the serial moved inside a processing call must also be a hop on which the stream restarted the
+ * model and spent the reprime (no inference that hop). A serial move that the stream did not follow
  * would leave the network state straddling the AEC's cleared filter state. */
 typedef struct {
     int hops, serial_moves, followed, delay_changed_moves;
@@ -786,7 +782,7 @@ static void test_serial_advance_resets_model(void) {
           fmt_msg("serial follow: every such hop is a delay.changed hop (%d of %d)",
                   sf.delay_changed_moves, sf.serial_moves));
 
-    /* aec_reset() moves the serial by itself; the pipeline reset pairs it with the stage reset. */
+    /* aec_reset() moves the serial by itself; the pipeline reset pairs it with the stream reset. */
     uint32_t s0 = aec_post_reset_serial(mu_get_aec(p));
     int r0 = st.reset_calls;
     mu_reset(p);
@@ -797,7 +793,7 @@ static void test_serial_advance_resets_model(void) {
 }
 
 /* =========================================================================
- * 3. fail-open model callback. Model A halves the spectrum on success (rc=0) and
+ * 3. fail-open model run. Model A's mask halves the spectrum on success (rc=0) and
  *    doubles it on scheduled failing hops (rc!=0); pipeline B has a NULL model.
  *    Output hop p mixes the frames pushed at hops p-1 and p (50% WOLA overlap), so
  *    A == B bitwise exactly when both contributing frames took the identity path.
@@ -811,15 +807,11 @@ static int failing_infer(void* user,
                          const float* far_re, const float* far_im,
                          float* out_re, float* out_im) {
     FailModelState* st = (FailModelState*)user;
-    (void)far_re; (void)far_im;
-    float scale = st->fail_now ? 2.0f : 0.5f;
-    for (int k = 0; k < BINS; k++) {
-        out_re[k] = scale * err_re[k];
-        out_im[k] = scale * err_im[k];
-    }
-    /* On failure the model has ALREADY written garbage (2x) into out_re/
-     * out_im — the pipeline must discard it, not "fail because the buffer
-     * was left untouched". */
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
+    mask_fill(out_re, out_im, mask_of_gain(st->fail_now ? 2.0f : 0.5f));
+    /* On failure the model has ALREADY written a finite (2x) mask — the
+     * pipeline must discard it, not "fail because the buffer was left
+     * untouched". */
     return st->fail_now ? 1 : 0;
 }
 
@@ -878,7 +870,7 @@ static void test_fail_open_and_delay_gating(void) {
          * region (lock_hop >= 2, asserted below), so one reprime frame is
          * consumed per hop here. */
         if (ds_a == AEC_LINEAR_DELAY_CHANGED)
-            reprime_left = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            reprime_left = REPRIME_FRAMES;
         {
             int reprimed = reprime_take(&reprime_left, 1);
             ident[h] = st.fail_now || reprimed > 0;
@@ -906,7 +898,7 @@ static void test_fail_open_and_delay_gating(void) {
                   "and the reprime lands in the steady 1-frame-per-hop region",
                   lock_hop, MAX_LOCK_HOPS));
     CHECK(n_unlocked >= 2 && n_failing == FAIL_LEN &&
-          n_reprime_hops == ULCNET_NN_STAGE_REPRIME_FRAMES,
+          n_reprime_hops == REPRIME_FRAMES,
           fmt_msg("coverage: %d UNLOCKED hops, %d scheduled infer failures, %d reprime "
                   "identity frames", n_unlocked, n_failing, n_reprime_hops));
     CHECK(states_ok, "model presence does not perturb the AEC (identical delay states A vs B)");
@@ -924,20 +916,23 @@ static void test_fail_open_and_delay_gating(void) {
 }
 
 /* =========================================================================
- * 10. far-input contract gate: a model that publishes a model-I/O
- * descriptor may only be wired to a stage whose far branch matches the
- * checkpoint the descriptor describes. Both directions are checked, on
- * every construction path of the composition.
+ * 10. graph descriptor gate: the composition checks the descriptor published beside
+ * the graph against its grid before any hop runs, as main.c does with the
+ * model's metadata (ulcnet_model_io_descriptor_validate(), one frame per call).
+ * Both construction paths are checked.
  * ========================================================================= */
 static void test_raw_descriptor_gate(void) {
-    UlcnetModelIoDescriptor raw_desc, aligned_desc;
+    UlcnetModelIoDescriptor raw_desc, aligned_desc, other_desc, packet_desc;
+    const UlcnetGrid other = other_grid();
     MonoUlcnetMemReq req;
     void* pool = NULL;
     MonoUlcnet* p;
 
     if (ulcnet_model_io_descriptor_default(&g_grid, &raw_desc) != 0 ||
-        ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) != 0) {
-        fprintf(stderr, "FAIL: setup (descriptor_default) for far-mode gate test\n");
+        ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) != 0 ||
+        ulcnet_model_io_descriptor_default(&other, &other_desc) != 0 ||
+        ulcnet_model_io_descriptor_default_packet(&g_grid, 8, &packet_desc) != 0) {
+        fprintf(stderr, "FAIL: setup (descriptor_default) for the descriptor gate test\n");
         g_failures++;
         return;
     }
@@ -945,45 +940,36 @@ static void test_raw_descriptor_gate(void) {
     CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
           "descriptor_default publishes the fixed raw-far contract");
 
-    /* An undescribed model remains valid for the identity/test boundary. */
-    MonoUlcnetConfig undescribed = mu_default_config(g_grid.sample_rate);
-    undescribed.model.user = NULL;
-    undescribed.model.infer = gate_infer_identity;
-    undescribed.model.reset = NULL;
-    undescribed.model.io_descriptor = NULL;
-    /* An INFERRING model must publish a descriptor: the stage pins the external contract
-     * (layout, grid, raw far, D range) against it, and a disagreement with the graph is
-     * undetectable downstream. An identity model -- no infer callback -- has nothing to
-     * agree about. */
-    p = mu_create(&undescribed);
-    CHECK(p == NULL, "an INFERRING model with io_descriptor == NULL is refused");
-    mu_destroy(p);
-    {
-        MonoUlcnetConfig identity_only = undescribed;
-        identity_only.model.infer = NULL;
-        p = mu_create(&identity_only);
-        CHECK(p != NULL, "an identity model (no infer) may still leave the descriptor NULL");
-        mu_destroy(p);
-    }
-    undescribed.model.io_descriptor = test_io_descriptor();
-
-    MonoUlcnetConfig raw_model = undescribed;
+    MonoUlcnetConfig raw_model = mu_default_config(g_grid.sample_rate);
+    raw_model.model.infer = unit_mask_infer;
     raw_model.model.io_descriptor = &raw_desc;
     p = mu_create(&raw_model);
     CHECK(p != NULL, "raw descriptor is accepted");
     mu_destroy(p);
 
-    MonoUlcnetConfig aligned_model = undescribed;
+    MonoUlcnetConfig aligned_model = raw_model;
     aligned_model.model.io_descriptor = &aligned_desc;
     p = mu_create(&aligned_model);
     CHECK(p == NULL, "aligned-far descriptor is rejected");
+    mu_destroy(p);
+
+    MonoUlcnetConfig other_model = raw_model;
+    other_model.model.io_descriptor = &other_desc;
+    p = mu_create(&other_model);
+    CHECK(p == NULL, "a descriptor of the other grid is rejected");
+    mu_destroy(p);
+
+    MonoUlcnetConfig packet_model = raw_model;
+    packet_model.model.io_descriptor = &packet_desc;
+    p = mu_create(&packet_model);
+    CHECK(p == NULL, "a packet descriptor (N = 8) is rejected by the one-hop composition");
     mu_destroy(p);
 
     /* The one-block construction shares the gate, so the mismatch is fail-fast on
      * both construction paths. */
     if (mu_get_mem_requirements(&raw_model, &req) != 0 ||
         posix_memalign(&pool, 16, (size_t)req.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for far-mode gate test\n");
+        fprintf(stderr, "FAIL: pool alloc for the descriptor gate test\n");
         g_failures++;
         return;
     }
@@ -998,8 +984,8 @@ static void test_raw_descriptor_gate(void) {
 
 /* The table row that is not the grid under test. */
 /* =========================================================================
- * The grid and the pool plan of the composition: the lane refuses what is not the stage's
- * grid, the delay request reaches the AEC pool size, and the stage and AEC blocks are
+ * The grid and the pool plan of the composition: the lane refuses what is not the stream's
+ * grid, the delay request reaches the AEC pool size, and the stream and AEC blocks are
  * refused when misaligned or short.
  * ========================================================================= */
 static void test_grid_and_pool_plan(void) {
@@ -1017,26 +1003,26 @@ static void test_grid_and_pool_plan(void) {
     for (int i = 0; i < 3; i++) {
         MonoUlcnetConfig c = mu_default_config(bad_rates[i]);
         CHECK(mu_get_mem_requirements(&c, &req) == -1,
-              fmt_msg("the lane rejects sample_rate=%d (the stage grid is %d Hz)", bad_rates[i],
+              fmt_msg("the lane rejects sample_rate=%d (the stream grid is %d Hz)", bad_rates[i],
                       g_grid.sample_rate));
     }
     {
         MonoUlcnetConfig bad_fft = mu_default_config(g_grid.sample_rate);
         bad_fft.fft_size = other.n_fft;   /* legal elsewhere -- NOT on this grid */
         CHECK(mu_get_mem_requirements(&bad_fft, &req) == -1,
-              fmt_msg("the lane rejects fft_size=%d (the stage grid is %d)",
+              fmt_msg("the lane rejects fft_size=%d (the stream grid is %d)",
                       other.n_fft, g_grid.n_fft));
     }
     {
-        MonoUlcnetConfig other_stage = mu_default_config(g_grid.sample_rate);
-        MonoUlcnetConfig bad_stage = good;
-        other_stage.grid = other;   /* a stage grid the lane does not run */
-        CHECK(mu_get_mem_requirements(&other_stage, &req) == -1,
-              "a stage grid that differs from the lane's rate and fft is refused");
-        bad_stage.grid.n_fft = 500;
-        bad_stage.fft_size = 500;
-        CHECK(mu_get_mem_requirements(&bad_stage, &req) == -1,
-              "an invalid stage grid is refused");
+        MonoUlcnetConfig other_stream = mu_default_config(g_grid.sample_rate);
+        MonoUlcnetConfig bad_stream = good;
+        other_stream.grid = other;   /* a stream grid the lane does not run */
+        CHECK(mu_get_mem_requirements(&other_stream, &req) == -1,
+              "a stream grid that differs from the lane's rate and fft is refused");
+        bad_stream.grid.n_fft = 500;
+        bad_stream.fft_size = 500;
+        CHECK(mu_get_mem_requirements(&bad_stream, &req) == -1,
+              "an invalid stream grid is refused");
     }
     {
         MonoUlcnetConfig bad_level = mu_default_config(g_grid.sample_rate);
@@ -1059,7 +1045,7 @@ static void test_grid_and_pool_plan(void) {
     {
         MonoUlcnetMemReq req0, req_explicit;
         MonoUlcnetConfig c0 = mu_default_config(g_grid.sample_rate);
-        c0.fft_size = 0;  /* 0 resolves to the stage's grid */
+        c0.fft_size = 0;  /* 0 resolves to the stream's grid */
         CHECK(mu_get_mem_requirements(&c0, &req0) == 0 &&
               mu_get_mem_requirements(&good, &req_explicit) == 0 &&
               req0.bytes == req_explicit.bytes && req0.bytes > 0,
@@ -1161,9 +1147,11 @@ static void test_create_vs_init_parity(void) {
 }
 
 /* =========================================================================
- * 5. NULL model == identity model, bit-identical (bulk-delay echo: covers
- *    UNLOCKED, CHANGED and LOCKED phases — the identity model's applied
- *    output must be byte-equal to the bypass path in every one of them).
+ * 5. NULL model vs unit-mask model (bulk-delay echo: covers UNLOCKED, CHANGED and
+ *    LOCKED phases). A mask of 1 runs the graph's arithmetic and changes the spectrum
+ *    only by the rounding of the compression, so the applied output stays within
+ *    2e-6 of the peak of the bypass path in every phase (measured 2e-7) and is not
+ *    bit-identical to it.
  * ========================================================================= */
 static void test_null_model_equals_identity_model(void) {
     enum { N = 200 };
@@ -1172,14 +1160,14 @@ static void test_null_model_equals_identity_model(void) {
     MonoUlcnetConfig cfg_null = mu_default_config(g_grid.sample_rate);
     MonoUlcnetConfig cfg_id   = mu_default_config(g_grid.sample_rate);
     cfg_id.model.user  = &st;
-    cfg_id.model.infer = counting_infer;   /* copies err -> out, returns 0 */
+    cfg_id.model.infer = counting_infer;   /* unit mask, returns 0 */
     cfg_id.model.io_descriptor = test_io_descriptor();
     cfg_id.model.reset = counting_reset;
 
     MonoUlcnet* pn = mu_create(&cfg_null);
     MonoUlcnet* pi = mu_create(&cfg_id);
     if (!pn || !pi) {
-        fprintf(stderr, "FAIL: setup (create) for NULL-vs-identity test\n");
+        fprintf(stderr, "FAIL: setup (create) for NULL-vs-unit-mask test\n");
         g_failures++;
         if (pn) mu_destroy(pn);
         if (pi) mu_destroy(pi);
@@ -1190,85 +1178,122 @@ static void test_null_model_equals_identity_model(void) {
     EchoSim sim;
     echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
 
-    int equal = 1, first_bad = -1, saw_locked = 0, n_changed = 0;
+    int saw_locked = 0, n_changed = 0, n_bit_equal = 0;
+    double max_err = 0.0, peak = 0.0;
     for (int h = 0; h < N; h++) {
         echo_sim_hop(&sim, mic, ref);
         mu_process(pn, mic, ref, out_n);
         mu_process(pi, mic, ref, out_i);
-        if (memcmp(out_n, out_i, HOP_BYTES) != 0 && equal) { equal = 0; first_bad = h; }
+        for (int i = 0; i < HOP; i++) {
+            double d = fabs((double)out_n[i] - (double)out_i[i]);
+            if (d > max_err) max_err = d;
+            if (fabs((double)out_n[i]) > peak) peak = fabs((double)out_n[i]);
+        }
+        if (memcmp(out_n, out_i, HOP_BYTES) == 0) n_bit_equal++;
         if (pipeline_delay_state(pi) != AEC_LINEAR_DELAY_UNLOCKED) saw_locked = 1;
         if (pipeline_delay_state(pi) == AEC_LINEAR_DELAY_CHANGED) n_changed++;
     }
 
-    CHECK(saw_locked, "NULL-vs-identity run reached the locked (model-applied) phase");
-    CHECK(equal,
-          fmt_msg("NULL model output == identity (err->out copy) model output, "
-                  "bit-identical over %d hops (first mismatch %d [-1=none])", N, first_bad));
-    /* Stepped on every emitted frame except the reprime frames -- which are
-     * identity frames too, so the bit-identity above is unaffected by them. */
+    CHECK(saw_locked, "NULL-vs-unit-mask run reached the locked (model-applied) phase");
+    CHECK(peak > 1e-3 && max_err <= 2e-6 * peak,
+          fmt_msg("unit-mask model output == NULL model output within the compression round trip "
+                  "over %d hops (max err %.3e, peak %.3e)", N, max_err, peak));
+    CHECK(max_err > 0.0 && n_bit_equal < N / 4,
+          fmt_msg("the unit mask was really applied: only %d of %d hops are bit-identical to the "
+                  "bypass path", n_bit_equal, N));
+    /* Stepped on every emitted frame except the reprime frames. */
     CHECK(st.infer_calls ==
-          N - n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES,
-          fmt_msg("identity model was stepped on every frame except the %d reprime "
+          N - n_changed * REPRIME_FRAMES,
+          fmt_msg("unit-mask model was stepped on every frame except the %d reprime "
                   "frames of its %d alignment generations (%d calls)",
-                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, n_changed,
+                  (int)REPRIME_FRAMES, n_changed,
                   st.infer_calls));
+    CHECK(pi->rig.broken == 0 && pi->rig.refused == 0 && pn->rig.broken == 0,
+          "every frame the model ran on carried the front end of the spectra handed in; none was refused");
 
     mu_destroy(pn);
     mu_destroy(pi);
 }
 
 /* =========================================================================
- * 6. far-timestamp after fixed-delay acquisition. A far-passthrough model, silence on
- *    the mic and one unit impulse in far at sample T: the mono far tap is same-hop
- *    with the error tap and the chain lags the input by one hop, so the impulse must
- *    land at exactly T + HOP. Feeding the AEC's aligned far would move it by
- *    FIXED_DELAY.
+ * 6. far-timestamp after fixed-delay acquisition. Silence on the mic and one unit impulse
+ *    in far at sample T; the model records the far spectrum it is handed on every hop
+ *    and the test synthesises those spectra with its own AcIstft. The mono far tap is
+ *    same-hop with the error tap and the synthesis lags by one hop, so the impulse must
+ *    land at exactly T + HOP. Feeding the AEC's aligned far would move it by FIXED_DELAY.
  * ========================================================================= */
 static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
     enum { N = 40, IMP_HOP = 8, IMP_OFF = 37 };
     const int FIXED_DELAY = 2 * HOP;
     const int imp_index = IMP_HOP * HOP + IMP_OFF;
-    const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop chain */
+    const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop synthesis */
+    static UlcFarCapture st;
+    AcStftConfig sc;
+    AcIstft* far_synth;
+    void* synth_mem = NULL;
+    size_t synth_bytes;
 
     MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.fixed_delay_samples = FIXED_DELAY;
-    cfg.model.infer = passthrough_far_infer;
+    cfg.model.user = &st;
+    cfg.model.infer = far_capture_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     MonoUlcnet* p = mu_create(&cfg);
-    if (!p) { fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n"); g_failures++; return; }
+    mu_frame_config(&sc, &g_grid);
+    synth_bytes = ac_istft_get_mem_size(&sc);
+    if (!p || posix_memalign(&synth_mem, 16, synth_bytes) != 0 ||
+        !(far_synth = ac_istft_init(synth_mem, synth_bytes, &sc))) {
+        fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n");
+        g_failures++;
+        mu_destroy(p);
+        free(synth_mem);
+        return;
+    }
 
-    float mic[HOP_MAX], ref[HOP_MAX];
-    static float out_hist[N][HOP_MAX];
+    float mic[HOP_MAX], ref[HOP_MAX], out[HOP_MAX];
+    static float far_hist[N][HOP_MAX];
+    int unseen = 0;
     for (int h = 0; h < N; h++) {
         memset(mic, 0, HOP_BYTES);
         memset(ref, 0, HOP_BYTES);
         if (h == IMP_HOP) ref[IMP_OFF] = 1.0f;
-        mu_process(p, mic, ref, out_hist[h]);
+        st.called = 0;
+        mu_process(p, mic, ref, out);
+        if (!st.called) {   /* the reprime hop of the FIXED lock: the model sees no frame */
+            unseen++;
+            memset(st.re, 0, sizeof(st.re));
+            memset(st.im, 0, sizeof(st.im));
+        }
+        (void)ac_istft_push_planar(far_synth, st.re, st.im, far_hist[h]);
     }
 
     int   found_index = -1;
     float peak = 0.0f;
     for (int h = 0; h < N; h++) {
         for (int i = 0; i < HOP; i++) {
-            float a = fabsf(out_hist[h][i]);
+            float a = fabsf(far_hist[h][i]);
             if (a > peak) { peak = a; found_index = h * HOP + i; }
         }
     }
 
+    CHECK(unseen == REPRIME_FRAMES,
+          fmt_msg("the model saw a far frame on every hop but the %d reprime hop of the FIXED lock (%d unseen)",
+                  (int)REPRIME_FRAMES, unseen));
     CHECK(found_index == expect_index,
-          fmt_msg("raw-far timestamp after fixed-delay lock: impulse at far[%d] lands at out[%d] "
-                  "(expected %d = impulse + 1 hop; offset %+d samples)",
+          fmt_msg("raw-far timestamp after fixed-delay lock: impulse at far[%d] lands at [%d] in the far "
+                  "frames the model was handed (expected %d = impulse + 1 hop; offset %+d samples)",
                   imp_index, found_index, expect_index, found_index - expect_index));
     CHECK(peak > 0.9f,
           fmt_msg("far impulse reconstructed at ~unit amplitude (peak %.4f)", peak));
 
     mu_destroy(p);
+    free(synth_mem);
 }
 
 /* =========================================================================
- * 7. Production does not gate on the delay lock: the 0.5x model's output is
- *    APPLIED from the first emitted frame (hop #1), while the delay is
+ * 7. Production does not gate on the delay lock: the 0.5x mask's output is
+ *    APPLIED from the first emitted frame (hop #0), while the delay is
  *    still UNLOCKED -- the model pipeline must differ from the
  *    NULL-model pipeline on every hop from #1 on (the bulk-delay near-end
  *    noise makes the error nonzero from the start).
@@ -1277,11 +1302,8 @@ static int halving_infer(void* user,
                          const float* err_re, const float* err_im,
                          const float* far_re, const float* far_im,
                          float* out_re, float* out_im) {
-    (void)user; (void)far_re; (void)far_im;
-    for (int k = 0; k < BINS; k++) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
-    }
+    (void)user; (void)err_re; (void)err_im; (void)far_re; (void)far_im;
+    mask_fill(out_re, out_im, mask_of_gain(0.5f));
     return 0;
 }
 
@@ -1312,12 +1334,26 @@ static void test_model_applies_unlocked(void) {
         mu_process(pr, mic, ref, out_r);
         mu_process(pn, mic, ref, out_n);
         if (h == 0) {
-            /* hop #0 is frame 0's first half alone, and the model halves that frame's
-             * spectrum: the synthesis is linear, so the output is exactly half the NULL-model one */
-            int halved = 1;
-            for (int i = 0; i < HOP; i++)
-                if (fabs((double)out_r[i] - 0.5 * (double)out_n[i]) > 1e-9) halved = 0;
-            CHECK(halved, "hop #0: the model is applied from the first frame (output == 0.5 x the NULL-model hop)");
+            /* The PCM of hop #0 is frame 0's first half over a zero history (rounding noise), so the
+             * first frame is judged on its spectrum: the stream's output is the mask arithmetic on the
+             * error spectrum bit for bit, half of it up to the rounding of the compression, and the
+             * NULL-model pipeline hands the error spectrum on unchanged. */
+            float want_re[BINS_MAX], want_im[BINS_MAX];
+            double worst = 0.0, pk = 0.0;
+            enhanced_of_gain(pr->err_re, pr->err_im, 0.5f, want_re, want_im);
+            for (int k = 0; k < BINS; k++) {
+                worst = fmax(worst, fabs((double)pr->out_re[k] - 0.5 * (double)pr->err_re[k]));
+                worst = fmax(worst, fabs((double)pr->out_im[k] - 0.5 * (double)pr->err_im[k]));
+                pk = fmax(pk, fmax(fabs((double)pr->err_re[k]), fabs((double)pr->err_im[k])));
+            }
+            CHECK(memcmp(pr->out_re, want_re, BINS * sizeof(float)) == 0 &&
+                  memcmp(pr->out_im, want_im, BINS * sizeof(float)) == 0 && pk > 1e-3 && worst <= 2e-6 * pk,
+                  fmt_msg("hop #0: the model is applied from the first frame (output spectrum == the 0.5x mask "
+                          "on the error spectrum bit for bit; |out - 0.5 err| <= %.3e, peak %.3e)", worst, pk));
+            CHECK(memcmp(pn->out_re, pn->err_re, BINS * sizeof(float)) == 0 &&
+                  memcmp(pn->out_im, pn->err_im, BINS * sizeof(float)) == 0 &&
+                  memcmp(pn->err_re, pr->err_re, BINS * sizeof(float)) == 0,
+                  "hop #0: the NULL-model pipeline hands on the same error spectrum unchanged");
         } else if (memcmp(out_r, out_n, HOP_BYTES) == 0 && applied_from_hop1) {
             applied_from_hop1 = 0;
             first_equal_hop = h;
@@ -1339,8 +1375,8 @@ static void test_model_applies_unlocked(void) {
 }
 
 /* =========================================================================
- * 8. NaN guard. On scheduled hops the model returns rc==0 but poisons one bin with
- *    NaN and another with +Inf; otherwise it halves the spectrum. As in test 3,
+ * 8. NaN guard. On scheduled hops the model returns rc==0 but poisons one mask bin with
+ *    NaN and another with +Inf; otherwise its mask halves the spectrum. As in test 3,
  *    output hop p is bit-identical to a NULL-model pipeline exactly when both
  *    contributing frames were poisoned and discarded, and differs once a clean frame
  *    contributes (so recovery is proven). No NaN may reach the output.
@@ -1354,11 +1390,8 @@ static int nan_infer(void* user,
                      const float* far_re, const float* far_im,
                      float* out_re, float* out_im) {
     NanModelState* st = (NanModelState*)user;
-    (void)far_re; (void)far_im;
-    for (int k = 0; k < BINS; k++) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
-    }
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
+    mask_fill(out_re, out_im, mask_of_gain(0.5f));
     if (st->poison_now) {
         /* rc stays 0: only the NaN/Inf guard can catch this frame. Poison
          * mid-array values so a partial scan would miss them. */
@@ -1434,6 +1467,11 @@ static void test_nan_guard(void) {
                   "reprime frame joins the schedule (%d CHANGED hops)", n_changed));
     CHECK(n_equal >= 10 && n_differ >= 10,
           fmt_msg("coverage: %d NaN-identity hops and %d applied hops compared", n_equal, n_differ));
+    CHECK(pa->rig.refused == 16 && pa->rig.edges == 0 && pa->rig.broken == 0 &&
+          ulcnet_stream_state_generation(pa->rig.stream) == 16u,
+          fmt_msg("each of the 16 poisoned frames is refused and restarts the state generation once "
+                  "(%ld refused, generation %u)", pa->rig.refused,
+                  (unsigned)ulcnet_stream_state_generation(pa->rig.stream)));
     CHECK(equal_ok,
           fmt_msg("rc==0 NaN frames are discarded: output BIT-IDENTICAL to the "
                   "NULL-model pipeline on all %d fully-poisoned hops (first bad "
@@ -1449,11 +1487,11 @@ static void test_nan_guard(void) {
 
 /* =========================================================================
  * 9. full-write contract. On scheduled hops the model writes only the first 100 bins
- *    but returns rc==0. The pipeline pre-fills its staging with NaN before every
- *    infer call, so the unwritten bins stay non-finite and the frame takes the
+ *    of the mask but returns rc==0. The stream pre-fills the mask staging with NaN before
+ *    every run, so the unwritten bins stay non-finite and the frame takes the
  *    identity path (same mixing rule as test 8); the next fully-written frame is
- *    applied again. MUTATION: removing the pre-fill leaves stale finite values in
- *    the unwritten bins and this test goes red.
+ *    applied again. MUTATION: removing the pre-fill (ulcnet_model_io_prepare) leaves stale
+ *    finite values in the unwritten bins and this test goes red.
  * ========================================================================= */
 typedef struct {
     int partial_now;   /* set by the test before each process call */
@@ -1464,11 +1502,11 @@ static int partial_write_infer(void* user,
                                const float* far_re, const float* far_im,
                                float* out_re, float* out_im) {
     PartialModelState* st = (PartialModelState*)user;
-    (void)far_re; (void)far_im;
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
     int n = st->partial_now ? 100 : BINS;
     for (int k = 0; k < n; k++) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
+        out_re[k] = mask_of_gain(0.5f);
+        out_im[k] = 0.0f;
     }
     /* rc stays 0 even for the partial write: only the pipeline's NaN
      * pre-fill + finite guard can catch the unwritten bins. */
@@ -1539,6 +1577,11 @@ static void test_partial_write_guard(void) {
                   "reprime frame joins the schedule (%d CHANGED hops)", n_changed));
     CHECK(n_equal >= 10 && n_differ >= 10,
           fmt_msg("coverage: %d partial-identity hops and %d applied hops compared", n_equal, n_differ));
+    CHECK(pa->rig.refused == 16 && pa->rig.edges == 0 && pa->rig.broken == 0 &&
+          ulcnet_stream_state_generation(pa->rig.stream) == 16u,
+          fmt_msg("each of the 16 partly written frames is refused and restarts the state generation once "
+                  "(%ld refused, generation %u)", pa->rig.refused,
+                  (unsigned)ulcnet_stream_state_generation(pa->rig.stream)));
     CHECK(equal_ok,
           fmt_msg("rc==0 partial-write frames (first 100 bins only) are discarded: "
                   "output BIT-IDENTICAL to the NULL-model pipeline on all %d "
@@ -1558,7 +1601,7 @@ static void test_partial_write_guard(void) {
  *     One unit impulse at the middle of hop T-1 (window weight 0.707 in both covering
  *     frames) is marked on the error or the far branch in separate runs. The count comes
  *     from a boundary-free control (FIXED delay 0, no reprime armed). The boundary run
- *     (FIXED delay = T hops) must skip exactly ULCNET_NN_STAGE_REPRIME_FRAMES frames,
+ *     (FIXED delay = T hops) must skip exactly REPRIME_FRAMES frames,
  *     at hops T.., and the first frame the model then sees must be marker-free on both
  *     branches. MUTATION: no reprime, or one frame too few, turns that red. */
 enum {
@@ -1598,8 +1641,7 @@ static int probe_infer(void* user,
     } else {
         st->overflow = 1;
     }
-    memcpy(out_re, err_re, BINS * sizeof(float));
-    memcpy(out_im, err_im, BINS * sizeof(float));
+    mask_fill(out_re, out_im, 1.0f);
     return 0;
 }
 
@@ -1697,12 +1739,12 @@ static void test_reprime_straddle_derivation(void) {
     printf("reprime derivation (mono, ERROR branch): %d straddling frames at hops "
            "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
            straddle_err, RP_T, RP_T + RP_WINDOW - 1, dmin, cmax);
-    CHECK(straddle_err >= ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(straddle_err >= REPRIME_FRAMES,
           fmt_msg("mono ERROR branch: chain memory of %d frames from hop %d on is at "
-                  "least ULCNET_NN_STAGE_REPRIME_FRAMES (%d) -- it carries the "
+                  "least REPRIME_FRAMES (%d) -- it carries the "
                   "AEC filter tail on top of the straddle, so it bounds rather than "
                   "derives it", straddle_err, RP_T,
-                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
+                  (int)REPRIME_FRAMES));
     /* No absolute floor on dmin here: the impulse arrives spread by the AEC
      * filter, so its peak is grid-dependent. The separation ratio is what
      * makes the classification sound. */
@@ -1717,22 +1759,22 @@ static void test_reprime_straddle_derivation(void) {
            straddle_far, RP_T, RP_T + RP_WINDOW - 1, dmin, cmax);
     /* The unfiltered branch IS the derivation: no filter tail, so its chain
      * memory is the window straddle and nothing else. */
-    CHECK(straddle_far == ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(straddle_far == REPRIME_FRAMES,
           fmt_msg("mono FAR branch: %d emitted frames from hop %d on still contain "
-                  "pre-switch samples == ULCNET_NN_STAGE_REPRIME_FRAMES (%d)",
-                  straddle_far, RP_T, (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
+                  "pre-switch samples == REPRIME_FRAMES (%d)",
+                  straddle_far, RP_T, (int)REPRIME_FRAMES));
     CHECK(straddle_far > 0 && dmin > 20.0f * cmax && dmin > 0.5f,
           fmt_msg("mono FAR branch marker is unambiguous (marked %.4f vs unmarked "
                   "%.3e, ratio %.1fx)", dmin, cmax,
                   cmax > 0.0f ? (double)(dmin / cmax) : 1e30));
 
-    /* ---- the boundary runs: the stage skips exactly those frames ---- */
+    /* ---- the boundary runs: the stream skips exactly those frames ---- */
     CHECK(err_bnd.resets == 1 && far_bnd.resets == 1,
           fmt_msg("boundary run: FIXED raw->aligned switch fired model->reset once "
                   "(err %d, far %d)", err_bnd.resets, far_bnd.resets));
     for (int c = 0; c < err_bnd.calls; c++) {
         if (err_bnd.call_hop[c] >= RP_T &&
-            err_bnd.call_hop[c] < RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
+            err_bnd.call_hop[c] < RP_T + REPRIME_FRAMES)
             stepped_inside_reprime++;
         if (err_bnd.call_hop[c] >= RP_T && first_visible_err < 0) {
             first_visible_err = err_bnd.call_hop[c];
@@ -1741,7 +1783,7 @@ static void test_reprime_straddle_derivation(void) {
     }
     for (int c = 0; c < far_bnd.calls; c++) {
         if (far_bnd.call_hop[c] >= RP_T &&
-            far_bnd.call_hop[c] < RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
+            far_bnd.call_hop[c] < RP_T + REPRIME_FRAMES)
             stepped_inside_reprime++;
         if (far_bnd.call_hop[c] >= RP_T && first_visible_far < 0) {
             first_visible_far = far_bnd.call_hop[c];
@@ -1765,18 +1807,18 @@ static void test_reprime_straddle_derivation(void) {
     CHECK(stepped_inside_reprime == 0,
           fmt_msg("boundary run: the model is not stepped on any hop in [%d, %d) "
                   "(%d stray calls)", RP_T,
-                  RP_T + (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  RP_T + (int)REPRIME_FRAMES,
                   stepped_inside_reprime));
-    CHECK(first_visible_err == RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES &&
-          first_visible_far == RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(first_visible_err == RP_T + REPRIME_FRAMES &&
+          first_visible_far == RP_T + REPRIME_FRAMES,
           fmt_msg("boundary run: stepping resumes on hop %d (err) / %d (far), "
                   "expected %d", first_visible_err, first_visible_far,
-                  RP_T + (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
-    CHECK(err_bnd.calls == expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES &&
-          far_bnd.calls == expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  RP_T + (int)REPRIME_FRAMES));
+    CHECK(err_bnd.calls == expected_frames - REPRIME_FRAMES &&
+          far_bnd.calls == expected_frames - REPRIME_FRAMES,
           fmt_msg("boundary run: exactly %d of %d emitted frames skipped inference "
                   "(err %d calls, far %d calls)",
-                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, expected_frames,
+                  (int)REPRIME_FRAMES, expected_frames,
                   err_bnd.calls, far_bnd.calls));
 }
 
@@ -1812,7 +1854,7 @@ static void test_reprime_behavior(void) {
         echo_sim_hop(&sim, mic, ref);
         mu_process(p, mic, ref, out);
         if (pipeline_delay_state(p) == AEC_LINEAR_DELAY_CHANGED) {
-            armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            armed = REPRIME_FRAMES;
             n_changed++;
             if (boundary_hop < 0) boundary_hop = h;
         }
@@ -1836,16 +1878,16 @@ static void test_reprime_behavior(void) {
           fmt_msg("reprime behaviour (MATCHED): infer is stepped once per emitted frame "
                   "EXCEPT the %d reprime frames after each CHANGED hop "
                   "(first mismatching hop %d [-1=none])",
-                  (int)ULCNET_NN_STAGE_REPRIME_FRAMES, first_bad_hop));
-    CHECK(skipped_total == n_changed * ULCNET_NN_STAGE_REPRIME_FRAMES &&
+                  (int)REPRIME_FRAMES, first_bad_hop));
+    CHECK(skipped_total == n_changed * REPRIME_FRAMES &&
           st.infer_calls == N - skipped_total,
           fmt_msg("reprime behaviour (MATCHED): %d frames skipped inference over %d "
                   "generations (%d infer calls in %d hops)",
                   skipped_total, n_changed, st.infer_calls, N));
-    CHECK(resumed_hop == boundary_hop + ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(resumed_hop == boundary_hop + REPRIME_FRAMES,
           fmt_msg("reprime behaviour (MATCHED): stepping stops on the boundary hop %d "
                   "and resumes on hop %d (expected %d)", boundary_hop, resumed_hop,
-                  boundary_hop + (int)ULCNET_NN_STAGE_REPRIME_FRAMES));
+                  boundary_hop + (int)REPRIME_FRAMES));
     CHECK(st.reset_calls == n_changed,
           fmt_msg("reprime behaviour (MATCHED): still exactly one model->reset per "
                   "generation (%d resets, %d generations)", st.reset_calls, n_changed));
@@ -1880,7 +1922,7 @@ static void test_reprime_behavior(void) {
             mu_process(p, mic, ref, out);
             if (h != 0 && prev == AEC_LINEAR_DELAY_UNLOCKED &&
                 pipeline_delay_state(p) == AEC_LINEAR_DELAY_LOCKED) {
-                armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+                armed = REPRIME_FRAMES;
                 fixed_boundary = h;
             }
             frames = frames_at_hop();
@@ -1894,27 +1936,27 @@ static void test_reprime_behavior(void) {
             if (fixed_boundary >= 0 && h == fixed_boundary)
                 fixed_calls_at_boundary = delta;
             if (fixed_boundary >= 0 &&
-                h == fixed_boundary + ULCNET_NN_STAGE_REPRIME_FRAMES)
+                h == fixed_boundary + REPRIME_FRAMES)
                 fixed_calls_after = delta;
         }
 
         CHECK(fixed_boundary == FIXED_HOPS,
               fmt_msg("reprime behaviour (FIXED): the raw->aligned switch is on hop %d "
                       "(expected %d)", fixed_boundary, FIXED_HOPS));
-        CHECK(pattern_ok && skipped_total == ULCNET_NN_STAGE_REPRIME_FRAMES,
+        CHECK(pattern_ok && skipped_total == REPRIME_FRAMES,
               fmt_msg("reprime behaviour (FIXED): exactly %d frames skipped inference at "
                       "the fill completion (%d skipped, first mismatching hop %d [-1=none])",
-                      (int)ULCNET_NN_STAGE_REPRIME_FRAMES, skipped_total,
+                      (int)REPRIME_FRAMES, skipped_total,
                       first_bad_hop));
         CHECK(fixed_calls_at_boundary == 0 && fixed_calls_after == 1,
               fmt_msg("reprime behaviour (FIXED): the boundary hop steps the model 0 times "
                       "and hop boundary+%d steps it once (%d then %d)",
-                      (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                      (int)REPRIME_FRAMES,
                       fixed_calls_at_boundary, fixed_calls_after));
         CHECK(fst.reset_calls == 1,
               fmt_msg("reprime behaviour (FIXED): exactly one model->reset (%d)",
                       fst.reset_calls));
-        CHECK(fst.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+        CHECK(fst.infer_calls == N - REPRIME_FRAMES,
               fmt_msg("reprime behaviour (FIXED): %d infer calls over %d hops "
                       "(%d emitted frames minus the reprime)",
                       fst.infer_calls, N, N));
@@ -2135,15 +2177,13 @@ static void test_known_delay_profile(void) {
                   cost.us_per_hop, hop_budget_us));
 }
 
-/* The phased hop (process_begin / nn_begin / nn_end / process_end) is
- * mu_process() with the model call moved out: a twin driven
- * phase by phase, with the same network run by the caller, reproduces the
- * callback-driven instance byte for byte -- across an alignment boundary (the
- * echo path is delayed, so the reprime hops are part of the claim). The
- * fail-open rows pin the ways a frame ends as the identity: a failed run, an
- * output with a non-finite bin (only nn_end's finite guard can catch it), a
- * frame left open, a frame never fetched. */
-enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
+/* The hop written out phase by phase (mu_process_begin, the frame's views, the network run by the
+ * caller, mu_process_end) is mu_process() with the model call moved out: a twin driven that way
+ * reproduces the model-driven instance byte for byte -- across an alignment boundary (the echo path
+ * is delayed, so the reprime hops are part of the claim). The fail-open rows pin the ways a frame
+ * ends as the error spectrum: a failed run, a mask with a non-finite bin, and a run that reports
+ * success without writing the mask (only the stream's NaN pre-fill can catch it). */
+enum { PH_RUN, PH_FAIL, PH_NAN, PH_UNWRITTEN };
 
 static int phased_twin_matches(int mode, int hops) {
     MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
@@ -2153,8 +2193,9 @@ static int phased_twin_matches(int mode, int hops) {
     MonoUlcnet *ph, *cb;
     EchoSim sim;
     float mic[HOP_MAX], ref[HOP_MAX], a[HOP_MAX], b[HOP_MAX];
-    UlcnetNnJob job;
+    UlcTestJob job;
     int h, ok = 1, nonzero = 0, ran = 0;
+    long want_refused;
 
     memset(&nan_state, 0, sizeof(nan_state));
     nan_state.poison_now = 1;
@@ -2176,60 +2217,60 @@ static int phased_twin_matches(int mode, int hops) {
     }
     echo_sim_init(&sim, ECHO_DELAY, 0xBEEFu + (uint32_t)mode);
     for (h = 0; h < hops && ok; ++h) {
-        int r = 0;
+        int r;
         echo_sim_hop(&sim, mic, ref);
         ok = mu_process(cb, mic, ref, b) == 0 &&
              mu_process_begin(ph, mic, ref) == 0;
         if (!ok) break;
-        if (mode != PH_UNFETCHED) {
-            r = mu_nn_begin(ph, &job);
-            if (r < 0) { ok = 0; break; }
-        }
+        r = ulc_rig_job(&ph->rig, &job);
+        if (r < 0) { ok = 0; break; }
         if (r == 1) {
             ran++;
             if (mode == PH_RUN)
-                ok = halving_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
-                                   job.out_re, job.out_im) == 0 &&
-                     mu_nn_end(ph, 0) == 0;
+                ok = ulc_rig_job_done(&ph->rig, halving_infer(NULL, job.err_re, job.err_im, job.far_re,
+                                                              job.far_im, job.mask_re, job.mask_im)) == 0;
             else if (mode == PH_FAIL)
-                ok = mu_nn_end(ph, -1) == 0;
+                ok = ulc_rig_job_done(&ph->rig, -1) == 0;
             else if (mode == PH_NAN)
-                ok = nan_infer(&nan_state, job.err_re, job.err_im, job.far_re, job.far_im,
-                               job.out_re, job.out_im) == 0 &&
-                     mu_nn_end(ph, 0) == 0;
-            /* PH_OPEN: the frame stays open into process_end */
+                ok = ulc_rig_job_done(&ph->rig, nan_infer(&nan_state, job.err_re, job.err_im, job.far_re,
+                                                          job.far_im, job.mask_re, job.mask_im)) == 0;
+            else   /* PH_UNWRITTEN: success reported, nothing written */
+                ok = ulc_rig_job_done(&ph->rig, 0) == 0;
         }
         ok = ok && mu_process_end(ph, a) == 0;
         if (!ok) break;
         if (memcmp(a, b, HOP_BYTES) != 0) ok = 0;
         for (int i = 0; i < HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
     }
+    /* A refused frame restarts the state generation; a failed run and an accepted one do not. */
+    want_refused = mode == PH_NAN || mode == PH_UNWRITTEN ? ran : 0;
+    ok = ok && ph->rig.refused == want_refused && ph->rig.broken == 0 && cb->rig.broken == 0 &&
+         ulcnet_stream_state_generation(ph->rig.stream) == (uint32_t)(ph->rig.edges + want_refused);
     mu_destroy(ph);
     mu_destroy(cb);
-    /* mode PH_UNFETCHED never fetches; every other mode must have run frames
-     * (the first hops after the boundary are reprime and run none). */
-    return ok && nonzero && (mode == PH_UNFETCHED || ran > 0);
+    /* Every mode must have run frames (the hops at the boundary are reprime and run none). */
+    return ok && nonzero && ran > 0 && ran < hops;
 }
 
 static void test_phased_hop(void) {
     MonoUlcnetConfig cfg = mu_default_config(g_grid.sample_rate);
     MonoUlcnet* p = mu_create(&cfg);
-    UlcnetNnJob job;
+    UlcTestJob job;
     float mic[HOP_MAX] = {0}, ref[HOP_MAX] = {0}, out[HOP_MAX];
 
     CHECK(phased_twin_matches(PH_RUN, 120),
-          "phased hop with the caller's network equals the callback-driven pipeline byte for byte");
-    CHECK(phased_twin_matches(PH_FAIL, 120), "phased: a failed run is the identity");
-    CHECK(phased_twin_matches(PH_NAN, 120), "phased: a non-finite output bin is the identity");
-    CHECK(phased_twin_matches(PH_OPEN, 120), "phased: a frame left open is the identity");
-    CHECK(phased_twin_matches(PH_UNFETCHED, 120), "phased: a frame never fetched is the identity");
+          "phased hop with the caller's network equals the model-driven pipeline byte for byte");
+    CHECK(phased_twin_matches(PH_FAIL, 120), "phased: a failed run is the error spectrum");
+    CHECK(phased_twin_matches(PH_NAN, 120),
+          "phased: a non-finite mask bin is the error spectrum and restarts the state generation");
+    CHECK(phased_twin_matches(PH_UNWRITTEN, 120),
+          "phased: a mask left unwritten is the error spectrum and restarts the state generation");
 
     CHECK(p != NULL, "phased: instance creates");
     if (!p) return;
-    CHECK(mu_nn_begin(p, &job) == -1 &&
-          mu_nn_end(p, 0) == -1 &&
+    CHECK(ulc_rig_job(&p->rig, &job) == -1 &&
           mu_process_end(p, out) == -1,
-          "phased: nn/end calls before process_begin are refused");
+          "phased: the frame and the end of a hop are refused before process_begin");
     CHECK(mu_process_begin(NULL, mic, ref) == -1 &&
           mu_process_begin(p, NULL, ref) == -1 &&
           mu_process_begin(p, mic, NULL) == -1,
@@ -2237,13 +2278,9 @@ static void test_phased_hop(void) {
     CHECK(mu_process_begin(p, mic, ref) == 0 &&
           mu_process_begin(p, mic, ref) == -1,
           "phased: a second process_begin before process_end is refused");
-    CHECK(mu_nn_begin(p, &job) == 1 &&
-          mu_nn_begin(p, &job) == -1,
-          "phased: one frame per hop; a second nn_begin is refused while it is open");
-    CHECK(mu_nn_end(p, 0) == 0 &&
-          mu_nn_end(p, 0) == -1 &&
-          mu_nn_begin(p, &job) == 0,
-          "phased: nn_end closes the frame; none is left in this hop");
+    CHECK(ulc_rig_job(&p->rig, &job) == 1 &&
+          ulc_rig_job(&p->rig, &job) == 0,
+          "phased: one frame per hop");
     CHECK(mu_process_end(p, out) == 0 &&
           mu_process_end(p, out) == -1,
           "phased: process_end closes the hop; a second one is refused");
@@ -2251,10 +2288,10 @@ static void test_phased_hop(void) {
 }
 
 /* =========================================================================
- * Guard hops. The stage reads the AEC's analysis seam (formed_hop), never the rendering base, so on a
+ * Guard hops. The stream is fed the AEC's analysis seam (formed_hop), never the rendering base, so on a
  * hop where AecResidualView.guard_active == 1 the identity output is the unguarded linear
  * residual and may be louder than the capture. Three guard scenes run with the NULL model (identity):
- * on every guard hop out[h+1] must equal formed[h] (the stage input is formed_hop, not base_spec), and
+ * on every guard hop out[h+1] must equal formed[h] (the stream input is formed_hop, not base_spec), and
  * base_spec must differ from error_spec on those hops (so the check can tell the two apart). The hops
  * on which the identity output is louder than the mic hop are counted and printed, not gated: that is
  * a characteristic of the contract, evaluated with the retrained model. A hop after aec_reset() emits
@@ -2376,12 +2413,12 @@ static void test_guard_hops_feed_analysis_seam(void) {
           fmt_msg("guard hops: base_spec differs from error_spec on a guard hop (relative distance %.3e), "
                   "so feeding the rendering base would be detected", worst_sep));
     CHECK(worst_guard_err <= 2e-4,
-          fmt_msg("guard hops: the stage input on guard hops is formed_hop, not base_spec (max err %.3e)",
+          fmt_msg("guard hops: the stream input on guard hops is formed_hop, not base_spec (max err %.3e)",
                   worst_guard_err));
     printf("  characteristic (reported, not gated): identity hops with output energy above the mic energy: "
            "%ld\n", louder_total);
 
-    /* Negative control: the same scenes with the stage fed the rendering base on guard hops. */
+    /* Negative control: the same scenes with the stream fed the rendering base on guard hops. */
     {
         GuardHopStats bad;
         double worst_bad = 0.0;
@@ -2391,7 +2428,7 @@ static void test_guard_hops_feed_analysis_seam(void) {
         }
         g_mu_feed_base = 0;
         CHECK(worst_bad > 2e-4,
-              fmt_msg("guard hops: a planted defect (the stage fed the rendering base on guard hops) is "
+              fmt_msg("guard hops: a planted defect (the stream fed the rendering base on guard hops) is "
                       "detected (max err %.3e)", worst_bad));
     }
     for (int i = 0; i < 3; i++) guard_scene_free(&sc[i]);
@@ -2400,33 +2437,41 @@ static void test_guard_hops_feed_analysis_seam(void) {
 
 /* =========================================================================
  * 11. Overlap-add acceptance of the time-domain error (the caller analyses the AEC's float formed_hop
- *     and the raw far, the stage takes the spectra). The caller synthesises with AC_OLA_ACCUMULATE: every hop is the frame's
+ *     and the raw far, the stream takes the spectra). The caller synthesises with AC_OLA_ACCUMULATE: every hop is the frame's
  *     first half plus the previous frame's saved second half, nothing is held back, so hop #0 is
- *     real output. A band-varying real mask model makes that first half non-zero, and every hop
+ *     real output. A band-varying complex mask model makes that first half non-zero, and every hop
  *     is compared with an independent chain -- own analysis STFT of the formed hop the AEC
- *     published, the mask applied where (and only where) the stage really ran the model, and a
- *     direct-DFT per-sample accumulate written here -- plus the audiolib accumulate chain bit for
- *     bit. Cases: first hop and steady state, `changed`, `solid false -> true`, full reset.
+ *     published, the fixture's copy of the mask arithmetic applied where (and only where) the
+ *     stream really ran the model, and a direct-DFT per-sample accumulate written here -- plus
+ *     the audiolib accumulate chain bit for bit. Cases: first hop and steady state, `changed`, `solid false -> true`, full reset.
  * ========================================================================= */
 static float band_gain(int k) { return 0.25f + 0.75f * (float)(k % 9) / 8.0f; }
 
 typedef struct BandModelState { int infer_calls, reset_calls; } BandModelState;
 
+/* The band model's mask: complex, a magnitude near band_gain(k)'s and a phase turn that varies from bin to bin. */
+static void band_mask(float* mask_re, float* mask_im) {
+    for (int k = 0; k < BINS; k++) {
+        mask_re[k] = mask_of_gain(band_gain(k));
+        mask_im[k] = 0.15f * (float)(k % 5 - 2);
+    }
+}
+
 static int band_infer(void* user, const float* err_re, const float* err_im,
                       const float* far_re, const float* far_im, float* out_re, float* out_im) {
-    (void)far_re; (void)far_im;
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
     ((BandModelState*)user)->infer_calls++;
-    for (int k = 0; k < BINS; k++) { out_re[k] = band_gain(k) * err_re[k]; out_im[k] = band_gain(k) * err_im[k]; }
+    band_mask(out_re, out_im);
     return 0;
 }
 static void band_reset(void* user) { ((BandModelState*)user)->reset_calls++; }
 
-/* Writes finite garbage, then reports failure: the stage must discard it. */
+/* Writes a finite garbage mask, then reports failure: the stream must discard it. */
 static int band_fail_infer(void* user, const float* err_re, const float* err_im,
                            const float* far_re, const float* far_im, float* out_re, float* out_im) {
-    (void)far_re; (void)far_im;
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
     ((BandModelState*)user)->infer_calls++;
-    for (int k = 0; k < BINS; k++) { out_re[k] = 3.0f * err_re[k]; out_im[k] = -2.0f * err_im[k]; }
+    for (int k = 0; k < BINS; k++) { out_re[k] = 3.0f; out_im[k] = -2.0f; }
     return -1;
 }
 
@@ -2479,7 +2524,7 @@ static void accref_dft_hop(AccRef* a, const float* re, const float* im, float* o
 
 enum { ACC_MAX_HOPS = 160 };
 typedef struct AccStats {
-    double max_err;               /* worst |stage - direct-DFT reference| */
+    double max_err;               /* worst |output - direct-DFT reference| */
     double peak0;                 /* peak |hop #0| of the first pass */
     int chain_bad;                /* hops not bit-equal to the audiolib accumulate chain */
     int ran[ACC_MAX_HOPS];        /* the model ran on this hop (infer_calls advanced) */
@@ -2492,9 +2537,10 @@ typedef struct AccStats {
 static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, AccRef* ref,
                      AccStats* r, float* out_hist, int model_effective) {
     float mic[HOP_MAX], far[HOP_MAX], out[HOP_MAX], want[HOP_MAX], dft[HOP_MAX];
-    float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX];
+    float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX], mask_re[BINS_MAX], mask_im[BINS_MAX];
     memset(r, 0, sizeof *r);
     if (n > ACC_MAX_HOPS) return -1;
+    band_mask(mask_re, mask_im);
     for (int h = 0; h < n; h++) {
         int before = st->infer_calls;
         AecResidualView rv;
@@ -2507,7 +2553,7 @@ static int acc_drive(MonoUlcnet* p, BandModelState* st, EchoSim* sim, int n, Acc
         r->changed[h] = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
         r->solid[h] = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
         (void)ac_stft_push_planar(ref->stft, rv.formed_hop, re, im);
-        if (r->ran[h] && model_effective) for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
+        if (r->ran[h] && model_effective) enhanced_of_mask(re, im, mask_re, mask_im, mre, mim);
         else { memcpy(mre, re, sizeof(float) * BINS); memcpy(mim, im, sizeof(float) * BINS); }
         if (ac_istft_push_planar(ref->istft, mre, mim, want) != HOP || memcmp(want, out, HOP_BYTES) != 0)
             r->chain_bad++;
@@ -2550,7 +2596,7 @@ static void test_accumulate_acceptance(void) {
         if (!p) return;
         echo_sim_init(&sim, 0, 0xC0FFEEu);
         CHECK(acc_drive(p, &sta, &sim, N, &ref, &ra, NULL, 1) == 0, "accumulate: run");
-        printf("  accumulate (%d Hz / fft %d): first hop peak %.6f, worst |stage - direct DFT| %.3g over %d hops, "
+        printf("  accumulate (%d Hz / fft %d): first hop peak %.6f, worst |output - direct DFT| %.3g over %d hops, "
                "model calls %d (first hop %d)\n", g_grid.sample_rate, g_grid.n_fft, ra.peak0, ra.max_err, N,
                sta.infer_calls, ra.ran[0]);
         CHECK(ra.peak0 > 0.005, fmt_msg("accumulate: hop #0 is real output, not zeros (peak %.6f)", ra.peak0));
@@ -2598,17 +2644,18 @@ static void test_accumulate_acceptance(void) {
         BandModelState st1 = {0, 0};
         MonoUlcnet* pp = acc_make(&st1, AEC_DELAY_MATCHED, -1);
         float err[HOP_MAX], far[HOP_MAX], out[HOP_MAX], dftout[HOP_MAX];
-        float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX];
-        UlcnetNnDelay ev; ev.changed = 0; ev.solid = 1;
+        float re[BINS_MAX], im[BINS_MAX], mre[BINS_MAX], mim[BINS_MAX], mask_re[BINS_MAX], mask_im[BINS_MAX];
+        UlcnetStreamDelay ev; ev.changed = 0; ev.solid = 1;
         CHECK(pp && accref_init(&ref) == 0, "accumulate: setup (solid-only first hop)");
         if (pp) {
             lcg_state = 0x5EEDu;
             for (int i = 0; i < HOP; i++) { err[i] = lcg_sample(); far[i] = lcg_sample(); }
-            CHECK(mu_stage_begin_time(pp, err, far, ev) == 0 &&
-                  ulcnet_nn_stage_process(pp->stage, pp->out_spec) == 0 && mu_synth(pp, out) == 0,
+            CHECK(mu_stream_begin_time(pp, err, far, ev) == 0 &&
+                  ulc_rig_process(&pp->rig, pp->out_re, pp->out_im) == 0 && mu_synth(pp, out) == 0,
                   "accumulate: solid-only first hop processes");
             (void)ac_stft_push_planar(ref.stft, err, re, im);
-            for (int k = 0; k < BINS; k++) { mre[k] = band_gain(k) * re[k]; mim[k] = band_gain(k) * im[k]; }
+            band_mask(mask_re, mask_im);
+            enhanced_of_mask(re, im, mask_re, mask_im, mre, mim);
             accref_dft_hop(&ref, mre, mim, dftout);
             double e = 0.0, pk = 0.0;
             for (int i = 0; i < HOP; i++) { e = fmax(e, fabs((double)out[i] - (double)dftout[i])); pk = fmax(pk, fabs((double)out[i])); }
@@ -2636,11 +2683,11 @@ static void test_accumulate_acceptance(void) {
             printf("  accumulate changed at hop %d: submissions on hops %d/%d/%d = %d/%d/%d, resets %d, total %d calls, "
                    "max err %.3g\n", ch, ch - 1, ch, ch + 1, ra.ran[ch - 1], ra.ran[ch], ra.ran[ch + 1],
                    sta.reset_calls, sta.infer_calls, ra.max_err);
-            CHECK(ran_ok && ULCNET_NN_STAGE_REPRIME_FRAMES == 1,
+            CHECK(ran_ok && REPRIME_FRAMES == 1,
                   "accumulate events: the CHANGED hop sends the model nothing, the hop before and after run it once");
-            CHECK(sta.reset_calls == 1 && sta.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+            CHECK(sta.reset_calls == 1 && sta.infer_calls == N - REPRIME_FRAMES,
                   fmt_msg("accumulate events: the model is reset once and skipped for exactly the %d event frame "
-                          "(%d resets, %d calls over %d hops)", (int)ULCNET_NN_STAGE_REPRIME_FRAMES,
+                          "(%d resets, %d calls over %d hops)", (int)REPRIME_FRAMES,
                           sta.reset_calls, sta.infer_calls, N));
             CHECK(ra.max_err < tol && ra.chain_bad == 0,
                   fmt_msg("accumulate events: PCM through the CHANGED hop equals the continuous accumulate "
@@ -2670,7 +2717,7 @@ static void test_accumulate_acceptance(void) {
                    ra.ran[first_solid - 1], ra.ran[first_solid], ra.ran[first_solid + 1],
                    sta.reset_calls, sta.infer_calls, ra.max_err);
             CHECK(!ra.ran[first_solid] && ra.ran[first_solid - 1] && ra.ran[first_solid + 1] &&
-                  sta.reset_calls == 1 && sta.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+                  sta.reset_calls == 1 && sta.infer_calls == N - REPRIME_FRAMES,
                   "accumulate events: solid false->true resets the model once, sends it nothing on the event hop, "
                   "exactly one submission on the next");
             CHECK(ra.max_err < tol && ra.chain_bad == 0,
@@ -2680,7 +2727,7 @@ static void test_accumulate_acceptance(void) {
         mu_destroy(p); accref_free(&ref);
     }
 
-    /* (3) full reset after non-zero overlap, replayed end to end (AEC and stage), against a newly
+    /* (3) full reset after non-zero overlap, replayed end to end (AEC and stream), against a newly
      * built pipeline and references restarted from zero. The bulk-delay echo makes the replay cross
      * the CHANGED hop again. */
     {
@@ -2796,6 +2843,10 @@ int main(void) {
                g_grid.sample_rate, g_grid.n_fft, g_grid.hop);
         run_grid();
     }
+    CHECK(g_rig_broken == 0,
+          fmt_msg("every frame of every test carried the front end of the spectra handed in, the stream's "
+                  "generation and a NaN-filled mask; the generation moved only at edges, resets and refusals "
+                  "(%ld violations)", g_rig_broken));
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);
         return 1;

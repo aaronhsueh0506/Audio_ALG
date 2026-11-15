@@ -1,30 +1,34 @@
 /**
  * Composition tests of the 4-channel linear AEC + beamformer unit (the array instance, lanes only
- * (AEC_RESIDUAL_STATE), with the sample SRP-PHAT/BF helper, array_sample_beam.h) feeding the Align-ULCNet stage (ulcnet/ulcnet_nn_stage.h), wired as
+ * (AEC_RESIDUAL_STATE), with the sample SRP-PHAT/BF helper, array_sample_beam.h) feeding the Align-ULCNet
+ * model stream (the spectrum entries of stream/aiaec/ulcnet/ulcnet_stream.h), wired as
  * 4ch/alignulcnet/main.c wires them (the application's own far AcStft and output AcIstft around the
- * stage): one-hop STFT/WOLA latency, delay-event identity reprime on
- * the real alignment state, the model-callback policy on real framing, and recovery by resetting
- * unit and stage together. A contract test, not a DSP-quality test. The stage alone (synthetic
- * alignment events) is tested in ulcnet/tests/test_ulcnet_nn_stage.c; the unit's split calls
+ * stream): one-hop STFT/WOLA latency, delay-event identity reprime on
+ * the real alignment state, the model-run policy on real framing, and recovery by resetting
+ * unit and stream together. A contract test, not a DSP-quality test. The stream alone (synthetic
+ * alignment events) is tested in stream/aiaec/ulcnet/tests; the unit's split calls
  * are tested in test_array_sample_beam.c. What needs the real lanes (FIXED and MATCHED delay
  * states, the framing straddle derivation, acquisition of a known delay) stays here. Each test
  * banner states its case:
  *   0. grid of the example unit config                1. identity E2E and the 1-hop timing contract
  *   2. counting model (stepping, reset, fail-open)    2b. same-delay relock resets the model
- *   2c. FIXED pre-lock seam is the RAW far            4. caller pool vs heap construction
+ *   2c. FIXED pre-lock seam is the RAW far            2d. delay shift while solid restarts the model
+ *   4. caller pool vs heap construction
  *   5/5b. far / error-branch impulse timestamps       6. production never gates on the delay lock
  *   7. NaN guard   8. full-write contract             9. identity-reprime straddle derivation
- *   10. identity-reprime behaviour                    11. fixed deployment contract
+ *   10. identity-reprime behaviour                    11. graph descriptor gate
  *   12. phased hop                                    13. recovery by paired reset equals a fresh pair
  * One binary runs every grid of k_grids. Build and run: `make test_4ch_ulcnet` in
  * 4ch/.
+ * The stand-in models write the graph's mask (tests/ulcnet_test_fixture.h): a real mask g scales the
+ * spectrum by g^(1/0.3) up to the rounding of the compression, and bit identity is asserted against
+ * the fixture's own copy of the mask arithmetic.
  */
 
 #define ARRAY_TEST_RIG_WITH_BEAM 1
 #include "4ch/tests/array_test_rig.h"
 #include "audio_stft.h"
-#include "ulcnet/ulcnet_nn_stage.h"
-#include "ulcnet/tests/ulcnet_test_fixture.h"
+#include "tests/ulcnet_test_fixture.h"
 #include "utility/mem_align.h"
 
 #include <math.h>
@@ -33,7 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The unit on the stage's grid, linear context only: what 4ch/alignulcnet/main.c builds. */
+/* The unit on the stream's grid, linear context only: what 4ch/alignulcnet/main.c builds. */
 static ArrayTestUnitConfig ulcnet_example_unit_config(void) {
     ArrayTestUnitConfig cfg = array_test_unit_default_config(g_grid.sample_rate);
     cfg.aec_cfg.fft_size = g_grid.n_fft;
@@ -42,18 +46,18 @@ static ArrayTestUnitConfig ulcnet_example_unit_config(void) {
 }
 
 /* ---------------------------------------------------------------------------------------
- * The composition under test: the unit plus the stage (the beamformed spectrum is the error
+ * The composition under test: the unit plus the stream (the beamformed spectrum is the error
  * frame) plus the application's far analysis and output synthesis, as main.c builds them. A small test-local shim gives the
  * pieces the shape the tests below drive. The unit is always called through its split
  * (front + beam) or one-call forms with the activity flag in both slots and no mask.
  * --------------------------------------------------------------------------------------- */
 
-/* The application's framing around the stage: the raw far analysis and the output synthesis. */
+/* The application's framing around the stream: the raw far analysis, the output synthesis and the spectrum planes. */
 typedef struct Frm {
     AcStft* far_stft;
     AcIstft* istft;
     void* mem;
-    Complex far_spec[BINS_MAX], out_spec[BINS_MAX];
+    float err_re[BINS_MAX], err_im[BINS_MAX], far_re[BINS_MAX], far_im[BINS_MAX], out_re[BINS_MAX], out_im[BINS_MAX];
 } Frm;
 
 static int frm_init(Frm* f, const UlcnetGrid* grid) {
@@ -71,65 +75,80 @@ static int frm_init(Frm* f, const UlcnetGrid* grid) {
 }
 static void frm_free(Frm* f) { free(f->mem); f->mem = NULL; }
 static void frm_reset(Frm* f) { ac_stft_reset(f->far_stft); ac_istft_reset(f->istft); }
-static int frm_synth(Frm* f, int hop, float* out) { return ac_istft_push(f->istft, f->out_spec, out) == hop ? 0 : -1; }
+static int frm_synth(Frm* f, int hop, float* out) {
+    return ac_istft_push_planar(f->istft, f->out_re, f->out_im, out) == hop ? 0 : -1;
+}
+/* The far analysis and the beamformed spectrum as planes, as main.c hands them to the stream. */
+static void frm_analyse(Frm* f, const Complex* beam_spectrum, const float* far) {
+    (void)ac_stft_push_planar(f->far_stft, far, f->far_re, f->far_im);
+    for (int k = 0; k < BINS; ++k) { f->err_re[k] = beam_spectrum[k].r; f->err_im[k] = beam_spectrum[k].i; }
+}
+
+/* The stream refused a call of the hop (a second begin, an end without a begin). */
+enum { UL4_STREAM_REFUSED = -100 };
 
 typedef struct Ul4 {
     ArraySampleBeam* unit;
-    UlcnetNnStage* stage;
+    UlcTestRig rig;             /* the stream and the stand-in model */
     Frm frm;
-    void* stage_mem;
+    void* stream_mem;
     AecDelayState last_delay;   /* alignment of the most recent successful hop */
 } Ul4;
 
-/* The stage takes grid.n_bins bins per hop, so a unit of another grid cannot feed it. */
-static int unit_matches_stage(const ArraySampleBeam* unit, const UlcnetGrid* grid) {
+/* Contract violations the rigs of every destroyed instance saw (ulc_rig_begin / ulc_rig_end); main expects 0. */
+static long g_rig_broken = 0;
+
+/* The stream takes grid.n_bins bins per hop, so a unit of another grid cannot feed it. */
+static int unit_matches_stream(const ArraySampleBeam* unit, const UlcnetGrid* grid) {
     return aec_hop_size(array_test_beam_aec(unit)) == grid->hop &&
            array_test_n_freqs(array_test_beam_aec(unit)) == grid->n_bins &&
            array_test_fft_size(array_test_beam_aec(unit)) == grid->n_fft &&
            array_test_sample_rate(array_test_beam_aec(unit)) == grid->sample_rate;
 }
 
-static Ul4* ul4_wrap(ArraySampleBeam* unit, void* stage_mem, size_t stage_bytes,
+static Ul4* ul4_wrap(ArraySampleBeam* unit, void* stream_mem, size_t stream_bytes,
                      const UlcnetGrid* grid) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
+    int ok = 0;
     if (!p) return NULL;
     p->unit = unit;
-    p->stage_mem = stage_mem;
-    if (unit && stage_mem && unit_matches_stage(unit, grid) && frm_init(&p->frm, grid) == 0)
-        p->stage = ulcnet_nn_stage_init(stage_mem, stage_bytes, grid);
-    if (!p->stage) {
+    p->stream_mem = stream_mem;
+    if (unit && stream_mem && unit_matches_stream(unit, grid) && frm_init(&p->frm, grid) == 0)
+        ok = ulc_rig_init(&p->rig, stream_mem, stream_bytes, grid) == 0;
+    if (!ok) {
         frm_free(&p->frm);
         if (unit) array_test_beam_destroy(unit);
-        free(stage_mem);
+        free(stream_mem);
         free(p);
         return NULL;
     }
     return p;
 }
 
-/* A fresh instance from separate heap allocations; the stage block starts stale. NULL when the
- * unit's grid is not the stage's. */
+/* A fresh instance from separate heap allocations; the stream block starts stale. NULL when the
+ * unit's grid is not the stream's. */
 static Ul4* ul4_create_for(const ArrayTestUnitConfig* cfg, const UlcnetGrid* grid) {
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(grid);
-    void* stage_mem = NULL;
-    if (!cfg || stage_bytes == 0 || posix_memalign(&stage_mem, 16, stage_bytes) != 0)
+    size_t stream_bytes = ulc_rig_stream_bytes(grid);
+    void* stream_mem = NULL;
+    if (!cfg || stream_bytes == 0 || posix_memalign(&stream_mem, 16, stream_bytes) != 0)
         return NULL;
-    memset(stage_mem, 0x5A, stage_bytes);
-    return ul4_wrap(array_test_beam_create(cfg), stage_mem, stage_bytes, grid);
+    memset(stream_mem, 0x5A, stream_bytes);
+    return ul4_wrap(array_test_beam_create(cfg), stream_mem, stream_bytes, grid);
 }
 
 static Ul4* ul4_create(const ArrayTestUnitConfig* cfg) { return ul4_create_for(cfg, &g_grid); }
 
 static void ul4_destroy(Ul4* p) {
     if (!p) return;
+    g_rig_broken += p->rig.broken;
     array_test_beam_destroy(p->unit);
     frm_free(&p->frm);
-    free(p->stage_mem);
+    free(p->stream_mem);
     free(p);
 }
 
-static int ul4_set_model(Ul4* p, const UlcnetModel* model) {
-    return p ? ulcnet_nn_stage_set_model(p->stage, model) : -1;
+static int ul4_set_model(Ul4* p, const UlcTestModel* model) {
+    return p ? ulc_rig_set_model(&p->rig, &g_grid, model) : -1;
 }
 
 static int ul4_hop_size(const Ul4* p) { return p ? aec_hop_size(array_test_beam_aec(p->unit)) : -1; }
@@ -137,11 +156,11 @@ static int ul4_fft_size(const Ul4* p) { return p ? array_test_fft_size(array_tes
 static int ul4_n_freqs(const Ul4* p) { return p ? array_test_n_freqs(array_test_beam_aec(p->unit)) : -1; }
 static int ul4_sample_rate(const Ul4* p) { return p ? array_test_sample_rate(array_test_beam_aec(p->unit)) : -1; }
 
-/* Unit and stage together: the recovery after any refused call, and the stream restart. */
+/* Unit and stream together: the recovery after any refused call, and the stream restart. */
 static void ul4_reset(Ul4* p) {
     if (!p) return;
     array_sample_beam_reset(p->unit);
-    ulcnet_nn_stage_reset(p->stage);
+    ulc_rig_reset(&p->rig);
     frm_reset(&p->frm);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
 }
@@ -152,15 +171,15 @@ static int ul4_last_delay(const Ul4* p, AecDelayState* out) {
     return 0;
 }
 
-static UlcnetNnDelay delay_events(const AecDelayState* d) {
-    UlcnetNnDelay e;
+static UlcnetStreamDelay delay_events(const AecDelayState* d) {
+    UlcnetStreamDelay e;
     e.changed = d->changed;
     e.solid = d->solid;
     return e;
 }
 
-/* Unit (split calls), the application's analysis of the raw far, then the stage's begin_spec with the
- * beamformed spectrum, the far spectrum and the alignment events of the front. A refused unit hop
+/* Unit (split calls), the application's analysis of the raw far, then the stream's pre_process_freq with
+ * the beamformed spectrum, the far spectrum and the alignment events of the front. A refused unit hop
  * takes both down. */
 static int ul4_process_begin(Ul4* p, const float* mic, const float* far, int vad) {
     AecArrayView front;
@@ -174,26 +193,21 @@ static int ul4_process_begin(Ul4* p, const float* mic, const float* far, int vad
         if (rc == AEC_ERR_DSP) ul4_reset(p);
         return rc;
     }
-    (void)ac_stft_push(p->frm.far_stft, far, p->frm.far_spec);
-    rc = ulcnet_nn_stage_begin_spec(p->stage, beam.spectrum, p->frm.far_spec, delay_events(&front.delay));
-    if (rc == ULCNET_NN_STAGE_OK) p->last_delay = front.delay;
-    return rc;
+    frm_analyse(&p->frm, beam.spectrum, far);
+    if (ulc_rig_begin(&p->rig, p->frm.err_re, p->frm.err_im, p->frm.far_re, p->frm.far_im,
+                      delay_events(&front.delay)) != 0)
+        return UL4_STREAM_REFUSED;
+    p->last_delay = front.delay;
+    return AEC_OK;
 }
 
-static int ul4_nn_begin(Ul4* p, UlcnetNnJob* job) {
-    return p ? ulcnet_nn_stage_nn_begin(p->stage, job) : -1;
-}
-static int ul4_nn_end(Ul4* p, int model_rc) {
-    return p ? ulcnet_nn_stage_nn_end(p->stage, model_rc) : -1;
-}
 static int ul4_process_end(Ul4* p, float* out) {
-    int rc;
     if (!p || !out) return -1;
-    rc = ulcnet_nn_stage_end_spec(p->stage, p->frm.out_spec);
-    return rc != 0 ? rc : frm_synth(&p->frm, ul4_hop_size(p), out);
+    if (ulc_rig_end(&p->rig, p->frm.out_re, p->frm.out_im) != 0) return UL4_STREAM_REFUSED;
+    return frm_synth(&p->frm, ul4_hop_size(p), out);
 }
 
-/* The whole hop with the installed model (identity when unset), the unit's one-call form. */
+/* The whole hop with the installed model (the beamformed spectrum when unset), the unit's one-call form. */
 static int ul4_process_with_activity(Ul4* p, const float* mic, const float* far, int vad,
                                      float* out) {
     ArraySampleBeamResult beam;
@@ -205,18 +219,14 @@ static int ul4_process_with_activity(Ul4* p, const float* mic, const float* far,
         if (rc == AEC_ERR_DSP) ul4_reset(p);
         return rc;
     }
-    (void)ac_stft_push(p->frm.far_stft, far, p->frm.far_spec);
-    rc = ulcnet_nn_stage_begin_spec(p->stage, beam.spectrum, p->frm.far_spec, delay_events(&info.delay));
-    if (rc != ULCNET_NN_STAGE_OK) return rc;
+    frm_analyse(&p->frm, beam.spectrum, far);
+    if (ulc_rig_begin(&p->rig, p->frm.err_re, p->frm.err_im, p->frm.far_re, p->frm.far_im,
+                      delay_events(&info.delay)) != 0)
+        return UL4_STREAM_REFUSED;
     p->last_delay = info.delay;
-    rc = ulcnet_nn_stage_process(p->stage, p->frm.out_spec);
-    return rc != 0 ? rc : frm_synth(&p->frm, ul4_hop_size(p), out);
+    if (ulc_rig_process(&p->rig, p->frm.out_re, p->frm.out_im) != 0) return UL4_STREAM_REFUSED;
+    return frm_synth(&p->frm, ul4_hop_size(p), out);
 }
-
-/* Every test model that actually infers must publish a descriptor: the stage refuses
- * infer-without-descriptor, because a shape disagreement between the graph and the stage's
- * grid is undetectable downstream (the finite guard catches an unwritten output, never a
- * wrong-shaped one). The descriptor of the grid under test. */
 
 /* DelayAec searches a 16 kHz-equivalent sidechain and scales the selected
  * delay back to native samples. Echo-delay stimuli therefore scale by
@@ -269,9 +279,10 @@ static void fill_echo_hop(int frame, int hop, int true_delay,
 /* ============================================================================
  * 1. Identity E2E: direct BF -> model -> synthesis chain and the 1-hop latency contract.
  *    The reference is synthesised by the TEST from the spectra the pipeline hands the model
- *    (a capture model that also returns the identity) through its own AcIstft: bit-identical
- *    output proves the chain adds nothing between the model's frame and the WOLA, and the
- *    call count proves one inference per hop from hop #0. FIXED delay 0 keeps the run
+ *    (a capture model with a unit mask), put through the fixture's copy of the mask
+ *    arithmetic and its own AcIstft: bit-identical output proves the chain adds nothing
+ *    between the model's frame and the WOLA, and the call count proves one inference per
+ *    hop from hop #0. The masked spectrum stays within 2e-6 of the captured one. FIXED delay 0 keeps the run
  *    boundary-free (asserted), so no reprime frame bypasses the model.
  * ========================================================================== */
 
@@ -292,8 +303,7 @@ static int capture_infer(
     (void)far_im;
     memcpy(m->re, err_re, BINS * sizeof(float));
     memcpy(m->im, err_im, BINS * sizeof(float));
-    memcpy(out_re, err_re, BINS * sizeof(float));
-    memcpy(out_im, err_im, BINS * sizeof(float));
+    mask_fill(out_re, out_im, 1.0f);
     m->calls += 1;
     return 0;
 }
@@ -305,7 +315,7 @@ static int test_identity_e2e(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CaptureModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AcIstft* ref_synth;
     void* ref_mem = NULL;
     float* microphones;
@@ -313,12 +323,13 @@ static int test_identity_e2e(void) {
     float* out;
     float* ref;
     float max_ref = 0.0f;
+    double max_mask_err = 0.0, max_spec = 0.0;
     int identical_hops = 0;
     int hop;
 
     CHECK(cfg.aec_cfg.sample_rate == g_grid.sample_rate &&
           cfg.aec_cfg.fft_size == g_grid.n_fft,
-          "default config matches the stage's grid");
+          "default config matches the stream's grid");
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.4f;
     cfg.beam.bf_mu = 0.02f;
@@ -328,12 +339,12 @@ static int test_identity_e2e(void) {
     p = ul4_create(&cfg);
     CHECK(p != NULL, "create ULCNet 4ch pipeline");
     hop = ul4_hop_size(p);
-    CHECK(hop == HOP && ulcnet_nn_stage_grid(p->stage)->hop == hop,
-          "hop matches the stage's grid");
+    CHECK(hop == HOP && ulcnet_stream_hop_size(p->rig.stream) == hop,
+          "hop matches the stream's grid");
     CHECK(ul4_fft_size(p) == g_grid.n_fft &&
           ul4_n_freqs(p) == BINS &&
           ul4_sample_rate(p) == g_grid.sample_rate,
-          "runtime dimensions match the stage's grid");
+          "runtime dimensions match the stream's grid");
 
     memset(&m, 0, sizeof(m));
     memset(&model, 0, sizeof(model));
@@ -391,9 +402,18 @@ static int test_identity_e2e(void) {
         CHECK(m.calls == (long)frame + 1,
               "exactly one inference per hop, from hop #0");
 
-        /* The reference: the frame the model saw, through the test's own
-         * synthesis. Same arithmetic on the same history -> bit-identical. */
-        ref_wrote = ac_istft_push_planar(ref_synth, m.re, m.im, ref);
+        /* The reference: the frame the model saw, through the unit mask and the
+         * test's own synthesis. Same arithmetic on the same history -> bit-identical. */
+        {
+            float want_re[BINS_MAX], want_im[BINS_MAX];
+            enhanced_of_gain(m.re, m.im, 1.0f, want_re, want_im);
+            for (int k = 0; k < BINS; ++k) {
+                max_mask_err = fmax(max_mask_err, fabs((double)want_re[k] - (double)m.re[k]));
+                max_mask_err = fmax(max_mask_err, fabs((double)want_im[k] - (double)m.im[k]));
+                max_spec = fmax(max_spec, fmax(fabs((double)m.re[k]), fabs((double)m.im[k])));
+            }
+            ref_wrote = ac_istft_push_planar(ref_synth, want_re, want_im, ref);
+        }
         CHECK(ref_wrote == hop,
               "reference emits a full hop on every hop, hop #0 included");
         for (int i = 0; i < hop; ++i) {
@@ -403,7 +423,7 @@ static int test_identity_e2e(void) {
         }
         CHECK(memcmp(out, ref, (size_t)hop * sizeof(float)) == 0,
               "out[hop p] is bit-identical to the accumulate synthesis of "
-              "the spectrum the model saw at hop p (identity chain, 1-hop "
+              "the unit-masked spectrum the model saw at hop p (1-hop "
               "latency), from hop #0");
         identical_hops += 1;
     }
@@ -414,6 +434,8 @@ static int test_identity_e2e(void) {
     /* The comparison must not be vacuous: the reference has to carry real
      * signal for this test to be able to fail. */
     CHECK(max_ref > 1e-3f, "beamformed error is non-trivial");
+    CHECK(max_spec > 1e-2 && max_mask_err <= 2e-6 * max_spec,
+          "the unit mask leaves the spectrum the model saw unchanged up to the rounding of the compression");
 
     ul4_destroy(p);
     free(ref_mem);
@@ -463,7 +485,7 @@ typedef struct CountingModel {
     long infer_calls;
     long reset_calls;
     int fail;       /* nonzero => infer reports an error */
-    float scale;    /* marker gain written to the output spectrum */
+    float scale;    /* marker gain: the mask scales the spectrum by it */
 } CountingModel;
 
 static int counting_infer(
@@ -472,13 +494,12 @@ static int counting_infer(
     const float* far_re, const float* far_im,
     float* out_re, float* out_im) {
     CountingModel* m = (CountingModel*)user;
+    (void)err_re;
+    (void)err_im;
     (void)far_re;
     (void)far_im;
     m->infer_calls += 1;
-    for (int k = 0; k < BINS; ++k) {
-        out_re[k] = m->scale * err_re[k];
-        out_im[k] = m->scale * err_im[k];
-    }
+    mask_fill(out_re, out_im, mask_of_gain(m->scale));
     return m->fail;
 }
 
@@ -491,7 +512,7 @@ static int test_counting_model_policy(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -562,7 +583,7 @@ static int test_counting_model_policy(void) {
 
         if (delay.changed) {
             changed_count += 1;
-            reprime_armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            reprime_armed = REPRIME_FRAMES;
         }
         scaled = !m.fail;
         if (delay.solid && delay.delay_samples >= 0) locked_frames += 1;
@@ -615,7 +636,7 @@ static int test_counting_model_policy(void) {
     CHECK(m.reset_calls == changed_count,
           "model->reset fired exactly once per delay change");
     CHECK(skipped_total ==
-              changed_count * ULCNET_NN_STAGE_REPRIME_FRAMES &&
+              changed_count * REPRIME_FRAMES &&
           skipped_total > 0,
           "the identity reprime really ran: REPRIME skipped frames per "
           "generation and no others");
@@ -664,7 +685,7 @@ static int test_fixed_first_alignment_resets_model(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float microphones[AEC_ARRAY_MICS * HOP_MAX] = {0};
     float far[HOP_MAX] = {0};
@@ -705,7 +726,7 @@ static int test_fixed_first_alignment_resets_model(void) {
     CHECK(m.reset_calls == 1,
           "4ch composition resets model once at FIXED raw-to-aligned transition");
     /* N hops, one frame each; exactly the straddling ones are skipped. */
-    CHECK(m.infer_calls == N - ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(m.infer_calls == N - REPRIME_FRAMES,
           "4ch FIXED transition suppresses inference for exactly the "
           "straddling reprime frames and no others");
     ul4_destroy(p);
@@ -722,7 +743,7 @@ static int test_fixed_first_alignment_resets_model(void) {
  * ========================================================================== */
 
 /* This case exercises the 4ch CORE's FIXED seam, so it pins the core's own
- * 16 kHz / FFT 512 grid rather than the stage's grid. Delays handed
+ * 16 kHz / FFT 512 grid rather than the stream's grid. Delays handed
  * to it must therefore be expressed in FIXED_SEAM_HOP, not in HOP:
  * the switch hop is ceil(fixed / FIXED_SEAM_HOP). */
 #define FIXED_SEAM_SR   16000
@@ -850,7 +871,7 @@ static int test_relock_same_delay_resets_model(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -922,7 +943,7 @@ static int test_relock_same_delay_resets_model(void) {
          * a hop where an alignment generation was ACCEPTED, never where the estimator is merely
          * confident (confidence >= 1.0 is delay_aec_is_solid()). Recomputed from the seam's own
          * estimator fields, independent of the `solid`/`changed` flags under test.
-         * MUTATION: handing the stage `solid = confidence >= 0.5f` instead of the front's
+         * MUTATION: handing the stream `solid = confidence >= 0.5f` instead of the front's
          * delay.solid fires a reset on the first COARSE hop and this counter goes non-zero. */
         if (m.reset_calls != reset_before_hop &&
             !(delay.confidence >= 1.0f && delay.estimator_updates >= 3))
@@ -1027,26 +1048,91 @@ static int test_relock_same_delay_resets_model(void) {
  *    (output hop #p = chain input hop p-1).
  *    MUTATION: delaying the far branch by a hop moves the impulse to T + 2 hops. */
 
+/* 2d. A confirmed shift of the bulk delay mid-stream is a `changed` hop on which the alignment stays solid, so the
+ *     boundary comes from delay.changed alone. Every such hop must restart the model once and run no frame.
+ *     MUTATION: not forwarding info.delay.changed to the stream leaves these hops unanswered. */
+static int test_delay_shift_restarts_model(void) {
+    enum { FIRST = 90, SECOND = 150 };
+    const int d0 = 64 * DELAY_RATE_FACTOR, d1 = 160 * DELAY_RATE_FACTOR;
+    ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
+    Ul4* p;
+    CountingModel m;
+    UlcTestModel model;
+    AecDelayState delay;
+    float *microphones, *far, *out, *far_hist;
+    int hop, prev_solid = 0, shifts = 0, followed = 0;
+
+    cfg.beam.bf_fixed_mode = 1;
+    cfg.beam.bf_fixed_doa_rad = 0.3f;
+    cfg.beam.bf_mu = 0.02f;
+    p = ul4_create(&cfg);
+    CHECK(p != NULL, "create delay-shift pipeline");
+    hop = ul4_hop_size(p);
+    memset(&m, 0, sizeof(m));
+    m.scale = 0.5f;
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
+    model.reset = counting_reset;
+    CHECK(ul4_set_model(p, &model) == 0, "install counting model");
+    microphones = (float*)malloc((size_t)hop * AEC_ARRAY_MICS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    out = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)(FIRST + SECOND) * hop, sizeof(float));
+    CHECK(microphones && far && out && far_hist, "allocate delay-shift buffers");
+
+    g_rng = 0x1234567u;
+    for (int frame = 0; frame < FIRST + SECOND; ++frame) {
+        long resets_before = m.reset_calls, calls_before = m.infer_calls;
+        fill_echo_hop(frame, hop, frame < FIRST ? d0 : d1, far_hist, far, microphones);
+        CHECK(ul4_process_with_activity(p, microphones, far, 0, out) == AEC_OK, "delay-shift frame processes");
+        CHECK(ul4_last_delay(p, &delay) == 0, "delay-state accessor works");
+        if (delay.changed && prev_solid && delay.solid) {
+            shifts += 1;
+            if (m.reset_calls == resets_before + 1 && m.infer_calls == calls_before) followed += 1;
+        }
+        prev_solid = delay.solid;
+    }
+    CHECK(shifts >= 1, "delay shift: the estimator reports a change while the alignment stays solid");
+    CHECK(followed == shifts,
+          "delay shift: every such hop restarts the model once and runs no frame");
+
+    ul4_destroy(p);
+    free(far_hist);
+    free(out);
+    free(far);
+    free(microphones);
+    return 1;
+}
+
 /* Shared shell of the two impulse-timestamp tests (5 and 5b): FRAMES hops
- * of silence with one unit impulse on ONE branch at (IMP_FRAME, IMP_OFF),
- * through `model` (NULL = identity). Reports where the output peaks and how
- * much of its energy sits within +-8 samples of the expected position; the
- * assertions differ per branch and stay in the callers. */
+ * of silence with one unit impulse on ONE branch at (IMP_FRAME, IMP_OFF).
+ * With `capture` the pipeline runs the far-capture model and the examined
+ * stream is the test's own synthesis of the far frames the model was handed
+ * (zeros on a hop without a frame, counted in `unseen`); without it the
+ * pipeline has no model and the examined stream is its output. Reports where
+ * that stream peaks and how much of its energy sits within +-8 samples of the
+ * expected position; the assertions differ per branch and stay in the callers. */
 typedef struct ImpulseRun {
     int imp_index;
     int expect_index;    /* imp_index + 1 hop: the synthesis' one hop */
     int found_index;
     float peak;
     double near_ratio;   /* energy within +-8 of expect_index / total */
+    int unseen;          /* hops on which the capture model was handed no frame */
 } ImpulseRun;
 
 static int run_impulse(const ArrayTestUnitConfig* cfg,
-                       const UlcnetModel* model, int impulse_on_mics,
+                       int capture, int impulse_on_mics,
                        int activity, ImpulseRun* r) {
     enum { FRAMES = 40, IMP_FRAME = 8, IMP_OFF = 37 };
+    static UlcFarCapture cap;
     Ul4* p;
+    Frm far_frm;   /* the test's own synthesis of the captured far frames */
     float* microphones;
     float* far;
+    float* out;
     float* out_hist;
     int hop;
     double energy_total = 0.0;
@@ -1055,15 +1141,22 @@ static int run_impulse(const ArrayTestUnitConfig* cfg,
     p = ul4_create(cfg);
     CHECK(p != NULL, "create impulse-timestamp pipeline");
     hop = ul4_hop_size(p);
-    if (model != NULL) {
-        CHECK(ul4_set_model(p, model) == 0,
+    CHECK(frm_init(&far_frm, &g_grid) == 0, "impulse-timestamp reference synthesis");
+    if (capture) {
+        UlcTestModel model;
+        memset(&model, 0, sizeof(model));
+        model.user = &cap;
+        model.infer = far_capture_infer;
+        model.io_descriptor = test_io_descriptor();
+        CHECK(ul4_set_model(p, &model) == 0,
               "install impulse-timestamp model");
     }
     microphones = (float*)calloc(
         (size_t)hop * AEC_ARRAY_MICS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
     out_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
-    CHECK(microphones && far && out_hist,
+    CHECK(microphones && far && out && out_hist,
           "allocate impulse-timestamp buffers");
 
     memset(r, 0, sizeof(*r));
@@ -1083,10 +1176,23 @@ static int run_impulse(const ArrayTestUnitConfig* cfg,
                 far[IMP_OFF] = 1.0f;
             }
         }
+        cap.called = 0;
         CHECK(ul4_process_with_activity(
                   p, microphones, far, activity,
-                  out_hist + (size_t)frame * hop) == AEC_OK,
+                  capture ? out : out_hist + (size_t)frame * hop) == AEC_OK,
               "impulse-timestamp frame processes");
+        if (capture) {
+            if (!cap.called) {
+                r->unseen += 1;
+                memset(far_frm.out_re, 0, sizeof(far_frm.out_re));
+                memset(far_frm.out_im, 0, sizeof(far_frm.out_im));
+            } else {
+                memcpy(far_frm.out_re, cap.re, sizeof(cap.re));
+                memcpy(far_frm.out_im, cap.im, sizeof(cap.im));
+            }
+            CHECK(frm_synth(&far_frm, hop, out_hist + (size_t)frame * hop) == 0,
+                  "impulse-timestamp far frame synthesises");
+        }
     }
 
     for (int t = 0; t < FRAMES * hop; ++t) {
@@ -1104,7 +1210,9 @@ static int run_impulse(const ArrayTestUnitConfig* cfg,
     r->near_ratio = energy_total > 0.0 ? energy_near / energy_total : 0.0;
 
     ul4_destroy(p);
+    frm_free(&far_frm);
     free(out_hist);
+    free(out);
     free(far);
     free(microphones);
     return 1;
@@ -1112,7 +1220,6 @@ static int run_impulse(const ArrayTestUnitConfig* cfg,
 
 static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
-    UlcnetModel model;
     ImpulseRun r;
 
     cfg.beam.bf_fixed_mode = 1;
@@ -1120,18 +1227,17 @@ static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     cfg.beam.bf_mu = 0.02f;
     cfg.aec_cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.aec_cfg.fixed_delay_samples = 2 * HOP;
-    memset(&model, 0, sizeof(model));
-    model.infer = passthrough_far_infer;
-    model.io_descriptor = test_io_descriptor();
 
-    CHECK(run_impulse(&cfg, &model, 0, 0, &r), "far-timestamp run");
-    printf("raw-far timestamp (4ch after fixed-delay lock): impulse at far[%d] -> out[%d] "
+    CHECK(run_impulse(&cfg, 1, 0, 0, &r), "far-timestamp run");
+    printf("raw-far timestamp (4ch after fixed-delay lock): impulse at far[%d] -> far frames [%d] "
            "(expected %d, offset %+d samples, peak %.4f)\n",
            r.imp_index, r.found_index, r.expect_index,
            r.found_index - r.expect_index, r.peak);
+    CHECK(r.unseen == REPRIME_FRAMES,
+          "the model was handed a far frame on every hop but the reprime hop of the FIXED lock");
     CHECK(r.found_index == r.expect_index,
-          "far impulse lands at impulse + 1 hop (the ULCNet synthesis only; "
-          "no err/far skew)");
+          "far impulse lands at impulse + 1 hop in the far frames the model was handed "
+          "(the synthesis only; no err/far skew)");
     CHECK(r.peak > 0.9f, "far impulse reconstructed at ~unit amplitude");
     return 1;
 }
@@ -1155,7 +1261,7 @@ static int test_error_timestamp_and_content(void) {
     cfg.aec_cfg.fixed_delay_samples = 0;
 
     /* Mics carry the impulse, far is silent, NULL model = identity. */
-    CHECK(run_impulse(&cfg, NULL, 1, 1, &r), "error-timestamp run");
+    CHECK(run_impulse(&cfg, 0, 1, 1, &r), "error-timestamp run");
     printf("error timestamp (4ch): impulse at mic[%d] -> out[%d] (expected %d, "
            "offset %+d samples, peak %.4f, near-peak energy %.3f of total)\n",
            r.imp_index, r.found_index, r.expect_index,
@@ -1190,7 +1296,7 @@ static int test_model_applies_unlocked(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -1248,7 +1354,7 @@ static int test_model_applies_unlocked(void) {
         /* Stepped on every emitted frame except the identity-reprime frames
          * armed at an alignment generation. */
         if (delay.changed)
-            reprime_armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            reprime_armed = REPRIME_FRAMES;
         {
             int skipped_here = reprime_take(&reprime_armed, frames);
             expected_infer += frames - skipped_here;
@@ -1309,14 +1415,13 @@ static int nan_infer(
     const float* far_re, const float* far_im,
     float* out_re, float* out_im) {
     NanModel* m = (NanModel*)user;
+    (void)err_re;
+    (void)err_im;
     (void)far_re;
     (void)far_im;
-    for (int k = 0; k < BINS; ++k) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
-    }
+    mask_fill(out_re, out_im, mask_of_gain(0.5f));
     if (m->poison) {
-        /* rc stays 0: only the finite-output guard can catch this frame.
+        /* rc stays 0: only the finite-mask guard can catch this frame.
          * Mid-array positions so a partial scan would miss them. */
         out_re[100] = nanf("");
         out_im[200] = INFINITY;
@@ -1330,7 +1435,7 @@ static int test_nan_guard(void) {
     Ul4* pa;
     IdentityTwin twin;   /* NULL model: identity */
     NanModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -1339,6 +1444,7 @@ static int test_nan_guard(void) {
     int poisoned[FRAMES];
     int reprime_left = 0;
     int n_reprime = 0;
+    long refused_expected = 0;   /* poisoned hops that had a frame to refuse */
     int n_equal = 0;
     int n_differ = 0;
     int hop;
@@ -1390,12 +1496,14 @@ static int test_nan_guard(void) {
         CHECK(ul4_last_delay(pa, &delay) == 0,
               "NaN-guard delay accessor works");
         if (delay.changed)
-            reprime_left = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            reprime_left = REPRIME_FRAMES;
         /* One frame per hop, so a hop spends at most one frame of the
          * budget. */
         if (reprime_take(&reprime_left, 1) > 0) {
             poisoned[frame] = 1;
             n_reprime += 1;
+        } else if (m.poison) {
+            refused_expected += 1;
         }
 
         for (int i = 0; i < hop; ++i) {
@@ -1430,8 +1538,12 @@ static int test_nan_guard(void) {
     }
     CHECK(n_equal >= 10 && n_differ >= 10,
           "NaN-guard coverage: both regimes actually compared");
-    CHECK(n_reprime % ULCNET_NN_STAGE_REPRIME_FRAMES == 0,
+    CHECK(n_reprime % REPRIME_FRAMES == 0,
           "NaN-guard: reprime frames accounted for in whole generations");
+    /* A poisoned hop that is also a reprime hop has no frame to refuse. */
+    CHECK(refused_expected >= 10 && pa->rig.refused == refused_expected && pa->rig.broken == 0 &&
+          ulcnet_stream_state_generation(pa->rig.stream) == (uint32_t)(pa->rig.refused + pa->rig.edges),
+          "NaN-guard: every poisoned frame is refused and restarts the state generation once");
 
     ul4_destroy(pa);
     twin_destroy(&twin);
@@ -1443,11 +1555,11 @@ static int test_nan_guard(void) {
 }
 
 /* 8. Full-write contract: infer() writes only the FIRST 100 bins (0.5x) on scheduled hops
- *    but returns rc==0. The stage pre-fills the enh_re/enh_im staging with NaN before
- *    every infer call (ulcnet_process.h's FULL-WRITE CONTRACT), so the unwritten bins stay
+ *    of the mask but returns rc==0. The stream pre-fills the mask staging with NaN before
+ *    every run (ulcnet_model_io_prepare()), so the unwritten bins stay
  *    NaN and the finite guard discards the frame: bit-identical to the NULL-model pipeline
  *    under the mixing rule of test 7, and the next fully-written frame is applied again.
- *    MUTATION: removing the NaN pre-fill in ulcnet_nn_stage_nn_begin() leaves stale finite
+ *    MUTATION: removing the NaN pre-fill in ulcnet_model_io_prepare() leaves stale finite
  *    values in bins 100..256 and the bit-identical check goes red. */
 
 typedef struct PartialModel {
@@ -1461,13 +1573,15 @@ static int partial_write_infer(
     float* out_re, float* out_im) {
     PartialModel* m = (PartialModel*)user;
     int n = m->partial ? 100 : BINS;
+    (void)err_re;
+    (void)err_im;
     (void)far_re;
     (void)far_im;
     for (int k = 0; k < n; ++k) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
+        out_re[k] = mask_of_gain(0.5f);
+        out_im[k] = 0.0f;
     }
-    /* rc stays 0 even for the partial write: only the stage's NaN
+    /* rc stays 0 even for the partial write: only the stream's NaN
      * pre-fill + finite guard can catch the 157 unwritten bins. */
     return 0;
 }
@@ -1478,7 +1592,7 @@ static int test_partial_write_guard(void) {
     Ul4* pa;
     IdentityTwin twin;   /* NULL model: identity */
     PartialModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -1487,6 +1601,7 @@ static int test_partial_write_guard(void) {
     int partial[FRAMES];
     int reprime_left = 0;
     int n_reprime = 0;
+    long refused_expected = 0;   /* partial hops that had a frame to refuse */
     int n_equal = 0;
     int n_differ = 0;
     int hop;
@@ -1535,10 +1650,12 @@ static int test_partial_write_guard(void) {
         CHECK(ul4_last_delay(pa, &delay) == 0,
               "partial-write delay accessor works");
         if (delay.changed)
-            reprime_left = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            reprime_left = REPRIME_FRAMES;
         if (reprime_take(&reprime_left, 1) > 0) {
             partial[frame] = 1;
             n_reprime += 1;
+        } else if (m.partial) {
+            refused_expected += 1;
         }
 
         for (int i = 0; i < hop; ++i) {
@@ -1570,8 +1687,11 @@ static int test_partial_write_guard(void) {
     }
     CHECK(n_equal >= 10 && n_differ >= 10,
           "partial-write coverage: both regimes actually compared");
-    CHECK(n_reprime % ULCNET_NN_STAGE_REPRIME_FRAMES == 0,
+    CHECK(n_reprime % REPRIME_FRAMES == 0,
           "partial-write: reprime frames accounted for in whole generations");
+    CHECK(refused_expected >= 10 && pa->rig.refused == refused_expected && pa->rig.broken == 0 &&
+          ulcnet_stream_state_generation(pa->rig.stream) == (uint32_t)(pa->rig.refused + pa->rig.edges),
+          "partial-write: every partly written frame is refused and restarts the state generation once");
 
     ul4_destroy(pa);
     twin_destroy(&twin);
@@ -1630,8 +1750,7 @@ static int probe_infer(
     } else {
         st->overflow = 1;
     }
-    memcpy(out_re, err_re, BINS * sizeof(float));
-    memcpy(out_im, err_im, BINS * sizeof(float));
+    mask_fill(out_re, out_im, 1.0f);
     return 0;
 }
 
@@ -1643,7 +1762,7 @@ static void probe_reset(void* user) { ((ProbeModel*)user)->resets += 1; }
 static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
-    UlcnetModel model;
+    UlcTestModel model;
     float microphones[AEC_ARRAY_MICS * HOP_MAX];
     float far[HOP_MAX];
     float out[HOP_MAX];
@@ -1749,9 +1868,9 @@ static int test_reprime_straddle_derivation(void) {
     printf("reprime derivation (4ch, ERROR branch): %d straddling frames at hops "
            "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
            straddle_err, RP_T, RP_T + RP_WINDOW - 1, (double)dmin, (double)cmax);
-    CHECK(straddle_err >= ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(straddle_err >= REPRIME_FRAMES,
           "4ch ERROR branch: chain memory is at least "
-          "ULCNET_NN_STAGE_REPRIME_FRAMES -- it carries the AEC "
+          "REPRIME_FRAMES -- it carries the AEC "
           "filter tail on top of the straddle, so it bounds rather than "
           "derives it");
     /* No absolute floor on dmin: the impulse arrives spread by the AEC
@@ -1765,21 +1884,21 @@ static int test_reprime_straddle_derivation(void) {
     printf("reprime derivation (4ch, FAR branch):   %d straddling frames at hops "
            "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
            straddle_far, RP_T, RP_T + RP_WINDOW - 1, (double)dmin, (double)cmax);
-    CHECK(straddle_far == ULCNET_NN_STAGE_REPRIME_FRAMES,
+    CHECK(straddle_far == REPRIME_FRAMES,
           "4ch FAR branch: the emitted frames that still contain pre-switch "
-          "samples number exactly ULCNET_NN_STAGE_REPRIME_FRAMES");
+          "samples number exactly REPRIME_FRAMES");
     CHECK(straddle_far > 0 && dmin > 20.0f * cmax && dmin > 0.2f,
           "4ch FAR branch marker is unambiguous (marked peak far above the "
           "unmarked residue)");
 
-    /* The boundary runs: the stage skips exactly those frames. */
+    /* The boundary runs: the stream skips exactly those frames. */
     CHECK(err_bnd.resets == 1 && far_bnd.resets == 1,
           "boundary run: the FIXED raw->aligned switch fired model->reset once");
 
     for (int c = 0; c < err_bnd.calls; ++c) {
         if (err_bnd.call_hop[c] >= RP_T &&
             err_bnd.call_hop[c] <
-                RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
+                RP_T + REPRIME_FRAMES)
             stepped_inside_reprime += 1;
         if (err_bnd.call_hop[c] >= RP_T && first_visible_err < 0) {
             first_visible_err = err_bnd.call_hop[c];
@@ -1789,7 +1908,7 @@ static int test_reprime_straddle_derivation(void) {
     for (int c = 0; c < far_bnd.calls; ++c) {
         if (far_bnd.call_hop[c] >= RP_T &&
             far_bnd.call_hop[c] <
-                RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES)
+                RP_T + REPRIME_FRAMES)
             stepped_inside_reprime += 1;
         if (far_bnd.call_hop[c] >= RP_T && first_visible_far < 0) {
             first_visible_far = far_bnd.call_hop[c];
@@ -1813,15 +1932,15 @@ static int test_reprime_straddle_derivation(void) {
     CHECK(stepped_inside_reprime == 0,
           "boundary run: the model is not stepped on any reprime hop");
     CHECK(first_visible_err ==
-              RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES &&
+              RP_T + REPRIME_FRAMES &&
           first_visible_far ==
-              RP_T + ULCNET_NN_STAGE_REPRIME_FRAMES,
+              RP_T + REPRIME_FRAMES,
           "boundary run: stepping resumes exactly REPRIME frames after the "
           "boundary hop");
     CHECK(err_bnd.calls ==
-              expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES &&
+              expected_frames - REPRIME_FRAMES &&
           far_bnd.calls ==
-              expected_frames - ULCNET_NN_STAGE_REPRIME_FRAMES,
+              expected_frames - REPRIME_FRAMES,
           "boundary run: exactly REPRIME emitted frames skipped inference");
     return 1;
 }
@@ -1838,7 +1957,7 @@ static int test_reprime_behavior(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4* p;
     CountingModel m;
-    UlcnetModel model;
+    UlcTestModel model;
     AecDelayState delay;
     float* microphones;
     float* far;
@@ -1892,7 +2011,7 @@ static int test_reprime_behavior(void) {
               "reprime-behaviour delay accessor works");
 
         if (delay.changed) {
-            armed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+            armed = REPRIME_FRAMES;
             changed_count += 1;
             if (boundary_frame < 0) boundary_frame = frame;
         }
@@ -1910,11 +2029,11 @@ static int test_reprime_behavior(void) {
     CHECK(changed_count >= 1,
           "reprime behaviour: the run really crossed an alignment generation");
     CHECK(skipped_total ==
-              changed_count * ULCNET_NN_STAGE_REPRIME_FRAMES,
+              changed_count * REPRIME_FRAMES,
           "reprime behaviour: REPRIME frames skipped per generation and no "
           "others -- compute DROPS on those frames, it never doubles");
     CHECK(resumed_frame ==
-              boundary_frame + ULCNET_NN_STAGE_REPRIME_FRAMES,
+              boundary_frame + REPRIME_FRAMES,
           "reprime behaviour: stepping stops on the boundary hop and resumes "
           "REPRIME frames later");
     CHECK(m.reset_calls == changed_count,
@@ -1931,7 +2050,7 @@ static int test_reprime_behavior(void) {
             ulcnet_example_unit_config();
         Ul4* fp;
         CountingModel fm;
-        UlcnetModel fmodel;
+        UlcTestModel fmodel;
         float mics[AEC_ARRAY_MICS * HOP_MAX];
         float ffar[HOP_MAX];
         float fout[HOP_MAX];
@@ -1974,7 +2093,7 @@ static int test_reprime_behavior(void) {
             CHECK(ul4_last_delay(fp, &fdelay) == 0,
                   "FIXED reprime: delay accessor works after the hop");
             if (frame != 0 && !solid_before && fdelay.solid) {
-                farmed = ULCNET_NN_STAGE_REPRIME_FRAMES;
+                farmed = REPRIME_FRAMES;
                 fixed_boundary = frame;
             }
             skipped_here = reprime_take(&farmed, frames);
@@ -1987,13 +2106,13 @@ static int test_reprime_behavior(void) {
                 calls_at_boundary = (int)delta;
             if (fixed_boundary >= 0 &&
                 frame == fixed_boundary +
-                             ULCNET_NN_STAGE_REPRIME_FRAMES)
+                             REPRIME_FRAMES)
                 calls_after_reprime = (int)delta;
         }
 
         CHECK(fixed_boundary == FIXED_HOPS,
               "FIXED reprime: the raw->aligned switch is on the expected hop");
-        CHECK(fskipped == ULCNET_NN_STAGE_REPRIME_FRAMES,
+        CHECK(fskipped == REPRIME_FRAMES,
               "FIXED reprime: exactly REPRIME frames skipped at the fill "
               "completion");
         CHECK(calls_at_boundary == 0 && calls_after_reprime == 1,
@@ -2007,50 +2126,59 @@ static int test_reprime_behavior(void) {
 }
 
 /* ============================================================================
- * 11. Fixed deployment contract: production accepts only the raw-far descriptor. The
- * aligned enumerator is used only for negative ABI tests; there is no runtime far-mode
- * setter.
+ * 11. Graph descriptor gate: the composition checks the descriptor published beside the
+ * graph against its grid before any hop runs, as main.c does with the model's metadata
+ * (ulcnet_model_io_descriptor_validate(), one frame per call). The aligned enumerator is
+ * used only for negative tests; there is no runtime far-mode setter.
  * ========================================================================== */
 static int test_raw_descriptor_gate(void) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
+    const UlcnetGrid og = other_grid();
     Ul4* p;
-    UlcnetModelIoDescriptor raw_desc;
-    UlcnetModelIoDescriptor aligned_desc;
-    UlcnetModel raw_model;
-    UlcnetModel aligned_model;
-    UlcnetModel undescribed_model;
+    CountingModel m;
+    UlcnetModelIoDescriptor raw_desc, aligned_desc, other_desc, packet_desc;
+    UlcTestModel raw_model, bad_model;
+    float mics[AEC_ARRAY_MICS * HOP_MAX] = {0}, far[HOP_MAX] = {0}, out[HOP_MAX];
 
     CHECK(ulcnet_model_io_descriptor_default(&g_grid, &raw_desc) == 0 &&
-          ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) == 0,
+          ulcnet_model_io_descriptor_default(&g_grid, &aligned_desc) == 0 &&
+          ulcnet_model_io_descriptor_default(&og, &other_desc) == 0 &&
+          ulcnet_model_io_descriptor_default_packet(&g_grid, 8, &packet_desc) == 0,
           "build model-I/O descriptors");
     aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
     CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
           "descriptor_default publishes fixed raw far");
 
-    memset(&undescribed_model, 0, sizeof(undescribed_model));
-    undescribed_model.infer = gate_infer_identity;
-    undescribed_model.io_descriptor = test_io_descriptor();
-    raw_model = undescribed_model;
+    memset(&m, 0, sizeof(m));
+    m.scale = 0.5f;
+    memset(&raw_model, 0, sizeof(raw_model));
+    raw_model.user = &m;
+    raw_model.infer = counting_infer;
     raw_model.io_descriptor = &raw_desc;
-    aligned_model = undescribed_model;
-    aligned_model.io_descriptor = &aligned_desc;
 
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.3f;
     cfg.beam.bf_mu = 0.02f;
     p = ul4_create(&cfg);
-    CHECK(p != NULL, "create aligned-descriptor gate pipeline");
+    CHECK(p != NULL, "create descriptor gate pipeline");
 
-    /* Baseline: an undescribed model publishes no contract, so the
-     * rejections below cannot be passing for want of a model. */
-    CHECK(ul4_set_model(p, &undescribed_model) == 0,
-          "a model with io_descriptor == NULL remains supported");
-
-    /* Production accepts only a raw-far descriptor. */
-    CHECK(ul4_set_model(p, &aligned_model) != 0,
-          "aligned descriptor is rejected");
     CHECK(ul4_set_model(p, &raw_model) == 0,
           "raw descriptor is accepted");
+    bad_model = raw_model;
+    bad_model.user = NULL;
+    bad_model.infer = unit_mask_infer;
+    bad_model.io_descriptor = &aligned_desc;
+    CHECK(ul4_set_model(p, &bad_model) != 0,
+          "aligned descriptor is rejected");
+    bad_model.io_descriptor = &other_desc;
+    CHECK(ul4_set_model(p, &bad_model) != 0,
+          "a descriptor of the other grid is rejected");
+    bad_model.io_descriptor = &packet_desc;
+    CHECK(ul4_set_model(p, &bad_model) != 0,
+          "a packet descriptor (N = 8) is rejected by the one-hop composition");
+    /* The refused models left the accepted one installed. */
+    CHECK(ul4_process_with_activity(p, mics, far, 0, out) == AEC_OK && m.infer_calls == 1,
+          "a refused model leaves the installed one running");
 
     ul4_destroy(p);
     return 1;
@@ -2060,25 +2188,21 @@ static int test_raw_descriptor_gate(void) {
  * 12. Phased hop
  * ========================================================================== */
 
-/* The phased hop (process_begin / nn_begin / nn_end / process_end) is
- * process_with_activity() with the model call moved out: a twin driven phase
- * by phase, with the same network run by the caller, reproduces the
- * callback-driven instance byte for byte (an echo path appears mid-run, so
+/* The hop written out phase by phase (ul4_process_begin, the frame's views, the network run by the
+ * caller, ul4_process_end) is process_with_activity() with the model call moved out: a twin driven
+ * that way reproduces the model-driven instance byte for byte (an echo path appears mid-run, so
  * the alignment boundary and its reprime hops are part of the claim). The
- * fail-open rows pin the ways a frame ends as the identity: a failed run, an
- * output with a non-finite bin, a frame left open, a frame never fetched. */
-enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
+ * fail-open rows pin the ways a frame ends as the beamformed spectrum: a failed run, a
+ * mask with a non-finite bin, and a run that reports success without writing the mask. */
+enum { PH_RUN, PH_FAIL, PH_NAN, PH_UNWRITTEN };
 
 static int phased_half_infer(void* user,
                              const float* err_re, const float* err_im,
                              const float* far_re, const float* far_im,
                              float* out_re, float* out_im) {
     int poison = user != NULL;
-    (void)far_re; (void)far_im;
-    for (int k = 0; k < BINS; ++k) {
-        out_re[k] = 0.5f * err_re[k];
-        out_im[k] = 0.5f * err_im[k];
-    }
+    (void)err_re; (void)err_im; (void)far_re; (void)far_im;
+    mask_fill(out_re, out_im, mask_of_gain(0.5f));
     if (poison) { out_re[100] = (float)NAN; out_im[200] = (float)INFINITY; }
     return 0;
 }
@@ -2087,20 +2211,21 @@ static int phased_fail_infer(void* user,
                              const float* err_re, const float* err_im,
                              const float* far_re, const float* far_im,
                              float* out_re, float* out_im) {
-    (void)user; (void)far_re; (void)far_im;
-    for (int k = 0; k < BINS; ++k) { out_re[k] = 2.0f * err_re[k]; out_im[k] = 2.0f * err_im[k]; }
-    return 1;   /* garbage written, failure reported: the pipeline must discard it */
+    (void)user; (void)err_re; (void)err_im; (void)far_re; (void)far_im;
+    mask_fill(out_re, out_im, mask_of_gain(2.0f));
+    return 1;   /* a finite mask written, failure reported: the pipeline must discard it */
 }
 
 static int phased_twin_matches(int mode, int frames) {
     enum { TRUE_DELAY = 400 };
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4 *ph, *cb;
-    UlcnetModel model;
-    UlcnetNnJob job;
+    UlcTestModel model;
+    UlcTestJob job;
     float *mics, *far, *far_hist, *a, *b;
     int hop, ran = 0, nonzero = 0, ok = 1;
     int poison_tag = 1;
+    long want_refused;
 
     cfg.beam.bf_fixed_mode = 1;
     cfg.beam.bf_fixed_doa_rad = 0.3f;
@@ -2122,54 +2247,57 @@ static int phased_twin_matches(int mode, int frames) {
     a = (float*)malloc((size_t)hop * sizeof(float));
     b = (float*)malloc((size_t)hop * sizeof(float));
     for (int f = 0; f < frames && ok; ++f) {
-        int r = 0;
+        int r;
         fill_echo_hop(f, hop, TRUE_DELAY, far_hist, far, mics);
         ok = ul4_process_with_activity(cb, mics, far, 0, b) == AEC_OK &&
              ul4_process_begin(ph, mics, far, 0) == AEC_OK;
         if (!ok) break;
-        if (mode != PH_UNFETCHED) {
-            r = ul4_nn_begin(ph, &job);
-            if (r < 0) { ok = 0; break; }
-        }
+        r = ulc_rig_job(&ph->rig, &job);
+        if (r < 0) { ok = 0; break; }
         if (r == 1) {
             ran++;
             if (mode == PH_RUN)
-                ok = phased_half_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
-                                       job.out_re, job.out_im) == 0 &&
-                     ul4_nn_end(ph, 0) == AEC_OK;
+                ok = ulc_rig_job_done(&ph->rig, phased_half_infer(NULL, job.err_re, job.err_im, job.far_re,
+                                                                  job.far_im, job.mask_re, job.mask_im)) == 0;
             else if (mode == PH_FAIL)
-                ok = ul4_nn_end(ph, -1) == AEC_OK;
+                ok = ulc_rig_job_done(&ph->rig, -1) == 0;
             else if (mode == PH_NAN)
-                ok = phased_half_infer(&poison_tag, job.err_re, job.err_im, job.far_re, job.far_im,
-                                       job.out_re, job.out_im) == 0 &&
-                     ul4_nn_end(ph, 0) == AEC_OK;
+                ok = ulc_rig_job_done(&ph->rig, phased_half_infer(&poison_tag, job.err_re, job.err_im, job.far_re,
+                                                                  job.far_im, job.mask_re, job.mask_im)) == 0;
+            else   /* PH_UNWRITTEN: success reported, nothing written */
+                ok = ulc_rig_job_done(&ph->rig, 0) == 0;
         }
         ok = ok && ul4_process_end(ph, a) == AEC_OK;
         if (!ok) break;
         if (memcmp(a, b, (size_t)hop * sizeof(float)) != 0) ok = 0;
         for (int i = 0; i < hop; ++i) if (a[i] != 0.0f) nonzero = 1;
     }
+    /* A refused frame restarts the state generation; a failed run and an accepted one do not. */
+    want_refused = mode == PH_NAN || mode == PH_UNWRITTEN ? ran : 0;
+    ok = ok && ph->rig.refused == want_refused && ph->rig.broken == 0 &&
+         ulcnet_stream_state_generation(ph->rig.stream) == (uint32_t)(ph->rig.edges + want_refused);
     free(mics); free(far); free(far_hist); free(a); free(b);
     ul4_destroy(ph);
     ul4_destroy(cb);
-    return ok && nonzero && (mode == PH_UNFETCHED || ran > 0);
+    return ok && nonzero && ran > 0 && ran < frames;
 }
 
 static int test_phased_hop(void) {
     CHECK(phased_twin_matches(PH_RUN, 80),
-          "phased hop with the caller's network equals the callback-driven pipeline byte for byte");
-    CHECK(phased_twin_matches(PH_FAIL, 80), "phased: a failed run is the identity");
-    CHECK(phased_twin_matches(PH_NAN, 80), "phased: a non-finite output bin is the identity");
-    CHECK(phased_twin_matches(PH_OPEN, 80), "phased: a frame left open is the identity");
-    CHECK(phased_twin_matches(PH_UNFETCHED, 80), "phased: a frame never fetched is the identity");
+          "phased hop with the caller's network equals the model-driven pipeline byte for byte");
+    CHECK(phased_twin_matches(PH_FAIL, 80), "phased: a failed run is the beamformed spectrum");
+    CHECK(phased_twin_matches(PH_NAN, 80),
+          "phased: a non-finite mask bin is the beamformed spectrum and restarts the state generation");
+    CHECK(phased_twin_matches(PH_UNWRITTEN, 80),
+          "phased: a mask left unwritten is the beamformed spectrum and restarts the state generation");
     return 1;
 }
 
 /* ============================================================================
- * 0. The example unit config is the stage's grid: its rate and FFT, linear context only
+ * 0. The example unit config is the stream's grid: its rate and FFT, linear context only
  *    (fuse is the post-beam stages' entry and is refused). A unit of the other grid builds,
- *    but the stage's bin count does not fit it, which is what the example's grid guard
- *    (unit_matches_stage) catches.
+ *    but the stream's bin count does not fit it, which is what the example's grid guard
+ *    (unit_matches_stream) catches.
  * ========================================================================== */
 
 static int test_example_unit_config_grid(void) {
@@ -2182,12 +2310,12 @@ static int test_example_unit_config_grid(void) {
     CHECK(og.n_fft != 0 && og.n_fft != g_grid.n_fft, "the grid table has a second row");
     CHECK(cfg.aec_cfg.sample_rate == g_grid.sample_rate && cfg.aec_cfg.fft_size == g_grid.n_fft &&
           cfg.aec_cfg.residual == AEC_RESIDUAL_STATE,
-          "example unit config: the stage's grid, lanes only (AEC_RESIDUAL_STATE)");
+          "example unit config: the stream's grid, lanes only (AEC_RESIDUAL_STATE)");
     unit = array_test_beam_create(&cfg);
-    CHECK(unit != NULL && unit_matches_stage(unit, &g_grid),
-          "example unit: hop, bins, FFT size and rate are the stage's");
+    CHECK(unit != NULL && unit_matches_stream(unit, &g_grid),
+          "example unit: hop, bins, FFT size and rate are the stream's");
     CHECK(array_test_sample_rate(array_test_beam_aec(unit)) == g_grid.sample_rate,
-          "example unit: sample rate is the stage's");
+          "example unit: sample rate is the stream's");
     CHECK(array_sample_beam_fuse(unit, &frame) == AEC_ERR_SEQUENCE,
           "example unit: fuse is refused without a beam of this hop");
     {   /* with a beam of this hop the lanes-only array refuses the fusion itself */
@@ -2205,29 +2333,30 @@ static int test_example_unit_config_grid(void) {
     other.aec_cfg.residual = AEC_RESIDUAL_STATE;
     unit = array_test_beam_create(&other);
     CHECK(unit != NULL, "a unit of the other grid builds");
-    CHECK(unit != NULL && !unit_matches_stage(unit, &g_grid),
-          "the other grid's unit does not fit the stage");
+    CHECK(unit != NULL && !unit_matches_stream(unit, &g_grid),
+          "the other grid's unit does not fit the stream");
     array_test_beam_destroy(unit);
     CHECK(ul4_create(&other) == NULL, "the composition refuses a unit of the other grid");
     CHECK(ul4_create_for(&cfg, &og) == NULL,
-          "the composition refuses a stage of the other grid");
+          "the composition refuses a stream of the other grid");
     return 1;
 }
 
 /* ============================================================================
  * 4. Caller-pool construction: the unit through its queried descriptor (init_ex) and the
- *    stage in a stale block, each in its own pool, against the heap construction. Same
+ *    stream in a stale block, each in its own pool, against the heap construction. Same
  *    stream, byte-identical output, nothing written past either pool, and the pools are
  *    reusable after destroy.
  * ========================================================================== */
 
 static Ul4* ul4_in_pools(void* unit_pool, size_t unit_bytes, const ArrayTestUnitConfig* cfg,
-                         void* stage_pool, size_t stage_bytes) {
+                         void* stream_pool, size_t stream_bytes) {
     Ul4* p = (Ul4*)calloc(1, sizeof(*p));
+    int ok;
     if (!p) return NULL;
     p->unit = array_test_beam_init(unit_pool, unit_bytes, cfg);
-    p->stage = frm_init(&p->frm, &g_grid) == 0 ? ulcnet_nn_stage_init(stage_pool, stage_bytes, &g_grid) : NULL;
-    if (!p->unit || !p->stage) {
+    ok = frm_init(&p->frm, &g_grid) == 0 && ulc_rig_init(&p->rig, stream_pool, stream_bytes, &g_grid) == 0;
+    if (!p->unit || !ok) {
         frm_free(&p->frm);
         free(p);
         return NULL;
@@ -2239,25 +2368,25 @@ static int test_create_vs_pool_parity(void) {
     enum { EXTRA = 32, FRAMES = 40, TRUE_DELAY = 400 };
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     AecMemReq req;
-    UlcnetModel model;
+    UlcTestModel model;
     Ul4 *heap, *pooled;
-    unsigned char *unit_pool = NULL, *stage_pool = NULL;
-    size_t stage_bytes = ulcnet_nn_stage_mem_size(&g_grid);
+    unsigned char *unit_pool = NULL, *stream_pool = NULL;
+    size_t stream_bytes = ulc_rig_stream_bytes(&g_grid);
     float *mics, *far, *far_hist, *oh, *op;
     size_t k;
     int hop;
 
     cfg.beam.bf_mu = 0.02f;
-    CHECK(array_test_unit_get_mem_requirements(&cfg, &req) == 0 && stage_bytes != 0,
+    CHECK(array_test_unit_get_mem_requirements(&cfg, &req) == 0 && stream_bytes != 0,
           "pool queries succeed");
     CHECK(posix_memalign((void**)&unit_pool, req.alignment, (size_t)req.bytes + EXTRA) == 0 &&
-              posix_memalign((void**)&stage_pool, 16, stage_bytes + EXTRA) == 0,
+              posix_memalign((void**)&stream_pool, 16, stream_bytes + EXTRA) == 0,
           "aligned caller pools allocate");
     memset(unit_pool, 0xa5, (size_t)req.bytes + EXTRA);
-    memset(stage_pool, 0xa5, stage_bytes + EXTRA);
+    memset(stream_pool, 0xa5, stream_bytes + EXTRA);
 
     heap = ul4_create(&cfg);
-    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stage_pool, stage_bytes);
+    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stream_pool, stream_bytes);
     CHECK(heap != NULL && pooled != NULL,
           "heap and poisoned caller-pool construction both succeed");
     memset(&model, 0, sizeof(model));
@@ -2283,31 +2412,31 @@ static int test_create_vs_pool_parity(void) {
               "heap/pool output is byte-identical");
     }
     for (k = 0; k < (size_t)EXTRA; ++k)
-        if (unit_pool[(size_t)req.bytes + k] != 0xa5 || stage_pool[stage_bytes + k] != 0xa5) break;
+        if (unit_pool[(size_t)req.bytes + k] != 0xa5 || stream_pool[stream_bytes + k] != 0xa5) break;
     CHECK(k == (size_t)EXTRA, "init stays inside both queried pools");
 
     array_test_beam_destroy(pooled->unit);
     frm_free(&pooled->frm);
     free(pooled);
-    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stage_pool, stage_bytes);
+    pooled = ul4_in_pools(unit_pool, (size_t)req.bytes, &cfg, stream_pool, stream_bytes);
     CHECK(pooled != NULL, "the caller pools are reusable after destroy");
     array_test_beam_destroy(pooled->unit);
     frm_free(&pooled->frm);
     free(pooled);
     ul4_destroy(heap);
     free(oh); free(op); free(far_hist); free(far); free(mics);
-    free(unit_pool); free(stage_pool);
+    free(unit_pool); free(stream_pool);
     return 1;
 }
 
 /* ============================================================================
- * 13. Recovery: any refused call is answered by resetting unit and stage together (what
+ * 13. Recovery: any refused call is answered by resetting unit and stream together (what
  *     4ch/alignulcnet/main.c does). After that the stream restarts as on a fresh pair, byte
  *     for byte, with the model reset once by the recovery and then by its own alignment
  *     events only. A model whose gain depends on the calls since its last reset makes any
- *     state the recovery leaves behind visible in the output. The three refusals: the stage
- *     is begun twice in one hop (sequence error), the unit gets a non-finite sample
- *     (invalid argument), and a model frame is left open. The activity pattern keeps SRP and
+ *     state the recovery leaves behind visible in the output. The three refusals: the stream
+ *     is begun twice in one hop (refused), the unit gets a non-finite sample
+ *     (invalid argument), and a hop is left open with its frame fetched. The activity pattern keeps SRP and
  *     BF adapting.
  * ========================================================================== */
 
@@ -2322,14 +2451,13 @@ static int stateful_infer(
     float* out_re, float* out_im) {
     StatefulModel* m = (StatefulModel*)user;
     float g = 0.5f + 0.5f * expf(-(float)m->calls_since_reset / 50.0f);
+    (void)err_re;
+    (void)err_im;
     (void)far_re;
     (void)far_im;
     m->infer_calls += 1;
     m->calls_since_reset += 1;
-    for (int k = 0; k < BINS; ++k) {
-        out_re[k] = g * err_re[k];
-        out_im[k] = g * err_im[k];
-    }
+    mask_fill(out_re, out_im, mask_of_gain(g));
     return 0;
 }
 
@@ -2339,7 +2467,7 @@ static void stateful_reset(void* user) {
     m->resets += 1;
 }
 
-enum { RC_STAGE_SEQUENCE, RC_UNIT_NONFINITE, RC_OPEN_FRAME };
+enum { RC_STREAM_SEQUENCE, RC_UNIT_NONFINITE, RC_OPEN_FRAME };
 
 /* The same scripted scene on every call: frames 0..frames-1, echo delay TRUE_DELAY. */
 static int run_scene(Ul4* p, int frames, float* out_all) {
@@ -2364,8 +2492,8 @@ static int recovery_case(int refusal) {
     ArrayTestUnitConfig cfg = ulcnet_example_unit_config();
     Ul4 *a, *b;
     StatefulModel ma, mb;
-    UlcnetModel model;
-    UlcnetNnJob job;
+    UlcTestModel model;
+    UlcTestJob job;
     float *oa, *ob, *mics, *far;
     long resets_after_recovery, calls_after_recovery;
     int hop, equal = 1, nonzero = 0;
@@ -2395,10 +2523,10 @@ static int recovery_case(int refusal) {
           "recovery: the first stretch used the model and an alignment event reset it");
 
     switch (refusal) {
-    case RC_STAGE_SEQUENCE:
+    case RC_STREAM_SEQUENCE:
         CHECK(ul4_process_begin(a, mics, far, 0) == AEC_OK &&
-              ul4_process_begin(a, mics, far, 0) == ULCNET_NN_STAGE_SEQUENCE_ERROR,
-              "recovery: a second stage begin in one hop is refused");
+              ul4_process_begin(a, mics, far, 0) == UL4_STREAM_REFUSED,
+              "recovery: a second stream begin in one hop is refused");
         break;
     case RC_UNIT_NONFINITE:
         mics[3] = NAN;
@@ -2407,8 +2535,8 @@ static int recovery_case(int refusal) {
         break;
     default:
         CHECK(ul4_process_begin(a, mics, far, 0) == AEC_OK &&
-              ul4_nn_begin(a, &job) == 1,
-              "recovery: a model frame is opened and left open");
+              ulc_rig_job(&a->rig, &job) == 1,
+              "recovery: a hop is begun, its frame fetched, and left open");
         break;
     }
 
@@ -2434,18 +2562,18 @@ static int recovery_case(int refusal) {
 }
 
 static int test_recovery_equals_fresh_pair(void) {
-    CHECK(recovery_case(RC_STAGE_SEQUENCE), "recovery after a stage sequence error");
+    CHECK(recovery_case(RC_STREAM_SEQUENCE), "recovery after a refused second begin");
     CHECK(recovery_case(RC_UNIT_NONFINITE), "recovery after a refused unit hop");
-    CHECK(recovery_case(RC_OPEN_FRAME), "recovery from an open model frame");
+    CHECK(recovery_case(RC_OPEN_FRAME), "recovery from an open hop");
     return 1;
 }
 
 
 /* ============================================================================
  * 18. Complex-spectrum entry vs an independent per-sample accumulate reference
- *     (begin_spec with the front end's beamformed spectrum and the far spectrum the application analysed).
- *     The expected PCM is built by the TEST: the spectrum the stage was handed (or, where the
- *     model ran and was accepted, the same spectrum through the band mask) goes through
+ *     (pre_process_freq with the front end's beamformed spectrum and the far spectrum the application analysed).
+ *     The expected PCM is built by the TEST: the spectrum the stream was handed (or, where the
+ *     model ran and was accepted, the same spectrum through the fixture's copy of the band mask) goes through
  *     (a) its own AcIstft in accumulate mode, bit for bit, and (b) a direct inverse DFT in
  *     double with the periodic sqrt-Hann window and a saved second half, within 2e-6.
  *     The alignment events are scheduled by the test (the real front end supplies the
@@ -2488,17 +2616,23 @@ static void cx_accref_hop(CxAccRef* a, const float* re, const float* im, float* 
 
 static float cx_gain(int k) { return 0.25f + 0.75f * (float)(k % 9) / 8.0f; }
 
+/* The band model's mask: complex, a magnitude near cx_gain(k)'s and a phase turn that varies from bin to bin. */
+static void cx_mask(float* mask_re, float* mask_im) {
+    for (int k = 0; k < BINS; ++k) {
+        mask_re[k] = mask_of_gain(cx_gain(k));
+        mask_im[k] = 0.15f * (float)(k % 5 - 2);
+    }
+}
+
 typedef struct CxModel { long calls, resets; int fail; } CxModel;
 
 static int cx_infer(void* user, const float* er, const float* ei, const float* fr, const float* fi,
                     float* orr, float* oi) {
     CxModel* m = (CxModel*)user;
-    (void)fr; (void)fi;
+    (void)er; (void)ei; (void)fr; (void)fi;
     m->calls += 1;
-    for (int k = 0; k < BINS; ++k) {
-        orr[k] = (m->fail ? 7.0f : cx_gain(k)) * er[k];
-        oi[k] = (m->fail ? 7.0f : cx_gain(k)) * ei[k];
-    }
+    if (m->fail) mask_fill(orr, oi, 7.0f);
+    else cx_mask(orr, oi);
     return m->fail ? -1 : 0;
 }
 static void cx_reset(void* user) { ((CxModel*)user)->resets += 1; }
@@ -2512,8 +2646,8 @@ typedef struct CxScn {
     int fail_from, fail_to;    /* model reports failure on [from, to) */
 } CxScn;
 
-static UlcnetNnDelay cx_event(const CxScn* sc, int h) {
-    UlcnetNnDelay d;
+static UlcnetStreamDelay cx_event(const CxScn* sc, int h) {
+    UlcnetStreamDelay d;
     d.changed = h == sc->changed_at;
     d.solid = !(sc->solid_off_at >= 0 && h >= sc->solid_off_at && h < sc->solid_back_at);
     return d;
@@ -2560,8 +2694,8 @@ static ArrayTestUnitConfig cx_unit_config(void) {
 }
 
 /* mode 0: front end makes the spectrum (recorded into `in`); 1: feed in->re/im straight to the
- * stage; 2: re-run the front end on in->mic/far and count spectra that differ from the record. */
-static int cx_drive(Ul4* p, UlcnetNnStage* stage, Frm* frm, const CxScn* sc, CxIn* in, int mode, CxModel* m,
+ * stream; 2: re-run the front end on in->mic/far and count spectra that differ from the record. */
+static int cx_drive(Ul4* p, UlcTestRig* rig, Frm* frm, const CxScn* sc, CxIn* in, int mode, CxModel* m,
                     CxRun* r, int* spec_diff) {
     memset(r, 0, sizeof(*r));
     if (spec_diff) *spec_diff = 0;
@@ -2585,10 +2719,10 @@ static int cx_drive(Ul4* p, UlcnetNnStage* stage, Frm* frm, const CxScn* sc, CxI
                     if (in->re[h][k] != c[k].r || in->im[h][k] != c[k].i) { (*spec_diff)++; break; }
             }
         }
-        (void)ac_stft_push(frm->far_stft, in->far[h], frm->far_spec);
-        CHECK(ulcnet_nn_stage_begin_spec(stage, c, frm->far_spec, cx_event(sc, h)) == 0 &&
-              ulcnet_nn_stage_process(stage, frm->out_spec) == 0 && frm_synth(frm, HOP, r->out[h]) == 0,
-              "complex entry: stage hop");
+        frm_analyse(frm, c, in->far[h]);
+        CHECK(ulc_rig_begin(rig, frm->err_re, frm->err_im, frm->far_re, frm->far_im, cx_event(sc, h)) == 0 &&
+              ulc_rig_process(rig, frm->out_re, frm->out_im) == 0 && frm_synth(frm, HOP, r->out[h]) == 0,
+              "complex entry: stream hop");
         r->ran[h] = m->calls > before;
         r->accepted[h] = r->ran[h] && !m->fail;
     }
@@ -2614,10 +2748,13 @@ static int cx_check(const CxScn* sc, const CxIn* in, CxRun* r) {
     r->max_err = 0.0; r->peak0 = 0.0; r->chain_bad = 0;
     for (int h = 0; h < sc->hops; ++h) {
         float re[BINS_MAX], im[BINS_MAX], want[HOP_MAX], dft[HOP_MAX];
-        for (int k = 0; k < BINS; ++k) {
-            float g = r->accepted[h] ? cx_gain(k) : 1.0f;
-            re[k] = g * in->re[h][k];
-            im[k] = g * in->im[h][k];
+        if (r->accepted[h]) {
+            float mask_re[BINS_MAX], mask_im[BINS_MAX];
+            cx_mask(mask_re, mask_im);
+            enhanced_of_mask(in->re[h], in->im[h], mask_re, mask_im, re, im);
+        } else {
+            memcpy(re, in->re[h], (size_t)BINS * sizeof(float));
+            memcpy(im, in->im[h], (size_t)BINS * sizeof(float));
         }
         if (ac_istft_push_planar(ref, re, im, want) != HOP ||
             memcmp(want, r->out[h], (size_t)HOP * sizeof(float)) != 0) r->chain_bad += 1;
@@ -2632,20 +2769,19 @@ static int cx_check(const CxScn* sc, const CxIn* in, CxRun* r) {
     return 1;
 }
 
-static int cx_fresh_stage(void** mem, UlcnetNnStage** st, Frm* frm, CxModel* m, UlcnetModel* um, int use_model) {
-    size_t bytes = ulcnet_nn_stage_mem_size(&g_grid);
+static int cx_fresh_rig(void** mem, UlcTestRig* rig, Frm* frm, CxModel* m, UlcTestModel* um, int use_model) {
+    size_t bytes = ulc_rig_stream_bytes(&g_grid);
     CHECK(frm_init(frm, &g_grid) == 0, "complex entry: application framing");
-    CHECK(bytes != 0 && posix_memalign(mem, 16, bytes) == 0, "complex entry: stage memory");
+    CHECK(bytes != 0 && posix_memalign(mem, 16, bytes) == 0, "complex entry: stream memory");
     memset(*mem, 0x5A, bytes);
-    *st = ulcnet_nn_stage_init(*mem, bytes, &g_grid);
-    CHECK(*st != NULL, "complex entry: stage init");
+    CHECK(ulc_rig_init(rig, *mem, bytes, &g_grid) == 0, "complex entry: stream init");
     memset(m, 0, sizeof(*m));
     memset(um, 0, sizeof(*um));
     if (use_model) {
         um->user = m; um->infer = cx_infer; um->reset = cx_reset;
         um->io_descriptor = test_io_descriptor();
     }
-    CHECK(ulcnet_nn_stage_set_model(*st, use_model ? um : NULL) == 0, "complex entry: model installed");
+    CHECK(ulc_rig_set_model(rig, &g_grid, use_model ? um : NULL) == 0, "complex entry: model installed");
     return 1;
 }
 
@@ -2653,19 +2789,20 @@ static int cx_case(const char* name, const CxScn* sc, CxIn* in, CxRun* r) {
     ArrayTestUnitConfig cfg = cx_unit_config();
     Ul4* p = ul4_create(&cfg);
     void* mem = NULL;
-    UlcnetNnStage* stage = NULL;
+    UlcTestRig rig;
     CxModel m;
-    UlcnetModel um;
+    UlcTestModel um;
     Frm frm;
     int ok;
     CHECK(p != NULL, "complex entry: create the front end");
-    ok = cx_fresh_stage(&mem, &stage, &frm, &m, &um, sc->use_model);
-    if (ok) ok = cx_drive(p, stage, &frm, sc, in, 0, &m, r, NULL) && cx_check(sc, in, r);
+    ok = cx_fresh_rig(&mem, &rig, &frm, &m, &um, sc->use_model);
+    if (ok) ok = cx_drive(p, &rig, &frm, sc, in, 0, &m, r, NULL) && cx_check(sc, in, r);
+    if (ok) g_rig_broken += rig.broken;
     frm_free(&frm);
     free(mem);
     ul4_destroy(p);
     if (!ok) return 0;
-    printf("  complex entry [%s]: hop0 peak %.6f, max |stage - direct DFT| %.3g, %ld inferences, %ld resets\n",
+    printf("  complex entry [%s]: hop0 peak %.6f, max |output - direct DFT| %.3g, %ld inferences, %ld resets\n",
            name, r->peak0, r->max_err, r->calls, r->resets);
     CHECK(r->max_err < 2e-6, "complex entry: PCM equals the direct-DFT accumulate reference");
     CHECK(r->chain_bad == 0, "complex entry: PCM equals the audiolib accumulate chain bit for bit");
@@ -2675,7 +2812,7 @@ static int cx_case(const char* name, const CxScn* sc, CxIn* in, CxRun* r) {
 static int test_complex_entry_accumulate(void) {
     static CxIn in;
     static CxRun r;
-    const int R = ULCNET_NN_STAGE_REPRIME_FRAMES;
+    const int R = REPRIME_FRAMES;
     CxScn sc;
     cx_make_input(&in, CX_MAX_HOPS);
 
@@ -2727,54 +2864,55 @@ static int test_complex_entry_accumulate(void) {
         ArrayTestUnitConfig cfg = cx_unit_config();
         Ul4* p = ul4_create(&cfg);
         void *m1 = NULL, *m2 = NULL;
-        UlcnetNnStage *s1 = NULL, *s2 = NULL;
+        UlcTestRig s1, s2;
         Frm f1, f2;
         CxModel ma, mb;
-        UlcnetModel ua, ub;
+        UlcTestModel ua, ub;
         static CxRun first, replay, fresh, e2e;
         int spec_diff = 0;
         CHECK(p != NULL, "complex entry: reset case front end");
-        CHECK(cx_fresh_stage(&m1, &s1, &f1, &ma, &ua, 1) && cx_fresh_stage(&m2, &s2, &f2, &mb, &ub, 1),
-              "complex entry: reset case stages");
-        CHECK(cx_drive(p, s1, &f1, &sc, &in, 0, &ma, &first, NULL) && cx_check(&sc, &in, &first),
+        CHECK(cx_fresh_rig(&m1, &s1, &f1, &ma, &ua, 1) && cx_fresh_rig(&m2, &s2, &f2, &mb, &ub, 1),
+              "complex entry: reset case streams");
+        CHECK(cx_drive(p, &s1, &f1, &sc, &in, 0, &ma, &first, NULL) && cx_check(&sc, &in, &first),
               "complex entry: reset case first pass");
         {   /* overlap is non-zero at the reset */
             double e = 0.0;
             for (int i = 0; i < HOP; ++i) e += fabs((double)first.out[sc.hops - 1][i]);
             CHECK(e > 1e-3, "complex entry: the stream carries non-zero overlap into the reset");
         }
-        /* (a) the stage alone, same recorded spectra */
+        /* (a) the stream alone, same recorded spectra */
         ma.calls = 0; ma.resets = 0;
-        ulcnet_nn_stage_reset(s1);
-        frm_reset(&f1);   /* the stage keeps no transform history: the application's objects restart with it */
-        CHECK(ma.resets == 1, "complex entry: stage reset resets the model once");
+        ulc_rig_reset(&s1);
+        frm_reset(&f1);   /* on the spectrum entries the application's transform objects restart with the stream */
+        CHECK(ma.resets == 1, "complex entry: stream reset restarts the model once");
         ma.resets = 0;
-        CHECK(cx_drive(NULL, s1, &f1, &sc, &in, 1, &ma, &replay, NULL) && cx_check(&sc, &in, &replay),
-              "complex entry: stage replay");
-        CHECK(cx_drive(NULL, s2, &f2, &sc, &in, 1, &mb, &fresh, NULL) && cx_check(&sc, &in, &fresh),
-              "complex entry: fresh stage pass");
+        CHECK(cx_drive(NULL, &s1, &f1, &sc, &in, 1, &ma, &replay, NULL) && cx_check(&sc, &in, &replay),
+              "complex entry: stream replay");
+        CHECK(cx_drive(NULL, &s2, &f2, &sc, &in, 1, &mb, &fresh, NULL) && cx_check(&sc, &in, &fresh),
+              "complex entry: fresh stream pass");
         CHECK(memcmp(replay.out, fresh.out, sizeof(replay.out)) == 0 &&
               memcmp(replay.out, first.out, sizeof(replay.out)) == 0,
-              "complex entry: PCM after a stage reset equals a new stage and the first pass bit for bit");
+              "complex entry: PCM after a stream reset equals a new stream and the first pass bit for bit");
         CHECK(memcmp(replay.ran, fresh.ran, sizeof(replay.ran)) == 0 &&
               replay.calls == fresh.calls && ma.resets == mb.resets,
-              "complex entry: submission timing after the reset equals a new stage");
+              "complex entry: submission timing after the reset equals a new stream");
         CHECK(replay.max_err < 2e-6 && replay.chain_bad == 0 && fresh.chain_bad == 0,
               "complex entry: both replays match the references restarted from zero");
         printf("  complex entry [reset]: hop0 peak %.6f (replay) / %.6f (first), submissions first=%ld replay=%ld fresh=%ld, event hop5 ran=%d, max err %.3g\n",
                replay.peak0, first.peak0, first.calls, replay.calls, fresh.calls, replay.ran[5], replay.max_err);
-        /* (b) end to end: the whole pair reset (the front end here, the stage under test beside it),
+        /* (b) end to end: the whole pair reset (the front end here, the stream under test beside it),
          * the front end regenerates the spectrum from the same four-channel input */
         ma.calls = 0; ma.resets = 0;
-        ulcnet_nn_stage_reset(s1);
+        ulc_rig_reset(&s1);
         frm_reset(&f1);
         ul4_reset(p);
         ma.resets = 0;
-        CHECK(cx_drive(p, s1, &f1, &sc, &in, 2, &ma, &e2e, &spec_diff) && cx_check(&sc, &in, &e2e),
+        CHECK(cx_drive(p, &s1, &f1, &sc, &in, 2, &ma, &e2e, &spec_diff) && cx_check(&sc, &in, &e2e),
               "complex entry: end-to-end replay after the paired reset");
         CHECK(spec_diff == 0, "complex entry: the reset front end regenerates the same beamformed spectrum");
         CHECK(memcmp(e2e.out, first.out, sizeof(e2e.out)) == 0 && e2e.calls == first.calls,
               "complex entry: end-to-end PCM and submission count equal the first pass");
+        g_rig_broken += s1.broken + s2.broken;
         frm_free(&f1); frm_free(&f2);
         free(m1); free(m2);
         ul4_destroy(p);
@@ -2784,7 +2922,7 @@ static int test_complex_entry_accumulate(void) {
 
 static int run_all_tests(void) {
     CHECK(test_example_unit_config_grid(),
-          "example unit config: the stage's grid, linear context only");
+          "example unit config: the stream's grid, linear context only");
     CHECK(test_identity_e2e(),
           "identity E2E / 1-hop timing contract");
     CHECK(test_counting_model_policy(),
@@ -2795,6 +2933,8 @@ static int run_all_tests(void) {
           "FIXED pre-lock seam serves the raw far byte for byte");
     CHECK(test_relock_same_delay_resets_model(),
           "relock on the same delay still resets the model (ALIGNED)");
+    CHECK(test_delay_shift_restarts_model(),
+          "delay shift: a change while solid restarts the model");
     CHECK(test_create_vs_pool_parity(),
           "caller pools vs heap construction");
     CHECK(test_raw_far_timestamp_after_fixed_delay_lock(),
@@ -2834,6 +2974,12 @@ int main(void) {
         printf("4ch_alignulcnet tests on grid %d Hz / fft %d / hop %d\n", g_grid.sample_rate,
                g_grid.n_fft, g_grid.hop);
         if (!run_all_tests()) return 1;
+    }
+    if (g_rig_broken != 0) {
+        fprintf(stderr, "FAIL: %ld rig contract violations (tensors that are not the front end of the spectra handed "
+                "in, a generation that moved outside edges, resets and refusals, a mask staging not NaN-filled)\n",
+                g_rig_broken);
+        return 1;
     }
     printf("All 4ch_ulcnet tests passed\n");
     return 0;

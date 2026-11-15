@@ -16,7 +16,7 @@
 3. 這一列已知有哪些落差（S-xx／D-xx／T-xx，見第 8 節的編號對照）。
 4. 這一列有沒有現成的對拍工具或測試，以及它到底是 C↔Py、C 對 C 還是 Python 對 Python。
 
-範圍內：`pipelines/`（common、mono、`dfn/`、`ulcnet/`、`4ch/`（四麥克風陣列的 sample helper 與各範例；陣列本體 `AecConfig.n_mics = 4` 在 AEC 函式庫內，其函式對照在 AEC repo））及其 Python 參考，audiolib 的 doa/bf/VAD/common/utility 對外函式，audiolib（hpf、audio_resampler、audio_stft／window、fft_wrapper、wav_io，以及 fast_math、mem_align、simd_kernels、simd_kernel_nn 四個 header-only 檔），AINR（DeepFilterNet2、GTCRN、RNNoise-ERB）與 AIAEC（Align-ULCNet、DeepVQE-S、共用 mask helper）的 C 前後處理。
+範圍內：`pipelines/`（common、mono、`dfn/`、`4ch/`（四麥克風陣列的 sample helper 與各範例；陣列本體 `AecConfig.n_mics = 4` 在 AEC 函式庫內，其函式對照在 AEC repo））及其 Python 參考，audiolib 的 doa/bf/VAD/common/utility 對外函式，audiolib（hpf、audio_resampler、audio_stft／window、fft_wrapper、wav_io，以及 fast_math、mem_align、simd_kernels、simd_kernel_nn 四個 header-only 檔），AINR（DeepFilterNet2、GTCRN、RNNoise-ERB）與 AIAEC（Align-ULCNet、DeepVQE-S、共用 mask helper）的 C 前後處理。
 
 範圍外（不是漏列）：AEC 與 NR 函式庫本體（本表只列 pipelines 呼叫它們的接縫；它們的函式對照在各自 repo 的 `docs/c_python_function_map.md`，建立本表時 `lib/aec/docs/` 與 `lib/nr/docs/` 內已有）、`lib/aec`／`lib/nr` 的 Python、`pipelines/tools/`（離線評測與 bench 工具）、各處 `tests/` 與 audiolib 的 `test/`（測試程式）、audiolib doa/bf/VAD 內的 static 輔助函式、Align_CRUSE 與 CAGCRN（沒有 C pre/post 類別）。
 
@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 289 | 54 | 34 | 20 | 235 | 0 | 55 | 18 |
+| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 277 | 54 | 34 | 20 | 223 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 295 | 39 | 19 | 20 | 256 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 145 | 48 | 25 | 23 | 97 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 106 | 35 | 20 | 15 | 71 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 896 | 176 | 98 | 78 | 720 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 884 | 176 | 98 | 78 | 708 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：896 個 C 函式中，176 個有 Python 對應（mirror 98、partial 78），其中 62 個的配對是推論；720 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：884 個 C 函式中，176 個有 Python 對應（mirror 98、partial 78），其中 62 個的配對是推論；708 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -120,7 +120,6 @@
 |---|---|---|
 | `pipelines/dfn/dfn_hop.h` | all | 17 |
 | `pipelines/dfn/dfn_hop_pool.h` | all | 4 |
-| `pipelines/ulcnet/ulcnet_nn_stage.c` | all | 12 |
 | `pipelines/common/example_cli.h` | all | 10 |
 | `pipelines/mono/aec_nr_res/example_board_adapter.c` | all | 12 |
 | `pipelines/mono/aec_nr_res/main.c` | all | 21 |
@@ -243,7 +242,7 @@
 | PL-MCAB-31 | `pipelines/4ch/array_sample_unit.h: array_sample_stages_plan, array_sample_stages_init, array_sample_stages_reset` | — | C-only | — | — | `array_sample_stages_plan` 算範例後級（NR、合成、NR 先驗暫存與輸出頻譜）的池大小，`_init` 切出並初始化，`_reset` 重置 NR 與合成（helper 與陣列的重置在 `array_sample_beam_reset`，`post_reset_serial` 的記憶在 `array_sample_post_reset_due`）。 |
 | PL-4DFN-06 | `pipelines/4ch/aec_bf_dfn_res/main.c: run_accelerator, dfn_unknown, dfn_set, dfn_parse, dfn_plan, dfn_reset, dfn_cleanup, dfn_build, dfn_setup, dfn_read, dfn_complete, main` | — | C-only | — | — | 板端範例：CLI、記憶體計畫（單元、P 緩衝、stage 或 bridge 各自的池）、組裝、重置（單元、comfort noise 種子、DfnHop 一起）、清理。 |
 | PL-4DFN-07 | `pipelines/4ch/aec_bf_dfn_res/main.c: dfn_process, dfn_form` | `pipelines/4ch/aec_bf_dfn_res/pipeline.py:run_front_end`<br>`pipelines/4ch/aec_bf_dfn_res/pipeline.py:post_dfn2` | partial | D-43 | `pipelines/4ch/aec_bf_dfn_res/tests/test_dfn2_4ch_contract.py`（Py 對 Py，identity 模型） | （推論）逐 hop：`array_sample_beam_process`（共用 delay、四條線性 AEC、SRP-PHAT、BF）→ `array_sample_beam_fuse`（陣列的增益級算 G_res）→ `dfn_form`（P = B·G_res，`aec_apply_gain`，選用 `aec_apply_cng`，無 NR）→ `dfn_hop_process`。Python 的 E 是 `EqualWeightBeamformer` 權重的相干投影，後波束 RES 由 `McabPipeline` 持有（`run_front_end` 呼叫它的 `process`）；權重一致時是同一個訊號。契約測試是 Python 對 Python（identity 模型），不是 C 對拍。 |
-| PL-ULC-01 | `pipelines/ulcnet/ulcnet_nn_stage.c: spectra_bytes, ulcnet_nn_stage_mem_size, ulcnet_nn_stage_init, ulcnet_nn_stage_grid, ulcnet_nn_stage_set_model, ulcnet_nn_stage_reset, gate_delay, ulcnet_nn_stage_begin_spec, ulcnet_nn_stage_nn_begin, ulcnet_nn_stage_nn_end, ulcnet_nn_stage_end_spec, ulcnet_nn_stage_process`<br>`pipelines/mono/alignulcnet/main.c: usage, grid_row, parse_options, run_accelerator, derive_lane, framing_config, framing_bytes, framing_init, reset_pipeline, process_hop, main`<br>`pipelines/4ch/alignulcnet/main.c: usage, grid_row, run_accelerator, ulcnet_example_unit_config, ulc_unknown, ulc_set, ulc_parse, ulc_setup, ulc_read, ulc_hop, ulc_process, ulc_complete, ulc_cleanup, main` | — | C-only | D-43；D-44；T-14 | — | ULCNet 後濾波 stage（頻譜進、頻譜出；模型呼叫政策；STFT／ISTFT 由應用端的 `AcStft`／`AcIstft` 做）與兩個範例 main（mono：`Aec` 加 stage；4ch：單元加 stage）沒有 Python 版，也沒有 pipeline 層的 C 對 Python 對拍。stage 的 grid 是應用端給的 `UlcnetGrid`（兩個 main 以 `--sample-rate` 16000／48000 經 `grid_row` 選列）。模型側前後處理見 AIAEC 區。`gate_delay` 的對齊事件政策（模型 reset＋1 個恆等框）Python 推論只能從記錄檔重播（D-44），無法從音訊推出事件；推論對拍只比沒有對齊事件的區段，區段定義見 `AIAEC/Align_ULCNet/reference/alignment.md`。 |
+| PL-ULC-01 | `pipelines/mono/alignulcnet/main.c: usage, grid_row, parse_options, run_accelerator, derive_lane, framing_config, framing_bytes, framing_init, reset_pipeline, process_hop, main`<br>`pipelines/4ch/alignulcnet/main.c: usage, grid_row, run_accelerator, ulcnet_example_unit_config, ulc_unknown, ulc_set, ulc_parse, ulc_setup, ulc_read, ulc_hop, ulc_process, ulc_complete, ulc_cleanup, main` | — | C-only | D-43；D-44；T-14 | — | 兩個 ULCNet 範例 main（mono：`Aec` 加模型串流；4ch：單元加模型串流）沒有 Python 版，也沒有 pipeline 層的 C 對 Python 對拍。兩者呼叫模型串流的頻譜進出口 `ulcnet_stream_pre_process_freq`／`ulcnet_stream_post_process_freq`（`stream/aiaec/ulcnet/ulcnet_stream.c`，不在本表涵蓋檔內；頻譜進、頻譜出，STFT／ISTFT 由應用端的 `AcStft`／`AcIstft` 做）。串流的 grid 是應用端給的 `UlcnetGrid`（兩個 main 以 `--sample-rate` 16000／48000 經 `grid_row` 選列）。模型側前後處理見 AIAEC 區。串流的對齊事件政策（state generation 前進＋1 個恆等框）Python 推論只能從記錄檔重播（D-44），無法從音訊推出事件；推論對拍只比沒有對齊事件的區段，區段定義見 `AIAEC/Align_ULCNet/reference/alignment.md`。 |
 | PL-PYO-01 | — | `pipelines/mono/aec_nr_res/pipeline.py:run_aec_classic`<br>`pipelines/mono/aec_nr_res/pipeline.py:parse_aec_mode` | Python-only | — | — | 經典模式（AEC 內建 RES）與 AEC 模式字串解析；兩條 C 管線都只用線性模式加外部 RES，沒有對應。 |
 | PL-PYO-02 | — | `pipelines/mono/aec_nr_res/pipeline.py:run_nr` | Python-only | — | — | 時域 NR 路徑（已被 `run_nr_spectrum` 取代）；C 沒有。 |
 | PL-PYO-03 | — | `pipelines/mono/aec_nr_res/pipeline.py:comfort_noise_fill` | Python-only | — | — | lib/aec 的 comfort-noise 填充（`aec_apply_cng_spec`，底層 `aec_cng_fill`）的逐位元孿生（呼叫 AEC 函式庫自己的 `modules/cng.py:cng_fill`，種子 `AEC_CNG_SEED`；回傳新的 rng 狀態）；`pyc_parity` 列 `d.mono.cng_pipeline` 比對 C 為 400 hop 逐位元相同。 |
@@ -395,8 +394,8 @@
 | D-40 | 8 kHz mono 只有 C；mono CLI 旗標不對等（另見 S-30、S-31）。 |
 | D-41 | R² 相量融合的相位下限：C 釘在 +實軸，Python 用 np.angle。 |
 | D-42 | DFN2 fail-open：Python 不步進遞迴狀態；C 在輸出被拒時，把已註冊的遞迴狀態就地歸零並遞增 state generation，未註冊狀態的 stage 與 rate bridge 只遞增 generation，由持有狀態的模型回呼重載零；每個暖機幀（N = 1、M ≥ 1）也各歸零並遞增一次（heads 丟棄，音訊不變），Python 沒有這一步（它的 heads 不經加速器）。 |
-| D-43 | audiolib（SRP-PHAT、BF、VAD）與 ULCNet NN stage 範例沒有 Python 版（設計如此）；Python 另有實驗專用開關。 |
-| D-44 | ULCNet NN stage 在對齊事件（`delay.changed`，或第一次轉為 solid）呼叫 model->reset 並插入 `ULCNET_NN_STAGE_REPRIME_FRAMES` 個恆等框。Python 串流推論（`AIAEC/Align_ULCNet/_streaming.py`）沒有逐 hop 事件來源：`lib/aec/python` 沒有 `AecLinearView.delay_state` 的對應存取器（只有 `get_post_reset_serial`），Python 無法從音訊推出事件。事件重播存在，但只從記錄檔來：`inference.py` 與 `inference.py calib` 的 `--events PATH`（`.json`／`.csv`／`.npz`，每個真實模型 hop 一筆 `(changed, solid)`），邊緣規則集中在 `AIAEC/Align_ULCNet/alignment_events.py` 的 `EdgeTracker`，N=1 與 N=8 共用。重播沿用 C `_freq` 的流程：事件 hop 重設模型 state 並以 error 頻譜旁路（N>1 為封包 graph 的 `frame_reset`），STFT／ISTFT 繼續跑，不重啟自己的分析與合成；C 的 PCM 入口（`aiaec_*`，以及外接 ISTFT 在 `synthesis_restart_mask` 重設的 `_spec`）會重啟，所以事件 hop 附近的 Python PCM 與 C `aiaec_*`／`_spec` 不同。沒有給 `--events` 時不會有任何事件。 |
+| D-43 | audiolib（SRP-PHAT、BF、VAD）與 ULCNet 範例 main 沒有 Python 版（設計如此）；Python 另有實驗專用開關。 |
+| D-44 | ULCNet 模型串流（`ulcnet_stream`）在對齊事件（`delay.changed`，或第一次轉為 solid）重啟模型 state（state generation 前進）並插入 `ULCNET_STREAM_REPRIME_FRAMES` 個恆等框。Python 串流推論（`AIAEC/Align_ULCNet/_streaming.py`）沒有逐 hop 事件來源：`lib/aec/python` 沒有 `AecLinearView.delay_state` 的對應存取器（只有 `get_post_reset_serial`），Python 無法從音訊推出事件。事件重播存在，但只從記錄檔來：`inference.py` 與 `inference.py calib` 的 `--events PATH`（`.json`／`.csv`／`.npz`，每個真實模型 hop 一筆 `(changed, solid)`），邊緣規則集中在 `AIAEC/Align_ULCNet/alignment_events.py` 的 `EdgeTracker`，N=1 與 N=8 共用。重播沿用 C `_freq` 的流程：事件 hop 重設模型 state 並以 error 頻譜旁路（N>1 為封包 graph 的 `frame_reset`），STFT／ISTFT 繼續跑，不重啟自己的分析與合成；C 的 PCM 入口（`aiaec_*`，以及外接 ISTFT 在 `synthesis_restart_mask` 重設的 `_spec`）會重啟，所以事件 hop 附近的 Python PCM 與 C `aiaec_*`／`_spec` 不同。沒有給 `--events` 時不會有任何事件。 |
 | S-04 | HPF 參數域檢查（0 < cutoff < 0.45 * sr）只在 C；Python 的 HighPassFilter／AecConfig 不檢查。 |
 | S-05 | AecResContext.filter_converged 在上升緣晚 1 hop：Python 在 update_convergence 之前建構 ctx。 |
 | S-14 | RNNoise-ERB 的 Valin post-filter（--pf-beta）只有 Python，C 沒有；出貨 beta=0 兩邊無差。 |

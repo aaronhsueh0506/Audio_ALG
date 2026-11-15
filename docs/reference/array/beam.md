@@ -132,7 +132,7 @@ c++ -o app app.o \
 ```
 
 要接 ULCNet 後濾波時，把 `cfg.residual` 設成 `AEC_RESIDUAL_STATE`、不呼叫 `array_sample_beam_fuse()`，把 `beam.spectrum`、同一次呼叫的**原始** far hop 與
-`info.delay.changed`／`info.delay.solid` 交給 `ulcnet_nn_stage_begin_spec()`（原始 far 先由應用端自己的 `AcStft` 做成頻譜；見 `pipelines/4ch/alignulcnet/README.md`）。
+`info.delay.changed`／`info.delay.solid` 交給 `ulcnet_stream_pre_process_freq()`（`beam.spectrum` 先拆成 re／im 平面，原始 far 由應用端自己的 `AcStft` 做成頻譜；見 `pipelines/4ch/alignulcnet/README.md`）。
 
 init 順序就是 `aec_get_mem_requirements()` 加 `aec_init_ex()`，見 [integration.md §2](integration.md#2-quick-start) 與 `pipelines/4ch/array_sample_unit.h` 的
 `array_sample_unit_plan()`／`_init()`／`_destroy()`（4ch_raw、4ch_static 共用；[§3](#3-lifecycle) 表列其步驟）。
@@ -174,7 +174,7 @@ reset **不會**重置你的後級（NR、合成、NN stage），也**不會**�
 
 **失敗語意是整合者的責任。** `AEC_ERR_DSP`（array 已自己 reset，你的後級沒有）、`array_sample_beam_fuse()` 因 array 的拒絕而回非 `AEC_OK`、非 `AEC_ERR_SEQUENCE`、非 `AEC_ERR_MODE`
 （helper 已整個 reset；NULL 引數、沒有 beam 的 SEQUENCE 與 STATE 陣列的 MODE 是 helper 自己的拒絕，什麼都不改）、你的 `array_sample_anr_gain()` 或 `aec_apply_*` 回 `NULL`／非 `AEC_OK`，或合成輸出不是有限值，
-你要**同時**呼叫 `array_sample_beam_reset()`、`anr_reset()`、`ac_istft_reset()`，並把你記的 `post_reset_serial` 設成 `aec_post_reset_serial(aec)`，以及用到 NN stage 時的 `ulcnet_nn_stage_reset()`。
+你要**同時**呼叫 `array_sample_beam_reset()`、`anr_reset()`、`ac_istft_reset()`，並把你記的 `post_reset_serial` 設成 `aec_post_reset_serial(aec)`，以及用到 ULCNet 模型串流時的 `ulcnet_stream_reset()`。
 漏掉其中一個，系統就不等於新建的實例。front／beam 階段的 `AEC_ERR_ARG` 與 `AEC_ERR_SEQUENCE` 不改動 array 與 helper 的自適應狀態（`process_front()` 因非有限輸入被拒時另外不再留待處理的 front，[§5.2](beam-errors.md#52-process-各入口與-fuse-的完整拒絕清單)），
 修正輸入或呼叫順序後重送同一個 hop 即可；本手冊的範例為求簡單，對任何非 `AEC_OK` 一律一起 reset。DFN2 的 hop（`DfnHop` 與它帶的模型串流）不因為 AEC 的 delay change 而 reset（見 `pipelines/dfn/dfn_hop.h`）。
 

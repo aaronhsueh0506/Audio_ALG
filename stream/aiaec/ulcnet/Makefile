@@ -92,7 +92,11 @@ SMOKE_SOURCES := tests/smoke_ulcnet_stream.c $(CORE_SOURCES) ulcnet_stream.c
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) ulcnet_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample audit-no-stdio clean _cfg_guard
+# The one-hop spectrum entries (the entries the desktop pipelines drive) against expectations built in the test.
+STREAM_FREQ_BIN := $(OBJ_DIR)/test_ulcnet_stream_freq
+STREAM_FREQ_SOURCES := tests/test_ulcnet_stream_freq.c $(CORE_SOURCES) ulcnet_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -146,7 +150,14 @@ verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
 	"$(VERIFY_VS_SAMPLE_BIN)"
 	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
 
-test: smoke verify-vs-sample
+$(STREAM_FREQ_BIN): $(STREAM_FREQ_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(STREAM_FREQ_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+test-stream-freq: $(STREAM_FREQ_BIN)
+	"$(STREAM_FREQ_BIN)"
+
+test: smoke verify-vs-sample test-stream-freq
 
 # audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
 # stdio symbol (nothing in this model needs stdio at all).

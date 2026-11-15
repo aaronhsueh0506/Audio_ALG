@@ -100,7 +100,7 @@ probes the host's MPS backend and fails where the backend agrees with the CPU.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (`make clean` first, `^PASS:` lines counted): `pipelines` (the mono applications, the
-`dfn/` and `ulcnet/` stage tests and `test_array_sample_post`), `pipelines/mono/aec_nr_res`, `pipelines/mono/alignulcnet`
+`dfn/` stage tests and `test_array_sample_post`), `pipelines/mono/aec_nr_res`, `pipelines/mono/alignulcnet`
 (its test covers the 16 kHz and the 48 kHz grid in one binary, and the target also runs `mono_alignulcnet --sample-rate 48000`) and `pipelines/4ch`
 (the four-microphone array; one-stop gate for the four-channel side: `test_4ch_chain`, `test_array_sample_beam`, `test_array_sample_driver`, the
 `4ch_raw`, `4ch_static` and `4ch_external_static` runs, `test_4ch_dfn` with the

@@ -386,8 +386,9 @@ bytes are equal. The class gate is `tests/test_ulcnet_prepost_c.py`.
 `ulcnet_accelerator_adapter.c/.h` is the reusable bridge from this explicit
 state ABI to `UlcnetModel`; it drives a `UlcnetPrepost` instance and takes the
 state registration (`UlcnetModelIoStateBuffers`, NULL on a board) at init. It
-is included in `libaiaec_prepost.a` (`make -C AIAEC print-lib-path`); the mono
-and four-channel applications add only their board runtime callback and
-surrounding audio flow.
+is included in `libaiaec_prepost.a` (`make -C AIAEC print-lib-path`). The mono
+and four-channel example applications do not use it: they drive the model
+stream's spectrum entries (`stream/aiaec/ulcnet/ulcnet_stream.h`) and add their
+board runtime call and surrounding audio flow.
 
 [返回本主題](../README.md)

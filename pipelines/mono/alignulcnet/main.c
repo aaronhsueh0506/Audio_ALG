@@ -1,32 +1,31 @@
-/* mono_alignulcnet board skeleton: the mono linear AEC feeding the Align-ULCNet post-filter
- * stage, composed here from the library calls. Example code: lib/aec's Aec
- * for the linear stage and ulcnet/ulcnet_nn_stage.h for the model call policy; the framing (an AcStft
- * for the formed hop, one for the raw reference, an AcIstft for the output spectrum) is this file's.
- * Per hop:
+/* mono_alignulcnet board skeleton: the mono linear AEC feeding the Align-ULCNet post-filter,
+ * composed here from the library calls. Example code: lib/aec's Aec for the linear stage and the
+ * model stream's spectrum entries (stream/aiaec/ulcnet/ulcnet_stream.h) for the model call policy;
+ * the framing (an AcStft for the formed hop, one for the raw reference, an AcIstft for the output
+ * spectrum) is this file's. Per hop:
  *
  *     aec_process_linear(aec, mic, ref);  aec_process_residual(aec, NULL);
  *     aec_get_residual / aec_get_linear                 // formed hop, alignment state
- *     ac_stft_push(err_stft, rctx.formed_hop, err_spec);  ac_stft_push(far_stft, ref, far_spec);
- *     ulcnet_nn_stage_begin_spec(stage, err_spec, far_spec, delay);
- *     if (ulcnet_nn_stage_nn_begin(stage, &job) == 1)   // or ulcnet_nn_stage_process()
- *         ulcnet_nn_stage_nn_end(stage, run_network(&job));
- *     ulcnet_nn_stage_end_spec(stage, out_spec);
- *     ac_istft_push(istft, out_spec, out);               // one hop
+ *     ac_stft_push_planar(err_stft, rctx.formed_hop, err_re, err_im);
+ *     ac_stft_push_planar(far_stft, ref, far_re, far_im);
+ *     pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);
+ *     if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   // 0 = every tensor written
+ *     ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);         // accepted frame, else the error
+ *     ac_istft_push_planar(istft, out_re, out_im, out);                       // one hop
  *
  * Grid: --sample-rate 16000 (FFT 512, default) or 48000 (FFT 1024); the UlcnetGrid built from it
- * sizes the lane, the stage and the adapter. The model gets the caller's raw `ref` hop. Replace
+ * sizes the lane and the stream. The model gets the caller's raw `ref` hop. Replace
  * run_accelerator() with the board runtime call.
- * Data domain: the stage reads the AEC's analysis seam (rctx.formed_hop), the signal the model was trained
+ * Data domain: the stream reads the AEC's analysis seam (rctx.formed_hop), the signal the model was trained
  * on, not the rendering base_spec (which does not pair with formed_hop on a hop where the output guard
  * fires). There is no comfort noise and no synthesis besides this file's AcIstft, so
- * aec_post_reset_serial() has nothing to clear or reseed here; the stage's alignment policy is the
+ * aec_post_reset_serial() has nothing to clear or reseed here; the stream's alignment policy is the
  * delay.changed flag below (an in-call hard reset of the AEC is also a delay.changed hop). A refused
- * call resets the AEC, the stage and the three transform objects together. */
+ * call resets the AEC, the stream and the three transform objects together. */
 #include "aec.h"
 #include "audio_stft.h"
 #include "common/example_cli.h"
-#include "ulcnet/ulcnet_nn_stage.h"
-#include "ulcnet_accelerator_adapter.h"
+#include "ulcnet_stream.h"
 #include "utility/mem_align.h"
 
 #include <math.h>
@@ -59,7 +58,7 @@ enum { K_GRIDS = (int)(sizeof k_grids / sizeof k_grids[0]) };
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  --sample-rate {16000|48000} grid of the stage and the lane (default 16000)\n"
+        "  --sample-rate {16000|48000} grid of the stream and the lane (default 16000)\n"
         "  --delay-mode {matched|fixed|external}\n"
         "                              far alignment policy (default: matched)\n"
         "  --delay-num-filters <1..5>  MATCHED matched-filter bank size\n"
@@ -122,7 +121,7 @@ static int parse_options(int argc, char** argv, ExampleCliDelayOptions* out, int
  * the state input of the same name, write `outputs->output`, and return 0, or -1 when the
  * run failed. The graph shifts every window itself; read every state input before writing any
  * state output. When the accelerator keeps fixed-point state, load quantized zeros at start
- * and whenever ulcnet_accelerator_adapter_state_generation() changes. */
+ * and whenever UlcnetHopIO.state_generation changes. */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {
@@ -132,8 +131,8 @@ static int run_accelerator(void *user,
     return -1; /* BOARD: invoke the stateless ONNX accelerator. */
 }
 
-/* The mono lane on the stage's grid: the state of the linear residual only (AEC_RESIDUAL_STATE); the stage
- * takes the formed hop. */
+/* The mono lane on the stream's grid: the state of the linear residual only (AEC_RESIDUAL_STATE); the
+ * stream takes the formed hop's spectrum. */
 static void derive_lane(const ExampleCliDelayOptions* profile, const UlcnetGrid* grid,
                         AecConfig* aec_cfg) {
     aec_config_from_level(aec_cfg, AEC_LEVEL_BALANCED, grid->sample_rate);
@@ -144,12 +143,13 @@ static void derive_lane(const ExampleCliDelayOptions* profile, const UlcnetGrid*
     aec_cfg->residual = AEC_RESIDUAL_STATE;
 }
 
-/* The application's framing of the stage (audiolib defaults on the grid: sqrt-Hann, centre 0, one
+/* The application's framing around the stream (audiolib defaults on the grid: sqrt-Hann, centre 0, one
  * frame per hop; the synthesis accumulates). */
 typedef struct Framing {
     AcStft *far_stft, *err_stft;
     AcIstft* istft;
-    Complex *far_spec, *err_spec, *out_spec;   /* grid.n_bins each */
+    float *err_re, *err_im, *far_re, *far_im, *out_re, *out_im;   /* grid.n_bins each */
+    int hop;
 } Framing;
 
 static void framing_config(AcStftConfig* sc, const UlcnetGrid* grid) {
@@ -157,18 +157,18 @@ static void framing_config(AcStftConfig* sc, const UlcnetGrid* grid) {
     sc->ola = AC_OLA_ACCUMULATE;
 }
 
-/* Two analyses, one synthesis and three spectra, each in its own 16-byte slot. */
+/* Two analyses, one synthesis and six spectrum planes, each in its own 16-byte slot. */
 static size_t framing_bytes(const UlcnetGrid* grid) {
     AcStftConfig sc;
     framing_config(&sc, grid);
     return 2 * ALIGN16(ac_stft_get_mem_size(&sc)) + ALIGN16(ac_istft_get_mem_size(&sc)) +
-           3 * ALIGN16((size_t)grid->n_bins * sizeof(Complex));
+           6 * ALIGN16((size_t)grid->n_bins * sizeof(float));
 }
 
 static int framing_init(Framing* f, void* mem, size_t bytes, const UlcnetGrid* grid) {
     AcStftConfig sc;
     unsigned char* cur = (unsigned char*)mem;
-    size_t stft_b, istft_b, spec_b = ALIGN16((size_t)grid->n_bins * sizeof(Complex));
+    size_t stft_b, istft_b, plane_b = ALIGN16((size_t)grid->n_bins * sizeof(float));
     if (!mem || bytes < framing_bytes(grid)) return -1;
     framing_config(&sc, grid);
     stft_b = ac_stft_get_mem_size(&sc);
@@ -176,28 +176,36 @@ static int framing_init(Framing* f, void* mem, size_t bytes, const UlcnetGrid* g
     f->far_stft = ac_stft_init(cur, stft_b, &sc);   cur += ALIGN16(stft_b);
     f->err_stft = ac_stft_init(cur, stft_b, &sc);   cur += ALIGN16(stft_b);
     f->istft = ac_istft_init(cur, istft_b, &sc);    cur += ALIGN16(istft_b);
-    f->far_spec = (Complex*)cur;                    cur += spec_b;
-    f->err_spec = (Complex*)cur;                    cur += spec_b;
-    f->out_spec = (Complex*)cur;
+    f->err_re = (float*)cur;                        cur += plane_b;
+    f->err_im = (float*)cur;                        cur += plane_b;
+    f->far_re = (float*)cur;                        cur += plane_b;
+    f->far_im = (float*)cur;                        cur += plane_b;
+    f->out_re = (float*)cur;                        cur += plane_b;
+    f->out_im = (float*)cur;
+    f->hop = grid->hop;
     return f->far_stft && f->err_stft && f->istft ? 0 : -1;
 }
 
-/* The stage and the transforms restart together. */
-static void reset_pipeline(Aec* aec, UlcnetNnStage* stage, Framing* f) {
+/* The stream and the transforms restart together. */
+static void reset_pipeline(Aec* aec, UlcnetStream* stream, Framing* f) {
     aec_reset(aec);
-    ulcnet_nn_stage_reset(stage);
+    ulcnet_stream_reset(stream);
     ac_stft_reset(f->far_stft);
     ac_stft_reset(f->err_stft);
     ac_istft_reset(f->istft);
 }
 
-/* One hop: linear AEC, then the framing of the lane's formed hop and of the raw reference, the stage
- * with the alignment events (changed = CHANGED, solid = not UNLOCKED), and the synthesis. */
-static int process_hop(Aec* aec, UlcnetNnStage* stage, Framing* f, const float* mic, const float* ref,
+/* One hop: linear AEC, then the framing of the lane's formed hop and of the raw reference, the stream
+ * with the alignment events (changed = CHANGED, solid = not UNLOCKED), the model run and the synthesis.
+ * A hop without a frame (the reprime hop after an alignment boundary) and a failed run pass the error
+ * spectrum through. */
+static int process_hop(Aec* aec, UlcnetStream* stream, Framing* f, const float* mic, const float* ref,
                        float* out) {
     AecResidualView rctx;
     AecLinearView lctx;
-    UlcnetNnDelay delay;
+    UlcnetStreamDelay delay;
+    UlcnetHopIO io;
+    int pre, ai_rc = -1;
     if (aec_process_linear(aec, mic, ref) != AEC_OK) return -1;
     if (aec_process_residual(aec, NULL) != AEC_OK) return -1;
     memset(&rctx, 0, sizeof(rctx));
@@ -207,29 +215,28 @@ static int process_hop(Aec* aec, UlcnetNnStage* stage, Framing* f, const float* 
     if (aec_get_residual(aec, &rctx) != AEC_OK || aec_get_linear(aec, &lctx) != AEC_OK) return -1;
     delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
     delay.solid = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    (void)ac_stft_push(f->err_stft, rctx.formed_hop, f->err_spec);
-    (void)ac_stft_push(f->far_stft, ref, f->far_spec);
-    if (ulcnet_nn_stage_begin_spec(stage, f->err_spec, f->far_spec, delay) != 0) return -1;
-    if (ulcnet_nn_stage_process(stage, f->out_spec) != 0) return -1;
-    return ac_istft_push(f->istft, f->out_spec, out) == ulcnet_nn_stage_grid(stage)->hop ? 0 : -1;
+    (void)ac_stft_push_planar(f->err_stft, rctx.formed_hop, f->err_re, f->err_im);
+    (void)ac_stft_push_planar(f->far_stft, ref, f->far_re, f->far_im);
+    pre = ulcnet_stream_pre_process_freq(stream, f->err_re, f->err_im, f->far_re, f->far_im, delay, &io);
+    if (pre < 0) return -1;
+    if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);
+    if (ulcnet_stream_post_process_freq(stream, ai_rc, f->out_re, f->out_im) != 1) return -1;
+    return ac_istft_push_planar(f->istft, f->out_re, f->out_im, out) == f->hop ? 0 : -1;
 }
 
 int main(int argc, char** argv) {
     AecConfig aec_cfg;
     ExampleCliDelayOptions profile;
     UlcnetGrid grid;
-    UlcnetAcceleratorAdapter *adapter;
     UlcnetModelIoDescriptor model_descriptor;
-    UlcnetNnStage *stage = NULL;
+    UlcnetStreamConfig stream_cfg;
+    UlcnetStreamMemReq stream_req;
+    UlcnetStream *stream = NULL;
     Framing framing;
     Aec *aec = NULL;
-    UlcnetModel model;
-    void *adapter_pool = NULL;
     void *pool = NULL;
     float *mic = NULL, *far = NULL, *output = NULL;
-    size_t adapter_bytes;
-    size_t adapter_alignment;
-    size_t aec_bytes, stage_bytes, framing_pool_bytes, pool_bytes;
+    size_t aec_bytes, stream_bytes, framing_pool_bytes, pool_bytes;
     int grid_index;
     int hop;
     int index;
@@ -240,11 +247,13 @@ int main(int argc, char** argv) {
 
     /* Print the resolved profile with the pool the same config costs; query and init
      * must agree on one (sample_rate, hop, n). */
-    stage_bytes = ulcnet_nn_stage_mem_size(&grid);
+    memset(&stream_cfg, 0, sizeof(stream_cfg));
+    stream_cfg.grid = grid;   /* one hop per accelerator job */
+    stream_bytes = ulcnet_stream_get_mem_size(&stream_cfg, &stream_req) == 0 ? (size_t)stream_req.bytes : 0;
     framing_pool_bytes = framing_bytes(&grid);
     derive_lane(&profile, &grid, &aec_cfg);
     aec_bytes = aec_get_mem_size(&aec_cfg);
-    if (aec_bytes == 0 || stage_bytes == 0) {
+    if (aec_bytes == 0 || stream_bytes == 0) {
         fprintf(stderr,
                 "mono_alignulcnet: pool query rejected the delay profile "
                 "(mode=%s n=%d fixed_delay=%d)\n",
@@ -252,7 +261,7 @@ int main(int argc, char** argv) {
                 profile.fixed_samples);
         return 1;
     }
-    pool_bytes = ALIGN16(aec_bytes) + ALIGN16(stage_bytes) + ALIGN16(framing_pool_bytes);
+    pool_bytes = ALIGN16(aec_bytes) + ALIGN16(stream_bytes) + ALIGN16(framing_pool_bytes);
     printf("mono_alignulcnet: grid %d Hz / fft %d / hop %d\n", grid.sample_rate, grid.n_fft,
            grid.hop);
     printf("mono_alignulcnet: delay profile mode=%s n=%d fixed_delay=%d "
@@ -260,47 +269,38 @@ int main(int argc, char** argv) {
            example_cli_delay_mode_name(profile.mode), profile.num_filters,
            profile.fixed_samples, (unsigned long long)pool_bytes, 16ul);
 
-    /* The board loads this descriptor from the exported model metadata. */
+    /* The board loads this descriptor from the exported model metadata and refuses a graph of another
+     * layout, grid or far input, or a packet graph, before any hop runs; here it is the grid's own. */
     if (ulcnet_model_io_descriptor_default(&grid, &model_descriptor) != 0 ||
-        ulcnet_accelerator_adapter_get_mem_size(
-            &model_descriptor, &adapter_bytes, &adapter_alignment) != 0 ||
-        posix_memalign(&adapter_pool, adapter_alignment, adapter_bytes) != 0) {
+        ulcnet_model_io_descriptor_validate(&grid, &model_descriptor) != 0 ||
+        ulcnet_model_io_descriptor_frames(&model_descriptor) != 1) {
         return 1;
     }
-    printf("%s: model I/O D=%d -> accelerator adapter pool %zu bytes (align %zu)\n",
-           argv[0], grid.delay_depth, adapter_bytes, adapter_alignment);
-    /* NULL state: a board's accelerator holds the recurrent state. */
-    adapter = ulcnet_accelerator_adapter_init(
-        adapter_pool, adapter_bytes, &model_descriptor, NULL,
-        run_accelerator, NULL);
-    if (!adapter) {
-        free(adapter_pool);
-        return 1;
-    }
-
-    model = ulcnet_accelerator_adapter_model(adapter);
+    printf("%s: model I/O D=%d -> model stream %zu bytes of that pool (align %u)\n",
+           argv[0], grid.delay_depth, stream_bytes, (unsigned)stream_req.alignment);
 
     mic = (float*)calloc((size_t)grid.hop, sizeof(float));
     far = (float*)calloc((size_t)grid.hop, sizeof(float));
     output = (float*)calloc((size_t)grid.hop, sizeof(float));
     if (!mic || !far || !output || posix_memalign(&pool, 16, pool_bytes) != 0) {
         free(mic); free(far); free(output);
-        free(adapter_pool);
         return 1;
     }
     aec = aec_init(pool, aec_bytes, &aec_cfg);
-    stage = aec ? ulcnet_nn_stage_init((unsigned char*)pool + ALIGN16(aec_bytes), stage_bytes, &grid)
-                : NULL;
-    if (!stage || ulcnet_nn_stage_set_model(stage, &model) != 0 ||
-        framing_init(&framing, (unsigned char*)pool + ALIGN16(aec_bytes) + ALIGN16(stage_bytes),
+    /* The stream holds no recurrent state: a board's accelerator does. */
+    stream = aec ? ulcnet_stream_init_ex(&stream_cfg, (unsigned char*)pool + ALIGN16(aec_bytes), stream_bytes,
+                                         &stream_req)
+                 : NULL;
+    if (!stream ||
+        framing_init(&framing, (unsigned char*)pool + ALIGN16(aec_bytes) + ALIGN16(stream_bytes),
                      framing_pool_bytes, &grid) != 0) {
         fprintf(stderr, "mono_alignulcnet: pipeline init failed\n");
         rc = 1;
     } else {
         /* Host smoke path: a product calls the hop once per grid.hop-sample hop. */
         for (hop = 0; hop < 4 && rc == 0; ++hop) {
-            if (process_hop(aec, stage, &framing, mic, far, output) != 0) {
-                reset_pipeline(aec, stage, &framing);   /* the AEC, the stage and the transforms restart together */
+            if (process_hop(aec, stream, &framing, mic, far, output) != 0) {
+                reset_pipeline(aec, stream, &framing);   /* the AEC, the stream and the transforms restart together */
                 rc = 1;
             }
             for (index = 0; index < grid.hop && rc == 0; ++index)
@@ -311,7 +311,6 @@ int main(int argc, char** argv) {
     if (aec) aec_destroy(aec);
     free(pool);
     free(mic); free(far); free(output);
-    free(adapter_pool);
     if (rc != 0) return 1;
     puts("mono_alignulcnet: fail-open board skeleton PASS");
     return 0;

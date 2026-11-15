@@ -1,13 +1,13 @@
 # C/Python inference parity and alignment events
 
-The C ULCNet stage (`pipelines/ulcnet/ulcnet_nn_stage.c`, `gate_delay`) and
+The C ULCNet stream (`stream/aiaec/ulcnet/ulcnet_stream.c`, `apply_alignment_edge`) and
 Python inference (`inference.py` -> `_streaming.py`) differ at alignment events:
 
-| | C stage | Python inference |
+| | C stream | Python inference |
 |---|---|---|
 | event | `delay.changed`, or the first transition to solid after the first hop | not detected: `lib/aec/python` has `get_post_reset_serial` but no equivalent of `AecLinearView.delay_state`; replayed from a record file with `--events` (below) |
-| model state | `model->reset` zeroes every state tensor (attention ring, logit history, recurrent state) | never reset without `--events`; with it, zeroed at each replayed event frame |
-| frames | `ULCNET_NN_STAGE_REPRIME_FRAMES` (1) identity frame | every frame goes through the model; a replayed event frame is the error spectrum unchanged |
+| model state | the state generation advances: the accelerator zeroes every state tensor (attention ring, logit history, recurrent state) | never reset without `--events`; with it, zeroed at each replayed event frame |
+| frames | `ULCNET_STREAM_REPRIME_FRAMES` (1) identity frame | every frame goes through the model; a replayed event frame is the error spectrum unchanged |
 
 `inference.py --events RECORD` (and `calib --events`) replay recorded `(changed, solid)` pairs through the same edge rule as the C stream (`alignment_events.py`), at every `--frames-per-call`; see the README, "Alignment events in Python". Python still cannot derive the pairs from audio.
 

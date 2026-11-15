@@ -33,10 +33,11 @@ extern "C" {
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
 #define ULCNET_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u
-/* Identity hops after an alignment boundary; equals ULCNET_NN_STAGE_REPRIME_FRAMES (pipelines/ulcnet/ulcnet_nn_stage.h). */
+/* Identity hops after an alignment boundary: each frame spans two hops, so only the boundary hop's frame straddles it. */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
 
-/* Alignment events of the hop from the caller's linear AEC (the mapping of UlcnetNnDelay, ulcnet_nn_stage.h). */
+/* Alignment events of the hop from the caller's linear AEC. A 4-channel unit passes delay.changed and delay.solid of
+ * its front frame; a mono lane maps AecLinearView.delay_state (changed = CHANGED, solid = not UNLOCKED). */
 typedef struct UlcnetStreamDelay {
     int changed;
     int solid;

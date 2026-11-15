@@ -4,9 +4,10 @@
  * a new frequency-domain stage behind the AEC, finishing the hop, the memory a
  * stage needs, and running a neural stage on an accelerator. The checks make
  * the examples tests: the chained mono composition with a unity stage is
- * bit-identical to the hand-written chain of tests/conv_chain_mono.h, and a
- * phased neural hop with the caller's model is bit-identical to the
- * callback-driven one. */
+ * bit-identical to the hand-written chain of tests/conv_chain_mono.h, a
+ * phased DFN2 hop with the caller's model is bit-identical to the
+ * callback-driven one, and the Align-ULCNet hop applies the caller's mask on
+ * the frames it runs and hands the error spectrum on otherwise. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,7 +18,7 @@
 #include "anr.h"
 #include "dfn/dfn_hop.h"
 #include "dfn/dfn_hop_pool.h"
-#include "ulcnet/ulcnet_nn_stage.h"
+#include "ulcnet_stream.h"
 #include "dfn/dfn_unit_partition.h"
 #include "dfn/tests/dfn_test_fixture.h"
 #include "mono/aec_nr_res/tests/conv_chain_mono.h"
@@ -347,48 +348,53 @@ static void example_dfn_phased(void) {
     dfn_host_free(&cb);
 }
 
-/* The shipped Align-ULCNet grid (hop 256) and its export delay depth: the grid the stage, the lane and the
- * model descriptor below are built for. */
+/* The shipped Align-ULCNet grid (hop 256) and its export delay depth: the grid the stream and the lane
+ * below are built for. */
 static const UlcnetGridSpec k_ulcnet_spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
 enum { ULC_HOP_MAX = 256, BINS_MAX_ULC = 257 };
 static UlcnetGrid g_ulc_grid;
 
-static int half_infer(void* user, const float* er, const float* ei, const float* fr,
-                      const float* fi, float* or_, float* oi) {
-    const UlcnetGrid* grid = (const UlcnetGrid*)user;
-    int k;
-    (void)fr; (void)fi;
-    for (k = 0; k < grid->n_bins; ++k) { or_[k] = 0.5f * er[k]; oi[k] = 0.5f * ei[k]; }
+/* The stand-in for the board's graph run: a real mask that scales the spectrum by 0.5 (the mask acts on
+ * the power-law compressed spectrum), every bin of both planes written. */
+static int run_ulcnet_npu(const UlcnetHopIO* io) {
+    const size_t bins = io->outputs.spectrum_ri_elements / 2u;
+    size_t k;
+    for (k = 0; k < bins; ++k) {
+        io->outputs.output[k] = powf(0.5f, ULCNET_MODEL_IO_COMPRESSION_EXP);
+        io->outputs.output[bins + k] = 0.0f;
+    }
     return 0;
 }
 
-static int run_ulcnet_npu(const UlcnetNnJob* job) {
-    return half_infer(&g_ulc_grid, job->err_re, job->err_im, job->far_re, job->far_im,
-                      job->out_re, job->out_im);
-}
-
-/* The mono linear AEC (linear context only) feeding the stage: the alignment events are the
+/* The mono linear AEC (linear context only) feeding the model stream: the alignment events are the
  * AEC's delay state. */
 typedef struct UlcHost {
     Aec* aec;
-    UlcnetNnStage* stage;
+    UlcnetStream* stream;
     AcStft *far_stft, *err_stft;    /* the application's analyses and synthesis */
     AcIstft* istft;
-    Complex far_spec[BINS_MAX_ULC], err_spec[BINS_MAX_ULC], out_spec[BINS_MAX_ULC];
+    float err_re[BINS_MAX_ULC], err_im[BINS_MAX_ULC], far_re[BINS_MAX_ULC], far_im[BINS_MAX_ULC];
+    float out_re[BINS_MAX_ULC], out_im[BINS_MAX_ULC];
     uint8_t* mem;
 } UlcHost;
 
-static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
+static int ulc_host_build(UlcHost* u) {
     AecConfig aec_cfg;
     AcStftConfig sc;
-    size_t aec_b, stage_b = ulcnet_nn_stage_mem_size(&g_ulc_grid), stft_b, istft_b;
+    UlcnetStreamConfig stream_cfg;
+    UlcnetStreamMemReq stream_req;
+    size_t aec_b, stream_b, stft_b, istft_b;
     uint8_t* cur;
     memset(u, 0, sizeof(*u));
     ac_stft_config_default(&sc, g_ulc_grid.n_fft);
     sc.ola = AC_OLA_ACCUMULATE;
     stft_b = ac_stft_get_mem_size(&sc);
     istft_b = ac_istft_get_mem_size(&sc);
-    /* the stage's grid; the lane keeps the state of the linear residual only */
+    memset(&stream_cfg, 0, sizeof(stream_cfg));
+    stream_cfg.grid = g_ulc_grid;                 /* one hop per accelerator job */
+    if (ulcnet_stream_get_mem_size(&stream_cfg, &stream_req) != 0) return -1;
+    stream_b = (size_t)stream_req.bytes;
+    /* the stream's grid; the lane keeps the state of the linear residual only */
     aec_config_from_level(&aec_cfg, AEC_LEVEL_BALANCED, g_ulc_grid.sample_rate);
     aec_cfg.fft_size = g_ulc_grid.n_fft;
     aec_cfg.delay_mode = AEC_DELAY_MATCHED;
@@ -397,19 +403,17 @@ static int ulc_host_build(UlcHost* u, const UlcnetModel* model) {
     aec_cfg.residual = AEC_RESIDUAL_STATE;
     aec_b = aec_get_mem_size(&aec_cfg);
     if (posix_memalign((void**)&u->mem, 16,
-                       ALIGN16(aec_b) + ALIGN16(stage_b) + 2 * ALIGN16(stft_b) + ALIGN16(istft_b)) != 0) return -1;
+                       ALIGN16(aec_b) + ALIGN16(stream_b) + 2 * ALIGN16(stft_b) + ALIGN16(istft_b)) != 0) return -1;
     u->aec = aec_init(u->mem, aec_b, &aec_cfg);
     cur = u->mem + ALIGN16(aec_b);
-    u->stage = ulcnet_nn_stage_init(cur, stage_b, &g_ulc_grid);
-    cur += ALIGN16(stage_b);
+    u->stream = ulcnet_stream_init_ex(&stream_cfg, cur, stream_b, &stream_req);
+    cur += ALIGN16(stream_b);
     u->far_stft = ac_stft_init(cur, stft_b, &sc);
     cur += ALIGN16(stft_b);
     u->err_stft = ac_stft_init(cur, stft_b, &sc);
     cur += ALIGN16(stft_b);
     u->istft = ac_istft_init(cur, istft_b, &sc);
-    if (!u->aec || !u->stage || !u->far_stft || !u->err_stft || !u->istft ||
-        ulcnet_nn_stage_set_model(u->stage, model) != 0) return -1;
-    return 0;
+    return u->aec && u->stream && u->far_stft && u->err_stft && u->istft ? 0 : -1;
 }
 
 static void ulc_host_free(UlcHost* u) {
@@ -418,11 +422,11 @@ static void ulc_host_free(UlcHost* u) {
 }
 
 /* AEC, then the application's analyses of the lane's formed hop and the raw reference, then the
- * stage's begin_spec with the delay events. */
-static int ulc_host_begin(UlcHost* u, const float* mic, const float* ref) {
+ * stream's pre_process_freq with the delay events: 1 with a frame to run, 0 on a reprime hop. */
+static int ulc_host_begin(UlcHost* u, const float* mic, const float* ref, UlcnetHopIO* io) {
     AecResidualView rv;
     AecLinearView lv;
-    UlcnetNnDelay delay;
+    UlcnetStreamDelay delay;
     if (aec_process_linear(u->aec, mic, ref) != AEC_OK) return -1;
     if (aec_process_residual(u->aec, NULL) != AEC_OK) return -1;
     memset(&rv, 0, sizeof(rv));
@@ -432,52 +436,65 @@ static int ulc_host_begin(UlcHost* u, const float* mic, const float* ref) {
     if (aec_get_residual(u->aec, &rv) != AEC_OK || aec_get_linear(u->aec, &lv) != AEC_OK) return -1;
     delay.changed = lv.delay_state == AEC_LINEAR_DELAY_CHANGED;
     delay.solid = lv.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-    (void)ac_stft_push(u->err_stft, rv.formed_hop, u->err_spec);
-    (void)ac_stft_push(u->far_stft, ref, u->far_spec);
-    return ulcnet_nn_stage_begin_spec(u->stage, u->err_spec, u->far_spec, delay);
+    (void)ac_stft_push_planar(u->err_stft, rv.formed_hop, u->err_re, u->err_im);
+    (void)ac_stft_push_planar(u->far_stft, ref, u->far_re, u->far_im);
+    return ulcnet_stream_pre_process_freq(u->stream, u->err_re, u->err_im, u->far_re, u->far_im, delay, io);
 }
 
 static void example_ulcnet_phased(void) {
-    UlcnetModelIoDescriptor d;
-    UlcnetModel none, cb_model;
-    UlcHost p, cb;
-    float mic[ULC_HOP_MAX], ref[ULC_HOP_MAX], out[ULC_HOP_MAX], out_cb[ULC_HOP_MAX];
-    UlcnetNnJob job;
-    int hop, h, i, identical = 1, ran = 0;
+    UlcHost p, off;
+    UlcnetHopIO io;
+    enum { ECHO_DELAY = 2000 };   /* beyond the filter reach: the matched filter locks, one alignment boundary */
+    static float line[ECHO_DELAY];
+    float mic[ULC_HOP_MAX], ref[ULC_HOP_MAX], out[ULC_HOP_MAX], out_off[ULC_HOP_MAX];
+    int hop, h, i, k, pos = 0, ran = 0, passed = 0, applied = 1, identity = 1, synth = 1;
 
-    CHECK(ulcnet_grid_make(&g_ulc_grid, &k_ulcnet_spec) == ULCNET_GRID_OK &&
-          g_ulc_grid.hop == ULC_HOP_MAX && ulcnet_model_io_descriptor_default(&g_ulc_grid, &d) == 0,
-          "readme/ulcnet: the grid and its descriptor");
+    CHECK(ulcnet_grid_make(&g_ulc_grid, &k_ulcnet_spec) == ULCNET_GRID_OK && g_ulc_grid.hop == ULC_HOP_MAX,
+          "readme/ulcnet: the grid");
     if (g_ulc_grid.hop != ULC_HOP_MAX) return;
     hop = g_ulc_grid.hop;
-    memset(&none, 0, sizeof(none));            /* no infer callback: the board runs the network */
-    cb_model = none;
-    cb_model.infer = half_infer;
-    cb_model.user = &g_ulc_grid;
-    cb_model.io_descriptor = &d;
-    CHECK(ulc_host_build(&p, &none) == 0 && ulc_host_build(&cb, &cb_model) == 0,
-          "readme/ulcnet: both hosts build");
-    if (!p.stage || !cb.stage) return;
+    CHECK(ulc_host_build(&p) == 0 && ulc_host_build(&off) == 0, "readme/ulcnet: both hosts build");
+    if (!p.stream || !off.stream) return;
+    memset(line, 0, sizeof(line));
     for (h = 0; h < 60; ++h) {
-        for (i = 0; i < hop; ++i) { ref[i] = lcg(); mic[i] = 0.3f * ref[i] + 0.05f * lcg(); }
+        int ai_rc = -1, pre;
+        for (i = 0; i < hop; ++i) {
+            ref[i] = lcg();
+            mic[i] = 0.3f * line[pos] + 0.02f * lcg();
+            line[pos] = ref[i];
+            pos = (pos + 1) % ECHO_DELAY;
+        }
 
-        ulc_host_begin(&p, mic, ref);                                /* AEC, analyses, begin_spec */
-        if (ulcnet_nn_stage_nn_begin(p.stage, &job) > 0) {           /* a frame to run            */
-            ulcnet_nn_stage_nn_end(p.stage, run_ulcnet_npu(&job));   /* accept, or the identity   */
+        pre = ulc_host_begin(&p, mic, ref, &io);                         /* AEC, analyses, pre_process_freq */
+        if (pre == 1) {                                                  /* a frame to run                  */
+            ai_rc = run_ulcnet_npu(&io);                                 /* 0 = every tensor written        */
             ++ran;
         }
-        ulcnet_nn_stage_end_spec(p.stage, p.out_spec);               /* the output spectrum       */
-        ac_istft_push(p.istft, p.out_spec, out);                     /* the application's WOLA    */
+        ulcnet_stream_post_process_freq(p.stream, ai_rc, p.out_re, p.out_im);   /* accepted, else the error */
+        synth &= ac_istft_push_planar(p.istft, p.out_re, p.out_im, out) == hop; /* the application's WOLA   */
 
-        ulc_host_begin(&cb, mic, ref);
-        ulcnet_nn_stage_process(cb.stage, cb.out_spec);              /* the callback-driven hop   */
-        ac_istft_push(cb.istft, cb.out_spec, out_cb);
-        if (memcmp(out, out_cb, (size_t)hop * sizeof(float)) != 0) identical = 0;
+        /* the same hop with a run that fails: the error spectrum */
+        (void)ulc_host_begin(&off, mic, ref, &io);
+        ulcnet_stream_post_process_freq(off.stream, -1, off.out_re, off.out_im);
+        synth &= ac_istft_push_planar(off.istft, off.out_re, off.out_im, out_off) == hop;
+        if (memcmp(off.out_re, p.err_re, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0 ||
+            memcmp(off.out_im, p.err_im, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0) identity = 0;
+        if (pre == 1) {
+            for (k = 0; k < g_ulc_grid.n_bins; ++k)
+                if (fabsf(p.out_re[k] - 0.5f * p.err_re[k]) > 2e-6f * (1.0f + fabsf(p.err_re[k])) ||
+                    fabsf(p.out_im[k] - 0.5f * p.err_im[k]) > 2e-6f * (1.0f + fabsf(p.err_im[k]))) applied = 0;
+        } else {
+            ++passed;
+            if (memcmp(p.out_re, p.err_re, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0 ||
+                memcmp(p.out_im, p.err_im, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0) identity = 0;
+        }
     }
-    CHECK(ran > 0 && identical,
-          "readme/ulcnet: begin_spec / nn_begin / nn_end / end_spec equals the callback-driven hop");
+    CHECK(ran > 0 && applied && synth,
+          "readme/ulcnet: pre_process_freq / the graph run / post_process_freq applies the mask on every frame it ran");
+    CHECK(passed > 0 && identity,
+          "readme/ulcnet: a reprime hop and a failed run hand the error spectrum on bit for bit");
     ulc_host_free(&p);
-    ulc_host_free(&cb);
+    ulc_host_free(&off);
 }
 
 int main(void) {

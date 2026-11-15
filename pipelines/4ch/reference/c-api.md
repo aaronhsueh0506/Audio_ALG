@@ -255,8 +255,8 @@ example main hold no pair (the application puts a `DFN2Grid` in the hop's pool p
 signature, so pairs never share an object directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
 
 There is no 4-channel archive: the array is in `libaec.a`. The sample objects (`array_sample_beam.o`,
-`array_sample_driver.o`), the example chain headers and the ULCNet stage object
-(`ulcnet_nn_stage.o`) are compiled into the application binaries that use them; no
+`array_sample_driver.o`), the example chain headers and the ULCNet model stream objects
+(`ulcnet_stream.o`, `ulcnet_prepost.o`, `ulcnet_model_io.o`) are compiled into the application binaries that use them; no
 per-application archive is produced. A consumer of the array alone links `libaec.a`,
 `libaudio_common.a` and `-lm` (`libanr.a` is for the programs that chain NR behind the array). A consumer of the sample
 beam helper links `array_sample_beam.o`, then `libdoa.a`, `libbf.a`, `libspatial_common.a`,

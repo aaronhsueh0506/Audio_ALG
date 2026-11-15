@@ -35,7 +35,7 @@
 - **Failure recovery is yours.** When the array, the denoiser or a stage refuses a call, or the emitted
   hop is not finite, reset the `Aec` (`aec_reset()`: for the array also the four lanes, the estimator and the gain stage; the level setting survives), the
   denoiser, the synthesis and any neural stage together
-  (`aec_reset()`, `anr_reset()`, `ac_istft_reset()`, `ulcnet_nn_stage_reset()`), and refresh the `post_reset_serial` you track.
+  (`aec_reset()`, `anr_reset()`, `ac_istft_reset()`, `ulcnet_stream_reset()`), and refresh the `post_reset_serial` you track.
   An `AEC_ERR_DSP` from an array has already reset the array itself. The DFN2 stage is not reset by an AEC delay change. A model
   that keeps its own recurrent state (the DFN2 stage and rate bridge register none) follows the state generation (a reset, each DFN2 warm-up frame and a refused commit advance it), see
   ["Running the model on the NPU"](sequence.md#running-the-model-on-the-npu-nn-applications).

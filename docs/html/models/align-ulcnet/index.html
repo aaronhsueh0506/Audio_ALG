@@ -142,7 +142,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <tr><th><code>aiaec_*</code>（PCM → PCM）</th><td>事件 hop 是 BYPASS，不呼叫加速器；stream 自己的分析與 ISTFT 在該 hop 重啟，該 hop 的 PCM 輸出恰為靜音，前一個輸入 hop 的音訊不輸出。</td><td>一包恆為一次 SUBMIT，graph 內以 <code>frame_reset</code>（0.0／1.0）重設 state 並直通該 hop；stream 自己的 STFT 分析與 ISTFT 合成在該 hop 重啟，與 N=1 在同一位置。PCM 輸出與同樣事件的 N=1 逐樣本相同，事件 hop 同樣恰為靜音。</td></tr>
 <tr><th><code>_spec</code>（PCM → 頻譜）</th><td>同 PCM 家族的分析重啟；ISTFT 在呼叫端。重啟的 hop 同樣記在 <code>work.synthesis_restart_mask</code>，外部 ISTFT 要在推入這些 hop 的增強頻譜之前先 <code>ac_istft_reset()</code>，輸出才等於 PCM 家族。</td><td>分析重啟同 PCM 家族；<code>work.synthesis_restart_mask</code> 的 bit k 是第 k 個 hop（最舊為 0），重設規則同 N=1。</td></tr>
 <tr><th><code>_freq</code>（頻譜 → 頻譜，aiaec）</th><td>只重啟模型；呼叫端的分析器與 ISTFT 不重啟，overlap 連續。</td><td>同 N=1：只有模型在 graph 內重設，分析與 ISTFT 的 overlap 連續。不要為此重設 ISTFT。</td></tr>
-<tr><th>pipeline stage（mono、4ch、live3 經 <code>ulcnet_nn_stage</code>）</th><td>只重啟模型；stage 外（應用端）的分析器與 ISTFT 不重啟，overlap 連續。</td><td>不適用：stage 只接受一幀一包的 graph，封包 graph（layout 19）在 <code>ulcnet_nn_stage_set_model()</code> 被拒（回 -1）。</td></tr>
+<tr><th>桌面 pipeline（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code> 經 <code>ulcnet_stream_*_freq</code>）</th><td>只重啟模型；應用端的分析器與 ISTFT 不重啟，overlap 連續。</td><td>不適用：兩支範例建的是一幀一包的 stream（<code>frames_per_call</code> 0），封包 graph（layout 19）的 descriptor 在啟動時被 <code>main.c</code> 拒絕。</td></tr>
 </tbody></table>
 <ul>
 <li>N=8 的事件由 graph 處理，generation 不變，一包仍是一次 AI3 呼叫。stream 把事件寫成 <code>frame_reset</code>：包內第 3 個 hop 是事件時為 <code>0 0 1 0 0 0 0 0</code>，sample 原樣搬進第五個訊號輸入。24 個 hop、第 3 個 hop 有事件的情境，N=1 送件 23 次（事件 hop 是 BYPASS，不送件，仍呼叫 post），N=8 每個完整包送一次、共 3 次。</li>

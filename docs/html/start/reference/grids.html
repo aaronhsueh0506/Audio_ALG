@@ -59,7 +59,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 範例 main 以 <code>--sample-rate 16000|48000</code>（預設 16000）選；一支 binary 兩個 grid 皆可，
 exporter 只收這兩個（<code>SUPPORTED_GRIDS</code>），16 k 的 checkpoint 不能當 48 k 用</td>
 <td rowspan="2"><code>ulcnet_model_io.h</code>（<code>UlcnetGrid</code>）、<code>ulcnet_process.h</code>（framing 契約）、
-<code>pipelines/ulcnet/ulcnet_nn_stage.h</code>；<code>ta_bins</code> 由 exporter 的 <code>ta_bins_for()</code> 導出</td></tr>
+<code>stream/aiaec/ulcnet/ulcnet_stream.h</code>；<code>ta_bins</code> 由 exporter 的 <code>ta_bins_for()</code> 導出</td></tr>
 <tr><td>48 k</td><td><b>1024 / 512（513）</b>；ta_bins 52</td></tr>
 <tr><td rowspan="3">DFN2 變體（mono + 4ch）<br>
 <span class="note">共用 <code>pipelines/dfn/dfn_hop.h</code>（模型串流 <code>stream/ainr/dfn2</code>）；1/√n_fft 進 / √n_fft 出的尺度邊界（出貨 grid 為 <code>2^-5</code> / <code>2^5</code>）</span></td>
@@ -113,7 +113,7 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <tr><td>mono 範例合成窗</td><td><code>pipelines/mono/aec_nr_res/main.c</code>：main 自己初始化的 <code>AcIstft</code> 借用 AEC 的窗表（初始化後的 <code>Aec</code> 經 <code>aec_synthesis_window()</code> 取得；<code>AcStftConfig.window</code> 借入，不另切）</td></tr>
 <tr><td>4ch 範例合成窗</td><td><code>pipelines/4ch/4ch_static.c</code>：main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>stream/ainr/bridge/ainr_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
-<tr><td>ULCNet 兩條範例</td><td>應用端（<code>main.c</code>）的 <code>AcStft</code>／<code>AcIstft</code>（<code>ac_stft_config_default()</code>，<code>AC_OLA_ACCUMULATE</code>）；<code>pipelines/ulcnet/ulcnet_nn_stage.c</code> 本身沒有 FFT</td></tr>
+<tr><td>ULCNet 兩條範例</td><td>應用端（<code>main.c</code>）的 <code>AcStft</code>／<code>AcIstft</code>（<code>ac_stft_config_default()</code>，<code>AC_OLA_ACCUMULATE</code>）；範例走 <code>ulcnet_stream</code> 的頻譜進出口，不呼叫串流自己的 FFT</td></tr>
 <tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_process.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code> 檔頭</td></tr>
 <tr><td>AIAEC Python streaming 參考</td>
 <td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
@@ -251,7 +251,7 @@ array 的增益級（<code>residual = FULL</code>）算 RES 增益，ULCNet 的 
 <td><code>ulcnet_process.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
 對應輸入 [（p−1)·<code>grid.hop</code>, p·<code>grid.hop</code>)</td></tr>
 <tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
-<td><code>ulcnet/ulcnet_nn_stage.h</code>：「Latency is one hop」(加上應用端 <code>AcIstft</code> 的總延遲不變；hop #0 是真輸出，第一幀合成窗前半疊加零歷史)；輸出 hop p ≙ 輸入 hop p−1</td></tr>
+<td><code>mono/alignulcnet/README.md</code>：延遲一個 hop，全部來自應用端 <code>AcIstft</code> 的合成(頻譜進出口不加延遲；hop #0 是真輸出，第一幀合成窗前半疊加零歷史)；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 </table>
 </div>
 
@@ -274,10 +274,10 @@ array 的增益級（<code>residual = FULL</code>）算 RES 增益，ULCNet 的 
 （16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td><td>同 mono 變體</td></tr>
 <tr><td><b>合計（新增）</b></td><td><b>1 hop（16 k: 256 samples = 16 ms；
 48 k: 512 samples = 10.67 ms）</b></td>
-<td><code>ulcnet/ulcnet_nn_stage.h</code> 的 timing 契約：<b>僅 hop#0</b> 輸出零；
+<td><code>4ch/alignulcnet/README.md</code> 的 timing 契約：identity 時<b>僅 hop#0</b> 接近零(前半窗疊加零歷史)；
 輸出 hop p（p≥1）≙ 輸入 hop p−1 的 beamformed 線性誤差。
-測試以 far 單位脈衝釘住：16 k far[2085]→out[2341]（= 脈衝位置 + 1 hop = 256 samples，offset +0）；
-48 k：far[4133]→out[4645]（= 脈衝位置 + 1 hop = 512 samples，offset +0），<code>make -C pipelines/4ch test</code> 的 <code>test_4ch_ulcnet</code> 在同一支 binary 內兩個格點各跑一次</td></tr>
+測試以 far 單位脈衝釘住(把模型拿到的 far 幀自行合成後找脈衝)：16 k far[2085]→[2341]（= 脈衝位置 + 1 hop = 256 samples，offset +0）；
+48 k：far[4133]→[4645]（= 脈衝位置 + 1 hop = 512 samples，offset +0），<code>make -C pipelines/4ch test</code> 的 <code>test_4ch_ulcnet</code> 在同一支 binary 內兩個格點各跑一次</td></tr>
 </table>
 </div>
 <p class="note">NN 模型本身：Align-ULCNet 演算法 lookahead = 0

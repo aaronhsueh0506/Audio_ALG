@@ -17,7 +17,7 @@
 <li><a href="#section-3">3. 4ch 範例</a></li>
 <li><a href="#section-4">4. 回傳值與錯誤處理</a></li>
 <li><a href="#sequence">逐 hop 時序</a></li>
-<li><a href="#section-5">1. 初始化(mono;4ch 把 Aec 換成 aec_init_ex() 的 array 加 array_sample_beam_init(),stage 用 ulcnet_nn_stage_mem_size(&amp;grid),應用端另備 AcStft／AcIstft)</a></li>
+<li><a href="#section-5">1. 初始化(mono;4ch 把 Aec 換成 aec_init_ex() 的 array 加 array_sample_beam_init(),串流同樣用 ulcnet_stream_get_mem_size(),應用端另備 AcStft／AcIstft)</a></li>
 <li><a href="#section-6">2. 穩態 hop:mono</a></li>
 <li><a href="#section-7">3. 穩態 hop:4ch(直送路徑)</a></li>
 <li><a href="#section-8">4. 失敗與 reset</a></li>
@@ -26,29 +26,28 @@
 <table>
 <tr><th>階段</th><th>mono(<code>mono_alignulcnet</code>)</th><th>4ch(<code>4ch_alignulcnet</code>)</th></tr>
 <tr><td>設定</td><td><code>ulcnet_grid_make(&amp;grid, &amp;spec)</code>;<code>aec_config_from_level(&amp;cfg, AEC_LEVEL_BALANCED, grid.sample_rate)</code> 加 <code>fft_size = grid.n_fft</code>、<code>delay_*</code>、<code>residual = AEC_RESIDUAL_STATE</code>(<code>main.c</code> 的 <code>derive_lane()</code>)</td><td><code>ulcnet_grid_make(&amp;grid, &amp;spec)</code>;<code>array_sample_default_config(&amp;cfg, grid.sample_rate)</code>;<code>fft_size = grid.n_fft</code>、<code>residual = AEC_RESIDUAL_STATE</code>、<code>delay_*</code>;helper 參數 <code>array_sample_beam_default_params()</code></td></tr>
-<tr><td>模型 descriptor</td><td><code>ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)</code>(<code>grid.delay_depth</code> 必須等於匯出時的 D)</td><td>同左</td></tr>
-<tr><td>查大小</td><td><code>ulcnet_accelerator_adapter_get_mem_size()</code>、<code>aec_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(&amp;grid)</code>、<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code></td><td><code>ulcnet_accelerator_adapter_get_mem_size()</code>、<code>aec_get_mem_requirements()</code>、<code>array_sample_beam_get_mem_size()</code>、<code>ulcnet_nn_stage_mem_size(&amp;grid)</code>、<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code></td></tr>
-<tr><td>init</td><td><code>ulcnet_accelerator_adapter_init(…, &amp;desc, NULL, run, user)</code>(板端 state 登錄 NULL)、<code>aec_init()</code>、<code>ulcnet_nn_stage_init(…, &amp;grid)</code>、<code>ac_stft_init()</code> ×2、<code>ac_istft_init()</code></td><td><code>ulcnet_accelerator_adapter_init()</code>、<code>aec_init_ex()</code>、<code>array_sample_beam_init(…, flow)</code>、<code>ulcnet_nn_stage_init(…, &amp;grid)</code>、<code>ac_stft_init()</code>、<code>ac_istft_init()</code></td></tr>
-<tr><td>裝模型</td><td><code>ulcnet_accelerator_adapter_model()</code> → <code>ulcnet_nn_stage_set_model()</code></td><td>同左</td></tr>
-<tr><td>每 hop</td><td><code>aec_process_linear()</code>、<code>aec_process_residual()</code>、<code>aec_get_residual()</code>、<code>aec_get_linear()</code>、兩次 <code>ac_stft_push()</code>、<code>ulcnet_nn_stage_begin_spec()</code>、<code>ulcnet_nn_stage_process()</code>(或 nn_begin／nn_end／end_spec)、<code>ac_istft_push()</code></td><td><code>array_sample_beam_process_with_activity()</code>、<code>ac_stft_push()</code>、<code>ulcnet_nn_stage_begin_spec()</code>、<code>ulcnet_nn_stage_process()</code>(或 nn_begin／nn_end／end_spec)、<code>ac_istft_push()</code></td></tr>
+<tr><td>模型 descriptor</td><td><code>ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)</code>(板端由匯出 metadata 填;<code>grid.delay_depth</code> 必須等於匯出時的 D)→ <code>ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc)</code> 與 <code>ulcnet_model_io_descriptor_frames(&amp;desc) == 1</code></td><td>同左</td></tr>
+<tr><td>查大小</td><td><code>aec_get_mem_size()</code>、<code>ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq)</code>、<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code></td><td><code>aec_get_mem_requirements()</code>、<code>array_sample_beam_get_mem_size()</code>、<code>ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq)</code>、<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code></td></tr>
+<tr><td>init</td><td><code>aec_init()</code>、<code>ulcnet_stream_init_ex(&amp;scfg, mem, bytes, &amp;sreq)</code>(串流不登錄 state:板端 state 在加速器裡)、<code>ac_stft_init()</code> ×2、<code>ac_istft_init()</code></td><td><code>aec_init_ex()</code>、<code>array_sample_beam_init(…, aec)</code>、<code>ulcnet_stream_init_ex()</code>、<code>ac_stft_init()</code>、<code>ac_istft_init()</code></td></tr>
+<tr><td>每 hop</td><td><code>aec_process_linear()</code>、<code>aec_process_residual()</code>、<code>aec_get_residual()</code>、<code>aec_get_linear()</code>、兩次 <code>ac_stft_push_planar()</code>、<code>ulcnet_stream_pre_process_freq()</code>、(回 1 時)加速器、<code>ulcnet_stream_post_process_freq()</code>、<code>ac_istft_push_planar()</code></td><td><code>array_sample_beam_process_with_activity()</code>、<code>ac_stft_push_planar()</code>、<code>beam.spectrum</code> 拆成平面、<code>ulcnet_stream_pre_process_freq()</code>、(回 1 時)加速器、<code>ulcnet_stream_post_process_freq()</code>、<code>ac_istft_push_planar()</code></td></tr>
 <tr><td>hop 之間</td><td>無 setter(沒有可調的強度面)</td><td>無 setter</td></tr>
-<tr><td>reset</td><td><code>aec_reset()</code> + <code>ulcnet_nn_stage_reset()</code> + <code>ac_stft_reset()</code> ×2 + <code>ac_istft_reset()</code></td><td><code>array_sample_beam_reset()</code>(連帶 flow)+ <code>ulcnet_nn_stage_reset()</code> + <code>ac_stft_reset()</code> + <code>ac_istft_reset()</code></td></tr>
-<tr><td>destroy</td><td><code>aec_destroy()</code>;釋放 stage、adapter、Aec 的 pool</td><td><code>array_sample_beam_destroy()</code>、<code>aec_destroy()</code>;釋放三塊 pool</td></tr>
+<tr><td>reset</td><td><code>aec_reset()</code> + <code>ulcnet_stream_reset()</code> + <code>ac_stft_reset()</code> ×2 + <code>ac_istft_reset()</code></td><td><code>array_sample_beam_reset()</code>(連帶 array)+ <code>ulcnet_stream_reset()</code> + <code>ac_stft_reset()</code> + <code>ac_istft_reset()</code></td></tr>
+<tr><td>destroy</td><td><code>aec_destroy()</code>;釋放 pool(串流沒有 destroy)</td><td><code>array_sample_beam_destroy()</code>、<code>aec_destroy()</code>;釋放三塊 pool</td></tr>
 </table>
 
 <h2 id="section-2">2. mono 範例</h2>
-<p>完整函式:grid、lane、adapter、pool 切分、init、每 hop、destroy。<code>board_run_stateless()</code>、<code>board_bind_adapter()</code>、<code>next_hop()</code>、<code>emit_hop()</code> 由板端提供;<code>board_run_stateless()</code> 讀完所有 state 輸入後才寫輸出,並把每個 <code>*_out</code> 寫到對應輸入的位址(見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>)。板端 state 在加速器裡:啟動時載入量化 0,之後每次跑加速器前比對 <code>ulcnet_accelerator_adapter_state_generation()</code>(init 後為 0,reset 與被拒的 frame 各加 1),與上次看到的值不同就重載。</p>
+<p>完整函式:grid、lane、descriptor 檢查、pool 切分、init、每 hop、destroy。<code>board_run_stateless()</code>、<code>board_sync_state()</code>、<code>board_refill_state_zero()</code>、<code>next_hop()</code>、<code>emit_hop()</code> 由板端提供;<code>board_run_stateless()</code> 讀完所有 state 輸入後才寫輸出,並把每個 <code>*_out</code> 寫到對應輸入的位址(見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>)。板端 state 在加速器裡:啟動時載入量化 0,之後每次跑加速器前比對 <code>io.state_generation</code>(init 後為 0,reset、alignment 邊界與被拒的 frame 各加 1),與上次看到的值不同就重載;推論失敗後也重填。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯。</p>
 <pre>#include "aec.h"
 #include "audio_stft.h"
-#include "ulcnet/ulcnet_nn_stage.h"
-#include "ulcnet_accelerator_adapter.h"
+#include "ulcnet_stream.h"
 #include "utility/mem_align.h"
 #include &lt;stdlib.h&gt;
 #include &lt;string.h&gt;
 
-/* 板端提供:無狀態的單幀 tensor invocation(回 0 = 已寫滿 outputs)、取 hop 與輸出 */
-extern int  board_run_stateless(void *user, const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
-extern void board_bind_adapter(UlcnetAcceleratorAdapter *a);   /* run 前比對 ulcnet_accelerator_adapter_state_generation(),變了就重載量化 0 */
+/* 板端提供:無狀態的單幀 tensor invocation(回 0 = 已寫滿 outputs)、state 同步、取 hop 與輸出 */
+extern int  board_run_stateless(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
+extern void board_sync_state(uint32_t generation);      /* 與上次看到的值不同就把加速器的 state 重載為量化 0 */
+extern void board_refill_state_zero(void);              /* 推論失敗後:裝置端 state 可能寫了一半 */
 extern int  next_hop(float *mic, float *ref);
 extern void emit_hop(const float *out, int n);
 
@@ -64,97 +63,85 @@ int mono_ulcnet_run(void) {
     aec_cfg.fixed_delay_samples = -1;
     aec_cfg.residual = AEC_RESIDUAL_STATE;               /* 只留 formed_hop 與狀態旗標:沒有 G_res、r2、comfort noise */
 
-    /* 2. accelerator adapter:把無狀態 run() 包成 UlcnetModel;板端不登錄 state(NULL),state 在加速器裡 */
+    /* 2. 模型的 descriptor(板端由匯出 metadata 填):只收這個 grid、raw-far、一幀一包的 graph */
     UlcnetModelIoDescriptor desc;
-    size_t ad_bytes, ad_align;
     if (ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc) != 0 ||
-        ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;ad_bytes, &amp;ad_align) != 0) return -1;
-    void *ad_pool = NULL;
-    if (posix_memalign(&amp;ad_pool, ad_align, ad_bytes) != 0) return -1;
-    UlcnetAcceleratorAdapter *adapter =
-        ulcnet_accelerator_adapter_init(ad_pool, ad_bytes, &amp;desc, NULL, board_run_stateless, NULL);
-    if (adapter) board_bind_adapter(adapter);
+        ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc) != 0 ||
+        ulcnet_model_io_descriptor_frames(&amp;desc) != 1) return -1;
 
-    /* 3. Aec 一塊、stage 一塊、應用端的 STFT／ISTFT 一塊(stage 本身沒有 STFT／ISTFT) */
+    /* 3. Aec、模型串流、應用端的 STFT／ISTFT 與六段頻譜平面,同一塊 pool;串流不登錄 state(state 在加速器裡) */
+    UlcnetStreamConfig scfg;
+    UlcnetStreamMemReq sreq;
+    memset(&amp;scfg, 0, sizeof(scfg));
+    scfg.grid = grid;                                    /* frames_per_call 0:一 hop 一次推論 */
+    if (ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq) != 0) return -1;
     AcStftConfig fcfg;
     ac_stft_config_default(&amp;fcfg, grid.n_fft);
     fcfg.ola = AC_OLA_ACCUMULATE;
-    size_t aec_b = aec_get_mem_size(&amp;aec_cfg), stage_b = ulcnet_nn_stage_mem_size(&amp;grid);
+    size_t aec_b = aec_get_mem_size(&amp;aec_cfg), stream_b = (size_t)sreq.bytes;
     size_t stft_b = ac_stft_get_mem_size(&amp;fcfg), istft_b = ac_istft_get_mem_size(&amp;fcfg);
-    size_t spec_b = ALIGN16((size_t)grid.n_bins * sizeof(Complex));
+    size_t plane_b = ALIGN16((size_t)grid.n_bins * sizeof(float));
     void *pool = NULL;
-    if (!adapter || aec_b == 0 || stage_b == 0 || stft_b == 0 || istft_b == 0 ||
-        posix_memalign(&amp;pool, 16, ALIGN16(aec_b) + ALIGN16(stage_b) + 2 * ALIGN16(stft_b) + ALIGN16(istft_b) + 3 * spec_b) != 0) {
-        free(ad_pool);  return -1;
-    }
+    if (aec_b == 0 || stft_b == 0 || istft_b == 0 ||
+        posix_memalign(&amp;pool, 16, ALIGN16(aec_b) + ALIGN16(stream_b) + 2 * ALIGN16(stft_b) + ALIGN16(istft_b) + 6 * plane_b) != 0)
+        return -1;
     unsigned char *cur = (unsigned char *)pool;
-    Aec *aec = aec_init(cur, aec_b, &amp;aec_cfg);                       cur += ALIGN16(aec_b);
-    UlcnetNnStage *stage = ulcnet_nn_stage_init(cur, stage_b, &amp;grid);  cur += ALIGN16(stage_b);
-    AcStft *err_stft = ac_stft_init(cur, stft_b, &amp;fcfg);               cur += ALIGN16(stft_b);   /* formed_hop 的分析 */
-    AcStft *far_stft = ac_stft_init(cur, stft_b, &amp;fcfg);               cur += ALIGN16(stft_b);   /* 原始 ref 的分析 */
-    AcIstft *istft = ac_istft_init(cur, istft_b, &amp;fcfg);               cur += ALIGN16(istft_b);
-    Complex *err_spec = (Complex *)cur;  cur += spec_b;
-    Complex *far_spec = (Complex *)cur;  cur += spec_b;
-    Complex *out_spec = (Complex *)cur;
-    UlcnetModel model = ulcnet_accelerator_adapter_model(adapter);
-    if (!aec || !stage || !err_stft || !far_stft || !istft ||
-        ulcnet_nn_stage_set_model(stage, &amp;model) != 0) {   /* 只收 raw-far descriptor */
-        free(pool);  free(ad_pool);  return -1;
-    }
+    Aec *aec = aec_init(cur, aec_b, &amp;aec_cfg);                              cur += ALIGN16(aec_b);
+    UlcnetStream *stream = ulcnet_stream_init_ex(&amp;scfg, cur, stream_b, &amp;sreq);   cur += ALIGN16(stream_b);
+    AcStft *err_stft = ac_stft_init(cur, stft_b, &amp;fcfg);                    cur += ALIGN16(stft_b);   /* formed_hop 的分析 */
+    AcStft *far_stft = ac_stft_init(cur, stft_b, &amp;fcfg);                    cur += ALIGN16(stft_b);   /* 原始 ref 的分析 */
+    AcIstft *istft = ac_istft_init(cur, istft_b, &amp;fcfg);                    cur += ALIGN16(istft_b);
+    float *err_re = (float *)cur;  cur += plane_b;
+    float *err_im = (float *)cur;  cur += plane_b;
+    float *far_re = (float *)cur;  cur += plane_b;
+    float *far_im = (float *)cur;  cur += plane_b;
+    float *out_re = (float *)cur;  cur += plane_b;
+    float *out_im = (float *)cur;
+    if (!aec || !stream || !err_stft || !far_stft || !istft) { free(pool);  return -1; }
 
     /* 4. 每個 hop(grid.hop 個樣本) */
     float mic[512], ref[512], out[512];                  /* &gt;= grid.hop */
     while (next_hop(mic, ref)) {
         AecResidualView rctx = { .struct_size = sizeof(rctx) };
         AecLinearView lctx = { .struct_size = sizeof(lctx) };
-        UlcnetNnDelay delay;
-        if (aec_process_linear(aec, mic, ref) != AEC_OK || aec_process_residual(aec, NULL) != AEC_OK ||
-            aec_get_residual(aec, &amp;rctx) != AEC_OK || aec_get_linear(aec, &amp;lctx) != AEC_OK) {
-            aec_reset(aec);  ulcnet_nn_stage_reset(stage);                           /* 被拒:一起 reset */
-            ac_stft_reset(err_stft);  ac_stft_reset(far_stft);  ac_istft_reset(istft);
-            continue;
-        }                                                /* rctx.formed_hop = error 的時域 hop */
-        delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
-        delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
-        (void)ac_stft_push(err_stft, rctx.formed_hop, err_spec);                    /* 應用端分析 */
-        (void)ac_stft_push(far_stft, ref, far_spec);                                 /* 模型 far = 原始 ref */
-        if (ulcnet_nn_stage_begin_spec(stage, err_spec, far_spec, delay) == 0 &amp;&amp;
-            ulcnet_nn_stage_process(stage, out_spec) == 0 &amp;&amp;
-            ac_istft_push(istft, out_spec, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
-        aec_reset(aec);  ulcnet_nn_stage_reset(stage);                               /* 被拒:一起 reset，連同應用端的 STFT／ISTFT */
+        UlcnetStreamDelay delay;
+        UlcnetHopIO io;
+        int pre = -1, ai_rc = -1;
+        if (aec_process_linear(aec, mic, ref) == AEC_OK &amp;&amp; aec_process_residual(aec, NULL) == AEC_OK &amp;&amp;
+            aec_get_residual(aec, &amp;rctx) == AEC_OK &amp;&amp; aec_get_linear(aec, &amp;lctx) == AEC_OK) {
+            delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
+            delay.solid   = lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
+            (void)ac_stft_push_planar(err_stft, rctx.formed_hop, err_re, err_im);   /* rctx.formed_hop = error 的時域 hop */
+            (void)ac_stft_push_planar(far_stft, ref, far_re, far_im);               /* 模型 far = 原始 ref */
+            pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &amp;io);
+        }
+        if (pre == 1) {                                  /* 本 hop 有一幀;0 = alignment 邊界後的 identity hop */
+            board_sync_state(io.state_generation);
+            ai_rc = board_run_stateless(&amp;io.inputs, &amp;io.outputs);
+            if (ai_rc != 0) board_refill_state_zero();
+        }
+        if (pre &gt;= 0 &amp;&amp; ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im) == 1 &amp;&amp;
+            ac_istft_push_planar(istft, out_re, out_im, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
+        aec_reset(aec);  ulcnet_stream_reset(stream);                               /* 被拒:一起 reset,連同應用端的 STFT／ISTFT */
         ac_stft_reset(err_stft);  ac_stft_reset(far_stft);  ac_istft_reset(istft);
     }
 
-    aec_destroy(aec);  free(pool);  free(ad_pool);      /* stage 沒有 destroy */
+    aec_destroy(aec);  free(pool);                       /* 串流沒有 destroy */
     return 0;
-}</pre>
-<p><b>phased(板端自己在中間跑加速器)</b>:<code>begin_spec</code> 之後把 <code>ulcnet_nn_stage_process()</code> 換成下面的序列。<code>nn_begin</code> 回 0 表示本 hop 沒有模型幀(alignment 邊界後的 identity reprime),此時直接 <code>end_spec</code>。</p>
-<pre>#include "ulcnet/ulcnet_nn_stage.h"
-
-extern int board_run_ulcnet_on_npu(UlcnetNnJob *job);   /* 0 = job.out_re / out_im 的每個 bin 都寫滿 */
-
-/* begin_spec 已呼叫過(mono:err_spec 來自 formed_hop 的分析;4ch:err_spec = beam.spectrum) */
-int phased_ulc_hop(UlcnetNnStage *stage, AcIstft *istft, Complex *out_spec, float *out, int hop) {
-    UlcnetNnJob job;
-    int r = ulcnet_nn_stage_nn_begin(stage, &amp;job);      /* 1 = 有一幀要跑;0 = 本 hop 無模型幀(reprime) */
-    if (r &lt; 0) return -1;
-    if (r == 1 &amp;&amp; ulcnet_nn_stage_nn_end(stage, board_run_ulcnet_on_npu(&amp;job)) != 0)
-        return -1;                                      /* rc != 0 或輸出非有限:該幀走 identity,不是錯誤 */
-    if (ulcnet_nn_stage_end_spec(stage, out_spec) != 0) return -1;   /* 採用的模型頻譜，否則 err_spec */
-    return ac_istft_push(istft, out_spec, out) == hop ? 0 : -1;      /* 應用端 WOLA,剛好一個 hop */
 }</pre>
 
 <h2 id="section-3">3. 4ch 範例</h2>
-<p>與 mono 的差別:前端是 <code>Aec</code> array(<code>n_mics = 4</code>;lane 與 estimator 由 <code>aec_init_ex()</code> 在同一個 pool 內建好,沒有注入的物件)加 SRP/BF helper,stage 以 <code>ulcnet_nn_stage_init(…, &amp;grid)</code> 建立(error 幀就是 <code>beam.spectrum</code>,不需要時域分析;應用端只有 far 的 <code>AcStft</code> 與輸出 <code>AcIstft</code>),每 hop 用 <code>ulcnet_nn_stage_begin_spec()</code>。array 以 <code>residual = AEC_RESIDUAL_STATE</code> 建立後 <code>array_sample_beam_fuse()</code> 不可用(回 <code>AEC_ERR_MODE</code>);STATE 的 array 沒有增益級,這條鏈也沒有 RES。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯。</p>
+<p>與 mono 的差別:前端是 <code>Aec</code> array(<code>n_mics = 4</code>;lane 與 estimator 由 <code>aec_init_ex()</code> 在同一個 pool 內建好,沒有注入的物件)加 SRP/BF helper;error 幀就是 <code>beam.spectrum</code>,拆成 re／im 平面後交給 <code>ulcnet_stream_pre_process_freq()</code>(不需要時域分析;應用端只有 far 的 <code>AcStft</code> 與輸出 <code>AcIstft</code>)。array 以 <code>residual = AEC_RESIDUAL_STATE</code> 建立後 <code>array_sample_beam_fuse()</code> 不可用(回 <code>AEC_ERR_MODE</code>);STATE 的 array 沒有增益級,這條鏈也沒有 RES。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯。</p>
 <pre>#include "4ch/array_sample_beam.h"
 #include "audio_stft.h"
-#include "ulcnet/ulcnet_nn_stage.h"
-#include "ulcnet_accelerator_adapter.h"
+#include "ulcnet_stream.h"
 #include "utility/mem_align.h"
 #include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
 
-extern int  board_run_stateless(void *user, const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
-extern void board_bind_adapter(UlcnetAcceleratorAdapter *a);   /* 同 mono */
+extern int  board_run_stateless(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
+extern void board_sync_state(uint32_t generation);      /* 同 mono */
+extern void board_refill_state_zero(void);
 extern int  next_hop4(float *mics_interleaved, float *ref, int *vad);   /* mics: [grid.hop][4] */
 extern void emit_hop(const float *out, int n);
 
@@ -170,64 +157,76 @@ int four_ulcnet_run(void) {
     cfg.residual = AEC_RESIDUAL_STATE;
     cfg.delay_mode = AEC_DELAY_MATCHED;  cfg.delay_num_filters = 5;  cfg.fixed_delay_samples = -1;
 
-    /* 2. 四塊各自的 pool:unit(array + helper)、stage、應用端的 far AcStft／輸出 AcIstft、adapter */
+    /* 2. 三塊各自的 pool:unit(array + helper)、模型串流、應用端的 far AcStft／輸出 AcIstft 與頻譜平面 */
     AecMemReq req;
     UlcnetModelIoDescriptor desc;
-    size_t aec_b, beam_b, stage_b = ulcnet_nn_stage_mem_size(&amp;grid), ad_bytes, ad_align;
-    if (ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc) != 0 ||
+    UlcnetStreamConfig scfg;
+    UlcnetStreamMemReq sreq;
+    size_t aec_b, beam_b;
+    memset(&amp;scfg, 0, sizeof(scfg));
+    scfg.grid = grid;
+    if (ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc) != 0 ||          /* 板端由匯出 metadata 填 */
+        ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc) != 0 ||
+        ulcnet_model_io_descriptor_frames(&amp;desc) != 1 ||
         aec_get_mem_requirements(&amp;cfg, &amp;req) != 0 ||
-        array_sample_beam_get_mem_size(&amp;cfg, &amp;bp, &amp;beam_b) != 0 || stage_b == 0 ||
-        ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;ad_bytes, &amp;ad_align) != 0) return -1;
+        array_sample_beam_get_mem_size(&amp;cfg, &amp;bp, &amp;beam_b) != 0 ||
+        ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq) != 0) return -1;
     aec_b = ALIGN16((size_t)req.bytes);
-    void *upool = NULL, *spool = NULL, *apool = NULL;
+    void *upool = NULL, *spool = NULL;
     if (posix_memalign(&amp;upool, req.alignment, aec_b + beam_b) != 0 ||
-        posix_memalign(&amp;spool, 16, stage_b) != 0 ||
-        posix_memalign(&amp;apool, ad_align, ad_bytes) != 0) return -1;     /* 範例省略已配置者的釋放 */
+        posix_memalign(&amp;spool, sreq.alignment, (size_t)sreq.bytes) != 0) return -1;     /* 範例省略已配置者的釋放 */
     Aec *aec = aec_init_ex(upool, aec_b, &amp;cfg, &amp;req);
     ArraySampleBeam *unit = NULL;
     if (aec)
         unit = array_sample_beam_init((unsigned char *)upool + aec_b, beam_b, &amp;cfg, &amp;bp, aec);
-    UlcnetNnStage *stage = ulcnet_nn_stage_init(spool, stage_b, &amp;grid);
-    /* 應用端的 framing:far 的 AcStft 與輸出 AcIstft(audiolib 預設，累加式合成)，各依 ac_*_get_mem_size() 配置 */
+    UlcnetStream *stream = ulcnet_stream_init_ex(&amp;scfg, spool, (size_t)sreq.bytes, &amp;sreq);
+    /* 應用端的 framing:far 的 AcStft 與輸出 AcIstft(audiolib 預設,累加式合成),各依 ac_*_get_mem_size() 配置 */
     AcStftConfig fcfg;
     ac_stft_config_default(&amp;fcfg, grid.n_fft);
     fcfg.ola = AC_OLA_ACCUMULATE;
     size_t stft_b = ac_stft_get_mem_size(&amp;fcfg), istft_b = ac_istft_get_mem_size(&amp;fcfg);
-    size_t spec_b = ALIGN16((size_t)grid.n_bins * sizeof(Complex));
+    size_t plane_b = ALIGN16((size_t)grid.n_bins * sizeof(float));
     void *fpool = NULL;
-    if (posix_memalign(&amp;fpool, 16, ALIGN16(stft_b) + ALIGN16(istft_b) + 2 * spec_b) != 0) return -1;
+    if (posix_memalign(&amp;fpool, 16, ALIGN16(stft_b) + ALIGN16(istft_b) + 6 * plane_b) != 0) return -1;
     unsigned char *cur = (unsigned char *)fpool;
     AcStft *far_stft = ac_stft_init(cur, stft_b, &amp;fcfg);   cur += ALIGN16(stft_b);
     AcIstft *istft = ac_istft_init(cur, istft_b, &amp;fcfg);   cur += ALIGN16(istft_b);
-    Complex *far_spec = (Complex *)cur;  cur += spec_b;
-    Complex *out_spec = (Complex *)cur;
-    UlcnetAcceleratorAdapter *adapter =
-        ulcnet_accelerator_adapter_init(apool, ad_bytes, &amp;desc, NULL, board_run_stateless, NULL);
-    if (!unit || !stage || !adapter || !far_stft || !istft ||
+    float *err_re = (float *)cur;  cur += plane_b;
+    float *err_im = (float *)cur;  cur += plane_b;
+    float *far_re = (float *)cur;  cur += plane_b;
+    float *far_im = (float *)cur;  cur += plane_b;
+    float *out_re = (float *)cur;  cur += plane_b;
+    float *out_im = (float *)cur;
+    if (!unit || !stream || !far_stft || !istft ||
         aec_hop_size(aec) != grid.hop || aec_hop_size(aec) + 1 != grid.n_bins)
         return -1;
-    board_bind_adapter(adapter);
-    UlcnetModel model = ulcnet_accelerator_adapter_model(adapter);
-    if (ulcnet_nn_stage_set_model(stage, &amp;model) != 0) return -1;
 
-    /* 3. 每個 hop:array + helper(delay、4 lane、SRP-PHAT、BF)-&gt; stage(BF 頻譜當 error 幀) */
+    /* 3. 每個 hop:array + helper(delay、4 lane、SRP-PHAT、BF)-&gt; 模型串流(BF 頻譜當 error 幀) */
     float mics[4 * 512], far[512], out[512];                /* &gt;= 4 * grid.hop、grid.hop */
     int vad;
     while (next_hop4(mics, far, &amp;vad)) {
-        ArraySampleBeamResult beam;  ArraySampleBeamInfo info;  UlcnetNnDelay delay;
+        ArraySampleBeamResult beam;  ArraySampleBeamInfo info;  UlcnetStreamDelay delay;
+        UlcnetHopIO io;
+        int pre = -1, ai_rc = -1;
         if (array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)
                 == AEC_OK) {
             delay.changed = info.delay.changed;  delay.solid = info.delay.solid;
-            (void)ac_stft_push(far_stft, far, far_spec);
-            if (ulcnet_nn_stage_begin_spec(stage, beam.spectrum, far_spec, delay) == 0 &amp;&amp;
-                ulcnet_nn_stage_process(stage, out_spec) == 0 &amp;&amp;
-                ac_istft_push(istft, out_spec, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
+            (void)ac_stft_push_planar(far_stft, far, far_re, far_im);
+            for (int k = 0; k &lt; grid.n_bins; ++k) { err_re[k] = beam.spectrum[k].r;  err_im[k] = beam.spectrum[k].i; }
+            pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &amp;io);
         }
-        array_sample_beam_reset(unit);  ulcnet_nn_stage_reset(stage);   /* 被拒:一起 reset，連同應用端的 STFT／ISTFT */
+        if (pre == 1) {
+            board_sync_state(io.state_generation);
+            ai_rc = board_run_stateless(&amp;io.inputs, &amp;io.outputs);
+            if (ai_rc != 0) board_refill_state_zero();
+        }
+        if (pre &gt;= 0 &amp;&amp; ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im) == 1 &amp;&amp;
+            ac_istft_push_planar(istft, out_re, out_im, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
+        array_sample_beam_reset(unit);  ulcnet_stream_reset(stream);   /* 被拒:一起 reset,連同應用端的 STFT／ISTFT */
         ac_stft_reset(far_stft);  ac_istft_reset(istft);
     }
     array_sample_beam_destroy(unit);  aec_destroy(aec);   /* 先 helper 再 array */
-    free(upool);  free(spool);  free(fpool);  free(apool);
+    free(upool);  free(spool);  free(fpool);
     return 0;
 }</pre>
 
@@ -235,82 +234,65 @@ int four_ulcnet_run(void) {
 <table>
 <tr><th>呼叫</th><th>成功</th><th>失敗／拒絕</th><th>呼叫端該做什麼</th></tr>
 <tr><td><code>ulcnet_grid_make()</code></td><td>0(<code>ULCNET_GRID_OK</code>,grid 已寫入)</td><td>負的狀態碼(取樣率、n_fft、delay_depth 不合法);grid 未動</td><td>修正 spec,不要 init</td></tr>
-<tr><td><code>*_get_mem_requirements()</code>、<code>*_mem_size()</code></td><td>0／大小</td><td>-1 或 0 大小(延遲組合被拒、<code>ulcnet_nn_stage_mem_size</code> 對無效 grid 回 0)</td><td>不要 init</td></tr>
-<tr><td><code>aec_init()</code>、<code>aec_init_ex()</code>(0／-1)、<code>array_sample_beam_init()</code>、<code>ulcnet_nn_stage_init()</code>、<code>ulcnet_accelerator_adapter_init()</code></td><td>物件指標</td><td>NULL:pool 未對齊(stage 要 16-byte,adapter 依 <code>alignment</code>)、太小、descriptor 或 state 登錄被拒、<code>_ex</code> 的 descriptor 不符</td><td>重新查大小並配置</td></tr>
-<tr><td><code>ulcnet_nn_stage_set_model()</code></td><td>0</td><td>-1:stage 為 NULL;<code>infer</code> 沒有 descriptor;descriptor 沒通過 <code>ulcnet_model_io_descriptor_validate()</code>(非 raw-far、D 超出 [2, 64]、格點不符);原本裝的模型保留</td><td>換模型後呼叫 <code>ulcnet_nn_stage_reset()</code>(不會自動 reset)</td></tr>
-<tr><td><code>ulcnet_nn_stage_begin_spec</code></td><td>0</td><td><code>INVALID_ARGUMENT</code>(-1:NULL)、<code>SEQUENCE_ERROR</code>(-2:上一 hop 沒 end_spec)</td><td>reset 前端 + stage + 應用端的 STFT／ISTFT</td></tr>
-<tr><td><code>ulcnet_nn_stage_nn_begin</code></td><td>1(幀已開)、0(本 hop 無模型幀)</td><td>-1／-2</td><td>reset 前端 + stage</td></tr>
-<tr><td><code>ulcnet_nn_stage_nn_end(rc)</code></td><td>0</td><td><code>rc != 0</code> 或輸出有非有限 bin 不是錯誤:該幀 identity;只有序列錯誤回 -2</td><td>不用 reset</td></tr>
-<tr><td><code>ulcnet_nn_stage_end_spec / _process</code></td><td>0;每次輸出整個頻譜(hop #0 也是)</td><td>-1(NULL)、-2(序列錯誤);沒有 DSP_ERROR(stage 不合成)。應用端 <code>ac_istft_push()</code> 回的不是整個 hop 時由應用端判定為失敗</td><td>reset 前端 + stage + 應用端的 STFT／ISTFT</td></tr>
-<tr><td><code>array_sample_beam_process*()</code></td><td><code>AEC_OK</code></td><td><code>AEC_ERR_ARG</code>(NULL／非有限樣本,狀態未動)、<code>AEC_ERR_SEQUENCE</code>(<code>process_beam</code> 沒有待處理的 front,未改)、<code>AEC_ERR_DSP</code>(lane 拒絕,array 已 reset)</td><td>reset helper + stage</td></tr>
-<tr><td>adapter 的 <code>run()</code></td><td>0</td><td>非 0:該幀 <code>frame_bypass</code>,state 不動(回報失敗的 runtime 視同沒寫);<code>frame_finish</code> 發現非有限:已登錄的 state 歸零、generation +1(板端未登錄,只加 generation)</td><td>定點加速器依 <code>ulcnet_accelerator_adapter_state_generation()</code> 重填量化 0</td></tr>
+<tr><td><code>*_get_mem_requirements()</code>、<code>*_get_mem_size()</code></td><td>0／大小</td><td>-1 或 0 大小(延遲組合被拒;<code>ulcnet_stream_get_mem_size()</code> 對無效 grid 或範圍外的 <code>frames_per_call</code> 回 -1,<code>req</code> 未動)</td><td>不要 init</td></tr>
+<tr><td><code>ulcnet_model_io_descriptor_validate()</code></td><td>0</td><td>-1:非 raw-far、layout 不符、D 超出 [2, 64]、格點不符</td><td>換成這個 grid 的 graph;不要 init</td></tr>
+<tr><td><code>aec_init()</code>、<code>aec_init_ex()</code>、<code>array_sample_beam_init()</code>、<code>ulcnet_stream_init_ex()</code></td><td>物件指標</td><td>NULL:pool 未對齊(串流依 <code>req.alignment</code>,16-byte)、太小、config 無效、<code>_ex</code> 的 descriptor 不符;被拒的 init 不動 pool</td><td>重新查大小並配置</td></tr>
+<tr><td><code>ulcnet_stream_pre_process_freq()</code></td><td>1(幀已開,<code>io</code> 有效)、0(本 hop 無模型幀:alignment 邊界後的 identity hop,<code>io</code> 全零)</td><td>-1:NULL 引數、上一 hop 還沒 <code>post_process_freq</code>、封包串流;串流未動</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
+<tr><td>加速器(<code>run_accelerator()</code>)</td><td>0(mask 寫滿)</td><td>非 0 不是錯誤:把它交給 <code>post_process_freq</code>,該幀 identity,generation 不動</td><td>定點加速器重填量化 0(state 可能寫了一半)</td></tr>
+<tr><td><code>ulcnet_stream_post_process_freq(ai_rc)</code></td><td>1;每次輸出整個頻譜(hop #0 也是)</td><td><code>ai_rc == 0</code> 但 mask 沒寫滿、mask 或增強頻譜有非有限值不是錯誤:該幀 identity、state generation +1。-1 只在 NULL 引數或沒有對應的 <code>pre_process_freq</code>(此時不寫輸出)</td><td>-1 時 reset 前端 + 串流 + 應用端的 STFT／ISTFT;generation 變了就重載量化 0</td></tr>
+<tr><td><code>ac_istft_push_planar()</code></td><td><code>grid.hop</code></td><td>回的不是整個 hop 時由應用端判定為失敗</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
+<tr><td><code>array_sample_beam_process*()</code></td><td><code>AEC_OK</code></td><td><code>AEC_ERR_ARG</code>(NULL／非有限樣本,狀態未動)、<code>AEC_ERR_SEQUENCE</code>(<code>process_beam</code> 沒有待處理的 front,未改)、<code>AEC_ERR_DSP</code>(lane 拒絕,array 已 reset)</td><td>reset helper + 串流</td></tr>
 </table>
 
-<h2 id="sequence">逐 hop 時序</h2><h2 id="section-5">1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>aec_init_ex()</code> 加 <code>array_sample_beam_init()</code>,stage 用 <code>ulcnet_nn_stage_mem_size(&amp;grid)</code>,應用端另備 <code>AcStft</code>／<code>AcIstft</code>)</h2>
-<pre>App(main.c)                 Aec                   UlcnetNnStage                 Adapter                   NPU run()
-  |                          |                          |                          |                          |
+<h2 id="sequence">逐 hop 時序</h2><h2 id="section-5">1. 初始化(mono;4ch 把 <code>Aec</code> 換成 <code>aec_init_ex()</code> 加 <code>array_sample_beam_init()</code>,串流同樣用 <code>ulcnet_stream_get_mem_size()</code>,應用端另備 <code>AcStft</code>／<code>AcIstft</code>)</h2>
+<pre>App(main.c)                 Aec                   UlcnetStream                                        NPU
+  |                          |                          |                                                 |
   | ulcnet_grid_make(&amp;grid, &amp;spec)   spec = {sample_rate, n_fft, delay_depth};delay_depth 必須等於匯出時的 D(範例 main:--sample-rate 選表的一列) |
   | aec_config_from_level(&amp;aec_cfg, BALANCED, grid.sample_rate) + fft_size = grid.n_fft / delay_* / residual = AEC_RESIDUAL_STATE(derive_lane())|
-  | ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)        取回該 grid 的契約(內部欄位為 0)                        |
-  |-- ulcnet_accelerator_adapter_get_mem_size(&amp;desc, &amp;bytes, &amp;align) -------------&gt;|                          |
-  |-- ulcnet_accelerator_adapter_init(pool, bytes, &amp;desc, NULL, run, user) -------------&gt;|                          |   (NULL = 板端不登錄 state)
-  |                          |                          |                          | ulcnet_prepost_init_ex -&gt; state 屬於應用端,不在 pool;NULL = 未對齊／太小／descriptor 或 state 登錄被拒
-  | aec_get_mem_size(&amp;aec_cfg)                          |                          |                          |
-  |-------------------------&gt;|                          |                          |                          |
-  | ulcnet_nn_stage_mem_size(&amp;grid)              (stage 無 STFT／ISTFT;framing 物件由應用端另外查大小)              |
-  |----------------------------------------------------&gt;|                          |                          |
-  | aec_init(pool, aec_b, &amp;aec_cfg)                     |                          |                          |
-  |-------------------------&gt;|                          |                          |                          |
-  |-- ulcnet_nn_stage_init(mem, stage_b, &amp;grid) -------------&gt;|                          |                          |
-  |                          |                          | ac_stft_init(far,持有 FftHandle 與視窗表) -&gt; [ac_stft_init(err)] -&gt; ac_istft_init;model 起始為 identity
-  |-- ulcnet_accelerator_adapter_model(adapter) ----------------------------------&gt;|                          |
-  |&lt;- UlcnetModel{user = adapter, infer, reset, io_descriptor} --------------------|                          |
-  |-- ulcnet_nn_stage_set_model(stage, &amp;model) --------&gt;|                          |                          |
-  | 0 | -1(infer 沒有 descriptor、或 descriptor 不是 raw-far／格點不符;原本裝的模型保留)                      |
-  |&lt;----------------------------------------------------|                          |                          |</pre>
+  | ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)        該 grid 的契約(板端由匯出 metadata 填)                |
+  | ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc) == 0 且 ulcnet_model_io_descriptor_frames(&amp;desc) == 1,否則不啟動 |
+  | aec_get_mem_size(&amp;aec_cfg)                          |                                                 |
+  |-------------------------&gt;|                          |                                                 |
+  | scfg.grid = grid;  ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq)      (framing 物件由應用端另外查大小)       |
+  |----------------------------------------------------&gt;|                                                 |
+  | aec_init(pool, aec_b, &amp;aec_cfg)                     |                                                 |
+  |-------------------------&gt;|                          |                                                 |
+  |-- ulcnet_stream_init_ex(&amp;scfg, mem, sreq.bytes, &amp;sreq) --&gt;|                                           |
+  |                          |                          | NULL = 未對齊／太小／config 無效／descriptor 不符;成功:generation 0,state 屬於應用端,不在 pool
+  | ac_stft_init(far) -&gt; [ac_stft_init(err)] -&gt; ac_istft_init   (應用端;AcStft 持有 FftHandle 與視窗表)   |
+  | 加速器的 state 載入量化 0                                                                             |
+  |----------------------------------------------------------------------------------------------------&gt;|</pre>
 
 <h2 id="section-6">2. 穩態 hop:mono</h2>
-<pre>App(main.c)                 Aec                   UlcnetNnStage          Adapter(model.infer)             NPU run()
-  |                          |                          |                          |                          |
+<pre>App(main.c)                 Aec                   UlcnetStream                                        NPU
+  |                          |                          |                                                 |
 -- 每個 hop(mic / ref / out 各 grid.hop 個 float) ----------------------------------------------------------------------
-  | aec_process_linear(aec, mic, ref); aec_process_residual(aec, NULL)              |                          |
-  |-------------------------&gt;|                          |                          |                          |
-  | aec_get_residual(aec, &amp;rctx);  aec_get_linear(aec, &amp;lctx)                       |                          |
-  |-------------------------&gt;|                          |                          |                          |
-  | delay.changed = (delay_state == CHANGED);  delay.solid = (delay_state != UNLOCKED)                        |
-  | ac_stft_push(err_stft, rctx.formed_hop, err_spec);  ac_stft_push(far_stft, ref, far_spec)   (應用端) |
-  | ulcnet_nn_stage_begin_spec(stage, err_spec, far_spec, delay)                   |                          |
-  |----------------------------------------------------&gt;|                          |                          |
-  |                          |                          | delay.changed 或 首次 solid:model.reset(user)(-&gt; ulcnet_prepost_reset)並武裝 reprime_frames = 1
-  |                          |                          | err_spec／far_spec 拆成平面 err_re／err_im、far_re／far_im(stage 內不做 STFT)
-  |                          |                          | reprime_frames &gt; 0 ? 遞減,本幀 identity(不 step 模型)  :  nn_wanted = 1
--- 路徑 A:ulcnet_nn_stage_process(stage, out_spec) = nn_begin + model.infer + nn_end + end_spec ----------------------------
-  |-- ulcnet_nn_stage_process(stage, out_spec) --------&gt;|                          |                          |
-  |                          |                          | model.infer(user, err_re, err_im, far_re, far_im, out_re, out_im)
-  |                          |                          |-------------------------&gt;|                          |
-  |                          |                          |                          | ulcnet_prepost_pre_process_freq -&gt; frame_open(K/V、logit、h_gru 視圖;output 預填 NaN)
-  |                          |                          |                          | run(run_user, &amp;inputs, &amp;outputs)    板端:跑前比對 state generation,變了就重載量化 0
-  |                          |                          |                          |-------------------------&gt;|
-  |                          |                          |                          | 0 = output 與四個 *_out 寫入原位址 | 非 0
-  |                          |                          |                          |&lt;-------------------------|
-  |                          |                          |                          | rc != 0 -&gt; frame_bypass,回 -1;frame_finish 驗證有限(失敗:已登錄的 state 歸零、generation +1、frame_bypass、回 -1);成功 -&gt; post_process_freq
-  |                          |                          |&lt;- 0 | -1 ----------------|                          |
--- 路徑 B:phased,呼叫端自己跑加速器(可以呼叫 adapter 的 model.infer,或自己的 NPU 程式) -----------------------------------
-  | ulcnet_nn_stage_nn_begin(stage, &amp;job)  -&gt;  1 | 0(reprime 幀)| &lt; 0              |                          |
-  |----------------------------------------------------&gt;|                          |                          |
-  |-- job.err_* / job.far_* -&gt; 加速器 -&gt; job.out_*(預填 NaN,每個 bin 都要寫) --------------------------------&gt;|
-  |-- ulcnet_nn_stage_nn_end(stage, rc) ---------------&gt;|                          |                          |
-  |                          |                          | rc == 0 且 ulcnet_frame_is_finite(out) 才採用,否則 identity(不是錯誤)
--- 收尾(兩條路徑相同) ----------------------------------------------------------------------------------------------------
-  | ulcnet_nn_stage_end_spec(stage, out_spec)   沒取走的幀 = identity(輸出 err_spec)  |                          |
-  |----------------------------------------------------&gt;|                          |                          |
-  |                          |                          | 採用的模型頻譜（否則 err_spec）寫入 out_spec，不合成
-  | 0 | SEQUENCE_ERROR(-2)| INVALID_ARGUMENT(-1)                                                       |
-  | ac_istft_push(istft, out_spec, out)   應用端合成:每 hop 回整個 hop(含 hop #0,AC_OLA_ACCUMULATE)   |
-  |&lt;----------------------------------------------------|                          |                          |</pre>
+  | aec_process_linear(aec, mic, ref); aec_process_residual(aec, NULL)                                    |
+  |-------------------------&gt;|                          |                                                 |
+  | aec_get_residual(aec, &amp;rctx);  aec_get_linear(aec, &amp;lctx)                                             |
+  |-------------------------&gt;|                          |                                                 |
+  | delay.changed = (delay_state == CHANGED);  delay.solid = (delay_state != UNLOCKED)                    |
+  | ac_stft_push_planar(err_stft, rctx.formed_hop, err_re, err_im);  ac_stft_push_planar(far_stft, ref, far_re, far_im)   (應用端) |
+  | ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &amp;io)                    |
+  |----------------------------------------------------&gt;|                                                 |
+  |                          |                          | delay.changed 或 首次 solid:ulcnet_prepost_reset(state generation +1)並武裝 reprime = 1
+  |                          |                          | ulcnet_prepost_pre_process_freq:前端特徵(error_mag、far_mag、error_cos、error_sin)
+  |                          |                          | reprime &gt; 0 ? 遞減,frame_bypass,io 清零,回 0  :  frame_open(mask 預填 NaN),回 1
+  |&lt;- 1(io.inputs、io.outputs、io.state_generation)| 0(reprime 幀)| -1 ---|                              |
+-- 回 1 時:呼叫端跑加速器 ----------------------------------------------------------------------------------------------
+  | io.state_generation 與上次不同 -&gt; 重載量化 0                                                          |
+  |-- io.inputs.* -&gt; 加速器 -&gt; io.outputs.output(每個值都要寫);ai_rc = 0 | 非 0 ----------------------&gt;|
+-- 收尾 ----------------------------------------------------------------------------------------------------------------
+  | ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im)                                        |
+  |----------------------------------------------------&gt;|                                                 |
+  |                          |                          | ai_rc == 0:frame_finish 驗證 mask 與增強頻譜有限(失敗:generation +1、frame_bypass)
+  |                          |                          | ai_rc != 0:frame_bypass;reprime 幀已在 pre 內 bypass
+  |                          |                          | 採用的增強頻譜（否則 err）寫入 out_re／out_im，不合成
+  | 1 | -1(NULL、沒有對應的 pre)                                                                          |
+  | ac_istft_push_planar(istft, out_re, out_im, out)   應用端合成:每 hop 回整個 hop(含 hop #0,AC_OLA_ACCUMULATE) |</pre>
 
 <h2 id="section-7">3. 穩態 hop:4ch(直送路徑)</h2>
-<pre>App(main.c)          ArraySampleBeam            Aec (array)             UlcnetNnStage          Adapter → NPU
+<pre>App(main.c)          ArraySampleBeam            Aec (array)             UlcnetStream                      NPU
   |                          |                          |                          |                          |
 -- 每個 hop(mics = [grid.hop][4] interleaved,far / out 各 grid.hop 個 float) -----------------------------------------
   | array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)                       |
@@ -320,40 +302,36 @@ int four_ulcnet_run(void) {
   |                          | doa_step -&gt; bf_process_with_weights;不 fuse(residual = STATE);此鏈沒有 RES        |
   | AEC_OK;beam.spectrum(BF 後頻譜)、info.delay.{changed, solid}                   |                          |
   |&lt;-------------------------|                          |                          |                          |
-  | ac_stft_push(far_stft, far, far_spec)  (應用端)                                  |                          |
-  | ulcnet_nn_stage_begin_spec(stage, beam.spectrum, far_spec, {changed, solid})   |                          |
+  | ac_stft_push_planar(far_stft, far, far_re, far_im);  err_re／err_im ← beam.spectrum  (應用端;不重建、不再分析) |
+  | ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, {changed, solid}, &amp;io)          |
   |-------------------------------------------------------------------------------&gt;|                          |
-  |                          |                          | beam.spectrum 直接拆成 err_re / err_im(不重建、不再分析);far 的分析在應用端
-  |                          |                          | delay.changed 或 首次 solid:model.reset + reprime_frames = 1;其餘同 mono
-  | ulcnet_nn_stage_process(stage, out_spec) | nn_begin / nn_end / end_spec          |                          |
-  |-------------------------------------------------------------------------------&gt;|                          |
-  |                          |                          | model.infer(...) -&gt; run(...) -&gt; NPU(與 mono 完全相同)
-  |                          |                          |------------------------------------------------&gt;|
-  |&lt;- 0;out = 一個 hop(hop #0 也是整個 hop) ---------------------------------------------------|                          |
+  |                          |                          | delay.changed 或 首次 solid:state generation +1 + reprime = 1;其餘同 mono
+  | 回 1 -&gt; 加速器(io.inputs -&gt; io.outputs.output) -&gt; ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im) |
+  |-------------------------------------------------------------------------------&gt;|-------------------------&gt;|
+  | ac_istft_push_planar(istft, out_re, out_im, out):out = 一個 hop(hop #0 也是整個 hop)                     |
 -- 拆開形式(需要用 lane 頻譜算 mask / VAD 時) ----------------------------------------------------------------------------
   | array_sample_beam_process_front(unit, mics, far, &amp;front)       front.lane_error_spec[4] 唯讀              |
   |-------------------------&gt;|                          |                          |                          |
   | 由 front.lane_error_spec[0] 算 mask(n_freqs 個 int)與 vad_raw / vad_out         |                          |
   | array_sample_beam_process_beam(unit, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)                       |
   |-------------------------&gt;|                          |                          |                          |
-  |                          | 沒有待處理的 front 時回 AEC_ERR_SEQUENCE;之後 begin_spec 與上面相同           |</pre>
+  |                          | 沒有待處理的 front 時回 AEC_ERR_SEQUENCE;之後 pre_process_freq 與上面相同     |</pre>
 
 <h2 id="section-8">4. 失敗與 reset</h2>
-<pre>App(main.c)             Aec | helper               UlcnetNnStage                 Adapter                      NPU
-  |                          |                          |                          |                          |
+<pre>App(main.c)             Aec | helper               UlcnetStream                                        NPU
+  |                          |                          |                                                 |
 -- 任何一步回負值(process_hop 回 -1) -------------------------------------------------------------------------------------
-  | aec_reset(aec)  |  array_sample_beam_reset(unit)(連帶 array、lane、estimator、SRP/BF)   |                          |
-  |-------------------------&gt;|                          |                          |                          |
-  |-- ulcnet_nn_stage_reset(stage) --------------------&gt;|                          |                          |
-  |                          |                          | last_delay、frame_index、phase、reprime_frames 清零;安裝的模型保留（STFT／ISTFT 由應用端另外 reset）
-  |                          |                          |-- model.reset(user) ----&gt;|                          |
-  |                          |                          |                          | ulcnet_prepost_reset:已登錄的 state 歸零(板端未登錄:無),ulcnet_accelerator_adapter_state_generation() +1
-  |                          |                          |                          | 定點加速器自己的 state 緩衝:generation 變了就填量化後的 0(板端 run() 內做)
-  |                          |                          |                          |-------------------------&gt;|
+  | aec_reset(aec)  |  array_sample_beam_reset(unit)(連帶 array、lane、estimator、SRP/BF)                |
+  |-------------------------&gt;|                          |                                                 |
+  |-- ulcnet_stream_reset(stream) ---------------------&gt;|                                                 |
+  |                          |                          | 開著的 hop 丟棄、alignment 記帳與 reprime 清零;ulcnet_prepost_reset:state generation +1
+  | ac_stft_reset／ac_istft_reset(應用端的 framing 由應用端另外 reset)                                    |
+  | 下一次跑加速器前:io.state_generation 變了,定點加速器自己的 state 緩衝填量化後的 0                    |
+  |----------------------------------------------------------------------------------------------------&gt;|
 -- 不是錯誤、不要 reset --------------------------------------------------------------------------------------------------
-  | nn_end(rc != 0)或輸出有非有限 bin:該幀 identity;adapter 的 frame_finish 拒絕時 state generation +1(已登錄的 state 歸零)                 |
-  | alignment 邊界(CHANGED／首次 solid):stage 在 begin 內自己 model.reset + reprime,不需要 App 動作           |</pre>
-<p>alignment 邊界(<code>CHANGED</code>，或 FIXED 首次 <code>UNLOCKED → LOCKED</code>)之後有 <code>ULCNET_NN_STAGE_REPRIME_FRAMES</code>(= 1)個發射幀走 identity 且不呼叫模型;推導與兩個 grid 的實測見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>。</p>
+  | ai_rc != 0:該幀 identity,generation 不動;mask 沒寫滿或 mask／增強頻譜有非有限值:該幀 identity,state generation +1 |
+  | alignment 邊界(CHANGED／首次 solid):串流在 pre_process_freq 內自己重啟模型 state + reprime,不需要 App 動作      |</pre>
+<p>alignment 邊界(<code>CHANGED</code>，或 FIXED 首次 <code>UNLOCKED → LOCKED</code>)之後有 <code>ULCNET_STREAM_REPRIME_FRAMES</code>(= 1)個發射幀走 identity 且沒有模型幀;推導與兩個 grid 的實測見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>。</p>
 </main>
 </body>
 </html>

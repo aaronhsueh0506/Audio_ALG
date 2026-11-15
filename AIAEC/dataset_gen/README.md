@@ -632,7 +632,7 @@ residual.
 **Training and C inference read the same signal.** The board pipelines feed the
 network the analysis seam, not the rendering base: `mono_alignulcnet` passes
 `AecResidualView.formed_hop` to its own `AcStft` and hands that spectrum to
-`ulcnet_nn_stage_begin_spec()`, and the Python `LinearAecEngine` returns
+`ulcnet_stream_pre_process_freq()`, and the Python `LinearAecEngine` returns
 `get_formed_output()`. The rendering base (`aec_get_residual().base_spec`, error or
 capture depending on the guard) exists for consumers that render audio as
 `base_spec * gain`; it does not pair with `formed_hop` and must never be

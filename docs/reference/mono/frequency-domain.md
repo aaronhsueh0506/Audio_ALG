@@ -110,8 +110,8 @@ out      = ac_istft_push(spec)                one iFFT/OLA per hop
 
 The frame is valid until its producer runs again and is never written through.
 Stages that run a neural model are split around the model call
-(`ulcnet_nn_stage_begin_spec` / `dfn_hop_begin`, `nn_begin`, caller runs the NPU, `nn_end`, `ulcnet_nn_stage_end_spec` / `dfn_hop_end`; the ULCNet stage takes and returns spectra and the application runs its own `AcStft` / `AcIstft`);
-a failed, non-finite or never-fetched model frame takes the identity, so the
+(DFN2: `dfn_hop_begin`, `nn_begin`, caller runs the NPU, `nn_end`, `dfn_hop_end`; Align-ULCNet: `ulcnet_stream_pre_process_freq`, caller runs the NPU, `ulcnet_stream_post_process_freq`, with spectra in and out and the application's own `AcStft` / `AcIstft`);
+a failed or non-finite model frame, and one the caller never ran, takes the identity, so the
 output timing does not depend on the model's health. There is no function-pointer
 table: the call order is part of each application's source.
 
