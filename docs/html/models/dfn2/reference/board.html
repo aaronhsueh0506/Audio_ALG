@@ -94,16 +94,18 @@ ainr_postprocess(ctx, ret == OK ? 0 : -1, pcm_out);</code></pre>
 <p>起始時 sample 先載入一次量化零，再把 <code>g_state_gen_seen</code> 設成 <code>ainr_state_generation(ctx)</code>。失敗的那一拍輸出近恆等直通，不是靜音；回復發生在下一次送件前。</p>
 
 <h2 id="samples">板端 sample 的接線</h2>
-<p>板端 sample 是本庫以外的檔案（<code>audio_sample</code>），本庫沒有建置它們，也沒有目標板 SDK。AI3 的接線程式——開圖、設定緩衝、加速器執行呼叫、讀回、cache flush——是板端負責人的程式，原版不改；我方只加模型設定與共用接線（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/common/graph_io.h</code>）這一側。本庫提供 <code>ainr_*</code> 與 SDK 無關的檢查器 <code>stream_check_ports()</code>。四支 sample 的 stream 端接線一致：</p>
+<p>板端 sample 是本庫以外的檔案（<code>audio_sample</code>），本庫沒有建置它們，也沒有目標板 SDK。AI3 的接線程式——開圖、設定緩衝、加速器執行呼叫、讀回、cache flush——是板端負責人的程式，原版不改；我方只加模型設定與共用接線（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/common/graph_io.h</code>）這一側。本庫提供 <code>ainr_*</code> 與 SDK 無關的檢查器 <code>stream_check_ports()</code>。五支 sample 的 stream 端接線一致：</p>
 <table>
 <thead><tr><th>sample</th><th>使用的入口</th><th>啟動</th></tr></thead>
 <tbody>
 <tr><th><code>alg_ai3_dfn.c</code>（full）</th><td><code>ainr_*</code>（PCM）</td><td>一個 host 端初始化函式依序做 size、pool、<code>ainr_init()</code>，由 config 算 N，查 <code>stream/ainr/graph_io_dfn2.h</code> 的列；開圖後埠檢查，再用 <code>ainr_state_generation()</code> 設同步起點；組態被拒或查無列時結束碼 1，未執行加速器</td></tr>
 <tr><th><code>alg_ai3_dfn_lite.c</code>（lite）</th><td>同上</td><td>同上；只登錄 48000／1024／512</td></tr>
 <tr><th><code>uvc_ai_nr_stream.c</code></th><td><code>ainr_*</code>（PCM）</td><td>固定 48000／1024／512；模型設定查不到該列時拒絕；開圖後埠檢查</td></tr>
-<tr><th><code>uvc_audio_live2a.c</code></th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td>固定 48000／1024／512；同樣查列；開圖後埠檢查</td></tr>
+<tr><th><code>alg_ai3_aec_dfn.c</code>（full）</th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td><code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 給模型 grid（N=1），SDK 呼叫之前做 size、pool、<code>ainr_init_freq()</code>；host 取樣率（<code>--sr</code>）不是模型的取樣率時另建 <code>AinrBridge</code>；查 full 的列；開圖後埠檢查。模型檔由 sample 依量化選項自己選</td></tr>
+<tr><th><code>uvc_audio_live2a.c</code></th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td>固定 48000／1024／512，16 kHz 的 pipeline 經 <code>AinrBridge</code>；同樣查列；開圖後埠檢查</td></tr>
 </tbody></table>
-<p>四支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都有「待回復」旗標（見上節），也都沒有 job_ready 分支：每次成功的 pre 都接一次 AI3 執行與一次 post。保留 full 的 alpha 對應與既有的數值處理。</p>
+<p>五支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都有「待回復」旗標（見上節），也都沒有 job_ready 分支：每次成功的 pre 都接一次 AI3 執行與一次 post。保留 full 的 alpha 對應與既有的數值處理。</p>
+<p>兩支 <code>_freq</code> sample 每個 hop 的 DFN2 步驟（橋接時是 <a href="bridge.html">AinrBridge</a> 的 frame 迴圈）有兩種失敗：AI3 執行或讀回失敗時，該 frame 以失敗狀態交給 <code>ainr_postprocess_freq()</code>，輸出近恆等，鏈不重置；<code>ainr_preprocess_freq()</code> 拒絕該包（非有限或超界的 bin）、橋接器或呼叫順序出錯時，該 hop 輸出全零，並在同一個 hop 重置 AEC、<code>ainr_reset_freq()</code> 與 <code>ainr_bridge_reset()</code>（直接路徑另清 sample 自己的合成），下一個 hop 從全新狀態開始，和啟動時相同：輸出先有一段零（橋接時約為 added delay），AEC 重新收斂。</p>
 <p>本庫未驗證的部分：正式量化後的 <code>model.bin</code>、目標板 SDK 的建置、板上的 descriptor 實值、音訊與每 hop 耗時。</p>
 
 <h2>參考</h2>
