@@ -3,6 +3,10 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — `DfnResStage` refuses a block with a bin beyond 2^63 (model scale), like `dfn2_stream_pre_process_freq_dual`
+
+`dfn_res_stage_begin()` only checked that the two input spectra were finite. A finite bin whose product with `dfn2_stft_scale(n_fft)` exceeds 2^63 (re^2 + im^2 no longer fits a float) was taken, put Inf into the feature normaliser, and every later hop then ran on poisoned features until reset (a model fed Inf/NaN produces non-finite heads, so each frame was a refused commit). The input check is now the one the stream layer applies: every bin times `dfn2_stft_scale(n_fft)` must be finite and at most 2^63 in magnitude, or the whole block is refused (`begin` returns -1) before a frame is consumed, with the pool, the counters and the state generation untouched. A normal signal is far below the limit, so nothing else changes. `pipelines/dfn/tests/test_dfn_res_stage.c` gains a row: one 1e21 bin among 80 normal hops took 81 frames as identity and moved the state generation 2 -> 83 before the change, and is refused alone (0 identity frames, generation 2 -> 2) after it; the four spectrum components in both signs are refused with every pool byte unchanged, and the limit is pinned on the scaled value (2x the limit refused, 0.75x taken). The check is local to `dfn_res_stage.c` (no new include path for the board build).
+
 ## [Unreleased] — 2026-11-15 — The stream graph port tables renamed `ai3_model_io*` -> `graph_io*` (no behaviour change)
 
 Rename only. The lib `<model>_model_io` (CPU-side graph-boundary adapter) and the stream per-(model, grid, N) graph port table shared a word; the stream side is now `graph_io`, and the `ai3_` prefix (a target-SDK mark, not a library prefix) is gone from `stream/`. The `cc -E -P` output of every `stream/` and `pipelines/` source and test is identical to the old tree after the identifiers are mapped back, the non-test objects are identical, and both `dump_graph_io` dumpers print what the old ones printed.

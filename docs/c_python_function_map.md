@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 257 | 47 | 29 | 18 | 210 | 0 | 55 | 16 |
+| `PL` pipelines（common、mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 258 | 47 | 29 | 18 | 211 | 0 | 55 | 16 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 295 | 39 | 19 | 20 | 256 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 145 | 48 | 25 | 23 | 97 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 106 | 35 | 20 | 15 | 71 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 864 | 169 | 93 | 76 | 695 | 0 | 57 | 60 |
+| `TOTAL` 合計 | 865 | 169 | 93 | 76 | 696 | 0 | 57 | 60 |
 <!-- map:stats:end -->
 
-讀法：864 個 C 函式中，169 個有 Python 對應（mirror 93、partial 76），其中 60 個的配對是推論；695 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：865 個 C 函式中，169 個有 Python 對應（mirror 93、partial 76），其中 60 個的配對是推論；696 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -126,7 +126,7 @@
 | `pipelines/mono/aec_nr_res/main.c` | all | 21 |
 | `pipelines/dfn/dfn_example_args.h` | all | 10 |
 | `pipelines/dfn/dfn_rate_bridge.c` | all | 32 |
-| `pipelines/dfn/dfn_res_stage.c` | all | 26 |
+| `pipelines/dfn/dfn_res_stage.c` | all | 27 |
 | `pipelines/dfn/dfn_unit_partition.h` | all | 1 |
 | `pipelines/mono/aec_dfn_res/main.c` | all | 9 |
 | `pipelines/4ch/array_sample_beam.c` | all | 23 |
@@ -197,7 +197,7 @@
 | PL-DFN-03 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |
 | PL-DFN-04 | `pipelines/dfn/dfn_res_stage.c: erb_inv_is_partition_of_unity` | `pipelines/dfn/dfn2_stage.py:erb_inv_is_partition_of_unity`<br>`AINR/DeepFilterNet2/export_erb_matrix.py:require_partition_of_unity` | mirror | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | identity（fail-open）路徑的前提：單位 band mask 展開後每個 bin 恰為 1.0。 |
 | PL-DFN-05 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput` 欄位。 |
-| PL-DFN-06 | `pipelines/dfn/dfn_res_stage.c: align_up, carve, fnv1a_u32, backend_id, model_valid, resolve, fill_descriptor, dfn_res_stage_default_config, dfn_res_stage_get_mem_requirements, descriptor_matches, dfn_res_stage_init_ex, dfn_res_stage_init, dfn_res_stage_create, dfn_res_stage_destroy, dfn_res_stage_get_counters, dfn_res_stage_grid, dfn_res_stage_state_generation, inputs_valid` | — | C-only | — | — | 描述子、記憶體池、counters；`dfn_res_stage_state_generation` 是模型遞迴狀態的重啟計數（stage 不註冊狀態，持有狀態的模型回呼在值改變時重載零）；`inputs_valid` 在 begin 前掃兩個輸入頻譜是否有限，Python 的 `Dfn2Stage.push` 只檢查 heads 輸出端（fail-open 的觸發條件），沒有輸入端掃描。 |
+| PL-DFN-06 | `pipelines/dfn/dfn_res_stage.c: align_up, carve, fnv1a_u32, backend_id, model_valid, resolve, fill_descriptor, dfn_res_stage_default_config, dfn_res_stage_get_mem_requirements, descriptor_matches, dfn_res_stage_init_ex, dfn_res_stage_init, dfn_res_stage_create, dfn_res_stage_destroy, dfn_res_stage_get_counters, dfn_res_stage_grid, dfn_res_stage_state_generation, spectrum_in_range, inputs_valid` | — | C-only | — | — | 描述子、記憶體池、counters；`dfn_res_stage_state_generation` 是模型遞迴狀態的重啟計數（stage 不註冊狀態，持有狀態的模型回呼在值改變時重載零）；`inputs_valid` 在 begin 前掃兩個輸入頻譜：每個 bin 乘 `dfn2_stft_scale` 後必須有限且不超過 2^63（與 `dfn2_stream_pre_process_freq_dual` 同一上限，`spectrum_in_range` 為逐 bin 檢查），超過就整個 block 拒絕、不消耗 frame；Python 的 `Dfn2Stage.push` 只檢查 heads 輸出端（fail-open 的觸發條件），沒有輸入端掃描。 |
 | PL-DFN-07 | `pipelines/dfn/dfn_rate_bridge.c: dfn_rate_bridge_process, dfn_rate_bridge_begin, dfn_rate_bridge_nn_begin, dfn_rate_bridge_nn_end, dfn_rate_bridge_finish, push_up, finish_frame` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.push` | mirror | D-24 | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | 兩邊用同一個 C resampler 核心，只剩 FFT 後端差；容差 float32 round-off，prefill／added delay 為相同整數。 |
 | PL-DFN-08 | `pipelines/dfn/dfn_rate_bridge.c: calibrate_prefill` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge._calibrate_prefill` | mirror | — | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | — |
 | PL-DFN-09 | `pipelines/dfn/dfn_rate_bridge.c: dfn_rate_bridge_reset, clear_streams` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.reset` | mirror | — | — | — |

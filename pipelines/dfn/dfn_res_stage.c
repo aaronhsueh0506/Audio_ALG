@@ -281,11 +281,30 @@ void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
     if (skips) *skips = s ? s->skips : 0;
 }
 
-/* Scans both spectra for finite values before they reach the recurrent state. */
-static int inputs_valid(const Complex *estimate, const Complex *apply, int n_bins) {
+/* Largest |bin * dfn2_stft_scale| accepted, IEEE bits of 2^63 (re^2 + im^2 stays below FLT_MAX); the
+ * limit dfn2_stream_pre_process_freq_dual applies. A larger or non-finite bin would put Inf/NaN into
+ * the feature normaliser until reset, so the block is refused before it is consumed. */
+#define STAGE_BIN_LIMIT_BITS 0x5F000000u
+
+static int spectrum_in_range(const Complex *x, int n_bins, float scale) {
+    int k;
+    for (k = 0; k < n_bins; ++k) {
+        float m[2];
+        uint32_t bits[2];
+        m[0] = x[k].r * scale;
+        m[1] = x[k].i * scale;
+        memcpy(bits, m, sizeof bits);
+        if ((bits[0] & 0x7FFFFFFFu) > STAGE_BIN_LIMIT_BITS ||
+            (bits[1] & 0x7FFFFFFFu) > STAGE_BIN_LIMIT_BITS)
+            return 0;
+    }
+    return 1;
+}
+
+static int inputs_valid(const Complex *estimate, const Complex *apply, int n_bins, float scale) {
     if (!estimate || !apply) return 0;
-    return skn_all_finite_cf32(estimate, n_bins) &&
-           skn_all_finite_cf32(apply, n_bins);
+    return spectrum_in_range(estimate, n_bins, scale) &&
+           spectrum_in_range(apply, n_bins, scale);
 }
 
 int dfn_res_stage_begin(DfnResStage *s,
@@ -296,7 +315,8 @@ int dfn_res_stage_begin(DfnResStage *s,
     const DFN2Grid *grid;
     if (!s || !job || s->phase != 0) return -1;
     grid = dfn2_prepost_grid(s->prepost);
-    if (!grid || !inputs_valid(estimate_spec, apply_spec, grid->n_bins)) return -1;
+    if (!grid || !inputs_valid(estimate_spec, apply_spec, grid->n_bins,
+                               dfn2_stft_scale(grid->n_fft))) return -1;
 
     skn_deinterleave_scale_cf32(estimate_spec, s->est_re, s->est_im,
                                 grid->n_bins, dfn2_stft_scale(grid->n_fft));

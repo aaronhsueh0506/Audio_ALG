@@ -746,6 +746,124 @@ static int run_refused_calls(void) {
     return rc;
 }
 
+/* A bin too large for the feature power is refused like a non-finite one: the block is rejected
+ * before it reaches the normaliser, so the stage is untouched and every later hop is normal. The
+ * limit is the one dfn2_stream_pre_process_freq_dual applies (|bin * dfn2_stft_scale| <= 2^63, so
+ * re^2 + im^2 stays finite in float). Row A: one 1e21 bin among normal hops, with the model
+ * committing every real frame unless its input window is non-finite; it prints how many of the later hops committed. Row B: each of
+ * the four spectrum components, both signs, is refused with the counters, the state generation and
+ * every byte of the caller's pool as they were. */
+#define LARGE_HOPS 80
+#define LARGE_WARM 4
+
+/* The identity heads, except that a non-finite input window yields a non-finite mask, as a network
+ * fed Inf/NaN does: the commit then refuses the frame. A normaliser poisoned by one large bin shows
+ * up as every later hop refused. */
+static int input_checking_infer(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
+    size_t i;
+    int rc = dfn_fixture_identity_infer(user, in, out);
+    for (i = 0; i < in->erb_window_elements; ++i)
+        if (!isfinite(in->erb_window[i])) out->erb_mask[0] = (float)NAN;
+    for (i = 0; i < in->spec_window_elements; ++i)
+        if (!isfinite(in->spec_window[i])) out->erb_mask[0] = (float)NAN;
+    return rc;
+}
+
+static int run_large_bin_refused(void) {
+    DFN2ModelIoDescriptor descriptor;
+    DfnResStageConfig cfg = base_config();
+    DfnResStageMemReq req;
+    Complex estimate[DFN2_N_BINS], apply[DFN2_N_BINS], out[DFN2_N_BINS];
+    unsigned char *snapshot;
+    void *mem = NULL;
+    DfnResStage *s;
+    long long frames0 = -1, frames1 = -1, commits = 0, skips = 0;
+    unsigned int gen0, gen1;
+    int frame, k, big_rc, rc = 0;
+
+    if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
+    cfg.model.infer = input_checking_infer;
+    cfg.model.io_descriptor = &descriptor;
+    if (dfn_res_stage_get_mem_requirements(&cfg, &req) != 0) return 2;
+    if (posix_memalign(&mem, (size_t)req.alignment, (size_t)req.bytes) != 0) return 3;
+    snapshot = (unsigned char *)malloc((size_t)req.bytes);
+    if (!snapshot) { free(mem); return 4; }
+
+    /* Row A */
+    s = dfn_res_stage_init(mem, (size_t)req.bytes, &cfg);
+    if (!s) { free(snapshot); free(mem); return 5; }
+    for (frame = 0; frame < LARGE_WARM; ++frame) {
+        fill_frame(estimate, apply, frame);
+        if (dfn_res_stage_process(s, estimate, apply, out) < 0) rc = 6;
+    }
+    gen0 = dfn_res_stage_state_generation(s);
+    fill_frame(estimate, apply, LARGE_WARM);
+    estimate[7].r = 1e21f;   /* the estimate spectrum feeds the normaliser */
+    big_rc = dfn_res_stage_process(s, estimate, apply, out);
+    for (frame = 0; frame < LARGE_HOPS; ++frame) {
+        fill_frame(estimate, apply, LARGE_WARM + 1 + frame);
+        if (dfn_res_stage_process(s, estimate, apply, out) < 0) rc = rc ? rc : 7;
+    }
+    gen1 = dfn_res_stage_state_generation(s);
+    dfn_res_stage_get_counters(s, NULL, &commits, &skips);
+    printf("dfn_res_stage: one 1e21 bin, then %d normal hops: block %s, frames taken as "
+           "identity %lld, state generation %u -> %u\n", LARGE_HOPS,
+           big_rc < 0 ? "refused" : "accepted", skips, gen0, gen1);
+    if (!rc && big_rc != -1) rc = 8;
+    if (!rc && skips != 0) rc = 9;
+    if (!rc && commits != (long long)(LARGE_WARM - M_FRAMES + LARGE_HOPS)) rc = 10;
+    if (!rc && gen1 != gen0) rc = 11;
+    for (k = 0; !rc && k < DFN2_N_BINS; ++k)
+        if (!isfinite(out[k].r) || !isfinite(out[k].i)) rc = 12;
+    dfn_res_stage_destroy(s);
+    if (rc) { free(snapshot); free(mem); return rc; }
+
+    /* Row B */
+    s = dfn_res_stage_init(mem, (size_t)req.bytes, &cfg);
+    if (!s) { free(snapshot); free(mem); return 13; }
+    for (frame = 0; frame < LARGE_WARM; ++frame) {
+        fill_frame(estimate, apply, frame);
+        if (dfn_res_stage_process(s, estimate, apply, out) < 0) rc = 14;
+    }
+    fill_frame(estimate, apply, LARGE_WARM);
+    for (k = 0; k < DFN2_N_BINS; ++k) { out[k].r = 7.0f; out[k].i = -7.0f; }
+    memcpy(snapshot, mem, (size_t)req.bytes);
+    dfn_res_stage_get_counters(s, &frames0, NULL, NULL);
+    gen0 = dfn_res_stage_state_generation(s);
+    for (k = 0; !rc && k < 8; ++k) {
+        Complex *spec = (k & 2) ? estimate : apply;
+        float *comp = (k & 1) ? &spec[100].i : &spec[100].r;
+        float saved = *comp;
+        *comp = (k & 4) ? -1e21f : 1e21f;
+        if (dfn_res_stage_process(s, estimate, apply, out) != -1) rc = 15;
+        *comp = saved;
+        dfn_res_stage_get_counters(s, &frames1, NULL, NULL);
+        if (!rc && frames1 != frames0) rc = 16;
+        if (!rc && dfn_res_stage_state_generation(s) != gen0) rc = 17;
+        if (!rc && memcmp(snapshot, mem, (size_t)req.bytes) != 0) rc = 18;
+        if (!rc && (out[5].r != 7.0f || out[5].i != -7.0f)) rc = 19;
+    }
+    if (!rc) {   /* the limit is on the model-scale value: twice it is refused, three quarters of it is taken */
+        float limit_audio = 9.223372036854775808e18f / dfn2_stft_scale(dfn_test_grid()->n_fft);
+        float saved = estimate[100].r;
+        estimate[100].r = 2.0f * limit_audio;
+        if (dfn_res_stage_process(s, estimate, apply, out) != -1) rc = 22;
+        if (!rc && memcmp(snapshot, mem, (size_t)req.bytes) != 0) rc = 23;
+        estimate[100].r = 0.75f * limit_audio;
+        if (!rc && dfn_res_stage_process(s, estimate, apply, out) < 0) rc = 24;
+        estimate[100].r = saved;
+        if (!rc) dfn_res_stage_reset(s);
+        if (!rc) frames0 = 0;
+    }
+    if (!rc && dfn_res_stage_process(s, estimate, apply, out) < 0) rc = 20;   /* the next hop is normal */
+    dfn_res_stage_get_counters(s, &frames1, NULL, NULL);
+    if (!rc && frames1 != frames0 + 1) rc = 21;
+    dfn_res_stage_destroy(s);
+    free(snapshot);
+    free(mem);
+    return rc;
+}
+
 /* Generation of the model's recurrent state: 1 after init, plus one per reset, one per warm-up frame
  * (whatever the model wrote) and one per refused commit of a real frame (a head the commit finds
  * non-finite); a model that reports failure and a committed real frame leave it alone. */
@@ -1049,6 +1167,8 @@ int main(void) {
     if (rc) { fprintf(stderr, "stale-pool gate failed: %d\n", rc); return 1; }
     rc = run_refused_calls();
     if (rc) { fprintf(stderr, "refused-call row failed: %d\n", rc); return 1; }
+    rc = run_large_bin_refused();
+    if (rc) { fprintf(stderr, "large-bin row failed: %d\n", rc); return 1; }
     rc = run_state_generation();
     if (rc) { fprintf(stderr, "state-generation row failed: %d\n", rc); return 1; }
     for (rc = 0; rc < 5; ++rc) {
