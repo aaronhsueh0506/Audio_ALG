@@ -470,7 +470,7 @@ test: test-third-party test-array-sample-driver \
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 48000
 # The DFN2 model grid is a run-time choice (--ai-sample-rate / --ai-fft-size, see dfn/dfn_example_args.h):
-# the host on the model's own rate runs the stage directly at that grid, any other host rate needs the
+# the host on the model's own rate runs the model stream directly at that grid, any other host rate needs the
 # bridge (48 kHz / 1024 model only: pool query rejected, exit 1), a pair outside the table is exit 2.
 	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the model stream on the host grid"
 	sh ../scripts/test_cli_exit_codes.sh 4ch_aec_bf_dfn_res "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"

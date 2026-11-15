@@ -343,7 +343,7 @@ static int phased(Rig* r, const Complex* e, const Complex* p, Behaviour b, float
     if (b != B_UNFETCHED) {
         while ((rc = dfn_hop_nn_begin(&r->h, &job)) == 1) {
             f++;
-            if (b == B_OPEN) break;
+            if (b == B_OPEN) { (void)dfn_hop_infer(&r->h, &job); break; }   /* heads written, frame left open */
             rc = dfn_hop_nn_end(&r->h, b == B_RUN ? dfn_hop_infer(&r->h, &job) : -1);
             if (rc != 0) return rc;
         }
