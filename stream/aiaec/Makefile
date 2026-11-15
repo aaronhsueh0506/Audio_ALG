@@ -90,7 +90,7 @@ LIB_OBJECTS := $(OBJ_DIR)/aiaec.o
 VPATH := .
 
 .PHONY: all lib print-lib-path print-cflags print-sources test deepvqe-lib ulcnet-lib \
-	test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec \
+	test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-nonfinite test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec \
 	bind-dumpers graph-io-dumper packet-driver test-single-model audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -192,6 +192,11 @@ test-aiaec-block: $(TEST_DEPS) | _cfg_guard
 # drain, per-family info and pool sizes, with the test catalog.
 test-aiaec-freq: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_freq,-DAIAEC_TEST_CATALOG)
+
+# test_aiaec_nonfinite: +-FLT_MAX is finite input (every feature tensor stays finite), NaN/Inf in any input plane is
+# refused with AIAEC_ERR_NONFINITE_INPUT before any state change; per product, with the test catalog.
+test-aiaec-nonfinite: $(TEST_DEPS) | _cfg_guard
+	$(call RUN_PER_PRODUCT,test_aiaec_nonfinite,-DAIAEC_TEST_CATALOG)
 
 # test_aiaec_packet: Align-ULCNet's packet graph (N=8, layout 19) against a host accelerator that implements the
 # graph's frame_reset semantics; the Align-ULCNet product only (the test catalog opens its N=8 row).
@@ -306,7 +311,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 # single-model `test` runs only `lib` (confirms aiaec.o itself still compiles clean under this
 # variant) and says plainly what covers that variant's contract: test-single-model.
 ifeq ($(AIAEC_MODEL),both)
-test: test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec ulcnet-lib
+test: test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-nonfinite test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec ulcnet-lib
 else
 test: lib
 	@echo "test: AIAEC_MODEL=$(AIAEC_MODEL) -- the per-product tests and link-only-aiaec assume both models and are skipped; run 'make test-single-model' for this variant's coverage (built with AIAEC_MODEL=both, which exercises AIAEC_MODEL=deepvqe and =align internally)."

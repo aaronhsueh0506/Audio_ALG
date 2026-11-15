@@ -34,6 +34,9 @@
 /* The one model this product ships (aiaec_product.h). Never a caller input. */
 #define AIAEC_BOUND_MODEL_ID ((int)(AIAEC_PRODUCT_MODEL_ID))
 
+/* IEEE bits of FLT_MAX: a spectrum bin only has to be finite (the features stay finite up to FLT_MAX). */
+#define AIAEC_FINITE_LIMIT_BITS 0x7F7FFFFFu
+
 static int aiaec_bound_model_in_build(void)
 {
     return 0
@@ -659,8 +662,20 @@ static int aiaec_deepvqe_post_freq(AiaecCore *c, int run_status, float *out_re, 
 }
 #endif /* AIAEC_ENABLE_DEEPVQE_S */
 
+/* 1 when every |x[k]| is at most the float whose IEEE bits are limit_bits (a NaN or Inf is above any finite limit). */
+static int aiaec_plane_within(const float *x, size_t n, uint32_t limit_bits)
+{
+    size_t k;
+    for (k = 0; k < n; ++k) {
+        uint32_t bits;
+        memcpy(&bits, &x[k], sizeof bits);
+        if ((bits & 0x7FFFFFFFu) > limit_bits) return 0;
+    }
+    return 1;
+}
+
 /* Shared by both families. `pin` (PCM in) or `fin` (spectra in) is non-NULL, the other NULL;
- * kind, size and NULL gates run in that order before the first call that advances any state. */
+ * kind, size, NULL and finiteness gates run in that order before the first call that advances any state. */
 static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const AiaecFreqInput *fin,
                                  StreamWork *work)
 {
@@ -681,6 +696,14 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 : (!fin->u.deepvqe_s.mic_re || !fin->u.deepvqe_s.mic_im ||
                    !fin->u.deepvqe_s.far_re || !fin->u.deepvqe_s.far_im))
             return AIAEC_ERR_NULL;
+        if (fin) {
+            const size_t plane = (size_t)c->frames_per_call * (size_t)c->n_bins;
+            if (!aiaec_plane_within(fin->u.deepvqe_s.mic_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.deepvqe_s.mic_im, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.deepvqe_s.far_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.deepvqe_s.far_im, plane, AIAEC_FINITE_LIMIT_BITS))
+                return AIAEC_ERR_NONFINITE_INPUT;
+        }
 
         rc = aiaec_deepvqe_pre(c, pin ? pin->u.deepvqe_s.mic_in : (const int16_t *)0,
                                pin ? pin->u.deepvqe_s.far_in : (const int16_t *)0, fin, &hio);
@@ -710,6 +733,19 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 : (!fin->u.align_ulcnet.err_re || !fin->u.align_ulcnet.err_im ||
                    !fin->u.align_ulcnet.far_re || !fin->u.align_ulcnet.far_im))
             return AIAEC_ERR_NULL;
+        if (pin) {
+            const size_t samples = (size_t)c->cfg.hop_in;
+            if (!aiaec_plane_within(pin->u.align_ulcnet.residual_in, samples, AIAEC_PCM_LIMIT_BITS) ||
+                !aiaec_plane_within(pin->u.align_ulcnet.far_in, samples, AIAEC_PCM_LIMIT_BITS))
+                return AIAEC_ERR_NONFINITE_INPUT;
+        } else {
+            const size_t plane = (size_t)c->frames_per_call * (size_t)c->n_bins;
+            if (!aiaec_plane_within(fin->u.align_ulcnet.err_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.align_ulcnet.err_im, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.align_ulcnet.far_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
+                !aiaec_plane_within(fin->u.align_ulcnet.far_im, plane, AIAEC_FINITE_LIMIT_BITS))
+                return AIAEC_ERR_NONFINITE_INPUT;
+        }
 
         if (c->frames_per_call > 1) {
             /* A packet: one event per model hop, one job for all of them. The graph resets and bypasses an
@@ -845,6 +881,7 @@ const char *aiaec_status_text(int code)
     case AIAEC_ERR_SEQUENCE: return "preprocess/postprocess called out of sequence";
     case AIAEC_ERR_INPUT_KIND: return "block input kind does not match the product's model";
     case AIAEC_ERR_INPUT_SIZE: return "block input sample/event count does not match this ctx";
+    case AIAEC_ERR_NONFINITE_INPUT: return "non-finite input (NaN/Inf spectrum bin, or a residual or far sample that is NaN/Inf or beyond AIAEC_PCM_LIMIT_BITS); refused, state untouched";
     default: return "unknown aiaec status";
     }
 }

@@ -794,7 +794,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
     int16_t *mic = calloc((size_t)hop_in * BLOCKS, sizeof(int16_t));
     float *e_re = calloc((size_t)frames * nb, sizeof(float)), *e_im = calloc((size_t)frames * nb, sizeof(float));
     float *o_re = calloc((size_t)frames * nb, sizeof(float)), *o_im = calloc((size_t)frames * nb, sizeof(float));
-    float *z = calloc((size_t)nb, sizeof(float)), *hopf = calloc((size_t)hop, sizeof(float));
+    float *z = calloc((size_t)n * (size_t)nb, sizeof(float)), *hopf = calloc((size_t)hop, sizeof(float));
     unsigned int gen_seen[BLOCKS];
     const int fail_lo = FAILED * n + n - 1, fail_hi = (FAILED + 1) * n + n - 2;   /* output frame positions of the failed job */
     int b, i, p, bad = g_fail;

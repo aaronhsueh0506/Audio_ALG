@@ -62,7 +62,7 @@ Values are 0/1. No file carries a precomputed restart flag. Behaviour:
 
 ## Deployment reference
 
-Connect the linear AEC’s float residual and the raw far-end hop with `ulcnet_stream_pre_process_f32()`. Each hop can return a real inference job or an alignment reprime. Follow the PCM SDK’s run-status and state-generation contract (`stream_run.h`). [PCM stream and frequency-domain APIs](../../docs/html/models/align-ulcnet/index.html)
+Connect the linear AEC’s float residual and the raw far-end hop with `ulcnet_stream_pre_process_f32()`. Each hop can return a real inference job or an alignment reprime. Follow the PCM SDK’s run-status and state-generation contract (`stream_run.h`); a NaN, an Inf or a PCM sample beyond `AIAEC_PCM_LIMIT_BITS` is refused with `AIAEC_ERR_NONFINITE_INPUT`. [PCM stream and frequency-domain APIs](../../docs/html/models/align-ulcnet/index.html)
 
 - [Inference parity and alignment events](reference/alignment.md)
 - [Choosing a delay profile](reference/delay.md)

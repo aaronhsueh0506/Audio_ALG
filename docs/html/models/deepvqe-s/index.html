@@ -92,6 +92,7 @@ while (read_blocks(mic, far, hop_in)) {
     write_block(pcm_out, hop_in);
 }</code></pre>
 <p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>
+<p><b>輸入檢查</b>：PCM 入口是 int16，不可能非有限，沒有掃描。<code>aiaec_preprocess_freq()</code> 在 kind、size、NULL 檢查之後、任何 frame 進入 stream 之前，掃四個平面（mic 與 far 的實部、虛部，各 N × n_bins 個 float）；任何一個 NaN 或 Inf 都讓整包以 <code>AIAEC_ERR_NONFINITE_INPUT</code>（-10）被拒絕。拒絕時 stream、分析器與 state generation 都沒有動，也沒有開啟的 block：sample 不要跑加速器，也不要呼叫 post，同一個 ctx 直接接下一包，輸出與從未收到這包相同。有限的 bin（到 FLT_MAX 為止）照常處理，送進加速器的特徵都是有限值。</p>
 <p>pool 大小（本庫 host 建置讀出，單位 bytes；16k／256 兩列只存在於測試登錄表）：</p>
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th><code>_freq</code></th></tr></thead>

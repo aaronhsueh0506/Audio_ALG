@@ -14,7 +14,8 @@
  * The AEC runs stage by stage at AEC_RESIDUAL_STATE (aec_process_linear, aec_process_residual: no gain, no output
  * stage); the residual is the analysis seam (AecResidualView.formed_hop). int16 input is scaled by 1/32768 once; float input is used as is; no
  * int16 round trip on the way to the block entry. A pipeline with its own linear AEC passes its residual, raw far and events to
- * aiaec_preprocess() directly. */
+ * aiaec_preprocess() directly. A non-finite AEC residual is refused by aiaec_preprocess() (AIAEC_ERR_NONFINITE_INPUT)
+ * after the AEC ran: reset the front and the ctx. */
 
 #ifndef AIAEC_FRONT_H
 #define AIAEC_FRONT_H
