@@ -16,7 +16,7 @@ grids or checkpoint contracts:
 - **`AIAEC/`** — four neural AEC candidate architectures (Align_ULCNet, Align_CRUSE,
   DeepVQE_S, CAGCRN), every one a joint AEC+RES+NR route (no AEC-only candidate); Python
   training/export side, C runtime in `lib/aiaec/<model>/`.
-- **`lib/ainr/`, `lib/aiaec/`** — the 8 models' C cores (single-model-release restructuring: each
+- **`lib/ainr/`, `lib/aiaec/`** — the 6 models' C cores (single-model-release restructuring: each
   model builds and ships independently of the rest of its family); **`stream/`** — the PCM
   framing/OLA layer on top of them, implemented for DFN2, DeepVQE-S and Align-ULCNet (see below).
 
@@ -57,7 +57,7 @@ make -C AINR/RNNoise-ERB test
 make -C AIAEC test
 
 # A single test binary, once built, runs standalone (binaries land in a config-keyed directory):
-BIN="$(make -s -C AINR print-bin-dir)"; "$BIN"/test_c_prepost
+BIN="$(make -s -C pipelines print-bin-dir)"; ls "$BIN"
 
 # Python side (training/export models, and the C<->Python parity suites) — run from repo root:
 python3 -m pytest -q AINR/tests/test_dfn2_prepost_c.py           # a single file
@@ -66,49 +66,65 @@ python3 -m pytest -q pipelines/tests/test_doc_layout_versions.py pipelines/tests
 ```
 
 `make -C pipelines publish` re-checks pins before building any release artifact;
-`check-pins` is the quick standalone preflight. `print-bin-dir` / `print-obj-dir` / `print-lib-path`
-exist on every Makefile for locating the config-keyed build output without guessing the hash.
+`check-pins` is the quick standalone preflight. `print-lib-path` (all library Makefiles) and, on
+`pipelines/` and `pipelines/4ch`, `print-bin-dir` / `print-obj-dir` print the config-keyed build
+output; `AINR/` and `AIAEC/` tests build into `build/simd<SIMD>-<hash>/`.
 
 ## Architecture that spans multiple files
 
-**The three-file model pattern.** Every AINR/AIAEC model (DFN2, DFN3, GTCRN, RNNoise-ERB,
-ULCNet, DeepVQE-S, ...) splits into `*_process.{c,h}` (feature normalization, mask/deep-filter
-math — pure, stateless-ish numerics), `*_model_io.{c,h}` (tensor windowing/batching and
-recurrent-state registration) and `*_prepost.{c,h}` (the frequency-domain per-hop lifecycle;
+**The model file pattern.** The roles are `*_process.{c,h}` (feature normalization,
+mask/deep-filter math — pure, stateless-ish numerics), `*_model_io.{c,h}` (tensor
+windowing/batching and recurrent-state registration) and `*_prepost.{c,h}` (the frequency-domain
+per-hop lifecycle). Each model has the files it needs:
+
+| Model | Files under `lib/ainr/` / `lib/aiaec/` |
+|---|---|
+| DFN2 | `dfn2_grid.h`, `dfn2_process`, `dfn2_model_io`, `dfn2_prepost` |
+| DFN3 | `dfn3_process`, `dfn3_model_io`, `dfn3_prepost` |
+| Align-ULCNet | `ulcnet_model_io`, `ulcnet_prepost` |
+| DeepVQE-S | `deepvqe_process`, `deepvqe_prepost` (no `_model_io`: the boundary contract, `DEEPVQE_PREPOST_LAYOUT_VERSION` and the descriptor are in `deepvqe_prepost.h`) |
+| GTCRN | `gtcrn_process` only |
+| RNNoise-ERB | `rnnoise_erb/process` only |
+
 GTCRN/RNNoise-ERB use their own `*_process_mask_validate`/`*_process_state_validate` /
-`*_frame_finish` names instead of `frame_open`/`frame_finish`/`frame_bypass`, see below). Reading
+`*_frame_finish` names instead of `frame_open`/`frame_finish`/`frame_bypass`, see below. Reading
 just the model's `*_prepost.h` (or `*_process.h` for GTCRN/RNNoise-ERB) is usually enough to
-integrate it; `*_process.c` is only needed to change the model's math itself. All 8 models' cores
+integrate it; `*_process.c` is only needed to change the model's math itself. All 6 models' cores
 now live under `lib/ainr/<model>/` / `lib/aiaec/<model>/` (the single-model-release restructuring);
 `AINR/`/`AIAEC/` keep the Python training/export side only.
 
 **Vocabulary.** A lib `<model>_model_io` is the CPU-side graph-boundary adapter (descriptor, feature windows, state registration); a stream `graph_io` is the per-(model, grid, N) graph port table of the exported graph (`stream/*/graph_io_*.h`). `wiring` stays only for the `stream_bind` `StreamWiring` struct; `stage` only for units inside pipelines and AEC's `aec_stage_*`; `adapter` = callback adapter, `bridge` = sample-rate bridge, `front` = AEC front end.
-`LAYOUT_VERSION` has two meanings: a lib's tensor/carve contract (`DFN2_MODEL_IO_LAYOUT_VERSION_*`, `AEC_LAYOUT_VERSION`) and the `layout_version` of a `graph_io` row, which must equal the lib's.
+`LAYOUT_VERSION` has two meanings: a lib's tensor/carve contract (`DFN2_MODEL_IO_LAYOUT_VERSION_*`, `ULCNET_MODEL_IO_LAYOUT_VERSION`, `DEEPVQE_PREPOST_LAYOUT_VERSION`, `AEC_LAYOUT_VERSION`) and the `layout_version` of a `graph_io` row, which must equal the lib's.
 
-**PCM stream SDKs.** Each wraps a frequency-domain core with analysis STFT and synthesis ISTFT. The caller owns the accelerator, synchronizes its recurrent state before each job, and reloads quantized zeros after a run that may have partially written device state.
+**PCM stream SDKs.** Each wraps a frequency-domain core with analysis STFT and synthesis ISTFT (a `freq_only` context, which only the `_freq` entries use, holds neither). The caller owns the accelerator. The run status of `stream/common/stream_run.h` goes back to postprocess: `STREAM_RUN_OK` (0) = every head written, `STREAM_RUN_NOT_STARTED` = the device state was not touched, any other value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to continue from; before a run the caller zeroes the accelerator's state (quantized zeros) when the generation differs from its value at the last zeroing.
 
 | SDK | Integration contract |
 |---|---|
-| `stream/ainr/dfn2` | One int16 input, optional HPF, `AC_OLA_ACCUMULATE`, `frames_per_call` 1..64 (`DFN2HopIO.job_ready` says which hop runs the accelerator). Full and mask-only use variant-specific public symbols. Post reports spectral validity. The customer entry is `stream/ainr/ainr.h` (`ainr_init(cfg, pool, bytes, &ctx, &info)`, `AinrInfo`, `AinrWork`). |
-| `stream/aiaec/deepvqe_s` | Mic and far int16 inputs, `AC_OLA_ACCUMULATE`, `frames_per_call` 1..64, used by both the 16kHz/256 and the 16kHz/512 grid alike (the 512 grid's first-hop PCM differs from its pre-batching history as a result). A rejected job contributes a zero spectrum (fail-closed). `deepvqe_stream.{c,h}` wraps `lib/aiaec/deepvqe_s/deepvqe_prepost.{c,h}`, a single merged core (no parallel copy). |
-| `stream/aiaec` (`aiaec.h`) | The customer-facing entry over DeepVQE-S and Align-ULCNet (PCM, `_spec` and `_freq` families): `aiaec_init(cfg, pool, bytes, &ctx, &info)` returns 0 or a negative `AIAEC_ERR_*` and fills the slim `AiaecInfo` (`graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; N is `cfg.hop_in / (cfg.fft / 2)`, computed by the caller). |
-| `stream/aiaec/ulcnet` | Feed the linear AEC's float residual and raw far to `ulcnet_stream_pre_process_f32()`. An int16 entry is also available. Reprime after an alignment change, and pass the error spectrum through on bypass. In a packet stream (`frames_per_call` N >= 2) an alignment event hop restarts the model in the graph and, on the PCM entries, the stream's own analysis and synthesis at that hop (`ulcnet_stream_restart_mask()`), so N = 8 PCM equals the N = 1 stream sample for sample; the spectrum entries keep continuous overlap. |
+| `stream/ainr/dfn2` | One int16 input, optional HPF, `AC_OLA_ACCUMULATE`, `frames_per_call` 1..64 (`DFN2HopIO.job_ready` says which hop runs the accelerator). Full and mask-only use variant-specific public symbols. Post reports spectral validity. The customer entry is `stream/ainr/ainr.h` (`ainr_init(cfg, pool, bytes, &ctx, &info)`, `AinrInfo`, `StreamWork`). |
+| `stream/aiaec/deepvqe_s` | Mic and far int16 inputs, `AC_OLA_ACCUMULATE`, `frames_per_call` 1..64, used by both the 16kHz/256 and the 16kHz/512 grid alike (the 512 grid's first-hop PCM differs from its pre-batching history as a result). A job that did not succeed contributes a zero spectrum (fail-closed); every state-generation advance also empties the CCM ring. `deepvqe_stream.{c,h}` wraps `lib/aiaec/deepvqe_s/deepvqe_prepost.{c,h}`, a single merged core (no parallel copy). |
+| `stream/aiaec` (`aiaec.h`) | The customer-facing entry over DeepVQE-S and Align-ULCNet (PCM and `_freq` families; the `_spec` family is retired, use `AcStft` + `_freq`): `aiaec_init(cfg, pool, bytes, &ctx, &info)` returns 0 or a negative `AIAEC_ERR_*` and fills the slim `AiaecInfo` (`graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; N is `cfg.hop_in / (cfg.fft / 2)`, computed by the caller). Preprocess fills a `StreamWork`, postprocess takes the run status. NaN/Inf input (and, on the Align-ULCNet float PCM entry, a sample beyond 2^112) is refused with `AIAEC_ERR_NONFINITE_INPUT` before any state change. |
+| `stream/aiaec/ulcnet` | Feed the linear AEC's float residual and raw far to `ulcnet_stream_pre_process_f32()`. An int16 entry is also available. Reprime after an alignment change, and pass the error spectrum through on bypass. An alignment event restarts only the model (in a packet stream, `frames_per_call` N >= 2, the graph does it before the event hop); no entry restarts the stream's own analysis or synthesis, so the PCM entries give the samples of the `_freq` entries around an `AcStft` / `AcIstft`, event hops included, and N = 8 PCM equals the N = 1 stream. |
 
-`ainr.h` / `aiaec.h` report no graph ports: `AinrInfo` / `AiaecInfo` carry only the selected `graph_path` and the trim/queue/tail lengths, and `AinrWork` / `AiaecWork` hold the block's signal and head tensors. The graph wiring (signal, head and state shapes per registered `(model, sr, fft, N)`) is the board sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper `stream/common/graph_io.h` (tested by `make -C stream/common test-graph-io`); samples add `-I stream/common -I stream/ainr|stream/aiaec`. The SDK-free checker `StreamWiring` / `StreamDeviceDesc` / `stream_check_ports()` (`stream/common/stream_bind.{h,c}`) is compiled by samples only, and `StreamMemReq` lives in `stream/common/stream_mem.h`. A board sample binds by index, never by name: inputs = signal inputs, then state inputs; outputs = head outputs, then state outputs; state k is input `signal_in_count + k` and output `head_out_count + k`. Align-ULCNet at N > 1 has `frame_reset` as the last signal input; the stream fills it in `AiaecWork` and the sample moves it like any other signal. The sample checks every block's work against its row before the accelerator call (a mismatch means no run and a failed post) and the opened graph's ports once after opening; fixed-point state ports need `zero_point` 0 at both ends. Float I/O is a compile-time choice of the AI3 samples (`FLOAT_IN` / `FLOAT_OUT`, default 0; the model stays fixed point and the hardware converts at the boundary). These models inherit the state port types, so set both alike (a mixed setting only warns); the samples print the reported port types at start-up for the board A/B (`docs/maintenance/float-io-board-ab.md`). `docs/maintenance/graph-wiring.md` has the details and the pins.
+**Customer headers.** A board sample includes only `stream/ainr/ainr.h`, `stream/ainr/bridge/ainr_bridge.h`, `stream/aiaec/aiaec.h`, `stream/aiaec/front/aiaec_front.h`, `stream/common/{stream_mem,stream_bind,stream_run,graph_io}.h` and the three `graph_io_*.h` (`docs/maintenance/models.md` §13). Include roots: each header's directory, `stream/common`, audiolib `common/` (for `utility/mem_align.h`) and, with `ainr_bridge.h`, audiolib `common/include`. `make -C stream/common check-public-headers` compiles the set as C99 `-Wpedantic` and C++11 with only those roots and checks C linkage.
 
-DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE have no C code (Python model and ONNX export only; the application does the mask multiply). Existing spectrum-level callers can use `pipelines/dfn/dfn_res_stage.h`, `dfn_rate_bridge.h`, or the `_freq` entries of `stream/aiaec/ulcnet/ulcnet_stream.h`. The [model manual](docs/html/models/index.html) contains the per-hop examples.
+`ainr.h` / `aiaec.h` report no graph ports: `AinrInfo` / `AiaecInfo` carry only the selected `graph_path` and the trim/queue/tail lengths, and a `StreamWork` (`stream/common/stream_run.h`, shared by both) holds the block's signal and head tensors. The graph wiring (signal, head and state shapes per registered `(model, sr, fft, N)`) is the board sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper `stream/common/graph_io.h` (tested by `make -C stream/common test-graph-io`); samples add `-I stream/common -I stream/ainr|stream/aiaec`. The SDK-free checker `StreamWiring` / `StreamDeviceDesc` / `stream_check_ports()` (`stream/common/stream_bind.{h,c}`) is compiled by samples only, and `StreamMemReq` lives in `stream/common/stream_mem.h`. A board sample binds by index, never by name: inputs = signal inputs, then state inputs; outputs = head outputs, then state outputs; state k is input `signal_in_count + k` and output `head_out_count + k`. Align-ULCNet at N > 1 has `frame_reset` as the last signal input; the stream fills it as the last input of the `StreamWork` and the sample moves it like any other signal. The sample checks every block's work against its row before the accelerator call (a mismatch means no run) and the opened graph's ports once after opening; fixed-point state ports need `zero_point` 0 at both ends. Float I/O is a compile-time choice of the AI3 samples (`FLOAT_IN` / `FLOAT_OUT`, default 0; the model stays fixed point and the hardware converts at the boundary). These models inherit the state port types, so set both alike (a mixed setting only warns); the samples print the reported port types at start-up for the board A/B (`docs/maintenance/float-io-board-ab.md`). `docs/maintenance/graph-wiring.md` has the details and the pins.
+
+DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE have no C code (Python model and ONNX export only; the application does the mask multiply). At the spectrum level, desktop pipelines use `stream/ainr/dfn2/dfn2_stream.h` (`_freq`) and `stream/aiaec/ulcnet/ulcnet_stream.h` (`_freq`); board samples use `stream/ainr/ainr.h` (`ainr_*_freq`), with `stream/ainr/bridge/ainr_bridge.h` for an 8/16 kHz host. `pipelines/dfn/dfn_res_stage.h` and `dfn_rate_bridge.h` stay only for existing callers. The [model manual](docs/html/models/index.html) contains the per-hop examples.
 
 **Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
-`pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or
-`frame_bypass()` on failure/refusal) → `post_process_freq()` → push to `AcIstft`. Missing a
-`frame_finish`/`frame_bypass` before the next `pre_process`/`post_process` call is a caller bug,
+`pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or, for
+DFN2/Align-ULCNet/DeepVQE-S, `frame_fail(p, run_started)` after a run that did not succeed;
+`frame_bypass()` after a commit `frame_finish()` refused, and for DFN3 on any failure) →
+`post_process_freq()` → push to `AcIstft`. `frame_fail` gives the `frame_bypass` output;
+`run_started` != 0 also zeroes the registered state and advances the generation. Missing a
+`frame_finish`/`frame_fail`/`frame_bypass` before the next `pre_process`/`post_process` call is a caller bug,
 not a library bug — the next call returns -1. **Warm-up (DFN2/DFN3 only, and only when
 `frames_per_call` == 1):** the first `mask_lookahead` hops after init/reset run this exact same
 flow (not a shortcut path), heads discarded, registered state zeroed, state generation +1 per
 warm-up hop — bit-identical audio to skipping them. DFN2 with `frames_per_call` > 1 keeps its
 separate, older behavior instead (infers once every N hops, not once per hop); Align-ULCNet and
-DeepVQE-S were not touched by this round and keep their own, different warm-up handling — do not
-assume either without checking that model's own `*_prepost.h`. GTCRN/RNNoise-ERB have no
+DeepVQE-S have their own, different warm-up handling — do not assume either without checking that
+model's own `*_prepost.h`. GTCRN/RNNoise-ERB have no
 `mask_lookahead`/warm-up concept at all: a callback failure is instead caught by their
 `*_mask_validate`/`*_frame_finish` finite-check, which (if the NaN-filled output sentinel the
 caller's own code must set before the call stays NaN) zeroes the registered state and advances the
@@ -117,20 +133,25 @@ generation on that same hop, regardless of the callback's own return code.
 **State ownership and the generation counter.** Recurrent state is either registered by the host
 (pointer+count pairs, all-or-none) and owned in caller memory, or left to a hardware accelerator
 that tracks its own quantized copy. A `*_state_generation()` counter advances on every reset, every
-warm-up frame, and every refused commit; any accelerator-side state must be reloaded with
-quantized zero whenever it sees the generation change (not just at init/reset) or it will carry
-stale state into the next real frame.
+warm-up frame, every refused commit and every `frame_fail(p, 1)` (the stream does this for a run
+status other than `STREAM_RUN_OK` and `STREAM_RUN_NOT_STARTED`); an Align-ULCNet model restart
+advances it too, and a packet with an event frame whose run was `STREAM_RUN_NOT_STARTED` advances
+it once. Any accelerator-side state must be reloaded with quantized zero whenever the generation
+differs from its value at the last zeroing (not just at init/reset) or it will carry stale state
+into the next real frame; a board sample keeps no failure flag of its own. A DFN2 `infer()` that
+fails inside `dfn2_model_run_frame` is a `frame_fail(p, 1)`.
 
 **Caller-owned memory.** `*_grid_make(spec)` → `*_get_mem_size(cfg)` → caller allocates one block
-→ `*_init`/`*_init_ex`. No internal `malloc`. A `CARVE_VERSION`/layout-version constant and a
+→ `*_init`/`*_init_ex`. No internal `malloc`, except the optional `*_create` / `*_destroy` helpers documented in each header (`*_prepost_create`, `ainr_bridge_create`, `aec_create`, ...), which allocate the pool with `aligned_alloc` or `posix_memalign` and free only what they allocated. A `CARVE_VERSION`/layout-version constant and a
 descriptor hash must bump together whenever a struct's carved layout changes size — both are
 checked by `pipelines/tests/test_doc_layout_versions.py` and guard against a stale caller pool
 being handed to a newer library build.
 
 **Frequency domain only inside models.** Framing, windowing, FFT/IFFT belong to the application
-via audiolib's `AcStft`/`AcIstft`; model libraries only ever see/produce spectra. A pipeline stage
-that itself performs STFT/ISTFT internally (`dfn_res_stage`, `dfn_rate_bridge`) is the exception that
-bridges a model into a different grid/host, not the norm. `ulcnet_stream_*_freq` takes and returns spectra.
+via audiolib's `AcStft`/`AcIstft`; model libraries only ever see/produce spectra. The model streams'
+PCM entries and `ainr_bridge` (an 8/16 kHz host) frame or resample inside; that is the exception, not
+the norm. The `_freq` entries (`dfn2_stream`, `ulcnet_stream`, `deepvqe_stream`, `ainr_*_freq`,
+`aiaec_*_freq`) take and return spectra. `dfn_res_stage` / `dfn_rate_bridge` stay only for existing callers.
 
 **The 4-channel flow is an `Aec` array instance (`AecConfig.n_mics == AEC_ARRAY_MICS`).** One
 `aec_init` builds the four lanes, the shared delay estimator, the aligned far ring and the fusion /
