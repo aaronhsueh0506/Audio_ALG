@@ -3,6 +3,12 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — `dfn2_process.h`: the whole header has C linkage under C++
+
+The `extern "C"` block of `lib/ainr/dfn2/dfn2_process.h` closed right after the variant-link symbol, so a C++ consumer got C++ linkage for `DFN2State`'s functions (`dfn2_state_*`, `dfn2_set_erb_matrices`, `dfn2_compute_features`, `dfn2_apply_atten_lim`, `dfn2_enhance_spectrum[_stream]`) and failed to link. The block now ends before the include guard's `#endif`. C is unaffected (`cc -E -P` output identical, full and mask-only).
+
+- **Test.** `make -C stream/ainr/dfn2 test` runs `check-header-cxx`: `tests/cxx_consumer.cpp` calls every function of `dfn2_process.h` plus a few of the other DFN2 headers from C++, and its object must reference no mangled symbol; a generated probe that calls one C++-linkage function must show one (positive control). With the old header the check fails and lists all eight `dfn2_process.h` functions mangled.
+
 ## [Unreleased] — 2026-11-15 — Align-ULCNet packet (N > 1): a failed job that carries an alignment event advances the generation
 
 At N > 1 the graph restarts the model at an event hop itself (`frame_reset`), so the generation stays. A job that fails before the device run never applied that restart: the library bypassed the packet with the generation unchanged, and the next packet ran from the pre-event recurrent state. `ulcnet_prepost_frame_bypass()` now zeroes the registered state and advances the generation for a packet opened by `frame_open()` that has an event frame, the same step an N = 1 event takes; the board sample's generation check then zeroes the device state.

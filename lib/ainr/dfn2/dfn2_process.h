@@ -31,9 +31,6 @@ extern "C" {
 #define DFN2_VARIANT_SYMBOL dfn2_variant_full
 #endif
 extern const unsigned char DFN2_VARIANT_SYMBOL;
-#ifdef __cplusplus
-}
-#endif
 #define DFN2_REQUIRE_VARIANT_LINK() \
     ((void)*(const volatile unsigned char *)&DFN2_VARIANT_SYMBOL)
 
@@ -143,5 +140,9 @@ int dfn2_enhance_spectrum_stream(DFN2State *st,
                         float *out_re,
                         float *out_im,
                         long long *output_frame_index);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DFN2_PROCESS_H */

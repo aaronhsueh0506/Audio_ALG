@@ -131,7 +131,7 @@ POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard audit-no-stdio clean _cfg_guard
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -216,7 +216,21 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard
+test: smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard check-header-cxx
+
+# check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
+# a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.
+CXX_PROBE_FLAGS = -std=c++11 -Wall -Wextra -Werror $(filter -I% -D%,$(CFLAGS)) $(MASK_CPPFLAGS)
+check-header-cxx: tests/cxx_consumer.cpp $(CORE_HEADERS) $(STREAM_HEADERS)
+	@mkdir -p "$(OBJ_DIR)"
+	$(CXX) $(CXX_PROBE_FLAGS) -c tests/cxx_consumer.cpp -o "$(OBJ_DIR)/cxx_consumer.o"
+	@printf 'int dfn2_cxx_control(int v);\nint dfn2_cxx_probe(int v) { return dfn2_cxx_control(v); }\n' > "$(OBJ_DIR)/cxx_control.cpp"
+	$(CXX) $(CXX_PROBE_FLAGS) -c "$(OBJ_DIR)/cxx_control.cpp" -o "$(OBJ_DIR)/cxx_consumer_control.o"
+	@mangled="$$(nm -u "$(OBJ_DIR)/cxx_consumer.o" | grep -E '(^|[ ])_?_Z' || true)"; \
+	if [ -n "$$mangled" ]; then echo "FAIL: C++ linkage leaked from the DFN2 headers:" >&2; echo "$$mangled" >&2; exit 1; fi; \
+	nm -u "$(OBJ_DIR)/cxx_consumer.o" | grep -Eq '(^|[ ])_?dfn2_state_mem_size$$' || { echo "FAIL: dfn2_state_mem_size not referenced with C linkage" >&2; exit 1; }; \
+	nm -u "$(OBJ_DIR)/cxx_consumer_control.o" | grep -Eq '(^|[ ])_?_Z[0-9]+dfn2_cxx_control' || { echo "FAIL: positive control shows no mangled reference" >&2; exit 1; }; \
+	echo "check-header-cxx: PASS (MASK_ONLY=$(MASK_ONLY): every DFN2 call from C++ has C linkage)"
 
 # test-variant-guard: builds BOTH full and mask-only archives, then links an external-consumer TU
 # (tests/variant_consumer.c, never the SDK's own .c files) against each in all four combinations.
