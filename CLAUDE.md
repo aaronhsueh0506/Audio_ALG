@@ -9,7 +9,7 @@ grids or checkpoint contracts:
 
 - **`pipelines/`** — the deployable conventional AEC + echo-aware NR/RES path (mono and
   4-channel), plus the DeepFilterNet2 (`pipelines/dfn/`) and Align-ULCNet
-  (`pipelines/ulcnet/`) application examples that sit on top of it. This is the reference
+  (`pipelines/{mono,4ch}/alignulcnet/`, on `stream/aiaec/ulcnet`) application examples that sit on top of it. This is the reference
   integration path; `AINR/` and `AIAEC/` models are not silently wired into it.
 - **`AINR/`** — standalone AI speech-enhancement models (RNNoise-ERB, GTCRN, DeepFilterNet2,
   DeepFilterNet3): Python training/export side; the C runtime itself lives in `lib/ainr/<model>/`.
@@ -96,7 +96,7 @@ now live under `lib/ainr/<model>/` / `lib/aiaec/<model>/` (the single-model-rele
 
 `ainr.h` / `aiaec.h` report no graph ports: `AinrInfo` / `AiaecInfo` carry only the selected `graph_path` and the trim/queue/tail lengths, and `AinrWork` / `AiaecWork` hold the block's signal and head tensors. The graph wiring (signal, head and state shapes per registered `(model, sr, fft, N)`) is the board sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper `stream/common/graph_io.h` (tested by `make -C stream/common test-graph-io`); samples add `-I stream/common -I stream/ainr|stream/aiaec`. The SDK-free checker `StreamWiring` / `StreamDeviceDesc` / `stream_check_ports()` (`stream/common/stream_bind.{h,c}`) is compiled by samples only, and `StreamMemReq` lives in `stream/common/stream_mem.h`. A board sample binds by index, never by name: inputs = signal inputs, then state inputs; outputs = head outputs, then state outputs; state k is input `signal_in_count + k` and output `head_out_count + k`. Align-ULCNet at N > 1 has `frame_reset` as the last signal input; the stream fills it in `AiaecWork` and the sample moves it like any other signal. The sample checks every block's work against its row before the accelerator call (a mismatch means no run and a failed post) and the opened graph's ports once after opening; fixed-point state ports need `zero_point` 0 at both ends. Float I/O is a compile-time choice of the AI3 samples (`FLOAT_IN` / `FLOAT_OUT`, default 0; the model stays fixed point and the hardware converts at the boundary). These models inherit the state port types, so set both alike (a mixed setting only warns); the samples print the reported port types at start-up for the board A/B (`docs/maintenance/float-io-board-ab.md`). `docs/maintenance/graph-wiring.md` has the details and the pins.
 
-DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE have no C code (Python model and ONNX export only; the application does the mask multiply). Existing spectrum-level callers can use `pipelines/dfn/dfn_res_stage.h`, `dfn_rate_bridge.h`, or `pipelines/ulcnet/ulcnet_nn_stage.h`. The [model manual](docs/html/models/index.html) contains the per-hop examples.
+DFN3, GTCRN and RNNoise-ERB expose frequency-domain cores. CAGCRN and Align-CRUSE have no C code (Python model and ONNX export only; the application does the mask multiply). Existing spectrum-level callers can use `pipelines/dfn/dfn_res_stage.h`, `dfn_rate_bridge.h`, or the `_freq` entries of `stream/aiaec/ulcnet/ulcnet_stream.h`. The [model manual](docs/html/models/index.html) contains the per-hop examples.
 
 **Per-hop contract (DFN2/DFN3/Align-ULCNet/DeepVQE-S's `frame_open`/`_finish`/`_bypass` shape).**
 `pre_process_freq()` → `frame_open()` → accelerator fills the tensors → `frame_finish()` (or
@@ -130,7 +130,7 @@ being handed to a newer library build.
 **Frequency domain only inside models.** Framing, windowing, FFT/IFFT belong to the application
 via audiolib's `AcStft`/`AcIstft`; model libraries only ever see/produce spectra. A pipeline stage
 that itself performs STFT/ISTFT internally (`dfn_res_stage`, `dfn_rate_bridge`) is the exception that
-bridges a model into a different grid/host, not the norm. `ulcnet_nn_stage` takes and returns spectra.
+bridges a model into a different grid/host, not the norm. `ulcnet_stream_*_freq` takes and returns spectra.
 
 **The 4-channel flow is an `Aec` array instance (`AecConfig.n_mics == AEC_ARRAY_MICS`).** One
 `aec_init` builds the four lanes, the shared delay estimator, the aligned far ring and the fusion /
