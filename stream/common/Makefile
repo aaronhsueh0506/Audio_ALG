@@ -1,7 +1,8 @@
 # Shared stream/ helpers: the header-only stream_mem.h (StreamMemReq, carve, hash, saturate), the
-# SDK-free port check stream_bind.{h,c}, which does not depend on stream_mem.h, and the header-only board
-# sample helper graph_io.h (row expansion, state pairing, boundary check) over it.
-# Standalone: `make -C stream/common test` builds and runs the three unit tests, the C++ header compile, the
+# SDK-free port check stream_bind.{h,c}, which does not depend on stream_mem.h, the header-only board
+# sample helper graph_io.h (row expansion, state pairing, boundary check) over it, and the header-only run
+# contract stream_run.h (StreamWork, STREAM_RUN_* statuses).
+# Standalone: `make -C stream/common test` builds and runs the four unit tests, the C++ header compile, the
 # customer header set check and the no-stdio audit.
 CC ?= cc
 CXX ?= c++
@@ -15,7 +16,7 @@ BUILD_DIR ?= build
 
 include ../../lib/deps.mk
 
-.PHONY: all test test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx check-public-headers audit-no-stdio clean
+.PHONY: all test test-stream-bind test-stream-mem test-graph-io test-stream-run check-stream-run check-graph-io-cxx check-public-headers audit-no-stdio clean
 
 all: $(BUILD_DIR)/stream_bind.o
 
@@ -46,6 +47,20 @@ $(BUILD_DIR)/test_graph_io: tests/test_graph_io.c graph_io.h stream_bind.c strea
 test-graph-io: $(BUILD_DIR)/test_graph_io
 	"$(BUILD_DIR)/test_graph_io"
 
+# stream_run.h: constants, layout and the work type under GRAPH_IO_CHECK_WORK.
+$(BUILD_DIR)/test_stream_run: tests/test_stream_run.c stream_run.h graph_io.h stream_bind.c stream_bind.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) tests/test_stream_run.c stream_bind.c -o "$@"
+
+test-stream-run: $(BUILD_DIR)/test_stream_run
+	"$(BUILD_DIR)/test_stream_run"
+
+# stream_run.h as the only include: C99 -Wpedantic object, and a C++11 program that is compiled and run.
+check-stream-run: stream_run.h tests/stream_run_c99_probe.c tests/stream_run_cxx_probe.cpp | $(BUILD_DIR)
+	$(CC) -std=c99 -Wall -Wextra -Wpedantic -Werror -I. -c tests/stream_run_c99_probe.c -o "$(BUILD_DIR)/stream_run_c99_probe.o"
+	$(CXX) -std=c++11 -Wall -Wextra -Wpedantic -Werror -I. tests/stream_run_cxx_probe.cpp -o "$(BUILD_DIR)/stream_run_cxx_probe"
+	"$(BUILD_DIR)/stream_run_cxx_probe"
+	@echo "check-stream-run: PASS"
+
 # The header must also compile as C++ (the samples may be built by a C++ driver).
 check-graph-io-cxx: graph_io.h stream_bind.h | $(BUILD_DIR)
 	@printf '#include "graph_io.h"\nint probe(const GraphIoRow *r, GraphIoConfig *c) {\n  struct W { int input_count, output_count; struct { const float *data; size_t elements; unsigned w, h, c, b; } inputs[1], outputs[1]; } wk = {0, 0, {{0, 0, 0, 0, 0, 0}}, {{0, 0, 0, 0, 0, 0}}};\n  int rc = graph_io_expand(r, c);\n  GRAPH_IO_CHECK_WORK(rc, c, &wk);\n  return rc + graph_io_frames(256, 128) + graph_io_state_count(c) + (int)graph_io_input_bytes(c, 0, 4);\n}\n' > "$(BUILD_DIR)/graph_io_cxx_probe.cpp"
@@ -68,7 +83,7 @@ audit-no-stdio: $(BUILD_DIR)/stream_bind.o | $(BUILD_DIR)
 	  echo "audit-no-stdio: positive control did not match"; exit 1; fi
 	@echo "audit-no-stdio: PASS"
 
-test: test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx check-public-headers audit-no-stdio
+test: test-stream-bind test-stream-mem test-graph-io test-stream-run check-stream-run check-graph-io-cxx check-public-headers audit-no-stdio
 
 clean:
 	rm -rf "$(BUILD_DIR)"
