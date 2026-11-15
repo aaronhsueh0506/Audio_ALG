@@ -265,8 +265,8 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>pool 未對齊／太小、config 錯、<code>expected</code> 不符（陳舊 pool；hash 認 grid、D、layout 與 carve 版本）；被拒的呼叫不動 pool</td></tr>
 <tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code>／<code>frame_fail</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
-<tr><td><code>frame_finish</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限：登錄的 state 全部歸零（沒登錄時只檢查 taps）、generation +1、CCM ring 不前進、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
-<tr><td><code>frame_fail</code></td><td>-1（無 frame；什麼都不動）</td><td>執行沒成功時關閉該批，輸出同 <code>frame_bypass</code>；<code>run_started</code> 非 0（加速器 state 可能已髒）另把登錄的 state 全部歸零、generation +1；0（未啟動）什麼都不動</td></tr>
+<tr><td><code>frame_finish</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限：登錄的 state 全部歸零（沒登錄時只檢查 taps）、generation +1、CCM ring 清空（冷啟動）、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
+<tr><td><code>frame_fail</code></td><td>-1（無 frame；什麼都不動）</td><td>執行沒成功時關閉該批，輸出同 <code>frame_bypass</code>；<code>run_started</code> 非 0（加速器 state 可能已髒）另把登錄的 state 全部歸零、CCM ring 清空、generation +1；0（未啟動）什麼都不動</td></tr>
 <tr><td><code>frame_bypass</code></td><td>-1（無 frame）</td><td>成功時當前增強頻譜歸零，PCM 合成保留前拍 overlap（mute、fail closed）：CCM ring 與 state 維持原樣。想要優雅降級的呼叫端須自己在 pipeline 層放 canceller 並 cross-fade</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
 </table></div>
@@ -375,8 +375,8 @@ k     pre_process -> open --------------------------------------> 替身回 -1, 
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
 <tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td><code>deepvqe_stream_reset()</code></td></tr>
-<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>reset 時清空；<code>ai_rc != 0</code> 的失敗關閉（bypass 輸出）不動；<code>frame_finish</code> 的非有限拒收「ring 不推進」但不清空</td></tr>
-<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收與已啟動的失敗（<code>frame_fail(p, 1)</code>）只歸零「已登錄的 state」</td></tr>
+<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>每次 generation 前進都清空（reset、<code>frame_finish</code> 的非有限拒收、<code>frame_fail(p, 1)</code>），下一幀等於冷啟動；<code>frame_bypass</code> 與 <code>STREAM_RUN_NOT_STARTED</code> 的失敗關閉不動</td></tr>
+<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收與已啟動的失敗（<code>frame_fail(p, 1)</code>）歸零「已登錄的 state」（同時清空 CCM ring）</td></tr>
 <tr><td><code>state_generation</code></td><td>轉呼叫 <code>deepvqe_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=0；reset、非有限拒收、<code>ai_rc</code> 為 <code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 各 +1；<code>STREAM_RUN_NOT_STARTED</code>（加速器 state 沒動）與單純 <code>frame_bypass</code> 不推進</td></tr>
 </table></div>
 

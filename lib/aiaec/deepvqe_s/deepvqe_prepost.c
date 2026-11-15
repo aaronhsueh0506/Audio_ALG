@@ -383,8 +383,10 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p) {
     if (base) free(base);
 }
 
+/* A state restart: the registered state and the CCM ring go cold together, the generation advances. */
 static void zero_state(DeepVqePrepost *p) {
     zero_registered(p);
+    deepvqe_ccm_reset(&p->ccm);
     ++p->state_generation;
 }
 
@@ -394,7 +396,6 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
     call_bytes = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
     zero_state(p);
     memset(p->taps, 0, p->taps_elements * sizeof(float));
-    deepvqe_ccm_reset(&p->ccm);
     memset(p->mic_re, 0, call_bytes);
     memset(p->mic_im, 0, call_bytes);
     memset(p->far_re, 0, call_bytes);
@@ -523,7 +524,7 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p) {
         ok = p->state[id] == NULL ||
              all_finite(p->state[id], p->state_elements[id]);
     if (!ok) {
-        /* Restart cold; the CCM ring is not pushed and the batch stays open for frame_bypass(). */
+        /* Restart cold (state and CCM ring); the batch stays open for frame_bypass(). */
         zero_state(p);
         p->prepared = 0;
         return -1;

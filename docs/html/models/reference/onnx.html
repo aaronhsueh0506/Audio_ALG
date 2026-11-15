@@ -121,10 +121,11 @@ DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <c
 Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，state 不預填。<code>frame_finish</code> 是<b>純驗證</b>：
 heads 與（有登錄時）state 都有限才成功，之後 CCM ring／enhance_spectrum／輸出暫存照常前進，本身不複製任何 state。
 state 已被加速器就地覆寫、<b>無法回滾</b>，所以遇到任何一處非有限值時<b>所有登錄的遞迴 state 歸零</b>（冷啟動）、state generation 加一、
-CCM ring／輸出暫存不前進、幀維持開啟、回 −1
+輸出暫存不前進（DeepVQE-S 的 CCM ring 與 state 一同清空）、幀維持開啟、回 −1
 （Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2、DFN3：<code>h_gru</code> 與 <code>df_convp_history</code> 兩個遞迴張量；DeepVQE-S：16 個 state），
 呼叫端再選 <code>frame_bypass</code> 或用新的 <code>frame_open</code> 從冷 state 重跑加速器。
 <code>frame_bypass</code> 該幀取 identity（DeepVQE-S 為靜音）、遞迴 state 維持原樣（加速器寫完的樣子；回報失敗的 runtime 視為沒有寫入）；DFN2、DFN3 的 frame clock 照常前進，DeepVQE-S 的 CCM ring 不前進。
+<code>frame_fail</code>（DeepVQE-S）在加速器執行沒成功時關閉該幀，輸出同 <code>frame_bypass</code>；已啟動的執行另把登錄 state 歸零、清空 CCM ring、generation 加一。
 <code>frame_finish</code> 沒有 <code>frame_open</code> 就回 −1，heads 預填 NaN，所以「加速器根本沒跑」不會被當成結果收下；幀還開著時再呼叫 <code>pre_process_freq</code> 回 −1。</p>
 
 <p><b>遞迴 state：就地綁定，由應用端持有</b>。每個 state 張量只有一個 buffer、位址在實例壽命內不變，沒有交替的 bank、沒有指標交換、沒有複製路徑。
@@ -141,7 +142,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉�
 並為每個 window 宣告丟哪一端（AINR 的 <code>state_slicing</code> 內 <code>drop</code>、AIAEC 的 <code>state_window_drop</code>：time-ordered window 為 <code>first</code>，newest-first ring 為 <code>last</code>），驗證器只接受那一端的 Slice 範圍。RNNoise-ERB 的匯出器只寫 <code>state_layout_version</code>，不寫 <code>state_binding</code>，也不跑這項檢查。</p>
 
 <p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 依同一規則）、
-<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN2／DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate 各加一，有沒有登錄 state 都照算。
+<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN2／DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate（DeepVQE-S 另有已啟動的 <code>frame_fail</code>）各加一，有沒有登錄 state 都照算。
 pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>；舊的 <code>dfn_res_stage_state_generation()</code>／<code>dfn_rate_bridge_state_generation()</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
 板端 sample 比較這個值，與上次看到的不同就用量化後的 0 重填 state 輸入。
 起始值不同（DFN2、DFN3、GTCRN、RNNoise-ERB 的 init 後為 1，Align-ULCNet、DeepVQE-S 為 0），所以只比較「是否變動」，不假設起始值。</p>

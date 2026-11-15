@@ -8,8 +8,9 @@
  *
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any other
  * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
- * continue from (reset, refused commit, a dirty status). Before a run, zero the accelerator's state when io.state_generation
- * differs from the value at the last zeroing; it is written every hop, also with the optional registered state.
+ * continue from (reset, refused commit, a dirty status); each advance also empties the CCM ring. Before a run, zero the
+ * accelerator's state when io.state_generation differs from the value at the last zeroing; it is written every hop, also with
+ * the optional registered state.
  * A status other than 0 fails CLOSED: the batch's spectrum is zero, but the overlap-add still carries the previous hop, so
  * pcm_out is not fully zero except on the first bypass. No warm-up: a frame is ready from hop 0 (N == 1) or hop N - 1, over a
  * zero-filled CCM ring. The zero hops are the N - 1 pre-roll hops of the first batch. PCM delay is N * grid.hop samples. */

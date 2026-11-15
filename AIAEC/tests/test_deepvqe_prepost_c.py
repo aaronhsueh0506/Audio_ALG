@@ -35,7 +35,8 @@ for the module):
              value in the newest, an older or the dropped frame is refused
   generation state_generation starts at 0 and advances on reset, on a
              refused commit and on frame_fail with a started run, and on
-             nothing else
+             nothing else (each advance restarts the CCM ring:
+             test_deepvqe_ccm_restart_c.py)
   fail       frame_fail closes the open batch with the frame_bypass output;
              a started run zeroes the registered state and advances the
              generation, a run that never started changes neither
@@ -1341,11 +1342,13 @@ static int case_inplace(void) {
                 CHECK(isfinite(outputs.state_out[id][i]));
     }
 
-    /* (3) A refused commit does not advance the CCM ring. X: poisoned f1
-     * refused, skipped (muted), then a healthy f2. Y: a fresh instance fed
-     * only the healthy f2. Both reach f2 from the cold state with an empty
-     * ring, so their outputs agree byte for byte -- a ring that had taken f1
-     * on the refused commit would split them. */
+    /* (3) A refused commit restarts the CCM ring (a cold start) and never
+     * pushes the refused frame into it. X: poisoned f1 refused, skipped
+     * (muted), then a healthy f2. Y: a fresh instance fed only the healthy
+     * f2. Both reach f2 from the cold state with an empty ring, so their
+     * outputs agree byte for byte -- a ring that had taken f1 on the refused
+     * commit would split them. A ring that held an earlier frame is the case
+     * of test_deepvqe_ccm_restart_c.py. */
     {
         Inst y;
         static float x_re[BINS_MAX], x_im[BINS_MAX];
@@ -2315,8 +2318,8 @@ def test_state_is_in_place_and_a_non_finite_write_zeroes_it(driver):
     (first and last element) through the in-place pointer makes _frame_finish
     return -1, zeroes ALL sixteen tensors, and the next healthy frame still
     commits -- while the identical uninjected frame commits, so the refusal is
-    attributable to the injection. A refused commit also leaves the CCM ring
-    where it was."""
+    attributable to the injection. A refused commit also restarts the CCM ring
+    (a cold start; test_deepvqe_ccm_restart_c.py)."""
     _run(driver, 'inplace')
 
 

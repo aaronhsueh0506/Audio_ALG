@@ -243,8 +243,9 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p);
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
 /* Counter of state restarts (reset, frame_finish refusing a frame, frame_fail with run_started); 0 after
- * init and for NULL; kept whether or not a state is registered. A fixed-point accelerator loads
- * quantized zeros into its own copy of the state at start and on every change. */
+ * init and for NULL; kept whether or not a state is registered. Every advance also empties the CCM
+ * ring, so the next frame is a cold start. A fixed-point accelerator loads quantized zeros into its
+ * own copy of the state at start and on every change. */
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
@@ -270,7 +271,7 @@ int deepvqe_prepost_frame_open(DeepVqePrepost *p,
  * TIME_ORDER raw microphone spectra, advanced once per frame, oldest batch frame first) and the N
  * enhanced spectra are staged for post_process_freq, one drained per call over the N calls that
  * follow. On a non-finite value the registered buffers are zeroed (nothing registered: only the
- * taps are checked), the state generation advances, the ring is not pushed, the batch stays open
+ * taps are checked), the CCM ring is emptied, the state generation advances, the batch stays open
  * and -1 is returned: call frame_bypass() or re-run. */
 int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
 
@@ -280,7 +281,8 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
 int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
 
 /* Closes the open batch after a run that did not succeed: the frame_bypass output. run_started != 0
- * (the device state may be dirty): the registered state is zeroed and the generation advances.
+ * (the device state may be dirty): the registered state is zeroed, the CCM ring is emptied and the
+ * generation advances.
  * Returns 0, or -1 (nothing changed) if no batch is open. */
 int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started);
 
