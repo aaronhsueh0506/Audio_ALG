@@ -34,7 +34,7 @@ static int raw_fill_accel(DFN2PrepostOutputs *out) {
     return 0;
 }
 
-static void ainr_fill_accel(AinrWork *io) {
+static void ainr_fill_accel(StreamWork *io) {
     size_t i;
     for (i = 0; i < io->outputs[0].elements; ++i) io->outputs[0].data[i] = 0.3f;    /* erb_mask */
 #ifndef DFN2_MASK_ONLY
@@ -82,7 +82,7 @@ static void run_reference_hops(DFN2Stream *s, const int16_t *pcm_in, int hops, i
 static int run_ainr_blocks(AinrCtx *ctx, const int16_t *pcm_in, int blocks, int hop_in, int16_t *pcm_out) {
     int i;
     for (i = 0; i < blocks; ++i) {
-        AinrWork io;
+        StreamWork io;
         int rc = ainr_preprocess(ctx, pcm_in + (size_t)i * (size_t)hop_in, &io);
         if (rc != AINR_OK) { fprintf(stderr, "ainr_preprocess rc=%d at block %d\n", rc, i); return -1; }
         ainr_fill_accel(&io);
@@ -251,7 +251,7 @@ static int test_postprocess_failure_recovery(const char *erb_path) {
     AinrCtx *ctx;
     int hop = grid.hop;
     int16_t *pcm_in, *pcm_out;
-    AinrWork io;
+    StreamWork io;
     int rc;
 
     cfg.sr = 16000;
@@ -324,7 +324,7 @@ static int test_sequence_misuse_and_reset(const char *erb_path) {
     AinrCtx *ctx;
     int hop = grid.hop;
     int16_t *pcm_in, *pcm_out;
-    AinrWork io;
+    StreamWork io;
     int rc;
 
     cfg.sr = 16000;
@@ -405,7 +405,7 @@ static int test_larger_pool_accepted(const char *erb_path) {
     }
     fill_pcm(pcm_in, 128 * 4, 3);
     for (b = 0; b < 4; ++b) {
-        AinrWork io;
+        StreamWork io;
         if (ainr_preprocess(ctx_big, pcm_in + 128 * b, &io) != AINR_OK) return 1;
         ainr_fill_accel(&io);
         if (ainr_postprocess(ctx_big, 0, out_big + 128 * b) != AINR_OK) return 1;
@@ -423,7 +423,7 @@ static int test_larger_pool_accepted(const char *erb_path) {
     return 0;
 }
 
-/* AinrWork's shapes come from the grid math while its data pointers and element counts come from the
+/* StreamWork's shapes come from the grid math while its data pointers and element counts come from the
  * authoritative DFN2Prepost views -- the one place those two could silently disagree. Every shape field
  * of a real block is checked against the exporter's tensor shapes spelled out for the 16k/256 N=1 grid
  * (graph inputs erb [1,1,T,24], spec [1,2,T,96] with T = N + 2; heads erb_mask [1,1,1,24], full also
@@ -446,7 +446,7 @@ static int test_work_matches_exporter_shapes(const char *erb_path) {
     int hop = grid.hop;
     int16_t *pcm_in, *pcm_out;
     AinrInfo info;
-    AinrWork real_io;
+    StreamWork real_io;
     int rc, i;
 
     cfg.sr = 16000;
@@ -471,7 +471,7 @@ static int test_work_matches_exporter_shapes(const char *erb_path) {
         return 1;
     }
     for (i = 0; i < real_io.input_count; ++i) {
-        const AinrTensorIn *t = &real_io.inputs[i];
+        const StreamTensorIn *t = &real_io.inputs[i];
         if (t->b != want_in[i].b || t->c != want_in[i].c || t->h != want_in[i].h || t->w != want_in[i].w ||
             t->elements != (size_t)t->b * t->c * t->h * t->w || !t->data) {
             fprintf(stderr, "test_work_matches_exporter_shapes: inputs[%d] shape mismatch\n", i);
@@ -479,7 +479,7 @@ static int test_work_matches_exporter_shapes(const char *erb_path) {
         }
     }
     for (i = 0; i < real_io.output_count; ++i) {
-        const AinrTensorOut *t = &real_io.outputs[i];
+        const StreamTensorOut *t = &real_io.outputs[i];
         if (t->b != want_out[i].b || t->c != want_out[i].c || t->h != want_out[i].h || t->w != want_out[i].w ||
             t->elements != (size_t)t->b * t->c * t->h * t->w || !t->data) {
             fprintf(stderr, "test_work_matches_exporter_shapes: outputs[%d] shape mismatch\n", i);
@@ -591,7 +591,7 @@ static int test_init_matches_erb_file(void) {
     fill_pcm(pcm_in, hops * hop, 9);
 
     for (i = 0; i < hops; ++i) {
-        AinrWork io_a, io_b;
+        StreamWork io_a, io_b;
         int rc;
         rc = ainr_preprocess(ctx_a, pcm_in + (size_t)i * (size_t)hop, &io_a);
         if (rc != AINR_OK) { fprintf(stderr, "test_init_matches_erb_file: ctx_a preprocess rc=%d\n", rc); return 1; }

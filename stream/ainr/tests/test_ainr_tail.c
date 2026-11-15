@@ -125,7 +125,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     pcm[s_real - 1] = PULSE;
 
     for (b = 0; b < total_blocks; ++b) {
-        AinrWork io;
+        StreamWork io;
         if (ainr_preprocess(cp, pcm + (size_t)b * (size_t)hop_in, &io) != AINR_OK ||
             ainr_postprocess(cp, 1, out16 + (size_t)b * (size_t)hop_in) != AINR_OK) {
             fprintf(stderr, "%s: PCM family block %d failed\n", label, b); return 1;
@@ -155,7 +155,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
         ola = ola_make(fft);
         memset(outf, 0, total * sizeof(float));
         for (b = 0; b < BLOCKS_REAL + zero_hops; ++b) {
-            AinrWork io;
+            StreamWork io;
             for (k = 0; k < hop; ++k) hopf[k] = (float)pcm[(size_t)b * (size_t)hop + (size_t)k] / 32768.0f;
             ac_stft_push_planar(st, hopf, are, aim);
             if (ainr_preprocess_freq(cf, are, aim, are, aim, &io) != AINR_OK ||
@@ -191,7 +191,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
         ola = ola_make(fft);
         memset(outf, 0, total * sizeof(float));
         for (b = 0; b < total_blocks; ++b) {
-            AinrWork io;
+            StreamWork io;
             for (f = 0; f < n; ++f) {
                 for (k = 0; k < hop; ++k)
                     hopf[k] = (float)pcm[(size_t)b * (size_t)hop_in + (size_t)f * (size_t)hop + (size_t)k] / 32768.0f;

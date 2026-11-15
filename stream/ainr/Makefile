@@ -76,7 +76,7 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-mask$(MASK_ONLY)-$(CFG_SIG)
 # ainr.c dispatches by model_id (DFN2 full/lite today) -- it lives here, one level above dfn2/,
 # instead of inside its own build. It only needs dfn2/'s headers, never recompiles dfn2's core.
 STREAM_SOURCES :=
-STREAM_HEADERS := ainr.h ainr_test.h ainr_product.h dfn2/dfn2_stream.h ../../lib/ainr/dfn2/dfn2_grid.h ../common/stream_mem.h
+STREAM_HEADERS := ainr.h ainr_test.h ainr_product.h dfn2/dfn2_stream.h ../../lib/ainr/dfn2/dfn2_grid.h ../common/stream_mem.h ../common/stream_run.h
 LIB := $(OBJ_DIR)/libainr.a
 LIB_OBJECTS :=
 ifeq ($(NO_STDIO),0)
@@ -233,7 +233,7 @@ test-ainr-atten-lim: $(OBJ_DIR)/test_ainr_atten_lim
 	"$(OBJ_DIR)/test_ainr_atten_lim"
 
 # work-dumper: builds tests/dump_work.c for this variant and prints the binary path. It prints the init result
-# and the AinrWork views (counts, shapes, element counts) of one config from real preprocess calls, for the
+# and the StreamWork views (counts, shapes, element counts) of one config from real preprocess calls, for the
 # Python pins and the sample model-config check to compare against the exporter.
 $(OBJ_DIR)/dump_work: tests/dump_work.c $(GENERIC_TEST_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
@@ -270,7 +270,7 @@ endif
 	  "$(OBJ_DIR)/test_ainr_product_$$1"; \
 	done
 
-# test-ainr-graph-io: the DFN2 graph rows (graph_io_dfn2.h) against the AinrWork of real preprocess calls
+# test-ainr-graph-io: the DFN2 graph rows (graph_io_dfn2.h) against the StreamWork of real preprocess calls
 # for this variant, with the default product id and the three others of ainr_product.h (alt2, alt1, the other
 # variant's). The port check of the model-config header links ../common/stream_bind.c (samples only, not the archive).
 test-ainr-graph-io: $(GENERIC_TEST_SOURCES) tests/test_ainr_graph_io.c graph_io_dfn2.h ../common/graph_io.h $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard

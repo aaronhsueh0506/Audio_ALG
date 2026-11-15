@@ -47,7 +47,7 @@ static void gen_block(float *buf, size_t n, int block, int array) {
     }
 }
 
-static void fill_heads(AinrWork *io, int blk) {
+static void fill_heads(StreamWork *io, int blk) {
     int o;
     size_t i;
     for (o = 0; o < io->output_count; ++o)
@@ -119,7 +119,7 @@ static int run_stream(const AinrConfig *cfg, const char *erb, int n, int n_bins,
         for (k = 0; k < 4; ++k) gen_block(a[k], blk_n, blk, k);   /* est_re, est_im, app_re, app_im */
 
         for (pass = 0; pass < npass; ++pass) {
-            AinrWork io;
+            StreamWork io;
             unsigned int gen_before;
             int corrupt = bad_blk && pass == 0 && (mode == MODE_SKIP || mode == MODE_RETRY);
             int rc, o;
@@ -242,7 +242,7 @@ static int run_boundary(int sr, int fft, int n_erb, const char *label) {
     StreamMemReq req;
     AinrInfo info;
     AinrFreqCtx *ctx = NULL;
-    AinrWork io;
+    StreamWork io;
     int n_bins = fft / 2 + 1, bad = 0, a, o;
     size_t bin = 5, i;
     float scale = dfn2_stft_scale(fft), edge = ldexpf(1.0f, 63) / scale, over = nextafterf(edge, INFINITY);

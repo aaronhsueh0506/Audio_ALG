@@ -1,4 +1,4 @@
-/* The board samples' DFN2 graph rows (stream/ainr/graph_io_dfn2.h) against the AinrWork a real preprocess
+/* The board samples' DFN2 graph rows (stream/ainr/graph_io_dfn2.h) against the StreamWork a real preprocess
  * call returns, for this build's variant (full, or lite under -DDFN2_MASK_ONLY) and product id
  * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM and _freq block must pass
  * GRAPH_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
@@ -49,11 +49,12 @@ static int write_erb(const char *path, int n_bins, int n_erb)
     return fclose(fp);
 }
 
-static void compare_work(const char *tag, const GraphIoConfig *mc, const AinrWork *work)
+static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamWork *work)
 {
     const StreamWiring *w = &mc->wiring;
     int i, rc;
 
+    CHECK(work->action == STREAM_WORK_SUBMIT, "%s action %d", tag, (int)work->action);
     CHECK(work->input_count == w->signal_in_count, "%s input_count %d vs %d", tag, work->input_count, w->signal_in_count);
     CHECK(work->output_count == w->head_out_count, "%s output_count %d vs %d", tag, work->output_count, w->head_out_count);
     for (i = 0; i < work->input_count && i < w->signal_in_count; ++i)
@@ -66,10 +67,10 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const AinrWor
               work->outputs[i].elements == w->outputs[i].elements, "%s head %d shape", tag, i);
     GRAPH_IO_CHECK_WORK(rc, mc, work);
     CHECK(rc == GRAPH_IO_OK, "%s GRAPH_IO_CHECK_WORK rc %d", tag, rc);
-    CHECK(graph_io_fits(mc, AINR_MAX_INPUT_TENSORS, AINR_MAX_OUTPUT_TENSORS) == GRAPH_IO_OK, "%s fits", tag);
+    CHECK(graph_io_fits(mc, STREAM_WORK_MAX_INPUTS, STREAM_WORK_MAX_OUTPUTS) == GRAPH_IO_OK, "%s fits", tag);
 }
 
-static void fill_heads(AinrWork *w)
+static void fill_heads(StreamWork *w)
 {
     int i;
     size_t k;
@@ -116,7 +117,7 @@ static void check_refusals(const char *erb)
 static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoConfig *mc, const char *tag)
 {
     AinrInfo info;
-    AinrWork work;
+    StreamWork work;
     StreamMemReq req;
     AinrCtx *pcm = NULL;
     AinrFreqCtx *freq = NULL;

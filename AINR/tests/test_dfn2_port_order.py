@@ -4,7 +4,7 @@ views are the graph's signal inputs and head outputs.
 Inputs are the signal inputs (erb, spec), then the state inputs; outputs are the head outputs, then the state
 outputs named ``<input>_out``; state k is input ``signal_in + k`` and output ``head_out + k`` with equal shapes.
 The board samples bind by position, so this order is the contract. The library keeps no port list: stream/ainr
-hands each block's signals and heads in AinrWork, and the graph's state ports belong to the sample's model
+hands each block's signals and heads in StreamWork, and the graph's state ports belong to the sample's model
 configuration. Random-weight graphs are exported full and mask-only at N = 1 and N = 8 for the order check (the
 ONNX names are read here, on the exporter side only), and at the registered catalog grids (16 kHz / 256, 48 kHz /
 1024) for the work-view check against ``make -C stream/ainr [MASK_ONLY=1] work-dumper``, which runs a real

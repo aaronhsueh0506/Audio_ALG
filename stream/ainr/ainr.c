@@ -51,7 +51,7 @@ static void ainr_erb_path(int sample_rate, int n_erb, char *out, size_t out_size
     snprintf(out, out_size, "%s/fb_%d_%d.bin", AINR_ERB_MATRIX_DIR, sample_rate, n_erb);
 }
 
-/* The recurrent state is never host-registered: the accelerator owns it, so AinrWork lists only the
+/* The recurrent state is never host-registered: the accelerator owns it, so StreamWork lists only the
  * per-hop tensors (erb and spec windows in; mask, coefs, alpha out). */
 
 /* graph_path NULL means this frames_per_call has no shipped graph yet -- the resolver must treat
@@ -448,14 +448,15 @@ unsigned int ainr_state_generation_freq(const AinrFreqCtx *ctx)
     return ctx ? dfn2_stream_state_generation(ctx->core.inner) : 0u;
 }
 
-/* Fills AinrWork from the inner API's one open hop: shapes (ONNX logical [b,c,h,w], w innermost)
+/* Fills StreamWork from the inner API's one open hop: shapes (ONNX logical [b,c,h,w], w innermost)
  * from the grid, data pointers and element counts from the authoritative DFN2Prepost views. */
 static void ainr_fill_work(const DFN2Grid *grid, const DFN2PrepostInputs *in,
-                           const DFN2PrepostOutputs *out, unsigned int generation, AinrWork *work)
+                           const DFN2PrepostOutputs *out, unsigned int generation, StreamWork *work)
 {
-    AinrTensorIn *ti = work->inputs;
-    AinrTensorOut *to = work->outputs;
+    StreamTensorIn *ti = work->inputs;
+    StreamTensorOut *to = work->outputs;
 
+    work->action = STREAM_WORK_SUBMIT;
     ti[0].data = in->erb_window;
     ti[0].elements = in->erb_window_elements;
     ti[0].w = (unsigned int)grid->n_erb;
@@ -603,7 +604,7 @@ static int ainr_close_spectrum(AinrCore *c, int infer_status, float *out_re, flo
     return AINR_OK;
 }
 
-int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, AinrWork *work)
+int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work)
 {
     AinrCore *c;
     DFN2HopIO hio;
@@ -654,7 +655,7 @@ static int ainr_freq_block_in_range(const AinrCore *c, const float *est_re, cons
 }
 
 int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est_im,
-                         const float *app_re, const float *app_im, AinrWork *work)
+                         const float *app_re, const float *app_im, StreamWork *work)
 {
     AinrCore *c;
     DFN2HopIO hio;

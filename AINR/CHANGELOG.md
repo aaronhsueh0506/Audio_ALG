@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### `ainr.h` uses the shared `StreamWork` (`stream/common/stream_run.h`); `AinrWork` and its tensor types are gone
+
+`ainr_preprocess()` and `ainr_preprocess_freq()` take a `StreamWork *`; `AinrWork`, `AinrTensorIn`, `AinrTensorOut`, `AINR_MAX_INPUT_TENSORS` and `AINR_MAX_OUTPUT_TENSORS` are removed, with no alias (`StreamTensorIn`, `StreamTensorOut`, `STREAM_WORK_MAX_INPUTS`, `STREAM_WORK_MAX_OUTPUTS` replace them). The extra field is `action`, which a DFN2 block always sets to `STREAM_WORK_SUBMIT`; every other field, count and shape is as before. `StreamWork` is larger than `AinrWork` (the shared arrays hold five inputs and three outputs), the same in the full and the lite archive. A caller rebuilds against `stream_run.h`, which sits in `stream/common` beside `stream_mem.h`. The `graph_io_fits()` bounds a sample passes become `STREAM_WORK_MAX_INPUTS` / `STREAM_WORK_MAX_OUTPUTS`. No numerics changed.
+
 ### DFN2 ERB file loader: the file must end after the two tables and the forward table must be finite
 
 `dfn2_stream_init_from_erb_file[_ex]` and so `ainr_init*` refuse (`AINR_ERR_ERB_FILE`) a file with bytes after the forward and inverse tables or with a NaN / infinite forward value; before, a NaN forward value loaded and reached the accelerator's inputs on every hop. Init-time check only: numbers, pool sizes, descriptors and layout versions unchanged. Every exporter output and shipped `fb_*.bin` copy found here still loads.

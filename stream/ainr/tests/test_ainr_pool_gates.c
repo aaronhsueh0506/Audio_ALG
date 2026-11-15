@@ -104,7 +104,7 @@ static int run_blocks(Fam f, void *ctx, const AinrConfig *cfg) {
     int t, k, j, rc = 0;
     if (!pcm || !x) exit(1);
     for (t = 0; t < 12 && rc == 0; ++t) {
-        AinrWork w;
+        StreamWork w;
         for (k = 0; k < cfg->hop_in; ++k) pcm[k] = (int16_t)((k * 29 + t * 7) % 2001 - 1000);
         for (k = 0; k < (int)(spec * 2u); ++k) x[k] = (float)((k * 13 + t * 5) % 97) / 97.0f - 0.5f;
         if (t == 5) { if (f == FAM_PCM) ainr_reset((AinrCtx *)ctx); else ainr_reset_freq((AinrFreqCtx *)ctx); }

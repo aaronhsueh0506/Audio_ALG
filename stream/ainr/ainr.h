@@ -16,8 +16,8 @@
  *
  * A failed run or readback still calls ainr_postprocess() with the failure status. An unregistered
  * config is refused before any SDK call. Every successful preprocess pairs with one run and one
- * postprocess. AinrWork has the same size in the full and the lite archive: a client linked to the
- * wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
+ * postprocess. StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
+ * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
  * File mode only: the pool size assumes the ERB tables load from a file. Under -DDFN2_STREAM_NO_STDIO
  * no init function is compiled in; use dfn2_stream_init() (dfn2/dfn2_stream.h) directly. */
 
@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "stream_mem.h"    /* StreamMemReq; include roots: stream/common and audiolib common/ */
+#include "stream_run.h"    /* StreamWork, STREAM_RUN_*: the per-block run contract */
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,34 +58,6 @@ enum {
 
 /* Short text for a status code, for a log line. Never NULL. */
 const char *ainr_status_text(int code);
-
-#define AINR_MAX_INPUT_TENSORS  2   /* erb window, spec window */
-#define AINR_MAX_OUTPUT_TENSORS 3   /* full: erb_mask, coefs, alpha; lite: erb_mask */
-
-typedef struct AinrTensorIn {
-    const float *data;
-    size_t elements;
-    unsigned int w, h, c, b;   /* tensor shape, w innermost (the ONNX logical [b,c,h,w]) */
-} AinrTensorIn;
-
-typedef struct AinrTensorOut {
-    float *data;
-    size_t elements;
-    unsigned int w, h, c, b;
-} AinrTensorOut;
-
-/* One block's tensors: inputs[i] is signal input i of the graph, outputs[j] head output j; the accelerator keeps the
- * recurrent state, state_generation says when to reload it with quantized zero. The data pointers are stream-owned,
- * valid until the matching postprocess: do not free them or write the inputs (the accelerator fills the outputs).
- * Preprocess NaN-fills the outputs, so a head the accelerator leaves unwritten counts as non-finite. */
-typedef struct AinrWork {
-    AinrTensorIn  inputs[AINR_MAX_INPUT_TENSORS];
-    int           input_count;
-    AinrTensorOut outputs[AINR_MAX_OUTPUT_TENSORS];
-    int           output_count;
-    /* Sampled every block, as DFN2HopIO.state_generation. */
-    unsigned int  state_generation;
-} AinrWork;
 
 /* Tail: AC_OLA_ACCUMULATE has no flush. After the last real block push info.tail_zero_blocks zero blocks,
  * drop info.trim_samples from the start, keep the real length. _freq: feed the upstream analyser the same
@@ -126,10 +99,11 @@ int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
  * All-zero bytes are that zero: the port check refuses a fixed-point state port with zero_point != 0. */
 unsigned int ainr_state_generation(const AinrCtx *ctx);
 
-/* One block in: exactly cfg->hop_in samples. AINR_OK: work holds the block's one job; run the accelerator,
- * then ainr_postprocess(). AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no
+/* One block in: exactly cfg->hop_in samples. AINR_OK: work (action SUBMIT) holds the block's one job: inputs[0] the
+ * ERB window, inputs[1] the spec window; outputs[] erb_mask, then coefs and alpha in the full archive. Run the
+ * accelerator, then ainr_postprocess(). AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no
  * block is open. */
-int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, AinrWork *work);
+int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work);
 
 /* Closes the block: infer_status 0 commits (full: df_alpha clamped to [0, 1] before use), anything else bypasses
  * with a near-identity pass-through (unit ERB mask, alpha 0). Returns 0 with hop_in samples in pcm_out either
@@ -137,7 +111,7 @@ int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, AinrWork *work);
 int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
 
 /* ---- Spectrum -> spectrum ("_freq") family ----
- * Same config, AinrInfo and AinrWork as the PCM family; only the data crossing the block boundary differs.
+ * Same config, AinrInfo and StreamWork as the PCM family; only the data crossing the block boundary differs.
  * Spectra are AUDIO scale (AcStft/AcIstft with scale 1.0, ac_stft_config_default(), the PCM scaled as
  * int16 / 32768), frame-major, oldest first, N frames of n_bins. The caller owns the analysis and synthesis:
  * it supplies an estimate spectrum E (features, mask, deep filter) and an apply spectrum P (what mask, deep
@@ -168,7 +142,7 @@ unsigned int ainr_state_generation_freq(const AinrFreqCtx *ctx);
  * power would overflow) refuses the block (AINR_ERR_NONFINITE_INPUT) before any frame is consumed: state untouched, no
  * block open, so no run and no postprocess_freq; queued frames come out a block late. */
 int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est_im,
-                         const float *app_re, const float *app_im, AinrWork *work);
+                         const float *app_re, const float *app_im, StreamWork *work);
 
 /* Closes the block like ainr_postprocess(), writing N frames of enhanced spectrum (out_re/out_im: N * n_bins
  * floats each). */

@@ -1,5 +1,5 @@
 /* The state-generation contract the samples reload their accelerator state by, for both
- * families (PCM, _freq): AinrWork.state_generation must equal the live
+ * families (PCM, _freq): StreamWork.state_generation must equal the live
  * ainr_state_generation*() at the moment it is read (the seed read right after init included), and
  * the counter must move exactly where ainr.h says:
  *
@@ -61,7 +61,7 @@ static void fam_reset(Fam *f) {
     else ainr_reset_freq(f->freq);
 }
 
-static int fam_pre(Fam *f, int blk, AinrWork *io) {
+static int fam_pre(Fam *f, int blk, StreamWork *io) {
     size_t i, cnt = (size_t)f->n * (size_t)f->n_bins;
     if (f->family == FAM_FREQ) {
         for (i = 0; i < cnt; ++i) {
@@ -79,7 +79,7 @@ static int fam_post(Fam *f, int status) {
          : ainr_postprocess_freq(f->freq, status, f->out_re, f->out_im);
 }
 
-static void fill_heads(AinrWork *io) {
+static void fill_heads(StreamWork *io) {
     int o;
     size_t i;
     for (o = 0; o < io->output_count; ++o)
@@ -91,7 +91,7 @@ static void fill_heads(AinrWork *io) {
 
 /* `warm` = mask_lookahead of the grid (hops after init/reset that advance the generation). */
 static int run_family(Fam *f, int warm, const char *label) {
-    AinrWork io;
+    StreamWork io;
     unsigned int g, seed;
     int blk = 0, w;
 
@@ -150,7 +150,7 @@ static int run_family(Fam *f, int warm, const char *label) {
         for (head = 0; head < io.output_count; ++head)
             for (v = 0; v < 3; ++v)
                 for (at = 0; at < 2; ++at) {
-                    AinrWork pw;
+                    StreamWork pw;
                     size_t idx;
                     g = fam_gen(f);
                     CHECK(fam_pre(f, blk++, &pw) == AINR_OK, "pre failed");

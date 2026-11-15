@@ -1,6 +1,6 @@
 /* Link-only check: this file includes only ainr.h and ainr_test.h and links against the built libainr.a and
  * the DFN2 archive (never compiled with ainr.c's sources, unlike the other tests): the shipped archive
- * exports ainr_*, runs a real round trip per family on its own catalog row, and AinrWork's counts and
+ * exports ainr_*, runs a real round trip per family on its own catalog row, and StreamWork's counts and
  * shapes reflect the variant it was built as. Pass -DAINR_TEST_EXPECT_LITE for the mask-only archive. */
 
 #include <stdint.h>
@@ -68,17 +68,17 @@ static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
 }
 
 /* Every tensor of the work has data, a non-zero shape and elements equal to the product of its axes. */
-static int check_work_tensors(const AinrWork *io) {
+static int check_work_tensors(const StreamWork *io) {
     int i;
     for (i = 0; i < io->input_count; ++i) {
-        const AinrTensorIn *t = &io->inputs[i];
+        const StreamTensorIn *t = &io->inputs[i];
         if (!t->data || t->elements == 0 || t->elements != (size_t)t->b * t->c * t->h * t->w) {
             fprintf(stderr, "link_only_ainr: input %d shape/elements\n", i);
             return 1;
         }
     }
     for (i = 0; i < io->output_count; ++i) {
-        const AinrTensorOut *t = &io->outputs[i];
+        const StreamTensorOut *t = &io->outputs[i];
         if (!t->data || t->elements == 0 || t->elements != (size_t)t->b * t->c * t->h * t->w) {
             fprintf(stderr, "link_only_ainr: output %d shape/elements\n", i);
             return 1;
@@ -96,7 +96,7 @@ static int run_round_trip(void) {
     char erb_path[64];
     int hop = EXPECT_FFT / 2;
     int16_t pcm_in[EXPECT_FFT / 2], pcm_out[EXPECT_FFT / 2];
-    AinrWork io;
+    StreamWork io;
     int rc, i;
 
     snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_erb_%d.bin", (int)getpid());
@@ -152,7 +152,7 @@ static int run_round_trip_freq(void) {
     int hop = EXPECT_FFT / 2;
     float in_re[EXPECT_N_BINS], in_im[EXPECT_N_BINS];
     float out_re[EXPECT_N_BINS], out_im[EXPECT_N_BINS];
-    AinrWork io;
+    StreamWork io;
     int rc, i;
 
     snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_freq_erb_%d.bin", (int)getpid());

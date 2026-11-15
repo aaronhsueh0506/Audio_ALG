@@ -32,7 +32,7 @@
 <li><code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code>。</li>
 </ul>
 <p>N 與 <code>hop_in</code> 不在 <code>AinrInfo</code>：客戶的三欄設定已經帶有它們，sample 自己算 N = <code>cfg.hop_in / (cfg.fft / 2)</code>。state 的起始 generation 也不在其中：sample 在 init 之後、第一次 <code>ainr_preprocess()</code> 之前呼叫 <code>ainr_state_generation(ctx)</code> 取得（reset 之後同樣用它）。函式庫不描述圖的埠，也不保存 state 的尺寸。</p>
-<p>圖的接線在兩個無 SDK 標頭：<code>stream/ainr/graph_io_dfn2.h</code> 是 DFN2 的固定表（只有標頭，<code>ainr.h</code> 不引用），每個登錄的 (產品, sr, fft, N) 一列，列出每個訊號輸入、每個 head 與每個 state 的 [b,c,h,w]，註明所對應的匯出器；<code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）是四支 sample（與另兩款模型）共用的程式：把一列展開成 <code>StreamWiring</code>、用數量迴圈算 state 配對、依 shape 算 input buffer 大小、呼叫埠檢查，以及送件前核對 <code>AinrWork</code> 的數量與 shape（<code>GRAPH_IO_CHECK_WORK</code>）。sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。查不到列（<code>GRAPH_IO_ERR_NO_ROW</code>）的組態在開圖前拒絕。</p>
+<p>圖的接線在兩個無 SDK 標頭：<code>stream/ainr/graph_io_dfn2.h</code> 是 DFN2 的固定表（只有標頭，<code>ainr.h</code> 不引用），每個登錄的 (產品, sr, fft, N) 一列，列出每個訊號輸入、每個 head 與每個 state 的 [b,c,h,w]，註明所對應的匯出器；<code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）是四支 sample（與另兩款模型）共用的程式：把一列展開成 <code>StreamWiring</code>、用數量迴圈算 state 配對、依 shape 算 input buffer 大小、呼叫埠檢查，以及送件前核對 <code>StreamWork</code> 的數量與 shape（<code>GRAPH_IO_CHECK_WORK</code>）。sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。查不到列（<code>GRAPH_IO_ERR_NO_ROW</code>）的組態在開圖前拒絕。</p>
 <p>埠順序是一條規則：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出；第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，每組兩端同形狀。DFN2 的 <code>signal_in_count</code> 恆為 2（erb 視窗、spec 視窗）。各列的 shape 見<a href="../index.html#graph-wiring">產品首頁的表</a>。</p>
 <table>
 <thead><tr><th>產品</th><th>輸入位置</th><th>輸出位置</th></tr></thead>
@@ -40,7 +40,7 @@
 <tr><th>full（<code>signal_in_count</code> 2、<code>head_out_count</code> 3）</th><td>0 erb、1 spec、2 state 0（<code>h_gru</code> [1,5,1,256]）、3 state 1（<code>df_convp_history</code> [1,64,5,96]）</td><td>0 erb_mask、1 df_coefs、2 df_alpha、3 state 0、4 state 1</td></tr>
 <tr><th>lite（2、1）</th><td>0 erb、1 spec、2 state 0（<code>h_gru</code> [1,3,1,256]）</td><td>0 erb_mask、1 state 0</td></tr>
 </tbody></table>
-<p>括號與表中的名稱是匯出器的 ONNX 名稱，只用來讀表；C 端不保存名稱，sample 不比對名稱。<code>AinrWork.inputs[i]</code> 是圖的輸入 i（只有兩個訊號輸入），<code>AinrWork.outputs[j]</code> 是圖的輸出 j（full 三個 head，lite 一個），索引與模型設定的 signal i、head j 一致。</p>
+<p>括號與表中的名稱是匯出器的 ONNX 名稱，只用來讀表；C 端不保存名稱，sample 不比對名稱。<code>StreamWork.inputs[i]</code> 是圖的輸入 i（只有兩個訊號輸入），<code>StreamWork.outputs[j]</code> 是圖的輸出 j（full 三個 head，lite 一個），索引與模型設定的 signal i、head j 一致。</p>
 
 <h2 id="ports">開圖後的埠檢查</h2>
 <p>開圖後、第一次執行前，把 SDK 回報的每個埠填成 <code>StreamDeviceDesc</code>（軸 <code>w, h, c, b</code>、<code>elem_bits</code>、<code>is_float</code>、<code>scale_ratio</code>／<code>zero_point</code>、<code>line_ofs</code>／<code>channel_ofs</code>／<code>batch_ofs</code>、<code>capacity_bytes</code>），依 SDK 的埠順序交給 <code>graph_io_check_ports(&amp;model, in, n_in, out, n_out, msg, sizeof msg)</code>，它呼叫 <code>stream_check_ports()</code>。<code>StreamWiring</code>、<code>StreamDeviceDesc</code> 與 <code>stream_check_ports()</code> 在 <code>stream/common/stream_bind.{h,c}</code>：SDK 無關的 sample 端檢查器，只由 sample 連結；<code>libainr.a</code> 不含它。回傳 <code>STREAM_PORT_OK</code> 或下列負值，並在 <code>msg</code> 給一行原因，以位置稱呼埠（例如 <code>input 2 (state 0)</code>）；不符就不要啟動，不會誤讀。</p>

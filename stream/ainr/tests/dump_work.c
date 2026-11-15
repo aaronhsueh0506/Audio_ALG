@@ -1,5 +1,5 @@
 /* Prints, for one {sr, fft, hop_in} of the variant this binary is built for (full, or lite under
- * -DDFN2_MASK_ONLY), the init result and the AinrWork views of the first block, one line per fact, for the
+ * -DDFN2_MASK_ONLY), the init result and the StreamWork views of the first block, one line per fact, for the
  * Python pins and the sample model-config check to compare against the exporter. Built by `make work-dumper`.
  *
  *   dump_work <sr> <fft> <hop_in> [family]        family 0 PCM (default), 2 _freq (1 was the retired _spec)
@@ -7,9 +7,9 @@
  *                                                 preprocess (a refused config prints this line only)
  *     graph <path>                                AinrInfo.graph_path
  *     info trim <int> queue <int> tail <int>      AinrInfo trim_samples / queue_frames / tail_zero_blocks
- *     counts inputs <int> outputs <int>           AinrWork input_count / output_count
- *     in <i> <b> <c> <h> <w> <elements>           AinrWork.inputs[i], signal inputs only
- *     out <i> <b> <c> <h> <w> <elements>          AinrWork.outputs[i], heads only
+ *     counts inputs <int> outputs <int>           StreamWork input_count / output_count
+ *     in <i> <b> <c> <h> <w> <elements>           StreamWork.inputs[i], signal inputs only
+ *     out <i> <b> <c> <h> <w> <elements>          StreamWork.outputs[i], heads only
  *
  * The recurrent state is the accelerator's and is not in the work. N and hop_in are the arguments. */
 
@@ -41,7 +41,7 @@ static int write_erb(const char *path, int n_bins, int n_erb) {
 int main(int argc, char **argv) {
     AinrConfig cfg;
     AinrInfo info;
-    AinrWork work;
+    StreamWork work;
     StreamMemReq req;
     AinrCtx *pcm = NULL;
     AinrFreqCtx *freq = NULL;

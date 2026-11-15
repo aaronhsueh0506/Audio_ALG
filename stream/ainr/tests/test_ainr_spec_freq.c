@@ -16,7 +16,7 @@
  *
  * Not built under NO_STDIO (ainr.c's only entry points, including the new families', are
  * file-mode only). MASK_ONLY-only concepts (coefs/alpha outputs) are already guarded by ainr.h's
- * own AinrWork contract (output_count differs), so this file needs no #ifdef DFN2_MASK_ONLY of
+ * own StreamWork contract (output_count differs), so this file needs no #ifdef DFN2_MASK_ONLY of
  * its own beyond what fill_accel() uses, matching test_ainr_dfn2.c's own convention. */
 
 #include <stdint.h>
@@ -42,10 +42,10 @@ static void fill_pcm(int16_t *pcm, int n, int seed) {
 
 /* Deterministic, non-constant fake accelerator fill: varies with hop_idx and element index, so an
  * indexing bug (wrong frame, wrong bin, cross-family data confusion) shows up as a mismatch
- * instead of being hidden behind constant values. Operates on AinrWork directly -- the same
+ * instead of being hidden behind constant values. Operates on StreamWork directly -- the same
  * tensor binding regardless of family (ainr.h's own documented contract), so one function serves
  * the PCM, _spec and _freq paths alike. */
-static void fill_accel(AinrWork *io, int hop_idx) {
+static void fill_accel(StreamWork *io, int hop_idx) {
     size_t i;
     for (i = 0; i < io->outputs[0].elements; ++i)
         io->outputs[0].data[i] = 0.1f + 0.01f * (float)((i + (size_t)hop_idx) % 7);
@@ -146,7 +146,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     fill_pcm(pcm_in, hops * hop, 7);
 
     for (i = 0; i < hops && !bad; ++i) {
-        AinrWork io_pcm, io_freq;
+        StreamWork io_pcm, io_freq;
         int infer_status = (i == bypass_hop) ? -1 : 0;
         int rc;
 
@@ -175,7 +175,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     /* Success is exactly 0, every refusal a negative AINR_ERR_*: a second preprocess while a block is
      * still open is refused in both families. */
     if (!bad) {
-        AinrWork io;
+        StreamWork io;
         int r1 = ainr_preprocess(ctx_pcm, pcm_in, &io), r2 = ainr_preprocess(ctx_pcm, pcm_in, &io);
         int f1 = ainr_preprocess_freq(ctx_freq, af_re, af_im, af_re, af_im, &io);
         int f2 = ainr_preprocess_freq(ctx_freq, af_re, af_im, af_re, af_im, &io);
@@ -212,7 +212,7 @@ static int test_core_ordering_and_bypass(void) {
     AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2) };
     StreamMemReq req;
     AinrFreqCtx *ctx;
-    AinrWork io;
+    StreamWork io;
     Audio audio;
     char erb_path[160];
     void *pool;
@@ -311,7 +311,7 @@ static int test_freq_core_matches_pcm_core(void) {
 
     for (block = 0; block < 2; ++block) {
         int infer_status = (block == 0) ? 0 : -1;   /* block 0 committed, block 1 bypassed */
-        AinrWork io_p, io_f;
+        StreamWork io_p, io_f;
 
         fill_pcm(pcm_in, n * hop, 300 + block);
 

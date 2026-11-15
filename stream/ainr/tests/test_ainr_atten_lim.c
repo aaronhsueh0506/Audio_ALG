@@ -23,7 +23,7 @@ static double run_energy(AinrCtx *ctx, int hop_in, int blocks) {
     int b, i, o;
     size_t k;
     for (b = 0; b < blocks; ++b) {
-        AinrWork io;
+        StreamWork io;
         for (i = 0; i < hop_in; ++i) in[i] = (int16_t)((((i * 37 + b * 11) % 201) - 100) * 40);
         if (ainr_preprocess(ctx, in, &io) != AINR_OK) exit(1);
         for (o = 0; o < io.output_count; ++o)
@@ -50,7 +50,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     StreamMemReq req;
     AinrCtx *ctx;
     AinrFreqCtx *fq;
-    AinrWork io;
+    StreamWork io;
     AinrInfo info;
     int16_t *buf;
     char erb[160];
