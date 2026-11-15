@@ -23,6 +23,7 @@
 #define ARRAY_TEST_RIG_WITH_BEAM 1
 #include "4ch/tests/array_test_rig.h"
 #include "dfn/dfn_hop.h"
+#include "dfn/dfn_hop_pool.h"
 #include "utility/mem_align.h"
 #include "dfn/tests/dfn_test_fixture.h"
 #include "4ch/tests/conv_chain_4ch.h"
@@ -114,23 +115,16 @@ typedef struct FourDfn {
     int sabotage;             /* negative controls (FDFN_SAB_*), 0 in the composition */
     int bridge_clear_due;     /* FDFN_SAB_LATE_CLEAR only: the event of the previous hop */
     int n_freqs, enable_cng;
-    DfnResStage *stage;          /* driven directly at 48 kHz; the bridge's own below 48 kHz */
-    DfnRateBridge *bridge;
-    AcIstft *istft;
-    void *istft_mem;
-    Complex *stage_out;
-    DfnHop hop;
+    void *dfn_pool;              /* the model stream, buffers and synthesis (48 kHz) or bridge (below) */
+    DfnHop hop;                  /* hop.bridge / hop.istft: the bridge, or the host synthesis */
     int hop_size;
 } FourDfn;
 
 static void fdfn_destroy(FourDfn *m) {
     if (!m) return;
-    if (m->bridge) dfn_rate_bridge_destroy(m->bridge);
-    else if (m->stage) dfn_res_stage_destroy(m->stage);
     if (m->unit) array_test_beam_destroy(m->unit);
     free(m->post_mem);
-    free(m->istft_mem);
-    free(m->stage_out);
+    free(m->dfn_pool);
     free(m);
 }
 
@@ -140,7 +134,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
                             int bf_enable) {
     FourDfn *m = (FourDfn *)calloc(1, sizeof(*m));
     ArrayTestUnitConfig ucfg = unit_config(sample_rate, fft_size);
-    DfnResStageConfig stage_cfg = dfn_res_stage_default_config(dfn_test_grid());
+    DfnHopPoolPlan plan;
     int n_freqs;
     if (!m) return NULL;
     ucfg.beam.bf_enable = bf_enable;
@@ -158,36 +152,17 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
     }
     m->post = (Complex *)m->post_mem;
 
-    stage_cfg.erb_fwd = erb_fwd;
-    stage_cfg.erb_inv = erb_inv;
-    if (model) stage_cfg.model = *model;
-    if (sample_rate != DFN2_SR) {
-        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(sample_rate, dfn_test_grid());
-        bc.fft_size = fft_size;
-        bc.stage = stage_cfg;
-        m->bridge = dfn_rate_bridge_create(&bc);
-        if (!m->bridge || dfn_rate_bridge_n_freqs(m->bridge) != n_freqs ||
-            dfn_rate_bridge_hop_size(m->bridge) != m->hop_size)
-            goto fail;
-        m->stage = dfn_rate_bridge_stage(m->bridge);
-        dfn_hop_init_bridge(&m->hop, m->bridge);
-    } else {
-        AcStftConfig scfg;
-        size_t istft_bytes;
-        if (n_freqs != DFN2_N_BINS || m->hop_size != DFN2_HOP_LEN) goto fail;
-        m->stage = dfn_res_stage_create(&stage_cfg);
-        ac_stft_config_default(&scfg, DFN2_N_FFT);
-        istft_bytes = ac_istft_get_mem_size(&scfg);
-        if (!m->stage || posix_memalign(&m->istft_mem, 16, istft_bytes) != 0) {
-            m->istft_mem = NULL;
-            goto fail;
-        }
-        m->istft = ac_istft_init(m->istft_mem, istft_bytes, &scfg);
-        m->stage_out = (Complex *)calloc(DFN2_N_BINS, sizeof(Complex));
-        if (!m->istft || !m->stage_out) goto fail;
-        dfn_hop_init_stage(&m->hop, m->stage, m->istft, m->stage_out);
-        m->hop.check_finite = 1;
+    dfn_hop_pool_plan_init(&plan, dfn_test_grid());
+    plan.stream_cfg.erb_fwd = erb_fwd;
+    plan.stream_cfg.erb_inv = erb_inv;
+    if (model) plan.model = *model;
+    if (dfn_hop_pool_plan(&plan, sample_rate, fft_size) != 0 ||
+        posix_memalign(&m->dfn_pool, 16, dfn_hop_pool_bytes(&plan)) != 0) {
+        m->dfn_pool = NULL;
+        goto fail;
     }
+    if (dfn_hop_pool_build(&plan, (unsigned char *)m->dfn_pool, n_freqs, m->hop_size, 1, &m->hop) != 0)
+        goto fail;
     return m;
 fail:
     fdfn_destroy(m);
@@ -212,12 +187,12 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     m->estimate = f.error_spec;
     due = array_sample_post_reset_due(&m->reset_handled, &f);
     if (due) ++m->reset_hops;
-    if (m->bridge) {
+    if (m->hop.bridge) {
         /* the bridge synthesises the host-grid spectra at the top of its begin(): the clear goes in on the hop
          * of the event, with no delay line, and DFN2 keeps running */
         int clear = due;
         if (m->sabotage & FDFN_SAB_LATE_CLEAR) { clear = m->bridge_clear_due; m->bridge_clear_due = due; }
-        if (clear && !(m->sabotage & FDFN_SAB_NO_CLEAR) && dfn_rate_bridge_reset_synthesis(m->bridge) != 0)
+        if (clear && !(m->sabotage & FDFN_SAB_NO_CLEAR) && ainr_bridge_reset_synthesis(m->hop.bridge) != 0)
             return -1;
     } else if (due) {
         dfn_hop_reset(&m->hop);
@@ -228,11 +203,11 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
 }
 
 static int fdfn_process(FourDfn *m, const float *mics, const float *ref, float *out) {
-    DfnResStageJob job;
+    DfnHopJob job;
     int r;
     if (fdfn_begin(m, mics, ref) != 0) return -1;
     while ((r = dfn_hop_nn_begin(&m->hop, &job)) == 1)
-        if (dfn_hop_nn_end(&m->hop, dfn_res_stage_infer(m->stage, &job)) != 0) return -1;
+        if (dfn_hop_nn_end(&m->hop, dfn_hop_infer(&m->hop, &job)) != 0) return -1;
     if (r < 0) return -1;
     return dfn_hop_end(&m->hop, out) == 0 ? 0 : -1;
 }
@@ -244,11 +219,10 @@ static int run_identity(int enable_cng) {
     float mics[DFN2_HOP_LEN * AEC_ARRAY_MICS];
     float ref[DFN2_HOP_LEN];
     float dfn_out[DFN2_HOP_LEN];
-    long long frames = -1, commits = -1, skips = -1;
     float min_res = 1.0f;
     int frame, i, k, delay_changes = 0, nonzero_hops = 0;
 
-    if (!dfn || dfn->hop_size != DFN2_HOP_LEN || dfn->bridge != NULL)
+    if (!dfn || dfn->hop_size != DFN2_HOP_LEN || dfn->hop.bridge != NULL)
         return 1;
     conventional = oracle_create(&ccfg, 1, enable_cng);
     if (!conventional) return 2;
@@ -274,14 +248,15 @@ static int run_identity(int enable_cng) {
     if (delay_changes < 1) return 3;          /* the contract was never exercised */
     if (!(min_res < 0.9f)) return 9;          /* RES never cut: A == B */
     if (nonzero_hops < TEST_FRAMES / 2) return 4;
-    dfn_res_stage_get_counters(dfn->stage, &frames, &commits, &skips);
-    if (frames != TEST_FRAMES || commits != 0 || skips != TEST_FRAMES - DFN2_MASK_LOOKAHEAD)
+    /* neither reset (by the delay change, say) nor handed a refused commit: the state generation is 1
+     * plus one per warm-up frame, and every frame was a bypass (no model set) */
+    if (dfn_hop_state_generation(&dfn->hop) != 1u + (unsigned)DFN2_MASK_LOOKAHEAD)
         return 5;                             /* a reset would leave a gap */
     if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE) != 0 ||
         aec_set_level(dfn->aec, (AecLevel)77) != -1)
         return 6;
-    if (dfn_res_stage_set_atten_lim(dfn->stage, 12.0f) != 0 ||
-        dfn_res_stage_set_atten_lim(dfn->stage, NAN) != -1)
+    if (dfn_hop_set_atten_lim(&dfn->hop, 12.0f) != 0 ||
+        dfn_hop_set_atten_lim(&dfn->hop, NAN) != -1)
         return 7;
     printf("4ch_aec_bf_dfn_res: cng=%d identity over %d hops, "
            "%d delay change(s), min G_res %.3f\n", enable_cng, TEST_FRAMES,
@@ -336,11 +311,11 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
     int schedule[8], last, max_err_at = -1;
     long long total_frames = 0;
 
-    if (!dfn || dfn->bridge == NULL) return 1;
+    if (!dfn || dfn->hop.bridge == NULL) return 1;
     hop = dfn->hop_size;
-    added = dfn_rate_bridge_added_delay_samples(dfn->bridge);
-    if (dfn_rate_bridge_added_delay_exact(dfn->bridge, &num, &den) != 0 ||
-        den != DFN_RATE_BRIDGE_DELAY_DENOMINATOR || num != expected_sixths ||
+    added = ainr_bridge_added_delay_samples(dfn->hop.bridge);
+    if (ainr_bridge_added_delay_exact(dfn->hop.bridge, &num, &den) != 0 ||
+        den != AINR_BRIDGE_DELAY_DENOMINATOR || num != expected_sixths ||
         added != num / den)
         return 2;
     conventional = oracle_create(&ccfg, 1, 0);
@@ -365,7 +340,7 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
                      conv + frame * hop) != 0)
             return 10 + frame;
         memcpy(mine + frame * hop, out, (size_t)hop * sizeof(float));
-        dfn_rate_bridge_get_counters(dfn->bridge, &total_frames, &last);
+        ainr_bridge_get_counters(dfn->hop.bridge, &total_frames, &last);
         if (frame < 8) schedule[frame] = last;
     }
     for (frame = 0; frame < 8; ++frame) {
@@ -405,7 +380,7 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
 
 /* The array reset at 16 kHz: the application restarts the unit and the RES (a lane's hard post-chain
  * reset, which moves AecResidualView.post_reset_serial) and nothing else; the hop, DFN2 and the bridge keep
- * running. The bridge's native-grid synthesis (dfn_rate_bridge_get_host_hops) must equal the
+ * running. The bridge's native-grid synthesis (ainr_bridge_get_host_hops) must equal the
  * hand-written chain (restarted the same way) bit for bit on every hop, the reset hop included, and a
  * bridge that is not cleared, or cleared one hop late, must not. */
 static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets) {
@@ -416,12 +391,12 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
     AcIstft *probe = NULL;
     void *probe_mem = NULL;
     static float probe_hop[512];
-    long long stage_frames = 0, commits, skips;
+    long long stage_frames = 0;
     static float mics[512 * AEC_ARRAY_MICS], ref[512], conv_out[512], out[512];
     static float tones[160 * 512];
     int hop, frame, i, ch, e, frames = 160, reset_at = 81;
     *diff_hops = 0;
-    if (!dfn || !dfn->bridge) return 1;
+    if (!dfn || !dfn->hop.bridge) return 1;
     dfn->sabotage = sabotage;
     conventional = oracle_create(&ccfg, 1, 1);
     if (!conventional) return 2;
@@ -436,7 +411,7 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
     for (frame = 0; frame < frames; ++frame) {
         const float *tap_e, *tap_p;
         long resets_before = dfn->reset_hops;
-        DfnResStageJob job;
+        DfnHopJob job;
         int r;
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
@@ -450,7 +425,7 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
             conv_reset(conventional);
         }
         if (fdfn_begin(dfn, mics, ref) != 0) return 10 + frame;
-        if (dfn_rate_bridge_get_host_hops(dfn->bridge, &tap_e, &tap_p) != 0) return 3;
+        if (ainr_bridge_get_host_hops(dfn->hop.bridge, &tap_e, &tap_p) != 0) return 3;
         if (conv_hop(conventional, mics, ref, dfn->beam.weights, dfn->beam.spectrum, conv_out) != 0)
             return 200 + frame;
         if (dfn->reset_hops != resets_before) ac_istft_reset(probe);
@@ -459,13 +434,15 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
             memcmp(tap_e, probe_hop, (size_t)hop * sizeof(float)) != 0)
             ++*diff_hops;
         while ((r = dfn_hop_nn_begin(&dfn->hop, &job)) == 1)
-            if (dfn_hop_nn_end(&dfn->hop, dfn_res_stage_infer(dfn->stage, &job)) != 0) return 4;
+            if (dfn_hop_nn_end(&dfn->hop, dfn_hop_infer(&dfn->hop, &job)) != 0) return 4;
         if (r < 0 || dfn_hop_end(&dfn->hop, out) != 0) return 5;
     }
     *resets = dfn->reset_hops;
     /* DFN2 kept running through the event: its frame count is the whole stream's, with no gap */
-    dfn_res_stage_get_counters(dfn->stage, &stage_frames, &commits, &skips);
+    ainr_bridge_get_counters(dfn->hop.bridge, &stage_frames, NULL);
     if (stage_frames != ((long long)frames * hop * DFN2_SR / sample_rate) / DFN2_HOP_LEN) return 8;
+    /* ... and the model stream was not reset either: 1 plus one per warm-up frame, every frame a bypass */
+    if (dfn_hop_state_generation(&dfn->hop) != 1u + (unsigned)DFN2_MASK_LOOKAHEAD) return 8;
     free(probe_mem);
     conv_destroy(conventional);
     fdfn_destroy(dfn);
@@ -539,7 +516,7 @@ static int run_phased(int sample_rate, int fft_size, int behaviour) {
     FourDfn *ph, *cb;
     static float mics[512 * AEC_ARRAY_MICS], ref[512], oa[512], ob[512];
     static float tones[100 * 512];
-    DfnResStageJob job;
+    DfnHopJob job;
     int hop, frame, i, ch, r, nonzero = 0, ran = 0, frames = 80;
 
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;

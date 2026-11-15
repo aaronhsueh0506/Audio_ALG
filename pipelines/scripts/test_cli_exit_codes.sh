@@ -42,7 +42,7 @@ delay_num_filters_garbage() {
 case "$prog" in
 mono_aec_dfn_res)
     # The DFN2 model grid is a run-time choice (--ai-sample-rate / --ai-fft-size, one of the rows of
-    # dfn/dfn_example_args.h): a host on the model's own rate runs the stage directly at that grid, any other host
+    # dfn/dfn_example_args.h): a host on the model's own rate runs the model stream directly at that grid, any other host
     # rate needs the bridge, which accepts the 48 kHz / 1024 model only (pool query rejected, exit 1); a pair outside
     # the table is a rejected argument (2).
     expect 2 --ai-sample-rate 32000 --ai-fft-size 512
@@ -68,7 +68,7 @@ mono_alignulcnet|4ch_alignulcnet)
     ;;
 4ch_aec_bf_dfn_res)
     # The DFN2 model grid is a run-time choice (--ai-sample-rate / --ai-fft-size): the host on the model's own rate
-    # runs the stage directly at that grid, any other host rate needs the bridge (48 kHz / 1024 model only: pool query
+    # runs the model stream directly at that grid, any other host rate needs the bridge (48 kHz / 1024 model only: pool query
     # rejected, exit 1), a pair outside the table is exit 2.
     expect 2 --ai-sample-rate 32000 --ai-fft-size 512
     expect 1 --ai-sample-rate 16000 --ai-fft-size 256 --sample-rate 48000

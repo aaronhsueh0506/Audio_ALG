@@ -44,8 +44,10 @@ stage, the rate bridge that takes that stage to its 48 kHz grid from a
 product-rate host (`dfn/dfn_rate_bridge.c`, a thin adapter over `stream/ainr/bridge`'s
 model-free `AinrBridge`; `make -C stream/ainr/bridge test` is the bridge's own gate), and the mono example that composes lib/aec's `Aec` (its own RES
 gain, formed into P in the example's `rig_process`; no denoiser; the host synthesis is
-the example's `AcIstft` on the stage path and the bridge's own otherwise) and
-`dfn/dfn_hop.h`:
+the example's `AcIstft` on the direct path and the bridge's own otherwise) and
+`dfn/dfn_hop.h`. The example and `dfn_hop.h` run the model through the model stream
+(`dfn2_stream_*_freq` of `stream/ainr/dfn2`, memory mode) and `AinrBridge`, not through the stage;
+`test_dfn_hop` holds the hop to the stage and the rate bridge bit for bit, `test_dfn_stream_equivalence` the stream to the stage:
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
@@ -53,7 +55,7 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 #       test_array_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
-#       --ai-fft-size 256, the model grid the stage drives directly)
+#       --ai-fft-size 256, the model grid the model stream runs directly on the host grid)
 make -C pipelines/mono/aec_dfn_res test   # scoped: test_dfn_res_stage,
 #       test_dfn_rate_bridge, test_mono_dfn and the skeleton runs (16 kHz,
 #       48 kHz, 8 kHz, the model-grid flags, the malformed-number and
@@ -98,11 +100,13 @@ Pass conditions:
       noise OFF and ON, across an AEC delay change.
 - [ ] The stimulus actually engages RES (`min G_res < 0.9`), so an
       estimate/apply swap cannot pass unnoticed.
-- [ ] Stage counters show no mid-stream reset (`frames == hops`,
-      `commits == 0`, `skips == hops - M` on the identity path, i.e. `hops - 1`
-      for the shipped 1/1 pair).
+- [ ] The model stream's state generation shows no mid-stream reset
+      (`dfn_hop_state_generation()` is `1 + M` at the end of the identity run: 1 plus one per
+      warm-up frame, i.e. 2 for the shipped 1/1 pair; a reset or a refused commit would add to it).
 - [ ] `erb_inv` that is not a bitwise partition of unity is refused at
-      `get_mem_requirements()` (stage) and at `init` (`dfn2_stream_init*`, `ainr_init*`).
+      `get_mem_requirements()` (stage) and at `init` (`dfn2_stream_init*`, `ainr_init*`); the two
+      example mains run the model stream, so they report it as `pipeline init failed` (exit 1),
+      from `dfn_hop_pool_build()`.
 - [ ] `--erb-fwd FILE` and `--erb-inv FILE` take the two raw float32 ERB matrices of the
       model grid (exactly `n_bins * n_erb` floats each): a missing value or only one of the
       two exits 2, an unreadable file or a wrong float count exits 1; with neither option a
@@ -121,8 +125,8 @@ Pass conditions:
       `8000` and `48000`, and prints a pool size, hop and algorithmic latency
       for each.
 - [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (carrying
-      `dfn_rate_bridge.o`, built from `dfn/dfn_rate_bridge.c`, and `ainr_bridge.o`, built from
-      `stream/ainr/bridge/ainr_bridge.c`) and the `mono_aec_dfn_res` board skeleton alongside
+      `dfn_rate_bridge.o`, built from `dfn/dfn_rate_bridge.c`, `ainr_bridge.o`, built from
+      `stream/ainr/bridge/ainr_bridge.c`, and `dfn2_stream.o`, built from `stream/ainr/dfn2/dfn2_stream.c`) and the `mono_aec_dfn_res` board skeleton alongside
       the other artifacts.
 
 ## 9. Four-channel pipeline gate
@@ -167,7 +171,7 @@ Pass conditions:
 
 `make -C pipelines/4ch test` also builds and runs the DFN2
 example over the array plus the sample beam helper (real SRP-PHAT/BF; the post-beam RES is the array's gain stage; no denoiser; the host synthesis is the example's `AcIstft` on the
-stage path and the bridge's own otherwise; `dfn/dfn_hop.h`):
+direct path and the bridge's own otherwise; `dfn/dfn_hop.h` over the model stream `stream/ainr/dfn2`):
 
 ```bash
 make -C pipelines/4ch BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
@@ -191,11 +195,13 @@ Pass conditions:
       delayed by exactly two hops (`M + D` for the build's pair), with comfort
       noise OFF and ON, across an AEC delay change.
 - [ ] The stimulus actually engages the post-beam RES (a run without the array's gain stage differs).
-- [ ] Stage counters show no mid-stream reset (the stage is not reset by a
-      delay change of the shared aligner).
+- [ ] The model stream's state generation shows no mid-stream reset (1 plus one per warm-up
+      frame at the end of the run: the hop is not reset by a delay change of the shared aligner).
+      The mono test asserts the same.
 - [ ] A rate the array does not offer is refused at
       `aec_get_mem_requirements()`, and a non-partition-of-unity
-      `erb_inv` at `dfn_res_stage_get_mem_requirements()` (`test_dfn_res_stage`).
+      `erb_inv` at `dfn_res_stage_get_mem_requirements()` (`test_dfn_res_stage`) and by the model
+      stream's init, that is by `dfn_hop_pool_build()` (`test_dfn_hop`; `make -C stream/ainr/dfn2 erb-partition`).
       8 kHz in particular must be refused: the array has no 8 kHz grid, so the
       4-channel DFN2 example cannot offer one either.
 - [ ] Native-grid gates pass for 16 kHz/fft 256 and 16 kHz/fft 512: the
@@ -204,7 +210,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o` and `ainr_bridge.o`); `AEC_LAYOUT_VERSION` is 3 (the `Aec` pool, array included).
+      `dfn_rate_bridge.o`, `ainr_bridge.o` and `dfn2_stream.o`); `AEC_LAYOUT_VERSION` is 3 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

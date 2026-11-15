@@ -17,9 +17,9 @@
 [`4ch/alignulcnet/README.md`](../4ch/alignulcnet/README.md)。
 
 The two DFN2 applications have an algorithmic latency of `M + D + 1` hops on a 48 kHz host (`M` = mask lookahead, `D` =
-deep-filter lookahead, fixed by the model and carried by the `DFN2Grid` in the stage config; the shipped 1/1 pair gives 3 hops, 32 ms). Below 48 kHz the rate bridge is used and
-the latency is the host's own WOLA hop plus `dfn_rate_bridge_added_delay_samples()` native samples (shipped 1/1 pair: 672 at
-16 kHz hop 128, 629 at 16 kHz hop 256, 330 at 8 kHz hop 128; the floor of the exact value, which `dfn_rate_bridge_added_delay_exact()` returns as a multiple of 1/3 sample, whole only when `M + D + 1` is a multiple of 3), a figure that grows with `M + D`; the other `(M, D)` pairs
+deep-filter lookahead, fixed by the model and carried by the `DFN2Grid` in the hop's pool plan (`DfnHopPoolPlan.stream_cfg.grid`); the shipped 1/1 pair gives 3 hops, 32 ms). Below 48 kHz the rate bridge (`stream/ainr/bridge`) is used and
+the latency is the host's own WOLA hop plus `ainr_bridge_added_delay_samples()` native samples (shipped 1/1 pair: 672 at
+16 kHz hop 128, 629 at 16 kHz hop 256, 330 at 8 kHz hop 128; the floor of the exact value, which `ainr_bridge_added_delay_exact()` returns as a multiple of 1/3 sample, whole only when `M + D + 1` is a multiple of 3), a figure that grows with `M + D`; the other `(M, D)` pairs
 follow the same formula but have no trained checkpoint, so their audio quality is unmeasured. See [`dfn/README.md`](../dfn/README.md) and [Build](build.md#build).
 
 ### Memory Budget
@@ -116,7 +116,7 @@ included) is a separate object that the integrator initialises (its own `mem_siz
 | Mono AEC + NR/RES | `aec_process_linear()` → `aec_process_residual()` → `aec_get_residual()` | `anr_process_gain_with_residual_psd()` on `v.base_spec`, `aec_apply_gain()` (`v.res_gain` with the denoiser gain), `aec_apply_cng()` | `ac_istft_push()` |
 | 4-ch AEC + BF + NR/RES | `aec_process_linear()` + `aec_get_array()` → the beamformer (the sample helper's `array_sample_beam_process_beam()` or your own) → `aec_process_residual()` + `aec_get_residual()` | `array_sample_anr_gain()`, `aec_apply_gain()` (the array's `G_res` with the denoiser gain), `aec_apply_cng()` | `ac_istft_push()` |
 | Mono / 4-ch Align-ULCNet | mono: `aec_process_linear()` → `aec_process_residual()` (`AEC_RESIDUAL_STATE`) → `aec_get_residual()` / `aec_get_linear()`; 4-ch: the array with `residual = AEC_RESIDUAL_STATE` and the sample beam helper; the application's `ac_stft_push()` of the raw far hop (mono: also of `formed_hop`), then `ulcnet_nn_stage_begin_spec()` | the network (`ulcnet_nn_stage_nn_begin` / `nn_end`) | `ulcnet_nn_stage_end_spec()` + `ac_istft_push()` |
-| Mono / 4-ch DFN2 | mono: `aec_process_linear()` → `aec_process_residual()` → `aec_get_residual()`; 4-ch: `array_sample_beam_process()` → `array_sample_beam_fuse()` | the example forms P itself (`rig_process()` / `dfn_form()`: `aec_apply_gain(aec, NULL, P)` and the optional `aec_apply_cng()`, for mono and 4-ch alike; no NR, no synthesis of its own), then the DFN2 stage through `dfn_hop_*` | `dfn_hop_end()` |
+| Mono / 4-ch DFN2 | mono: `aec_process_linear()` → `aec_process_residual()` → `aec_get_residual()`; 4-ch: `array_sample_beam_process()` → `array_sample_beam_fuse()` | the example forms P itself (`rig_process()` / `dfn_form()`: `aec_apply_gain(aec, NULL, P)` and the optional `aec_apply_cng()`, for mono and 4-ch alike; no NR, no synthesis of its own), then the DFN2 model stream (`dfn2_stream_*_freq` of `stream/ainr/dfn2`) through `dfn_hop_*` | `dfn_hop_end()` |
 
 ### How do I chain a new frequency-domain stage?
 
@@ -229,7 +229,9 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   at 16 kHz/256 (48 kHz/1024: 2,074,176 B and 336,544 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages are separate blocks sized by their own queries
   (`anr_get_mem_size()`, `ac_istft_get_mem_size()`),
-  and a neural stage (`ulcnet_nn_stage_mem_size(&grid)` plus the application's `AcStft` / `AcIstft`, `dfn_rate_bridge_get_mem_requirements()`)
+  and a neural stage (`ulcnet_nn_stage_mem_size(&grid)` plus the application's `AcStft` / `AcIstft`; for DFN2 the tail `dfn_hop_pool_bytes()`
+  sizes: `dfn2_stream_get_mem_size()`, six `n_bins` float buffers, then `ainr_bridge_get_mem_requirements()` or the synthesis and the output
+  spectrum: 294,480 B for a 16 kHz/256 host and 223,568 B for a 48 kHz host with the shipped 48 kHz / 1024 model, NE10)
   is one more block. The recurrent state of the network is in none of these pools: a float host registers
   its own buffers, a board's accelerator holds it.
 - Re-query the descriptor after any library, backend, build-option or config
@@ -275,13 +277,13 @@ with any non-finite value, a frame left open and a frame never fetched all take
 the identity for that frame (ULCNet: the error spectrum passes; DFN2: a unit band
 mask), the framing and the clocks advance exactly once, and the latency never
 changes. `ulcnet_nn_stage_process()` and `dfn_hop_process()` are this same
-sequence driven by the model callback installed on the stage, so a board with no
+sequence driven by the model callback installed on the stage (DFN2: in the hop's pool plan), so a board with no
 callback and a host with one produce identical bytes. The model's `reset` callback
-(if set) is still called on an alignment boundary and by the stage's `reset()`. A board that
+(if set) is still called on an alignment boundary and by the stage's `reset()` (DFN2: by `dfn_hop_reset()`). A board that
 registers no state keeps it in the accelerator and reloads quantized zeros at start and whenever the
-state generation changes (`dfn_res_stage_state_generation()` or `dfn_rate_bridge_state_generation()`
+state generation changes (`job.state_generation` / `dfn_hop_state_generation()`, the model stream's `dfn2_stream_state_generation()`,
 for DFN2, `ulcnet_accelerator_adapter_state_generation()` for ULCNet); a refused commit (a
-non-finite output) advances the counter as a reset does. DFN2's first `mask_lookahead` hops are warm-up frames: the model runs, the stage
+non-finite output) advances the counter as a reset does. DFN2's first `mask_lookahead` hops are warm-up frames: the model runs, the model stream
 drops its heads, and each one advances the counter (a failing model on such a frame is a bypass that does the same); on a real frame a
 nonzero model result does not advance it.
 

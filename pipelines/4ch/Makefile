@@ -64,8 +64,18 @@ include ../../lib/deps.mk
 # Model cores moved to lib/ainr/, lib/aiaec/ by the single-model-release restructuring.
 ULCNET_DIR ?= $(ALG_DIR)/lib/aiaec/ulcnet
 DFN2_DIR ?= $(ALG_DIR)/lib/ainr/dfn2
-# The sample-rate bridge (stream/ainr/bridge) that ../dfn/dfn_rate_bridge.c adapts.
+# The sample-rate bridge (stream/ainr/bridge) that ../dfn/dfn_hop.h and ../dfn/dfn_rate_bridge.c use, and the
+# model stream (stream/ainr/dfn2) that ../dfn/dfn_hop.h drives.
 BRIDGE_DIR ?= $(ALG_DIR)/stream/ainr/bridge
+STREAM_DFN2_DIR ?= $(ALG_DIR)/stream/ainr/dfn2
+STREAM_COMMON_DIR ?= $(ALG_DIR)/stream/common
+# Include paths of every TU that includes ../dfn/dfn_hop.h or ../dfn/dfn_hop_pool.h.
+DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
+# dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
+DFN2_STREAM_NO_STDIO_FLAG :=
+ifeq ($(NO_STDIO),1)
+DFN2_STREAM_NO_STDIO_FLAG := -DDFN2_STREAM_NO_STDIO
+endif
 
 # DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 stage, the
 # bridge and the example main take their grid and pair at run time (the config carries a DFN2Grid),
@@ -270,6 +280,7 @@ endif
 
 SRCS := array_sample_beam.c \
         ../dfn/dfn_res_stage.c ../dfn/dfn_rate_bridge.c $(BRIDGE_DIR)/ainr_bridge.c \
+        $(STREAM_DFN2_DIR)/dfn2_stream.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
         ../ulcnet/ulcnet_nn_stage.c \
@@ -300,6 +311,7 @@ SAMPLE_BEAM_OBJ := $(OBJ_DIR)/array_sample_beam.o
 DFN_PIPELINE_OBJS := $(OBJ_DIR)/dfn_res_stage.o \
                      $(OBJ_DIR)/dfn_rate_bridge.o \
                      $(OBJ_DIR)/ainr_bridge.o \
+                     $(OBJ_DIR)/dfn2_stream.o \
                      $(OBJ_DIR)/dfn2_process.o \
                      $(OBJ_DIR)/dfn2_model_io.o \
                      $(OBJ_DIR)/dfn2_prepost.o
@@ -342,6 +354,9 @@ $(OBJ_DIR)/dfn_rate_bridge.o: ../dfn/dfn_rate_bridge.c ../dfn/dfn_rate_bridge.h 
 $(OBJ_DIR)/ainr_bridge.o: $(BRIDGE_DIR)/ainr_bridge.c $(BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(BRIDGE_DIR) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
@@ -353,11 +368,11 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 
 # aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with
 # ../dfn/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../common/example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
 # ULCNet NN stage example.
@@ -457,7 +472,7 @@ test: test-third-party test-array-sample-driver \
 # The DFN2 model grid is a run-time choice (--ai-sample-rate / --ai-fft-size, see dfn/dfn_example_args.h):
 # the host on the model's own rate runs the stage directly at that grid, any other host rate needs the
 # bridge (48 kHz / 1024 model only: pool query rejected, exit 1), a pair outside the table is exit 2.
-	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
+	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the model stream on the host grid"
 	sh ../scripts/test_cli_exit_codes.sh 4ch_aec_bf_dfn_res "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
 	sh ../scripts/test_cli_exit_codes.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet"
 
@@ -492,6 +507,8 @@ audit-no-stdio: $(DFN_PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) \
 	  hits=$$(nm -A "$$archive" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
 	  if [ -n "$$hits" ]; then echo "FAIL: stdio symbols in $$archive" >&2; echo "$$hits" >&2; exit 1; fi; \
 	 done; \
+	 hits=$$(nm -A "$(DFN_PIPELINE_LIB)" | awk '{ n=$$NF; if (n ~ /^_?(fopen|fread|fclose)$$/) print }'); \
+	 if [ -n "$$hits" ]; then echo "FAIL: file-loader symbols in $(DFN_PIPELINE_LIB) (dfn2_stream.o)" >&2; echo "$$hits" >&2; exit 1; fi; \
 	 echo "4ch pipeline stack: NO_STDIO audit PASS"
 
 FORCE:

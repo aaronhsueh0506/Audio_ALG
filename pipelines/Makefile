@@ -87,11 +87,19 @@ ALG_ROOT = ..
 AIAEC_DIR = ../AIAEC
 ULCNET_DIR = ../lib/aiaec/ulcnet
 DFN2_DIR = ../lib/ainr/dfn2
-# The stream layer (stream/ainr/dfn2) that test_dfn_stream_equivalence compares the stage with.
+# The model stream (stream/ainr/dfn2) that dfn/dfn_hop.h drives and test_dfn_stream_equivalence
+# compares the stage with.
 STREAM_DFN2_DIR = ../stream/ainr/dfn2
 STREAM_COMMON_DIR = ../stream/common
-# The sample-rate bridge (stream/ainr/bridge) that dfn_rate_bridge.c adapts.
+# The sample-rate bridge (stream/ainr/bridge) that dfn/dfn_hop.h and dfn_rate_bridge.c use.
 STREAM_BRIDGE_DIR = ../stream/ainr/bridge
+# Include paths of every TU that includes dfn/dfn_hop.h or dfn/dfn_hop_pool.h.
+DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
+# dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
+DFN2_STREAM_NO_STDIO_FLAG :=
+ifeq ($(NO_STDIO),1)
+DFN2_STREAM_NO_STDIO_FLAG := -DDFN2_STREAM_NO_STDIO
+endif
 
 # DeepFilterNet2 lookahead pair the test programs run: mask 0..2, deep filter 0..4 (the shipped
 # deep filter has 5 taps), plain decimals. The stage, the rate bridge and the example mains hold
@@ -475,7 +483,7 @@ endif
 
 # One optional descriptor test (test_target_abi) spans all public pipeline/prepost APIs.
 TARGET_ABI_SRCS := tests/test_target_abi.c \
- dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c \
+ dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_DFN2_DIR)/dfn2_stream.c \
  $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c \
  ../lib/ainr/dfn3/dfn3_process.c ../lib/ainr/dfn3/dfn3_model_io.c \
  ../lib/ainr/dfn3/dfn3_prepost.c \
@@ -487,7 +495,7 @@ TARGET_ABI_TEST_CFLAGS :=
 ifeq ($(AEC_NO_ARRAY),1)
   TARGET_ABI_TEST_CFLAGS += -DTARGET_ABI_TEST_NO_ARRAY
 endif
-TARGET_ABI_INCLUDES := -I$(DFN2_DIR) -I../lib/ainr/dfn3 -I$(ULCNET_DIR) \
+TARGET_ABI_INCLUDES := $(DFN_HOP_INC) -I$(DFN2_DIR) -I../lib/ainr/dfn3 -I$(ULCNET_DIR) \
  -I$(AIAEC_DIR) -I../lib/aiaec/deepvqe_s -I$(COMMON_DIR)/utility
 
 # The same CC command can select a different SDK through PATH.
@@ -614,8 +622,8 @@ $(OBJ_DIR)/dfn_res_stage.o: dfn/dfn_res_stage.c dfn/dfn_res_stage.h $(DFN2_DIR)/
 $(OBJ_DIR)/test_array_sample_post.o: 4ch/tests/test_array_sample_post.c 4ch/array_sample_post.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h ulcnet/ulcnet_nn_stage.h mono/aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h dfn/dfn_hop_pool.h ulcnet/ulcnet_nn_stage.h mono/aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: dfn/tests/test_dfn_res_stage.c dfn/dfn_res_stage.h dfn/tests/dfn_test_fixture.h dfn/dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
@@ -627,7 +635,7 @@ $(OBJ_DIR)/ainr_bridge.o: $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_BRIDGE_DIR
 	$(CC) $(CFLAGS) -I$(STREAM_BRIDGE_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_stream_equivalence.o: dfn/tests/test_dfn_stream_equivalence.c dfn/dfn_res_stage.h $(STREAM_DFN2_DIR)/dfn2_stream.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
@@ -635,15 +643,15 @@ $(OBJ_DIR)/test_dfn_stream_equivalence.o: dfn/tests/test_dfn_stream_equivalence.
 $(OBJ_DIR)/test_dfn_rate_bridge.o: dfn/tests/test_dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_mono_dfn.o: mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_mono_dfn.o: mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_hop_pool.h dfn/tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h common/example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h common/example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-# test_dfn_hop: the DfnHop paths against direct calls of a twin stage.
-$(OBJ_DIR)/test_dfn_hop.o: dfn/tests/test_dfn_hop.c dfn/dfn_hop.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/dfn_unit_partition.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+# test_dfn_hop: the DfnHop paths against twins built from the stream layer and from the shipped stage and bridge.
+$(OBJ_DIR)/test_dfn_hop.o: dfn/tests/test_dfn_hop.c dfn/dfn_hop.h dfn/dfn_hop_pool.h dfn/dfn_res_stage.h dfn/dfn_rate_bridge.h dfn/dfn_unit_partition.h dfn/tests/dfn_test_fixture.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
 # common-memory-manager integration -- see that
@@ -655,7 +663,7 @@ $(OBJ_DIR)/example_board_adapter.o: mono/aec_nr_res/example_board_adapter.c | _c
 DFN_LIB_TARGET = $(BIN_DIR)/libaudio_pipeline_dfn.a
 DFN_STAGE_OBJS = $(OBJ_DIR)/dfn_res_stage.o $(OBJ_DIR)/dfn2_prepost.o \
                  $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_process.o
-DFN_PIPELINE_OBJS = $(OBJ_DIR)/dfn_rate_bridge.o $(OBJ_DIR)/ainr_bridge.o $(DFN_STAGE_OBJS)
+DFN_PIPELINE_OBJS = $(OBJ_DIR)/dfn_rate_bridge.o $(OBJ_DIR)/ainr_bridge.o $(OBJ_DIR)/dfn2_stream.o $(DFN_STAGE_OBJS)
 
 # =============================================================================
 # Phase 2 real rules: only defined once COMMON_LIB (and, transitively, AEC_LIB/
@@ -706,8 +714,8 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 # two rows of dfn/dfn_example_args.h): a host on the model's own rate runs the stage directly at
 # that grid (the banner names it), any other host rate needs the bridge, which accepts the 48 kHz /
 # 1024 model only (pool query rejected, exit 1); a pair outside the table is a rejected argument (2).
-	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"
-	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the stage on the host grid"
+	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the model stream on the host grid"
+	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the model stream on the host grid"
 	sh scripts/test_cli_exit_codes.sh mono_aec_dfn_res "$(abspath $(BIN_DIR))/mono_aec_dfn_res"
 	sh scripts/test_cli_exit_codes.sh mono_alignulcnet "$(abspath $(BIN_DIR))/mono_alignulcnet"
 	bash scripts/test_deps_env_safe.sh
@@ -922,10 +930,11 @@ audit-dead-defines:
 	@scripts/audit_dead_defines.sh $(DEAD_DEFINES_ARGS)
 
 # audit-no-stdio: builds libaudio_pipeline_dfn.a with NO_STDIO=1 and asserts, with `nm` over the delivered
-# keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp is in it, and that its
+# keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp (and, for dfn2_stream.o's
+# file loader, fopen/fread/fclose) is in it, and that its
 # resolved path differs from the default (NO_STDIO=0) config's path so the two cannot alias. `ar -t`
-# confirms the members (dfn_rate_bridge.o, ainr_bridge.o, dfn_res_stage.o, dfn2_prepost.o, dfn2_model_io.o,
-# dfn2_process.o). The regex tolerates a
+# confirms the members (dfn_rate_bridge.o, ainr_bridge.o, dfn2_stream.o, dfn_res_stage.o, dfn2_prepost.o,
+# dfn2_model_io.o, dfn2_process.o). The regex tolerates a
 # leading underscore and matches the last field of nm's NAME column, as
 # ../../audiolib/common/scripts/audit_alloc_symbols.sh does, so it works with macOS/BSD and GNU nm.
 # Prints PASS/FAIL; non-zero exit on FAIL.
@@ -943,17 +952,17 @@ audit-no-stdio:
 	   echo "FAIL: $$lib_nostdio not found after building libaudio_pipeline_dfn.a with NO_STDIO=1"; \
 	   exit 1; \
 	 fi; \
-	 for m in dfn_rate_bridge ainr_bridge dfn_res_stage dfn2_prepost dfn2_model_io dfn2_process; do \
+	 for m in dfn_rate_bridge ainr_bridge dfn2_stream dfn_res_stage dfn2_prepost dfn2_model_io dfn2_process; do \
 	   ar -t "$$lib_nostdio" | grep -q "^$$m\.o$$" || { echo "FAIL: $$lib_nostdio missing $$m.o member"; exit 1; }; \
 	 done; \
-	 echo "audit-no-stdio: nm -A $$lib_nostdio | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
-	 hits=$$(nm -A "$$lib_nostdio" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$/) print }'); \
+	 echo "audit-no-stdio: nm -A $$lib_nostdio | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp|fopen|fread|fclose)$$' (NAME column)"; \
+	 hits=$$(nm -A "$$lib_nostdio" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp|fopen|fread|fclose)$$/) print }'); \
 	 if [ -n "$$hits" ]; then \
 	   echo "FAIL: forbidden stdio symbol(s) found in $$lib_nostdio (NO_STDIO=1 build):"; \
 	   echo "$$hits"; \
 	   exit 1; \
 	 fi; \
-	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
+	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp/fopen/fread/fclose symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
 
 # audit-no-stdio-stack (full-image gate): builds the delivered archives with NO_STDIO=1 (the
 # dispatch forwards it to audiolib / lib/aec / lib/nr; lib/aec compiles its trace/debug TU out under

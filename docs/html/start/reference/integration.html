@@ -33,7 +33,7 @@
 <tr><td>4ch array(shared aligner + 4 條 linear AEC)+ <b>外部</b> beamformer(自己串後級;不需要 helper)</td><td><code>aec.h</code>(<code>aec_process_linear</code> / <code>aec_process_residual</code>)</td></tr>
 <tr><td>mono linear AEC + NN 後級</td><td><code>aec.h</code> ＋ <code>pipelines/ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/mono/alignulcnet/main.c</code>)</td></tr>
 <tr><td>4ch linear AEC + SRP/BF + NN 後級</td><td><code>aec.h</code>(<code>residual = AEC_RESIDUAL_STATE</code>)＋ <code>array_sample_beam.h</code> ＋ <code>ulcnet/ulcnet_nn_stage.h</code>(<code>pipelines/4ch/alignulcnet/main.c</code>)</td></tr>
-<tr><td>mono 或 4ch ＋ DeepFilterNet2 後級</td><td><code>dfn/dfn_hop.h</code> ＋ <code>dfn/dfn_res_stage.h</code>／<code>dfn/dfn_rate_bridge.h</code>(<code>pipelines/mono/aec_dfn_res/main.c</code>、<code>pipelines/4ch/aec_bf_dfn_res/main.c</code>)</td></tr>
+<tr><td>mono 或 4ch ＋ DeepFilterNet2 後級</td><td><code>dfn/dfn_hop.h</code>、<code>dfn/dfn_hop_pool.h</code> ＋ 模型串流 <code>stream/ainr/dfn2/dfn2_stream.h</code>／取樣率橋接器 <code>stream/ainr/bridge/ainr_bridge.h</code>(<code>pipelines/mono/aec_dfn_res/main.c</code>、<code>pipelines/4ch/aec_bf_dfn_res/main.c</code>)</td></tr>
 <tr><td>mono 線性 AEC + 自己的頻域 stage 鏈</td><td><code>aec_process_linear()</code> + <code>aec_process_residual()</code> + <code>aec_get_residual()</code> + 自己的鏈(見 2.5)</td></tr>
 <tr><td>只做單路 AEC,或自行組合其他 post-filter</td><td><code>aec.h</code></td></tr>
 <tr><td>已有 STFT/WOLA,只需要頻域 NR</td><td><code>anr.h</code></td></tr>
@@ -44,7 +44,7 @@
 <div class="tblwrap"><table>
 <tr><th>面向</th><th>四條一致的事實</th></tr>
 <tr><td>AEC 一律分段呼叫</td><td><b>四條都用 <code>aec_process_linear()</code> + <code>aec_process_residual()</code>,不經 <code>aec_process()</code></b>(<code>AecConfig.residual</code> 決定做到哪:mono／4ch 的 NR 鏈用 <code>FULL</code>,ULCNet 用 <code>STATE</code>)。反向 FFT 與 OLA 由應用的 <code>AcIstft</code> 做;殘留抑制的增益由 AEC 自己算(mono 單支、4ch 融合後的唯一增益級,<code>v.res_gain</code>),由 <code>aec_apply_gain()</code>／<code>aec_apply_cng()</code> 套用在各 main 的逐 hop 串接裡(或交給 NN)</td></tr>
-<tr><td>audiolib 只用到少數符號</td><td><code>fft_*</code>、<code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ALIGN16</code>/<code>ck_*</code>。<b>這四條沒有任何一條用 <code>hpf_*</code>／<code>audio_resampler_*</code></b>——HPF 在 AEC 內部,gain 與 resample 是 pipeline <b>之外</b>的前級(只有 DFN2 變體的取樣率橋接器 <code>stream/ainr/bridge/ainr_bridge.c</code>(<code>pipelines/dfn/dfn_rate_bridge.c</code> 是它的轉接層)用 <code>audio_resampler_*</code>)</td></tr>
+<tr><td>audiolib 只用到少數符號</td><td><code>fft_*</code>、<code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>ALIGN16</code>/<code>ck_*</code>。<b>這四條沒有任何一條用 <code>hpf_*</code>／<code>audio_resampler_*</code></b>——HPF 在 AEC 內部,gain 與 resample 是 pipeline <b>之外</b>的前級(只有 DFN2 變體的取樣率橋接器 <code>stream/ainr/bridge/ainr_bridge.c</code> 用 <code>audio_resampler_*</code>;範例經 <code>dfn_hop.h</code> 直接用它,<code>pipelines/dfn/dfn_rate_bridge.c</code> 是它的舊轉接層)</td></tr>
 <tr><td>各自 init、32-byte descriptor 只在 <code>Aec</code> 與 DFN</td><td>每個函式庫(<code>Aec</code>、<code>AnrDenoiser</code>、<code>AcIstft</code>、stage／bridge、4ch 的 helper)自己查大小、自己 init;帶 32-byte 固定寬度 descriptor 與 <code>init_ex()</code> 閘的是 <code>Aec</code>(<code>AecMemReq</code>:單支與 4ch array 同一個型別,<code>aec_init()</code> 則不核對)與 DFN stage／bridge,其餘函式庫物件、sample helper 與 NN stage 範例沒有</td></tr>
 </table></div>
 
@@ -141,7 +141,7 @@ if (ulcnet_nn_stage_nn_begin(stage, &amp;job) &gt; 0) {   /* 1 = 有一幀;0 = �
 }
 ulcnet_nn_stage_end_spec(stage, out_spec);   /* 採用的模型頻譜，否則 err_spec */
 ac_istft_push(istft, out_spec, out);   /* 應用端合成剛好一個 hop */</pre>
-<p>DFN 範例的 <code>dfn_hop_nn_begin</code> 在迴圈裡(<code>while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) { rc = run_npu(&amp;job); dfn_hop_nn_end(&amp;hop, rc); }</code>),因為 rate bridge 在一個 native hop 內可能開 0..2 個 48 kHz 幀(板端每次跑前比對 <code>dfn_res_stage_state_generation(dfn_hop_stage(&amp;hop))</code>,見 <a href="../../pipelines/reference/dfn2/integration.html">DFN2 pipeline 呼叫與時序</a>);ULCNet 板端同樣比對 <code>ulcnet_accelerator_adapter_state_generation()</code>,變動時重載量化零。</p>
+<p>DFN 範例的 <code>dfn_hop_nn_begin</code> 在迴圈裡(<code>while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) { rc = run_npu(&amp;job); dfn_hop_nn_end(&amp;hop, rc); }</code>),因為 rate bridge 在一個 native hop 內可能開 0..2 個 48 kHz 幀(板端每次跑前比對 <code>job.state_generation</code>(<code>dfn_hop_state_generation(&amp;hop)</code>),見 <a href="../../pipelines/reference/dfn2/integration.html">DFN2 pipeline 呼叫與時序</a>);ULCNet 板端同樣比對 <code>ulcnet_accelerator_adapter_state_generation()</code>,變動時重載量化零。</p>
 <p>4 聲道 ULCNet 應用若要用由同一 hop 的 lane 頻譜算出的 mask 與 VAD,把 helper 的 hop 拆成 <code>array_sample_beam_process_front()</code> 與 <code>array_sample_beam_process_beam()</code>,呼叫端在兩者之間讀 <code>front.lane_error_spec[0]</code>(見 <a href="../../pipelines/4ch/align-ulcnet/index.html">四聲道 · Align-ULCNet</a>)。</p>
 <h3>Model I/O descriptor 是必要的,不是選配</h3>
 <p><code>ulcnet_nn_stage_set_model()</code>:<code>model-&gt;infer</code> 非 NULL 而 <code>io_descriptor</code> 為 NULL ⇒ 回 −1;有 descriptor 但 <code>ulcnet_model_io_descriptor_validate()</code> 不為 0 ⇒ 回 −1。</p>

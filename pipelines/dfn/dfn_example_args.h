@@ -21,7 +21,7 @@
  * df_bins, df_order and lookahead pair is a property of the trained model
  * (AINR/DeepFilterNet2/config.ini [signal], [model]), so it is this program's table; hop, bins,
  * the scales and the feature normaliser are all fixed by dfn2_grid.h / dfn2_grid_make(). There is
- * no 32 kHz row: the AEC in front of the stage has no 32 kHz grid, so no host could run that
+ * no 32 kHz row: the AEC in front of the model has no 32 kHz grid, so no host could run that
  * model. */
 static const DFN2GridSpec DFN_EXAMPLE_MODEL_ROWS[] = {
     { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
@@ -101,7 +101,7 @@ static void dfn_example_usage(const char *prog, const char *rates_text) {
         "Usage: %s [options]\n"
         "  --sample-rate {%s}\n"
         "                              host grid (default 16000); only the DFN2\n"
-        "                              stage runs at the model grid, through the\n"
+        "                              model runs at the model grid, through the\n"
         "                              rate bridge when the host rate differs\n"
         "                              (the bridge needs the 48 kHz / 1024 model)\n"
         "  --ai-sample-rate <Hz>       DFN2 model grid: sample rate (default %d)\n"

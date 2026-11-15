@@ -2,29 +2,36 @@
  * copy and adapt.
  *
  * The host forms E (the linear-AEC error) and P (E after the RES gain, plus comfort noise when
- * enabled; the DFN example mains show it) before the hop begins. DFN2 then runs on (E, P):
- *   host rate == the model grid's rate   the stage (dfn_res_stage.h) on the host grid; DfnHop
- *                                        synthesises its output through the caller's AcIstft
- *   other host rates                     dfn_rate_bridge.h runs the same stage on its 48 kHz grid
- *                                        and synthesises the host hop itself
+ * enabled; the DFN example mains show it) before the hop begins. DFN2 then runs on (E, P) through
+ * the model-stream layer (stream/ainr/dfn2: dfn2_stream_pre_process_freq_dual /
+ * dfn2_stream_post_process_freq in memory mode); this header adds what that layer leaves to its
+ * caller: the audio-scale spectra in and out (dfn2_stft_scale in, dfn2_stft_unscale out), the
+ * model callback, and the synthesis.
+ *   host rate == the model grid's rate   DfnHop synthesises through the caller's AcIstft
+ *   other host rates                     stream/ainr/bridge's AinrBridge puts the hop on its 48 kHz
+ *                                        grid, runs the model there and synthesises the host hop
  *
  *     dfn_hop_begin(&h, E, P);
  *     while (dfn_hop_nn_begin(&h, &job) == 1)       // a model frame is open
  *         dfn_hop_nn_end(&h, run_model(&job));      // 0 = every output written
  *     dfn_hop_end(&h, out);                         // one host hop
  *
- * The stage path opens exactly one model frame per hop (the first mask_lookahead are warm-up
+ * The direct path opens exactly one model frame per hop (the first mask_lookahead are warm-up
  * frames: the model runs, its heads are discarded), the bridge path 0, 1 or 2 by its schedule.
+ * A frame the model refuses or leaves unwritten, a frame left open and a frame never fetched all
+ * take the identity through the cascade. job.state_generation moves on a reset, a warm-up frame
+ * and a refused commit: an accelerator that holds the recurrent state refills it with quantized
+ * zeros whenever it changes.
  *
- * dfn_hop_process() does the same with the stage's configured model callback. The pointers
- * are not owned; the stage, bridge, synthesis and output spectrum come from the caller's
- * pool. The stage does not reset on an AEC delay change. It adds dfn_res_stage_lookahead_frames()
- * hops of delay on the model's own grid (2 for the shipped 1/1 pair at 48 kHz) and
- * dfn_rate_bridge_added_delay_samples() through the bridge; the first output hops are zero. An
- * AEC post-chain reset event (aec_post_reset_serial() moved) is followed by the caller before the
- * hop: through the bridge dfn_rate_bridge_reset_synthesis(bridge) (the host-grid synthesis is
- * inside the bridge and runs at the top of dfn_hop_begin(): no delay line); with the stage driven
- * directly the caller clears its own AcIstft dfn_res_stage_lookahead_frames() hops later (see
+ * dfn_hop_process() does the same with the model callback of the pool plan. The pointers are not
+ * owned; the stream, bridge, synthesis and spectra come from the caller's pool (dfn_hop_pool.h).
+ * The hop does not reset on an AEC delay change. It adds dfn_hop_lookahead_frames() hops of delay
+ * on the model's own grid (2 for the shipped 1/1 pair at 48 kHz) and
+ * ainr_bridge_added_delay_samples() through the bridge; the first output hops are zero. An AEC
+ * post-chain reset event (aec_post_reset_serial() moved) is followed by the caller before the
+ * hop: through the bridge ainr_bridge_reset_synthesis(h.bridge) (the host-grid synthesis is inside
+ * the bridge and runs at the top of dfn_hop_begin(): no delay line); with the model grid driven
+ * directly the caller clears its own AcIstft dfn_hop_lookahead_frames() hops later (see
  * mono/aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front
  * end, the comfort-noise generator and DfnHop together. */
 #ifndef PIPELINES_DFN_DFN_HOP_H
@@ -33,103 +40,203 @@
 #include <math.h>
 #include <string.h>
 
+#include "ainr_bridge.h"
 #include "audio_stft.h"
-#include "dfn_rate_bridge.h"
-#include "dfn_res_stage.h"
+#include "dfn2_stream.h"
+#include "utility/simd_kernel_nn.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 enum {
-    DFN_HOP_INVALID = -1,         /* NULL argument, a refused stage contract, or a non-finite hop */
+    DFN_HOP_INVALID = -1,         /* NULL argument, a refused block, or a non-finite hop */
     DFN_HOP_SEQUENCE_ERROR = -2   /* a call out of begin / nn_begin / nn_end / end order */
 };
 
+/* Doubles as the model's per-frame views: job.inputs / job.outputs, job.state_generation. */
+typedef DFN2HopIO DfnHopJob;
+
 typedef struct DfnHop {
-    DfnResStage* stage;           /* host on the model grid: driven directly (bridge == NULL) */
-    DfnRateBridge* bridge;        /* other rates: the stage inside the bridge */
-    AcIstft* istft;               /* stage path: synthesis of stage_out */
-    Complex* stage_out;           /* stage path: n_bins bins */
-    int n_bins;                   /* stage path: the stage grid's bins */
-    int hop_size;                 /* stage path: the stage grid's hop */
-    int check_finite;             /* stage path: refuse a non-finite stage_out or hop at end */
+    DFN2Stream* stream;
+    AinrBridge* bridge;           /* other host rates: the bridge around the stream; else NULL */
+    DFN2Model model;              /* by value; no infer = every frame the identity */
+    AcIstft* istft;               /* direct path: synthesis of out_spec */
+    Complex* out_spec;            /* direct path: n_bins bins, audio scale */
+    float* planar;                /* 6 * n_bins: E and P (re, im) at model scale, then the output */
+    int n_bins;                   /* the model grid's */
+    int hop_size;                 /* direct path: the model grid's hop */
+    float scale, unscale;         /* dfn2_stft_scale / dfn2_stft_unscale of the model grid's fft */
+    int check_finite;             /* direct path: refuse a non-finite out_spec or hop at end */
 
     int phase;                    /* 0 idle, 1 hop begun, 2 model frame open */
-    DfnResStageJob job;           /* stage path: the frame begun, until fetched */
-    int job_pending;              /* stage path: job holds an unfetched frame */
-    int stage_ended;              /* stage path: the stage frame is closed */
+    DfnHopJob job;                /* the frame begun, until fetched */
+    int job_pending;              /* direct path: job holds an unfetched frame */
+    int frame_ended;              /* direct path: the frame is closed */
+    int frame_open;               /* bridge path: a model frame is open */
+    Complex* frame_out;           /* bridge path: the open frame's output spectrum */
 } DfnHop;
 
-/* Host on the stage's grid. `stage_out` holds the grid's n_bins bins. */
-static inline void dfn_hop_init_stage(DfnHop* h, DfnResStage* stage, AcIstft* istft,
-                                      Complex* stage_out) {
-    const DFN2Grid* grid = dfn_res_stage_grid(stage);
+/* Frames the emitted spectrum trails the newest input by: the grid's mask + deep-filter lookahead
+ * (one frame per call). */
+static inline int dfn_hop_lookahead_frames(const DFN2Grid* grid) {
+    return grid ? grid->mask_lookahead + grid->df_lookahead : 0;
+}
+
+/* 1 when the model is usable on `grid`: no infer needs no reset and no descriptor; an infer needs a
+ * descriptor valid for the grid (another grid, lookahead pair or frame count is refused). */
+static inline int dfn_hop_model_valid(const DFN2Model* model, const DFN2Grid* grid) {
+    if (!model || !grid) return 0;
+    if (!model->infer) return model->reset == NULL && model->io_descriptor == NULL;
+    return model->io_descriptor != NULL &&
+           dfn2_model_io_descriptor_validate(grid, model->io_descriptor) == 0;
+}
+
+static inline unsigned int dfn_hop_state_generation(const DfnHop* h) {
+    return h ? dfn2_stream_state_generation(h->stream) : 0u;
+}
+
+/* Between hops only; 0, or -1 on NULL, a non-finite value or an open frame. */
+static inline int dfn_hop_set_atten_lim(DfnHop* h, float atten_lim_db) {
+    return h ? dfn2_stream_set_atten_lim(h->stream, atten_lim_db) : -1;
+}
+
+/* The model callback on an open frame: its result (0 = success), or -1 when none is set. */
+static inline int dfn_hop_infer(const DfnHop* h, DfnHopJob* job) {
+    if (!h || !job || !h->model.infer) return -1;
+    return h->model.infer(h->model.user, &job->inputs, &job->outputs);
+}
+
+/* Host on the model's grid. `planar` holds 6 * n_bins floats, `out_spec` n_bins bins; both are
+ * zeroed here. */
+static inline void dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
+                                       const DFN2Model* model, AcIstft* istft, Complex* out_spec,
+                                       float* planar) {
     memset(h, 0, sizeof(*h));
-    h->stage = stage;
+    h->stream = stream;
+    h->model = *model;
     h->istft = istft;
-    h->stage_out = stage_out;
-    h->n_bins = grid ? grid->n_bins : 0;
-    h->hop_size = grid ? grid->hop : 0;
+    h->out_spec = out_spec;
+    h->planar = planar;
+    h->n_bins = grid->n_bins;
+    h->hop_size = grid->hop;
+    h->scale = dfn2_stft_scale(grid->n_fft);
+    h->unscale = dfn2_stft_unscale(grid->n_fft);
+    memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
+    memset(out_spec, 0, (size_t)grid->n_bins * sizeof(Complex));
 }
 
-/* Host rate differs from the stage grid (bridge path). */
-static inline void dfn_hop_init_bridge(DfnHop* h, DfnRateBridge* bridge) {
+/* Host rate differs from the model grid (bridge path). */
+static inline void dfn_hop_init_bridge(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
+                                       const DFN2Model* model, AinrBridge* bridge, float* planar) {
     memset(h, 0, sizeof(*h));
+    h->stream = stream;
     h->bridge = bridge;
-    h->stage = dfn_rate_bridge_stage(bridge);
+    h->model = *model;
+    h->planar = planar;
+    h->n_bins = grid->n_bins;
+    h->scale = dfn2_stft_scale(grid->n_fft);
+    h->unscale = dfn2_stft_unscale(grid->n_fft);
+    memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
 }
 
-/* Back to hop #0: the stage or bridge (and its stage), the synthesis and the output spectrum. */
+/* Back to hop #0: the stream, the model (reset callback), the bridge or the synthesis, and the
+ * output spectrum. */
 static inline void dfn_hop_reset(DfnHop* h) {
     if (!h) return;
     h->phase = 0;
     h->job_pending = 0;
-    h->stage_ended = 0;
+    h->frame_ended = 0;
+    h->frame_open = 0;
+    dfn2_stream_reset(h->stream);
+    if (h->model.reset) h->model.reset(h->model.user);
     if (h->bridge) {
-        dfn_rate_bridge_reset(h->bridge);   /* resets its stage too */
+        ainr_bridge_reset(h->bridge);
         return;
     }
-    dfn_res_stage_reset(h->stage);
     if (h->istft) ac_istft_reset(h->istft);
-    memset(h->stage_out, 0, (size_t)h->n_bins * sizeof(Complex));
+    memset(h->out_spec, 0, (size_t)h->n_bins * sizeof(Complex));
+}
+
+/* Opens one model frame on the audio-scale spectra e and p (n_bins bins each): scaled to the model's
+ * normalised spectra, estimated on e and applied on p. A bin that is non-finite or beyond 2^63 at
+ * model scale refuses the block whole and leaves the stream untouched. 0, or -1. */
+static inline int dfn_hop_open_frame(DfnHop* h, const Complex* e, const Complex* p, DfnHopJob* job) {
+    float* w = h->planar;
+    const int n = h->n_bins;
+    skn_deinterleave_scale_cf32(e, w, w + n, n, h->scale);
+    skn_deinterleave_scale_cf32(p, w + 2 * n, w + 3 * n, n, h->scale);
+    if (dfn2_stream_pre_process_freq_dual(h->stream, w, w + n, w + 2 * n, w + 3 * n, job) != 1 ||
+        !job->job_ready)
+        return -1;
+    return 0;
+}
+
+/* Closes the open frame into `out` (n_bins bins, audio scale; zeros while no spectrum is due):
+ * the model's output is committed only for model_rc == 0 and a finite output, anything else is
+ * the identity. 0, or -1. */
+static inline int dfn_hop_close_frame(DfnHop* h, int model_rc, Complex* out) {
+    float* w = h->planar + 4 * h->n_bins;
+    int valid = 0;
+    if (dfn2_stream_post_process_freq(h->stream, model_rc, w, w + h->n_bins, &valid) != 0) return -1;
+    if (valid) skn_interleave_scale_cf32(w, w + h->n_bins, out, h->n_bins, h->unscale);
+    else memset(out, 0, (size_t)h->n_bins * sizeof(Complex));
+    return 0;
 }
 
 /* Starts a hop on the host-grid spectra E and P (borrowed for this call only). */
 static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
-    int r;
     if (!h || !e || !p) return DFN_HOP_INVALID;
     if (h->phase != 0) return DFN_HOP_SEQUENCE_ERROR;
     h->job_pending = 0;
-    h->stage_ended = 0;
+    h->frame_ended = 0;
     if (h->bridge) {
-        if (dfn_rate_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
+        if (ainr_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
     } else {
-        r = dfn_res_stage_begin(h->stage, e, p, &h->job);
-        if (r < 0) return DFN_HOP_INVALID;
+        if (dfn_hop_open_frame(h, e, p, &h->job) != 0) return DFN_HOP_INVALID;
         h->job_pending = 1;
     }
     h->phase = 1;
     return 0;
 }
 
+/* Opens the bridge's next model frame: 1, 0 when the hop has no further frame, or -1. */
+static inline int dfn_hop_bridge_frame(DfnHop* h) {
+    AinrBridgeFrame frame;
+    int r = ainr_bridge_model_begin(h->bridge, &frame);
+    if (r != 1) return r;
+    if (dfn_hop_open_frame(h, frame.estimate_spec, frame.apply_spec, &h->job) != 0) return -1;
+    h->frame_out = frame.out_spec;
+    h->frame_open = 1;
+    return 1;
+}
+
+static inline int dfn_hop_bridge_frame_end(DfnHop* h, int model_rc) {
+    if (!h->frame_open) return -1;
+    h->frame_open = 0;
+    if (dfn_hop_close_frame(h, model_rc, h->frame_out) != 0) return -1;
+    return ainr_bridge_model_end(h->bridge);
+}
+
 /* 1 with the open frame's tensors in *job, 0 when the hop has no further frame, or a negative
  * status. */
-static inline int dfn_hop_nn_begin(DfnHop* h, DfnResStageJob* job) {
+static inline int dfn_hop_nn_begin(DfnHop* h, DfnHopJob* job) {
     int r;
     if (!h || !job) return DFN_HOP_INVALID;
     if (h->phase != 1) return DFN_HOP_SEQUENCE_ERROR;
     if (h->bridge) {
-        r = dfn_rate_bridge_nn_begin(h->bridge, job);
+        r = dfn_hop_bridge_frame(h);
         if (r < 0) return DFN_HOP_INVALID;
     } else if (h->job_pending) {
-        *job = h->job;
         h->job_pending = 0;
         r = 1;
     } else {
         r = 0;
     }
-    if (r == 1) h->phase = 2;
+    if (r == 1) {
+        *job = h->job;
+        h->phase = 2;
+    }
     return r;
 }
 
@@ -140,10 +247,10 @@ static inline int dfn_hop_nn_end(DfnHop* h, int model_rc) {
     if (h->phase != 2) return DFN_HOP_SEQUENCE_ERROR;
     h->phase = 1;
     if (h->bridge) {
-        if (dfn_rate_bridge_nn_end(h->bridge, model_rc) != 0) return DFN_HOP_INVALID;
+        if (dfn_hop_bridge_frame_end(h, model_rc) != 0) return DFN_HOP_INVALID;
     } else {
-        if (dfn_res_stage_end(h->stage, model_rc, h->stage_out) < 0) return DFN_HOP_INVALID;
-        h->stage_ended = 1;
+        if (dfn_hop_close_frame(h, model_rc, h->out_spec) != 0) return DFN_HOP_INVALID;
+        h->frame_ended = 1;
     }
     return 0;
 }
@@ -154,10 +261,15 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
     if (!h || !out) return DFN_HOP_INVALID;
     if (h->phase == 0) return DFN_HOP_SEQUENCE_ERROR;
     if (h->bridge) {
+        int r;
         h->phase = 0;
-        return dfn_rate_bridge_finish(h->bridge, out) != 0 ? DFN_HOP_INVALID : 0;
+        if (h->frame_open && dfn_hop_bridge_frame_end(h, -1) != 0) return DFN_HOP_INVALID;
+        while ((r = dfn_hop_bridge_frame(h)) == 1)
+            if (dfn_hop_bridge_frame_end(h, -1) != 0) return DFN_HOP_INVALID;
+        if (r < 0) return DFN_HOP_INVALID;
+        return ainr_bridge_finish(h->bridge, out) != 0 ? DFN_HOP_INVALID : 0;
     }
-    if (!h->stage_ended && dfn_res_stage_end(h->stage, -1, h->stage_out) < 0) {
+    if (!h->frame_ended && dfn_hop_close_frame(h, -1, h->out_spec) != 0) {
         h->phase = 0;
         return DFN_HOP_INVALID;
     }
@@ -165,10 +277,10 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
     h->job_pending = 0;
     if (h->check_finite) {
         for (k = 0; k < h->n_bins; ++k)
-            if (!isfinite(h->stage_out[k].r) || !isfinite(h->stage_out[k].i))
+            if (!isfinite(h->out_spec[k].r) || !isfinite(h->out_spec[k].i))
                 return DFN_HOP_INVALID;
     }
-    (void)ac_istft_push(h->istft, h->stage_out, out);
+    (void)ac_istft_push(h->istft, h->out_spec, out);
     if (h->check_finite) {
         for (k = 0; k < h->hop_size; ++k)
             if (!isfinite(out[k])) return DFN_HOP_INVALID;
@@ -176,24 +288,19 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
     return 0;
 }
 
-/* The whole hop with the stage's configured model callback (identity when unset). */
+/* The whole hop with the pool plan's model callback (identity when unset). */
 static inline int dfn_hop_process(DfnHop* h, const Complex* e, const Complex* p, float* out) {
-    DfnResStageJob job;
+    DfnHopJob job;
     int r;
     if (!h || !out) return DFN_HOP_INVALID;
     r = dfn_hop_begin(h, e, p);
     if (r != 0) return r;
     while ((r = dfn_hop_nn_begin(h, &job)) == 1) {
-        int nr = dfn_hop_nn_end(h, dfn_res_stage_infer(h->stage, &job));
+        int nr = dfn_hop_nn_end(h, dfn_hop_infer(h, &job));
         if (nr != 0) return nr;
     }
     if (r < 0) return r;
     return dfn_hop_end(h, out);
-}
-
-/* The stage, for set_atten_lim and counters. */
-static inline DfnResStage* dfn_hop_stage(const DfnHop* h) {
-    return h ? h->stage : NULL;
 }
 
 #ifdef __cplusplus

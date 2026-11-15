@@ -15,20 +15,20 @@
  * that lane's capture while the model still estimates on E. The array reseeds its comfort noise
  * on a lane's post-chain reset (frame.post_reset_serial moved) before P is formed. On the bridge path
  * (host rate differs from the model grid) the host-grid synthesis is inside the bridge and runs at
- * the top of its begin(), so dfn_rate_bridge_reset_synthesis() on that hop clears just its
- * overlap-add tail (DFN2 and the resamplers keep running, no delay line). On the stage path (host
- * rate equals the model grid's) the synthesis follows the stage by its lookahead and this example
+ * the top of its begin(), so ainr_bridge_reset_synthesis() on that hop clears just its
+ * overlap-add tail (DFN2 and the resamplers keep running, no delay line). On the direct path (host
+ * rate equals the model grid's) the synthesis follows the model by its lookahead and this example
  * resets the whole hop instead. Here that serial moves only with an array reset, which the
  * refused-call path below already pairs with a hop reset.
  *
- * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives dfn_res_stage.h and
- * synthesises through an AcIstft; any other host rate runs the same stage on its 48 kHz grid inside
- * dfn_rate_bridge.h (which needs the 48 kHz / 1024 model). The model grid is built from the
- * --ai-sample-rate / --ai-fft-size pair (dfn_example_args.h) with dfn2_grid_make() and handed to
- * every object. The first output hops are zero: the model's
- * dfn_res_stage_lookahead_frames() hops on the stage path (two for the shipped 1/1 lookahead pair),
- * the bridge's added delay otherwise (printed below). The stage does not reset on a delay
- * change of the shared aligner.
+ * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives the model stream
+ * (stream/ainr/dfn2, memory mode) and synthesises through an AcIstft; any other host rate runs the
+ * same stream on its 48 kHz grid inside stream/ainr/bridge's AinrBridge (which needs the 48 kHz /
+ * 1024 model). The model grid is built from the --ai-sample-rate / --ai-fft-size pair
+ * (dfn_example_args.h) with dfn2_grid_make() and handed to every object. The first output hops are
+ * zero: the model's dfn_hop_lookahead_frames() hops on the direct path (two for the shipped 1/1
+ * lookahead pair), the bridge's added delay otherwise (printed below). The hop does not reset on a
+ * delay change of the shared aligner.
  *
  * The program builds the pool from the command-line delay profile and ERB matrices, installs a
  * fail-open model callback and runs a few silent hops. Replace run_accelerator() with the board
@@ -74,18 +74,15 @@ typedef struct DfnSample {
     AecSignalGrid grid;
     size_t aec_bytes, beam_bytes;     /* the array pool; SRP/BF helper */
     Aec *aec;
-    DfnHopPoolPlan dfn;               /* the stage (or bridge), its synthesis and output */
-    DfnExampleErb erb;                /* the stage borrows these matrices until it is destroyed */
+    DfnHopPoolPlan dfn;               /* the model stream, its conversion buffers, the synthesis or bridge */
+    DfnExampleErb erb;                /* the model stream borrows these matrices until the pool is freed */
     DFN2ModelIoDescriptor descriptor;
     size_t spec_bytes, total;
     void *pool;
     ArraySampleBeam *unit;
     Complex *post;                    /* P */
     uint32_t reset_handled;           /* AecResidualView.post_reset_serial last followed */
-    DfnResStage *stage;
-    DfnRateBridge *bridge;
-    AcIstft *istft;
-    DfnHop hop;
+    DfnHop hop;                       /* hop.bridge / hop.istft: the bridge, or the synthesis */
     const char *program;
     char rates_text[64];
 } DfnSample;
@@ -150,7 +147,7 @@ static int dfn_parse(void *user, int argc, char **argv) {
     return rc;
 }
 
-/* Everything the pool holds, sized once. 0, or -1 for a configuration no stage accepts. */
+/* Everything the pool holds, sized once. 0, or -1 for a configuration nothing accepts. */
 static int dfn_plan(DfnSample *s) {
     if (aec_get_mem_requirements(&s->unit_cfg,&s->unit_req) != 0 ||
         aec_resolve_signal_grid(s->unit_cfg.sample_rate,s->unit_cfg.fft_size,&s->grid) != AEC_OK ||
@@ -160,16 +157,16 @@ static int dfn_plan(DfnSample *s) {
     s->aec_bytes=ALIGN16((size_t)s->unit_req.bytes);
     s->spec_bytes=ALIGN16((size_t)s->grid.n_freqs*sizeof(Complex));
 
-    s->dfn.stage_cfg=dfn_res_stage_default_config(&s->args.model_grid);
-    s->dfn.stage_cfg.atten_lim_db=s->args.atten_lim_db;
-    s->dfn.stage_cfg.erb_fwd=s->erb.fwd;
-    s->dfn.stage_cfg.erb_inv=s->erb.inv;
-    s->dfn.stage_cfg.model.user=NULL;
-    s->dfn.stage_cfg.model.infer=run_accelerator;
-    s->dfn.stage_cfg.model.reset=NULL;
-    s->dfn.stage_cfg.model.io_descriptor=&s->descriptor;
+    dfn_hop_pool_plan_init(&s->dfn,&s->args.model_grid);
+    s->dfn.stream_cfg.atten_lim_db=s->args.atten_lim_db;
+    s->dfn.stream_cfg.erb_fwd=s->erb.fwd;
+    s->dfn.stream_cfg.erb_inv=s->erb.inv;
+    s->dfn.model.user=NULL;
+    s->dfn.model.infer=run_accelerator;
+    s->dfn.model.reset=NULL;
+    s->dfn.model.io_descriptor=&s->descriptor;
     if (dfn_hop_pool_plan(&s->dfn,s->args.sample_rate,0) != 0) return -1;   /* the rate's default grid */
-    /* array, helper, P, then the stage (or bridge) and its synthesis */
+    /* array, helper, P, then the model stream, its buffers and the synthesis (or bridge) */
     s->total=s->aec_bytes+ALIGN16(s->beam_bytes)+s->spec_bytes+
              dfn_hop_pool_bytes(&s->dfn);
     return 0;
@@ -183,19 +180,18 @@ static void dfn_reset(DfnSample *s) {
 
 static void dfn_cleanup(void *user) {
     DfnSample *s=user;
-    if (s->bridge) dfn_rate_bridge_destroy(s->bridge);
-    else if (s->stage) dfn_res_stage_destroy(s->stage);
     if (s->unit) array_sample_beam_destroy(s->unit);
     aec_destroy(s->aec);
     s->aec=NULL;
     free(s->pool);
     s->pool=NULL;
     dfn_example_erb_free(&s->erb);
-    s->bridge=NULL; s->stage=NULL; s->unit=NULL; s->istft=NULL;
+    s->unit=NULL;
+    memset(&s->hop,0,sizeof(s->hop));
 }
 
-/* Carves the planned pool: the array, the helper, the P buffer, then the stage
- * (or bridge) and its synthesis. */
+/* Carves the planned pool: the array, the helper, the P buffer, then the model stream, its
+ * buffers and the synthesis (or bridge). */
 static int dfn_build(DfnSample *s) {
     unsigned char *cur;
     if (posix_memalign(&s->pool,s->unit_req.alignment,s->total) != 0) { s->pool=NULL; return -1; }
@@ -208,8 +204,7 @@ static int dfn_build(DfnSample *s) {
     if (!s->unit) return -1;
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
     s->reset_handled=0u;
-    return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,
-                              &s->hop,&s->stage,&s->bridge,&s->istft);
+    return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,&s->hop);
 }
 
 static int dfn_setup(void *user, ArraySampleHopView *view) {
@@ -219,7 +214,7 @@ static int dfn_setup(void *user, ArraySampleHopView *view) {
         return 1;
 
     /* The residual gain stage (balanced, in the array) is always on; the comfort-noise fill is the
-     * program's switch: E and P must share a phase for the DFN2 stage, so it is off unless asked for. */
+     * program's switch: E and P must share a phase for the DFN2 hop, so it is off unless asked for. */
     array_sample_default_config(&s->unit_cfg, s->args.sample_rate);
     s->unit_bp = array_sample_beam_default_params();
     s->unit_cfg.delay_mode = s->args.delay_mode;
@@ -248,7 +243,7 @@ static int dfn_setup(void *user, ArraySampleHopView *view) {
            s->args.model_grid.sample_rate, s->args.model_grid.n_fft, s->args.model_grid.n_erb,
            s->args.model_grid.df_bins, s->args.model_grid.mask_lookahead,
            s->args.model_grid.df_lookahead,
-           s->dfn.use_bridge ? "through the rate bridge" : "the stage on the host grid");
+           s->dfn.use_bridge ? "through the rate bridge" : "the model stream on the host grid");
 
     if (dfn_build(s) != 0) {
         fprintf(stderr, "%s: pipeline init failed\n", name);
@@ -257,11 +252,11 @@ static int dfn_setup(void *user, ArraySampleHopView *view) {
     }
     hop_size = s->grid.hop_size;
     /* Core WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
-     * core hop on the stage path. */
+     * core hop on the direct path. */
     DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 variant is the archive's */
     latency = s->dfn.use_bridge
-        ? hop_size + dfn_rate_bridge_added_delay_samples(s->bridge)
-        : hop_size * (dfn_res_stage_lookahead_frames(&s->args.model_grid) + 1);
+        ? hop_size + ainr_bridge_added_delay_samples(s->hop.bridge)
+        : hop_size * (dfn_hop_lookahead_frames(&s->args.model_grid) + 1);
     printf("%s: hop %d samples, algorithmic latency %d samples\n", name, hop_size, latency);
     view->hop=hop_size; view->output=output; view->check_finite=1;
     return 0;
@@ -271,10 +266,10 @@ static int dfn_read(void *user, int frame) {
 }
 /* P = B * G_res, plus comfort noise on the bins the gain cut when enabled (no denoiser: unity extra
  * gain); a lane's post-chain reset first clears the synthesis (the bridge's host-grid tail on the bridge
- * path, the whole hop on the stage path). Before the hop enters the DFN hop. 0, or -1 on a refusal. */
+ * path, the whole hop on the direct path). Before the hop enters the DFN hop. 0, or -1 on a refusal. */
 static int dfn_form(DfnSample *s, const AecResidualView *f) {
     if (array_sample_post_reset_due(&s->reset_handled,f)) {
-        if (s->bridge) (void)dfn_rate_bridge_reset_synthesis(s->bridge);   /* between hops: cannot refuse */
+        if (s->hop.bridge) (void)ainr_bridge_reset_synthesis(s->hop.bridge);   /* between hops: cannot refuse */
         else dfn_hop_reset(&s->hop);
     }
     if (aec_apply_gain(s->aec,NULL,s->post) != AEC_OK) return -1;

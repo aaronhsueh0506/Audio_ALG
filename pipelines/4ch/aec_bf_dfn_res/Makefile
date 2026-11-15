@@ -15,7 +15,7 @@ test: all
 	  "$$bin/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12; \
 	  "$$bin/4ch_aec_bf_dfn_res" --sample-rate 48000; \
 	  out="$$("$$bin/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)"; \
-	  printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the stage on the host grid"; \
+	  printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the model stream on the host grid"; \
 	  sh ../../scripts/test_cli_exit_codes.sh 4ch_aec_bf_dfn_res "$$bin/4ch_aec_bf_dfn_res"
 endif
 

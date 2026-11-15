@@ -136,7 +136,7 @@ samples.
 `-DDFN2_DF_LOOKAHEAD`; `dfn2_test_grid()` and `dfn_test_grid()` return the `DFN2Grid`). They give the macros that size the tests'
 fixed arrays and sweep grids and pairs; they are test scaffolding only, and the pair they default to is 1/1 for every preset, which is
 not the board table's 0 / 0 for 16 and 32 kHz. The pipeline objects (`dfn_res_stage`, `dfn_rate_bridge`, `dfn_hop`) and the example
-mains hold no build-time grid: the `DFN2Grid` travels in `DfnResStageConfig.grid`, and the example mains build it from
+mains hold no build-time grid: the `DFN2Grid` travels in `DfnResStageConfig.grid` (in `DfnHopPoolPlan.stream_cfg.grid`, a `DFN2StreamConfig`, for `dfn_hop` and the example mains, which run the model stream), and the example mains build it from
 `--ai-sample-rate` / `--ai-fft-size` and the table above.
 
 **Limits.** The rate bridge (`pipelines/dfn/dfn_rate_bridge.c`) is written for the 48 kHz model and refuses another (see

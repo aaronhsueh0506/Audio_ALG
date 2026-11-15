@@ -17,6 +17,8 @@
 #include "dfn/tests/dfn_test_grid.h"
 #include "dfn/dfn_res_stage.h"
 #include "dfn/dfn_rate_bridge.h"
+#include "dfn2_stream.h"
+#include "ainr_bridge.h"
 #include "dfn2_prepost.h"
 #include "dfn3_prepost.h"
 #include "ulcnet_prepost.h"
@@ -89,6 +91,15 @@ static void deepvqe_target_grid(DeepVqeGrid *grid) {
     assert(deepvqe_grid_make(grid, &spec) == DEEPVQE_GRID_OK);
 }
 
+/* dfn2_stream takes its config first and calls the query get_mem_size; the macro's argument order is the pool's. */
+static int dfn2_stream_abi_get_mem_requirements(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req) {
+    return dfn2_stream_get_mem_size(cfg, req);
+}
+static DFN2Stream *dfn2_stream_abi_init_ex(void *mem, size_t bytes, const DFN2StreamConfig *cfg,
+                                           const DFN2StreamMemReq *expected) {
+    return dfn2_stream_init_ex(cfg, mem, bytes, expected);
+}
+
 /* The pre/post APIs call their descriptor query get_mem_size. */
 #define dfn2_prepost_get_mem_requirements dfn2_prepost_get_mem_size
 #define dfn3_prepost_get_mem_requirements dfn3_prepost_get_mem_size
@@ -107,6 +118,8 @@ int main(int argc, char **argv) {
     DeepVqeGrid deep_grid;
     DfnResStageConfig stage = dfn_res_stage_default_config(dfn_test_grid());
     DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000, dfn_test_grid());
+    DFN2StreamConfig stream;
+    AinrBridgeConfig ainr_bridge_cfg = ainr_bridge_default_config(16000, DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD);
 
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
         write_file = fopen(argv[2], "wb");
@@ -150,6 +163,10 @@ int main(int argc, char **argv) {
     dfn2.erb_inv = dfn3.erb_inv = erb_inv;
     stage.erb_fwd = bridge.stage.erb_fwd = erb_fwd;
     stage.erb_inv = bridge.stage.erb_inv = erb_inv;
+    memset(&stream, 0, sizeof stream);
+    stream.grid = *dfn_test_grid();
+    stream.erb_fwd = erb_fwd;
+    stream.erb_inv = erb_inv;
 
     EXERCISE(dfn2_prepost, DFN2PrepostMemReq, dfn2);
     EXERCISE(dfn3_prepost, DFN3PrepostMemReq, dfn3);
@@ -160,7 +177,9 @@ int main(int argc, char **argv) {
     EXERCISE(aec, AecMemReq, lanes_only);
     EXERCISE(dfn_res_stage, DfnResStageMemReq, stage);
     EXERCISE(dfn_rate_bridge, DfnRateBridgeMemReq, bridge);
-    assert(cases == 8u);
+    EXERCISE(dfn2_stream_abi, DFN2StreamMemReq, stream);
+    EXERCISE(ainr_bridge, AinrBridgeMemReq, ainr_bridge_cfg);
+    assert(cases == 10u);
     if (write_file) assert(fclose(write_file) == 0);
     if (foreign_file) {
         assert(fgetc(foreign_file) == EOF);

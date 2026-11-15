@@ -9,7 +9,7 @@ the residual gain stage are carved from one pool by `aec_init_ex()`; the applica
 There is no DFN wrapper library either. `main.c` builds the array in one block with
 `aec_get_mem_requirements()` + `aec_init_ex()` on `array_sample_default_config()` (residual `AEC_RESIDUAL_FULL`), adds the sample SRP-PHAT/BF helper
 (`array_sample_beam.h`, in no archive), carves the P spectrum of the RES path (no denoiser)
-and the DFN2 stage (or the rate bridge, sized and carved by `dfn/dfn_hop_pool.h`) separately,
+and the DFN2 model stream (`stream/ainr/dfn2`, memory mode; at 16 kHz with the sample-rate bridge `stream/ainr/bridge` around it; sized and carved by `dfn/dfn_hop_pool.h`) separately,
 forms P in `dfn_form()` (`aec_apply_gain(aec, NULL, P)`, optional `aec_apply_cng(aec, NULL, P)`), and `dfn/dfn_hop.h` runs
 the network between the post-RES spectrum and the synthesis:
 
@@ -30,7 +30,7 @@ mics/ref -> array_sample_beam_process(unit, mics, far, &beam, NULL)
 The skeleton uses the helper's own SRP-PHAT and BF, so `array_sample_beam_fuse()` hands the array the
 BF's spectrum and weights. An application with its own beamformer calls `aec_process_linear()` and
 `aec_process_residual(aec, &{W, E})` instead. `dfn_hop_process(&hop, v.error_spec, P, out)` is the sequence of
-the `dfn_hop_*` calls with the model callback (`dfn_res_stage_infer()` here) as the runner. The RES
+the `dfn_hop_*` calls with the model callback (`dfn_hop_infer()` here) as the runner. The RES
 strength is `aec_set_level(aec, level)` on the array. The array owns the RES gain stage and the
 comfort-noise generator; the example owns the P buffer and the ISTFT in the `DfnHop`, and a refused call resets
 the helper (and with it the array, gain stage and comfort-noise generator) and the `DfnHop` together (`dfn_reset()` in `main.c`). The
@@ -45,32 +45,32 @@ conventional chain with the denoiser off delayed: bit for bit by L = M + D hops 
 48 kHz (two for the shipped lookahead pair; the acceptance gate in `tests/test_4ch_dfn.c` asserts it against the hand-written chain of
 `4ch/tests/conv_chain_4ch.h`, with comfort noise off and on, across a real
 shared-estimator delay re-lock, on a stimulus where a run without the array's gain stage provably
-differs, and checks that the stage is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
+differs, and checks that the model stream is not reset on the shared aligner's delay change), and through the resampler round trip by the bridge delay at
 16 kHz (the same test pins the delay with a near-end impulse, the frame
 schedule, and, where the delay is a whole number of native samples, the pass-band error
 against the conventional 16 kHz output, observed at about 1e-5 against a gate of 1e-3 for the shipped pair).
 
 The flow runs on the product's own grid: 16 kHz (fft 256, hop 128) by
 default, 16 kHz/512 (covered by `test_4ch_dfn`; the skeleton has no fft flag), or 48 kHz (the array's
-rates, no 8 kHz). Only the DFN2 stage runs
+rates, no 8 kHz). Only the DFN2 model runs
 at 48 kHz: directly on the flow's spectra at 48 kHz (algorithmic latency
-L + 1 hops; three hops, 32 ms, for the shipped pair), or through the rate bridge (`pipelines/dfn/dfn_rate_bridge.h`)
+L + 1 hops; three hops, 32 ms, for the shipped pair), or through the rate bridge (`stream/ainr/bridge/ainr_bridge.h`)
 at 16 kHz, which synthesises E and P on the native grid, resamples them up,
-runs the stage on the 48 kHz 1024/512 grid and resamples the result down.
+hands the hop the 48 kHz 1024/512 frames for the model stream and resamples the result down.
 The four lanes, the beamformer (bf) seam, the RES and the comfort noise never leave
 the product rate. The bridge adds `prefill + 32 + (L + 1) x 512 x sr / 48000` native samples (integer
 division) to the host's own output: for the shipped pair 672 samples (42 ms) at 16 kHz with hop
 128 and 629 (39 ms) with hop 256; total algorithmic
 latency is that plus the host's WOLA hop (16 kHz, hop 128: 800 samples,
-50 ms). A pair whose L + 1 is not a multiple of 3 has a fractional stage delay that is floored
-(pair 0/1: 501 / 458 samples). The stage schedule per native hop is 0,1,1,1 frames at hop 128 and
+50 ms). A pair whose L + 1 is not a multiple of 3 has a fractional model delay that is floored
+(pair 0/1: 501 / 458 samples). The model schedule per native hop is 0,1,1,1 frames at hop 128 and
 1,2 at hop 256.
 
 DFN2 grid and lookahead pair. The model grid is a run-time choice of `main.c`: `--ai-sample-rate <Hz>` / `--ai-fft-size <n>`
 (default 48000 / 1024, a row of the two-row table in `dfn/dfn_example_args.h`) built with `dfn2_grid_make()` and handed to
-`DfnResStageConfig.grid`; the mask and deep-filter lookaheads M (0..2) and D (0..4) are fields of that grid and must equal the
+`DfnHopPoolPlan.stream_cfg.grid` (`dfn_hop_pool_plan_init()`); the mask and deep-filter lookaheads M (0..2) and D (0..4) are fields of that grid and must equal the
 pair the model was trained for. A host on the model's own rate (`--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz core) runs
-the stage directly; any other host rate needs the bridge, which accepts the 48 kHz / 1024 model only (otherwise "pool query rejected",
+the model stream directly; any other host rate needs the bridge, which accepts the 48 kHz / 1024 model only (otherwise "pool query rejected",
 exit 1). The `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` make variables (default 1/1; this folder's Makefile forwards to
 `4ch/Makefile`, which takes both, folds them into its build signature and has no `test-pairs` target) reach the test
 program `test_4ch_dfn` only. The rules, the pipelines make
@@ -89,13 +89,13 @@ builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters
 `--sample-rate 48000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
 `--atten-lim 12dB` exit with 2, and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
 
-`libdfn_res_stage.a` holds the shared stage, the rate bridge and the DFN2 host
-pre/post objects; link it ahead of the producer archives (the SRP/BF archives of audiolib, `libaec` (which holds the array),
+`libdfn_res_stage.a` holds the DFN2 model stream (`dfn2_stream.o`), the sample-rate bridge (`ainr_bridge.o`), the DFN2 host
+pre/post objects, and the older stage and rate bridge adapter (`dfn_res_stage.o`, `dfn_rate_bridge.o`), which this example no longer calls; link it ahead of the producer archives (the SRP/BF archives of audiolib, `libaec` (which holds the array),
 `libanr` and `libaudio_common`). The
 sample objects `array_sample_beam.o` and `array_sample_driver.o` are linked into
 the program, not archived. The board supplies the stateless model
 callback (`DFN2Model`; its recurrent state is the accelerator's, reloaded with quantized zeros when
-`dfn_res_stage_state_generation()`, through the bridge `dfn_rate_bridge_state_generation()`, changes: a reset, each warm-up frame or a
+`job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, each warm-up frame or a
 refused commit) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
@@ -125,25 +125,26 @@ current model-v6/feature-v5.
 ## Calling sequence and parameters
 
 ```
-App          Aec (array)                   ArraySampleBeam   DfnHop + DfnResStage | DfnRateBridge   AcIstft (DFN2 grid rate; 48 kHz as shipped)
+App          Aec (array)                   ArraySampleBeam   DfnHop + DFN2Stream (+ AinrBridge)   AcIstft (DFN2 grid rate; 48 kHz as shipped)
  |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
  |-- array_sample_default_config; aec_get_mem_requirements; aec_init_ex -->|
  |-- array_sample_beam_default_params; array_sample_beam_get_mem_size / _init(aec) -->|
- |-- dfn_hop_pool_plan / dfn_hop_pool_build: dfn_res_stage_* (48 kHz) or dfn_rate_bridge_* (16 kHz), dfn_hop_init_*
+ |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_build: dfn2_stream_* (memory mode) and the conversion buffers,
+ |     then ac_istft_init + dfn_hop_init_direct (48 kHz) or ainr_bridge_* + dfn_hop_init_bridge (16 kHz)
  |   per hop: array_sample_beam_process --> array_sample_beam_fuse (the array's gain stage runs on E)
- |            --> v.post_reset_serial moved: dfn_rate_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
+ |            --> v.post_reset_serial moved: ainr_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
  |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
  |   refused call: array_sample_beam_reset (helper + array) + dfn_hop_reset   (dfn_reset())
- |   never reset the stage on the shared aligner's delay change
- |-- stage / bridge destroy; array_sample_beam_destroy; aec_destroy; release the blocks
+ |   never reset the hop on the shared aligner's delay change
+ |-- array_sample_beam_destroy; aec_destroy; release the pool (the DFN tail owns nothing else)
 ```
 
 The model estimates on the analysis beam `E` (`v.error_spec`) and is applied on `P`, formed over the rendering base
 `B` (`v.base_spec`, see [the 4ch README](../../4ch/README.md), "Analysis and rendering spectra"). `B` is
 `E` except on hops where a contributing lane's output guard fired; there `P` carries that lane's capture while the
 estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
-`dfn_rate_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
-its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the stage
+`ainr_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
+its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the model
 by its lookahead and this example resets the whole hop (the delayed tail clear of `mono_aec_dfn_res` is not ported). In
 this flow the serial moves only with an array reset (the lanes take an aligned far), which the refused-call path already
 pairs with a hop reset.
@@ -154,7 +155,7 @@ External parameters: the same board-skeleton flags as the mono variant (`--sampl
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
 product replaces with the measured one) and `aec_set_level(aec, ...)` on the array.
 Internal: the helper's BF / DOA / VAD constants (section 0.3 of
-[SRP／BF helper](../../../docs/reference/array/beam.md)), the stage
+[SRP／BF helper](../../../docs/reference/array/beam.md)), the model
 grid and scale constants, the bridge FIR and schedule.
 
 ## Compute admission
@@ -174,10 +175,14 @@ requires the final int8/fp runtime and board cycle measurement.
 
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
-the P buffer, and the stage or bridge, each 16-byte
-aligned; shipped pair): 1,716,544 bytes at the 16 kHz default (array plus helper 1,492,672 bytes, plus the rate bridge) and
-5,692,128 bytes at 48 kHz (array plus helper 5,536,096 bytes). The array's own pool is 700,480 bytes at
-16 kHz/256 (the lanes 570,880 of it; `residual = STATE` 594,944 bytes); the model stage and the bridge have their own pools.
+the P buffer, and the DFN tail of `dfn_hop_pool_bytes()`, each part 16-byte
+aligned; shipped pair): 1,788,192 bytes at the 16 kHz default (array plus helper 1,492,672 bytes, the P buffer, and a DFN tail of
+294,480 bytes: the model stream 164,304, the six conversion buffers 12,312 and the bridge 117,856) and
+5,763,776 bytes at 48 kHz (array plus helper 5,536,096 bytes; DFN tail 223,568: the stream and the buffers, the synthesis 42,832
+and the output spectrum 4,104). Against the stage these programs ran before, the tail is 71,600 bytes larger at 16 kHz and 71,648
+at 48 kHz (the stream's pool also holds the analysis and synthesis of its PCM entries, and the conversion buffers moved from the
+stage into the hop). The array's own pool is 700,480 bytes at
+16 kHz/256 (the lanes 570,880 of it; `residual = STATE` 594,944 bytes).
 Model weights, accelerator activation/workspace memory and the recurrent state are external;
 adding int8 weights alone brings the pool plus weights to about 3.7 MiB at
 16 kHz.

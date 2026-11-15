@@ -12,25 +12,26 @@
  *
  * The AEC residual view carries two signals. E (v.error_spec, v.formed_hop) is the analysis seam, never
  * altered by the output guard; B is what aec_process() itself would multiply by its gain, E bit for bit
- * on every hop the guard leaves alone. The DFN2 stage reads the pair (B, P): its estimate and the
+ * on every hop the guard leaves alone. The DFN2 hop reads the pair (B, P): its estimate and the
  * spectrum it filters stay the same signal, so a guard hop does not pair a capture-based P with a
- * residual-based estimate. There is no denoiser in this chain; the stage keeps running through an AEC
+ * residual-based estimate. There is no denoiser in this chain; the hop keeps running through an AEC
  * reset event (it never resets on one). On a new aec_post_reset_serial() the library reseeds its
- * comfort-noise generator before that hop's first draw. On the stage path (host rate equals the model grid's) the
- * host synthesis also drops its overlap-add tail, dfn_res_stage_lookahead_frames() hops later (0 for
- * the 16 kHz row), before the push of the first frame built after the reset: the stage delays
+ * comfort-noise generator before that hop's first draw. With the host on the model grid's rate the
+ * host synthesis also drops its overlap-add tail, dfn_hop_lookahead_frames() hops later (0 for
+ * the 16 kHz row), before the push of the first frame built after the reset: the model delays
  * every frame by that many hops, so the event is delayed with it. On the bridge path the host-grid
- * synthesis lives inside dfn_rate_bridge and runs at the top of its begin(): there
- * dfn_rate_bridge_reset_synthesis() on the hop of the event clears just that overlap-add tail (DFN2,
+ * synthesis lives inside the AinrBridge and runs at the top of its begin(): there
+ * ainr_bridge_reset_synthesis() on the hop of the event clears just that overlap-add tail (DFN2,
  * the resamplers and the FIFOs keep running), with no delay line.
  *
- * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives dfn_res_stage.h and
- * synthesises through an AcIstft; any other host rate runs the same stage on its 48 kHz grid inside
- * dfn_rate_bridge.h, which needs the 48 kHz / 1024 model. The model grid is built from the
- * --ai-sample-rate / --ai-fft-size pair (dfn_example_args.h) with dfn2_grid_make() and handed to
- * every object; nothing here is fixed at build time. The first output hops are zero: the model's
- * dfn_res_stage_lookahead_frames() hops on the stage path (two for the shipped 1/1 lookahead pair),
- * the bridge's added delay otherwise (printed below).
+ * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives the model stream
+ * (stream/ainr/dfn2, memory mode) and synthesises through an AcIstft; any other host rate runs the
+ * same stream on its 48 kHz grid inside stream/ainr/bridge's AinrBridge, which needs the 48 kHz /
+ * 1024 model. The model grid is built from the --ai-sample-rate / --ai-fft-size pair
+ * (dfn_example_args.h) with dfn2_grid_make() and handed to every object; nothing here is fixed at
+ * build time. The first output hops are zero: the model's dfn_hop_lookahead_frames() hops on the
+ * direct path (two for the shipped 1/1 lookahead pair), the bridge's added delay otherwise
+ * (printed below).
  *
  * The program builds the pool from the command-line delay profile and ERB matrices, installs a
  * fail-open model callback and runs a few silent hops. Replace run_accelerator() with the board
@@ -51,10 +52,10 @@
 
 /* Replace with the board runtime call. `inputs` carries the feature windows; the recurrent state
  * is the accelerator's own (its views are NULL/0 here), bound input to output in place and
- * refilled with quantized zeros whenever dfn_res_stage_state_generation() (through the bridge,
- * dfn_rate_bridge_state_generation()) changes, which includes the end of each warm-up frame (the
- * first mask_lookahead hops run the model like any other; their heads are discarded). Fill the heads
- * in `outputs` and return 0. A nonzero return takes the frame as the identity (dfn_res_stage.h). */
+ * refilled with quantized zeros whenever job.state_generation (dfn_hop_state_generation()) changes,
+ * which includes the end of each warm-up frame (the first mask_lookahead hops run the model like
+ * any other; their heads are discarded). Fill the heads in `outputs` and return 0. A nonzero return
+ * takes the frame as the identity (dfn_hop.h). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
                            DFN2PrepostOutputs *outputs) {
     (void)user;
@@ -85,7 +86,7 @@ typedef struct Plan {
     AecConfig aec_cfg;
     AecSignalGrid grid;
     int enable_cng;
-    DfnHopPoolPlan dfn;               /* the stage (or bridge), its synthesis and output */
+    DfnHopPoolPlan dfn;               /* the model stream, its conversion buffers, the synthesis or bridge */
     size_t aec_bytes, spec_bytes;
     size_t total;
 } Plan;
@@ -97,20 +98,20 @@ static int make_plan(const DfnExampleArgs *args, const DfnExampleErb *erb,
         return -1;
 
     /* No denoiser, RES gain only; the comfort-noise fill is the program's switch. E and P must
-     * share a phase for the DFN2 stage, so it is off unless asked for. */
+     * share a phase for the DFN2 hop, so it is off unless asked for. */
     p->enable_cng = args->enable_cng;
     p->spec_bytes = ALIGN16((size_t)p->grid.n_freqs * sizeof(Complex));
 
-    p->dfn.stage_cfg = dfn_res_stage_default_config(&args->model_grid);
-    p->dfn.stage_cfg.atten_lim_db = args->atten_lim_db;
-    p->dfn.stage_cfg.erb_fwd = erb->fwd;
-    p->dfn.stage_cfg.erb_inv = erb->inv;
-    p->dfn.stage_cfg.model = *model;
+    dfn_hop_pool_plan_init(&p->dfn, &args->model_grid);
+    p->dfn.stream_cfg.atten_lim_db = args->atten_lim_db;
+    p->dfn.stream_cfg.erb_fwd = erb->fwd;
+    p->dfn.stream_cfg.erb_inv = erb->inv;
+    p->dfn.model = *model;
 
     p->aec_bytes = aec_get_mem_size(&p->aec_cfg);
     if (p->aec_bytes == 0 || !isfinite(args->atten_lim_db)) return -1;
     if (dfn_hop_pool_plan(&p->dfn, args->sample_rate, 0) != 0) return -1;
-    /* AEC, P, then the stage (or bridge) and its synthesis */
+    /* AEC, P, then the model stream, its buffers and the synthesis (or bridge) */
     p->total = ALIGN16(p->aec_bytes) + p->spec_bytes + dfn_hop_pool_bytes(&p->dfn);
     return 0;
 }
@@ -121,18 +122,13 @@ typedef struct Rig {
     Aec *aec;
     Complex *post;                    /* P */
     uint32_t reset_serial;            /* the aec_post_reset_serial() value already handled */
-    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the stage path's delay line) */
+    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
     int enable_cng;
-    int reset_delay;                  /* hops the stage path delays a frame by (the model's lookahead) */
-    DfnResStage *stage;
-    DfnRateBridge *bridge;
-    AcIstft *istft;
-    DfnHop hop;
+    int reset_delay;                  /* hops the direct path delays a frame by (the model's lookahead) */
+    DfnHop hop;                       /* hop.bridge / hop.istft: the bridge, or the synthesis */
 } Rig;
 
 static void rig_free(Rig *r) {
-    if (r->bridge) dfn_rate_bridge_destroy(r->bridge);
-    else if (r->stage) dfn_res_stage_destroy(r->stage);
     if (r->aec) aec_destroy(r->aec);
     free(r->pool);
     memset(r, 0, sizeof(*r));
@@ -147,11 +143,10 @@ static int rig_build(Rig *r, const Plan *p) {
     cur += ALIGN16(p->aec_bytes);
     if (!r->aec) goto fail;
     r->enable_cng = p->enable_cng;
-    r->reset_delay = dfn_res_stage_lookahead_frames(&p->dfn.stage_cfg.grid);
+    r->reset_delay = dfn_hop_lookahead_frames(&p->dfn.stream_cfg.grid);
     r->post = (Complex *)cur;     cur += p->spec_bytes;
     r->reset_serial = aec_post_reset_serial(r->aec);
-    if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop,
-                           &r->stage, &r->bridge, &r->istft) != 0)
+    if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop) != 0)
         goto fail;
     return 0;
 fail:
@@ -169,24 +164,24 @@ static void rig_reset(Rig *r) {
 
 /* The AEC's hard post-chain reset event (aec.h, aec_post_reset_serial): the reset happened inside this
  * hop's aec_process_linear(), before its synthesis; the library reseeds its comfort-noise generator.
- * The stage path (host rate equals the model grid's) owns its synthesis: its output for the frame built on
- * this hop appears dfn_res_stage_lookahead_frames() hops later, so the overlap-add tail is dropped
+ * The direct path (host rate equals the model grid's) owns its synthesis: its output for the frame built on
+ * this hop appears dfn_hop_lookahead_frames() hops later, so the overlap-add tail is dropped
  * before the push of that frame. The bridge path synthesises the spectra it is given at the top of
  * its begin(), so its tail is dropped now, before this hop enters it. Call this before
  * dfn_hop_process() of every hop. Nothing else follows: the AEC is not reset in response and the
- * stage keeps running. */
+ * model stream keeps running. */
 static void follow_post_reset(Rig *r) {
     uint32_t serial = aec_post_reset_serial(r->aec);
     uint32_t moved = serial != r->reset_serial;
     r->reset_serial = serial;
-    if (moved && r->bridge) (void)dfn_rate_bridge_reset_synthesis(r->bridge);   /* between hops: cannot refuse */
-    if (!r->istft) return;
+    if (moved && r->hop.bridge) (void)ainr_bridge_reset_synthesis(r->hop.bridge);   /* between hops: cannot refuse */
+    if (!r->hop.istft) return;
     r->reset_pending = (r->reset_pending << 1) | moved;
-    if ((r->reset_pending >> r->reset_delay) & 1u) ac_istft_reset(r->istft);
+    if ((r->reset_pending >> r->reset_delay) & 1u) ac_istft_reset(r->hop.istft);
 }
 
 /* One host hop: P = B * G_res, B the rendering base, plus comfort noise on the bins the RES cut when
- * enabled (no denoiser: no extra gain). The stage's estimate is B too. Returns 0, or -1 after a refused
+ * enabled (no denoiser: no extra gain). The model's estimate is B too. Returns 0, or -1 after a refused
  * call (the caller resets). */
 static int rig_process(Rig *r, const float *mic, const float *ref, float *out) {
     AecResidualView v;
@@ -247,7 +242,7 @@ int main(int argc, char **argv) {
     printf("%s: model grid %d Hz / FFT %d (n_erb %d, df_bins %d, lookahead %d/%d), %s\n", name,
            args.model_grid.sample_rate, args.model_grid.n_fft, args.model_grid.n_erb,
            args.model_grid.df_bins, args.model_grid.mask_lookahead, args.model_grid.df_lookahead,
-           plan.dfn.use_bridge ? "through the rate bridge" : "the stage on the host grid");
+           plan.dfn.use_bridge ? "through the rate bridge" : "the model stream on the host grid");
 
     if (rig_build(&rig, &plan) != 0) {
         fprintf(stderr, "%s: pipeline init failed\n", name);
@@ -255,11 +250,11 @@ int main(int argc, char **argv) {
     }
     hop_size = plan.grid.hop_size;
     /* Host WOLA hop plus the bridge's added delay, or the model's lookahead hops plus the
-     * host hop on the stage path. */
+     * host hop on the direct path. */
     DFN2_REQUIRE_VARIANT_LINK();   /* this unit's DFN2 variant is the archive's */
     latency = plan.dfn.use_bridge
-        ? hop_size + dfn_rate_bridge_added_delay_samples(rig.bridge)
-        : (dfn_res_stage_lookahead_frames(&args.model_grid) + 1) * args.model_grid.hop;
+        ? hop_size + ainr_bridge_added_delay_samples(rig.hop.bridge)
+        : (dfn_hop_lookahead_frames(&args.model_grid) + 1) * args.model_grid.hop;
     printf("%s: hop %d samples, algorithmic latency %d samples\n", name, hop_size, latency);
     /* Host smoke path: a product calls the hop once per host hop; the first hops
      * (the latency) come out silent. */

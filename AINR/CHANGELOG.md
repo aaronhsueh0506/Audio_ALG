@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### The desktop DFN2 pipelines call `dfn2_stream_*_freq` (memory mode) and `AinrBridge` directly
+
+`pipelines/dfn/dfn_hop.h` / `dfn_hop_pool.h` and the two example mains (`mono_aec_dfn_res`, `4ch_aec_bf_dfn_res`) are now callers of `stream/ainr/dfn2` (`dfn2_stream_get_mem_size()`, `dfn2_stream_init_ex()` with caller ERB matrices, `dfn2_stream_pre_process_freq_dual()`, `dfn2_stream_post_process_freq()`, `dfn2_stream_reset()`, `dfn2_stream_set_atten_lim()`, `dfn2_stream_state_generation()`) and of `ainr_bridge_*`, instead of `DfnResStage` / `DfnRateBridge`. No change to `stream/ainr`, `lib/ainr`, `ainr.h` or any pool or layout version here: `dfn2_stream.c` and `ainr_bridge.c` are additionally compiled into the pipelines' archives (`libaudio_pipeline_dfn.a`, `libdfn_res_stage.a`; with `-DDFN2_STREAM_NO_STDIO` under `NO_STDIO=1`). Output is bit-identical to the stage path at SIMD=1 / 0 and mask-only; the DFN tail of those examples grows by 71,600 B (bridge) / 71,648 B (48 kHz host), since the stream's memory-mode pool (164,304 B at 48 kHz / 1024) also holds the analysis and synthesis of its PCM entries. Details in `pipelines/CHANGELOG.md`.
+
 ### New `stream/ainr/bridge` (`AinrBridge`): the 8 / 16 kHz host to 48 kHz model sample-rate bridge, without a model inside
 
 `ainr_bridge.{h,c}` carries the signal path that `pipelines/dfn/dfn_rate_bridge.c` used to own (host-grid WOLA, resamplers, 48 kHz analysis and synthesis, FIFOs, prefill, added delay); the caller runs any 48 kHz / 1024 model (`dfn2_stream_*_freq`, `ainr_*_freq`, DFN3) between `ainr_bridge_model_begin()` and `ainr_bridge_model_end()`. The configuration carries `lookahead_frames` only. No change to `lib/ainr`, `ainr.h` or any DFN2 pool; `dfn_rate_bridge` in `pipelines/dfn` is an adapter over it with identical output (details in `pipelines/CHANGELOG.md`). Page: `docs/html/models/dfn2/reference/bridge.html`.

@@ -171,10 +171,13 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
     array_sample_beam_init (SRP-PHAT, BF), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init (the 4ch_static sample synthesis carries its own window table; optionally borrow aec_synthesis_window(a) as in mono),
     ulcnet_nn_stage_mem_size(&grid) / ulcnet_nn_stage_init(mem, bytes, &grid) (grid from ulcnet_grid_make; the stage has no STFT, so an AcStft for the raw far hop and an AcIstft for the output come with ac_*_get_mem_size / init),
-    dfn_rate_bridge_default_config(host_rate, &model_grid) / dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init
-    (or dfn_res_stage_default_config(&model_grid) / dfn_res_stage_get_mem_requirements / dfn_res_stage_init when the
-    host rate equals the model grid's; model_grid from dfn2_grid_make; cfg.stage.erb_fwd / erb_inv (cfg.erb_fwd / erb_inv
-    on the stage path) point into the application's ERB data); the gain stage is inside the array)
+    for DFN2 the example tail of dfn/dfn_hop_pool.h: dfn_hop_pool_plan_init(&plan, &model_grid) / dfn_hop_pool_plan /
+    dfn_hop_pool_bytes / dfn_hop_pool_build (the model stream dfn2_stream in memory mode, the conversion buffers, then the
+    AinrBridge, or the synthesis when the host rate equals the model grid's; model_grid from dfn2_grid_make;
+    plan.stream_cfg.erb_fwd / erb_inv point into the application's ERB data. A caller written against the older objects uses
+    dfn_rate_bridge_default_config(host_rate, &model_grid) / dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init, or
+    dfn_res_stage_default_config(&model_grid) / dfn_res_stage_get_mem_requirements / dfn_res_stage_init on the model's own rate);
+    the gain stage is inside the array)
 
 4. process  aec_process_linear(a, mics, far);  aec_get_array(a, &front);   // shared delay + 4 lanes
             // your beamformer on front.lane_error_spec -> weights W (+ its spectrum E); or the helper:
@@ -235,7 +238,7 @@ alignment state (`info.delay`). `array_sample_beam_process_with_activity(b, mics
 
 The recurrent state is the application's, not the library's. On a board the accelerator keeps it and nothing is registered with the
 library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
-that owns the restart count changes: `dfn_res_stage_state_generation()` (direct stage), `dfn_rate_bridge_state_generation()` (bridge),
+that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
 and for Align-ULCNet the generation of the pre/post class or adapter the callback drives (`ulcnet_prepost_state_generation()`,
 `ulcnet_accelerator_adapter_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
 its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused

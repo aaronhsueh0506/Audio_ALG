@@ -107,7 +107,7 @@ for (each hop of grid.hop samples) {
 直接餵進來會<b>剛好過驅動 √n_fft 倍</b>(出貨 grid 32 倍),反向欠驅動同倍;兩邊都偵測不到——都是量綱合法的 float 頻譜,
 ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是錯的。跨這個邊界必須自己換算
 (出貨 grid <code>× 1/32</code> 進、<code>× 32</code> 出;一般用 <code>grid.stft_scale</code>／<code>stft_unscale</code>)。</p>
-<p class="note">兩支 DFN2 pipeline 的 stage 收 audio-scale 頻譜,以 <code>DfnResStageConfig.grid</code> 的 <code>stft_scale</code>／<code>stft_unscale</code>（出貨 grid 為 2<sup>-5</sup>／2<sup>5</sup>）自行換算,其 <code>AcStft</code>／<code>AcIstft</code> 留 scale 1。
+<p class="note">兩支 DFN2 pipeline 的 <code>DfnHop</code>（<code>pipelines/dfn/dfn_hop.h</code>）收 audio-scale 頻譜,以 <code>dfn2_stft_scale(n_fft)</code>／<code>dfn2_stft_unscale(n_fft)</code>（出貨 grid 為 2<sup>-5</sup>／2<sup>5</sup>）在模型串流的頻譜入口前後換算,其 <code>AcStft</code>／<code>AcIstft</code> 留 scale 1（舊的 <code>dfn_res_stage</code> 做同一件事）。
 特徵分支內部另有一次同值的縮放(libDF wnorm 殘留),
 只作用在餵給正規化器的那份拷貝,從不碰 masking/ISTFT 路徑上的頻譜。</p>
 
@@ -459,7 +459,7 @@ int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
 <code>df_gru_layers</code>、<code>gru_hidden</code>、<code>encoder_channels</code>、<code>df_pathway_window</code>——應用端記帳用,<code>_descriptor_default</code> 填 0、<code>validate</code> 不讀。<code>input_frames</code> = <code>grid.input_frames</code> = N+2(N=1 時 3),N 由 <code>input_frames - 2</code> 得出,descriptor 沒有另外的 N 欄位。<code>_descriptor_default(grid, &amp;d)</code> 填外部欄位,<code>_descriptor_validate(grid, &amp;d)</code>
 <b>逐欄位</b>比對外部欄位(不是 memcmp,padding 不得參與決定),不合即 -1(grid 無效也是 -1)。幾何與兩個 lookahead 取自傳入的 grid,<code>layout_version</code> 與 <code>state_tensor_count</code> 是本 build 的常數,所以 <code>validate(grid, default(grid))==0</code> 恆真,它的工作是<b>擋掉對著另一個
 layout 版本、另一組幾何或另一個 lookahead pair 匯出的圖</b>——那正是 NaN 預填看不見的一類錯誤(抓得到「沒寫」,抓不到「形狀不對」)。</p>
-<p class="note">實際消費者:<code>pipelines/dfn/dfn_res_stage.c</code>。它在 <code>get_mem_requirements()</code> 就把
+<p class="note">實際消費者:<code>pipelines/dfn/dfn_hop_pool.h</code>(兩支 pipeline 範例,<code>dfn_hop_model_valid()</code>)與舊的 <code>pipelines/dfn/dfn_res_stage.c</code>。兩者在大小查詢(<code>dfn_hop_pool_plan()</code>／<code>get_mem_requirements()</code>)就把
 「有 <code>infer</code> 卻沒 descriptor」「descriptor 被 <code>validate()</code> 拒絕」「有 <code>reset</code>／descriptor 卻沒
 <code>infer</code>」三種組合一併拒掉,再由 <a href="../../../pipelines/mono/dfn2/index.html">mono</a> 與
 <a href="../../../pipelines/4ch/dfn2/index.html">4ch</a> 兩支 DFN2 pipeline 使用;它們走的是雙輸入入口(估計用 pre-RES 頻譜、

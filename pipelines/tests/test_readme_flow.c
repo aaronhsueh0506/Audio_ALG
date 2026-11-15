@@ -16,6 +16,7 @@
 #include "aec.h"
 #include "anr.h"
 #include "dfn/dfn_hop.h"
+#include "dfn/dfn_hop_pool.h"
 #include "ulcnet/ulcnet_nn_stage.h"
 #include "dfn/dfn_unit_partition.h"
 #include "dfn/tests/dfn_test_fixture.h"
@@ -237,7 +238,7 @@ static void example_chain_new_stage(void) {
 /* The accelerator, stood in for by a function writing the heads a model
  * would: a uniform 0.5 band mask. A board binds job->inputs / job->outputs
  * to its tensors instead. */
-static int run_npu(DfnResStageJob* job) {
+static int run_npu(DfnHopJob* job) {
     size_t i;
     for (i = 0; i < job->outputs.erb_mask_elements; ++i) job->outputs.erb_mask[i] = 0.5f;
     memset(job->outputs.coefs, 0, job->outputs.coefs_elements * sizeof(float));
@@ -246,7 +247,7 @@ static int run_npu(DfnResStageJob* job) {
 }
 
 static int npu_callback(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
-    DfnResStageJob job;
+    DfnHopJob job;
     (void)user;
     job.inputs = *in;
     job.outputs = *out;
@@ -256,11 +257,10 @@ static int npu_callback(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutp
 static float g_erb_fwd[DFN2_N_BINS * DFN2_N_ERB], g_erb_inv[DFN2_N_ERB * DFN2_N_BINS];
 
 /* One DFN2 host: the AEC (its own RES gain), P = B * G_res without denoiser or comfort
- * noise (B and P must share a phase), and the rate bridge with its DfnHop. */
+ * noise (B and P must share a phase), and the model stream behind the rate bridge in its DfnHop. */
 typedef struct DfnHost {
     Aec* aec;
     Complex* post;
-    DfnRateBridge* bridge;
     DfnHop hop;
     uint8_t* mem;
 } DfnHost;
@@ -268,31 +268,28 @@ typedef struct DfnHost {
 static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
     AecSignalGrid grid;
     AecConfig aec_cfg;
-    DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(16000, dfn_test_grid());
-    DfnRateBridgeMemReq breq;
+    DfnHopPoolPlan plan;
     size_t aec_b, cvec;
     uint8_t* cur;
     memset(d, 0, sizeof(*d));
     if (derive_mono_lane(16000, 0, &grid, &aec_cfg) != 0) return -1;
-    bc.stage.erb_fwd = g_erb_fwd;
-    bc.stage.erb_inv = g_erb_inv;
-    bc.stage.model = *model;
+    dfn_hop_pool_plan_init(&plan, dfn_test_grid());
+    plan.stream_cfg.erb_fwd = g_erb_fwd;
+    plan.stream_cfg.erb_inv = g_erb_inv;
+    plan.model = *model;
     aec_b = aec_get_mem_size(&aec_cfg);
     cvec = ALIGN16((size_t)grid.n_freqs * sizeof(Complex));
-    if (dfn_rate_bridge_get_mem_requirements(&bc, &breq) != 0) return -1;
-    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + cvec + (size_t)breq.bytes) != 0)
+    if (dfn_hop_pool_plan(&plan, 16000, 0) != 0) return -1;
+    if (posix_memalign((void**)&d->mem, 16, ALIGN16(aec_b) + cvec + dfn_hop_pool_bytes(&plan)) != 0)
         return -1;
     cur = d->mem;
     d->aec = aec_init(cur, aec_b, &aec_cfg);  cur += ALIGN16(aec_b);
     d->post = (Complex*)cur;                   cur += cvec;
-    d->bridge = dfn_rate_bridge_init(cur, (size_t)breq.bytes, &bc);
-    if (!d->aec || !d->bridge) return -1;
-    dfn_hop_init_bridge(&d->hop, d->bridge);
-    return 0;
+    if (!d->aec) return -1;
+    return dfn_hop_pool_build(&plan, cur, grid.n_freqs, grid.hop_size, 0, &d->hop);
 }
 
 static void dfn_host_free(DfnHost* d) {
-    if (d->bridge) dfn_rate_bridge_destroy(d->bridge);
     if (d->aec) aec_destroy(d->aec);
     free(d->mem);
 }
@@ -314,7 +311,7 @@ static void example_dfn_phased(void) {
     DFN2ModelIoDescriptor descriptor;
     DfnHost p, cb;
     float mic[256], ref[256], out[256], out_cb[256];
-    DfnResStageJob job;
+    DfnHopJob job;
     int hop, h, i, identical = 1, frames = 0;
 
     dfn_unit_partition(g_erb_fwd, g_erb_inv, dfn_test_grid());
@@ -325,8 +322,8 @@ static void example_dfn_phased(void) {
     cb_model.io_descriptor = &descriptor;
     CHECK(dfn_host_build(&p, &none) == 0 && dfn_host_build(&cb, &cb_model) == 0,
           "readme/dfn: both hosts build");   /* 16 kHz: the rate bridge, up to two frames per hop */
-    if (!p.bridge || !cb.bridge) return;
-    hop = dfn_rate_bridge_hop_size(p.bridge);
+    if (!p.hop.bridge || !cb.hop.bridge) return;
+    hop = ainr_bridge_hop_size(p.hop.bridge);
     for (h = 0; h < 80; ++h) {
         int r;
         for (i = 0; i < hop; ++i) { ref[i] = lcg(); mic[i] = 0.4f * ref[i] + 0.02f * lcg(); }
@@ -340,7 +337,7 @@ static void example_dfn_phased(void) {
 
         dfn_host_begin(&cb, mic, ref);
         while ((r = dfn_hop_nn_begin(&cb.hop, &job)) == 1)
-            dfn_hop_nn_end(&cb.hop, dfn_res_stage_infer(dfn_hop_stage(&cb.hop), &job));
+            dfn_hop_nn_end(&cb.hop, dfn_hop_infer(&cb.hop, &job));
         dfn_hop_end(&cb.hop, out_cb);
         if (r < 0 || memcmp(out, out_cb, (size_t)hop * sizeof(float)) != 0) identical = 0;
     }
