@@ -471,6 +471,7 @@ test: test-third-party test-array-sample-driver \
 	out="$$("$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --ai-sample-rate 16000 --ai-fft-size 256)" && printf '%s\n' "$$out" | grep -q "model grid 16000 Hz / FFT 256 (n_erb 24, df_bins 96, lookahead 0/0), the model stream on the host grid"
 	sh ../scripts/test_cli_exit_codes.sh 4ch_aec_bf_dfn_res "$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
 	sh ../scripts/test_cli_exit_codes.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet"
+	sh ../scripts/test_delay_depth_refusal.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet_d1" 1 2 64
 
 libdfn_res_stage.a: $(DFN_PIPELINE_LIB)
 libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(DFN_PIPELINE_LIB) \
@@ -570,6 +571,15 @@ $(BIN_DIR)/test_4ch_ulcnet: $(OBJ_DIR)/test_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(UN
 
 $(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
+
+# The example at delay depth 1, outside [2, 64]: `test` checks that it refuses with the range message.
+$(OBJ_DIR)/4ch_alignulcnet_main_d1.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../example_cli.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -DULCNET_EXAMPLE_DELAY_FRAMES=1 -MD -MP -c -o $@ $<
+
+$(BIN_DIR)/4ch_alignulcnet_d1: $(OBJ_DIR)/4ch_alignulcnet_main_d1.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main_d1.o $(OBJ_DIR)/array_sample_driver.o $(ULCNET_4CH_OBJS) $(UNIT_LIBS) $(LDLIBS)
+
+test: $(BIN_DIR)/4ch_alignulcnet_d1
 
 # The 4-channel DFN2 example and its test compose the unit, so they link the DFN archive ahead of
 # the unit's archives.

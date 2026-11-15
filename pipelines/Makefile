@@ -706,6 +706,7 @@ test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pi
 	out="$$("$(abspath $(BIN_DIR))/mono_aec_dfn_res" --ai-sample-rate 48000 --ai-fft-size 1024 --sample-rate 48000)" && printf '%s\n' "$$out" | grep -q "model grid 48000 Hz / FFT 1024 (n_erb 32, df_bins 96, lookahead 1/1), the model stream on the host grid"
 	sh scripts/test_cli_exit_codes.sh mono_aec_dfn_res "$(abspath $(BIN_DIR))/mono_aec_dfn_res"
 	sh scripts/test_cli_exit_codes.sh mono_alignulcnet "$(abspath $(BIN_DIR))/mono_alignulcnet"
+	sh scripts/test_delay_depth_refusal.sh mono_alignulcnet "$(abspath $(BIN_DIR))/mono_alignulcnet_d1" 1 2 64
 	bash scripts/test_deps_env_safe.sh
 
 # example-adapter: build + RUN the REFERENCE ONLY
@@ -802,6 +803,15 @@ $(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_PIPELIN
 	$(LINK) -o $@ $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_alignulcnet [$(BACKEND)] -> $@"
 
+# The example at delay depth 1, outside [2, 64]: `test` checks that it refuses with the range message.
+# Not in `all` or the published artifacts.
+$(OBJ_DIR)/mono_alignulcnet_main_d1.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h example_cli.h | _cfg_guard
+	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -DULCNET_EXAMPLE_DELAY_FRAMES=1 -MD -MP -c -o $@ $<
+
+$(BIN_DIR)/mono_alignulcnet_d1: $(OBJ_DIR)/mono_alignulcnet_main_d1.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/mono_alignulcnet_main_d1.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
+
+test: $(BIN_DIR)/mono_alignulcnet_d1
 
 # The mono DFN2 program composes lib/aec's Aec (its RES gain) with the DFN archive; it has no
 # denoiser.

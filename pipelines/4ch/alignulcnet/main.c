@@ -166,7 +166,13 @@ static int ulc_setup(void *user, ArraySampleHopView *view) {
     AcStftConfig sc;
     size_t stft_bytes, istft_bytes, plane_bytes;
     unsigned char *cur;
-    if (ulcnet_grid_make(&s->grid, &k_grids[s->grid_index]) != ULCNET_GRID_OK) return 1;
+    int rc = ulcnet_grid_make(&s->grid, &k_grids[s->grid_index]);
+    if (rc != ULCNET_GRID_OK) {
+        fprintf(stderr, "4ch_alignulcnet: grid refused (%d): delay depth %d, accepted range [%d, %d] "
+                "(-DULCNET_EXAMPLE_DELAY_FRAMES)\n", rc, k_grids[s->grid_index].delay_depth,
+                ULCNET_MODEL_IO_MIN_D, ULCNET_MODEL_IO_MAX_D);
+        return 1;
+    }
     s->cfg = ulcnet_example_unit_config(&s->grid);
     s->bp = array_sample_beam_default_params();
     s->cfg.delay_mode = s->profile.mode;

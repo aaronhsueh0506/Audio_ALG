@@ -243,7 +243,13 @@ int main(int argc, char** argv) {
     int rc;
     rc = parse_options(argc, argv, &profile, &grid_index);
     if (rc != 0) return rc == 1 ? 0 : rc;
-    if (ulcnet_grid_make(&grid, &k_grids[grid_index]) != ULCNET_GRID_OK) return 1;
+    rc = ulcnet_grid_make(&grid, &k_grids[grid_index]);
+    if (rc != ULCNET_GRID_OK) {
+        fprintf(stderr, "mono_alignulcnet: grid refused (%d): delay depth %d, accepted range [%d, %d] "
+                "(-DULCNET_EXAMPLE_DELAY_FRAMES)\n", rc, k_grids[grid_index].delay_depth,
+                ULCNET_MODEL_IO_MIN_D, ULCNET_MODEL_IO_MAX_D);
+        return 1;
+    }
 
     /* Print the resolved profile with the pool the same config costs; query and init
      * must agree on one (sample_rate, hop, n). */

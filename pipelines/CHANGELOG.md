@@ -3,6 +3,10 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — The Align-ULCNet examples name the refused delay depth
+
+`mono_alignulcnet` and `4ch_alignulcnet` built with an out-of-range `-DULCNET_EXAMPLE_DELAY_FRAMES` used to exit 1 with no message. They now print one stderr line, e.g. `mono_alignulcnet: grid refused (-4): delay depth 1, accepted range [2, 64] (-DULCNET_EXAMPLE_DELAY_FRAMES)`; the exit code stays 1 and nothing else changes. `make -C pipelines test` and `make -C pipelines/4ch test` build each example a second time at D = 1 (`*_alignulcnet_d1`, not in `all` or the published artifacts) and `scripts/test_delay_depth_refusal.sh` checks exit 1, empty stdout and the exact stderr line.
+
 ## [Unreleased] — 2026-11-15 — Docs and header comments that contradicted the code
 
 Text only: every changed C file preprocesses identically (`cc -E -P`, plain and `-DDFN2_MASK_ONLY`); no layout, ABI or output change.
