@@ -11,8 +11,8 @@ ONNX names are read here, on the exporter side only), and at the registered cata
 preprocess for each registered row. Set AINR_PIN_DUMPERS to ``<full dumper><pathsep><lite dumper>`` to compare
 other builds (the mutation check of this test).
 
-The board samples' DFN2 rows (stream/ainr/ai3_model_io_dfn2.h) are pinned here as well: every row printed by
-``make -C stream/ainr model-io-dumper`` (set AINR_MODEL_IO_DUMPER to compare another build) is compared with a fresh
+The board samples' DFN2 rows (stream/ainr/graph_io_dfn2.h) are pinned here as well: every row printed by
+``make -C stream/ainr graph-io-dumper`` (set AINR_GRAPH_IO_DUMPER to compare another build) is compared with a fresh
 export at the production model dimensions: layout version, port counts and order, every input and output shape, the
 state shapes at both ends, the state output name ``<input>_out`` and the row set itself.
 """
@@ -182,11 +182,11 @@ def test_the_customer_arithmetic_picks_the_exported_n(work_dumpers):
     assert run_work_dumper(lite, 16000, 256, 128)['rc'] == -3       # lite has only 48 kHz / 1024
 
 
-# ---- the graph rows (stream/ainr/ai3_model_io_dfn2.h) against a fresh export at the production dimensions ----
+# ---- the graph rows (stream/ainr/graph_io_dfn2.h) against a fresh export at the production dimensions ----
 
 # (row id, mask_only, sr, fft, n_erb, mask_lookahead, df_lookahead, N): the rows of the header, spelled out here from
 # the exporter's arguments, never from the header
-MODEL_IO_CASES = [
+GRAPH_IO_CASES = [
     ('dfn2_full_16000_256_n1', False, 16000, 256, 24, 0, 0, 1),
     ('dfn2_full_16000_256_n8', False, 16000, 256, 24, 0, 0, 8),
     ('dfn2_full_48000_1024_n1', False, 48000, 1024, 32, 1, 1, 1),
@@ -195,23 +195,23 @@ MODEL_IO_CASES = [
 
 
 @pytest.fixture(scope='module')
-def model_io_dumper():
-    override = os.environ.get('AINR_MODEL_IO_DUMPER')
+def graph_io_dumper():
+    override = os.environ.get('AINR_GRAPH_IO_DUMPER')
     if override:
         return override
     if shutil.which('make') is None or shutil.which('cc') is None:
         pytest.skip('no make / C compiler available')
-    out = subprocess.run(['make', '-s', '-C', str(STREAM_AINR), 'model-io-dumper'],
+    out = subprocess.run(['make', '-s', '-C', str(STREAM_AINR), 'graph-io-dumper'],
                          check=True, capture_output=True, text=True)
     return out.stdout.strip().splitlines()[-1]
 
 
 @pytest.fixture(scope='module')
-def model_io_rows(model_io_dumper):
+def graph_io_rows(graph_io_dumper):
     """row id -> {'layout', 'counts' (signals, heads, inputs, outputs), 'in', 'out'} as the header's rows expand."""
     rows = {}
     current = None
-    text = subprocess.run([model_io_dumper], check=True, capture_output=True, text=True).stdout
+    text = subprocess.run([graph_io_dumper], check=True, capture_output=True, text=True).stdout
     for line in text.splitlines():
         fields = line.split()
         if fields[0] == 'row':
@@ -228,14 +228,14 @@ def model_io_rows(model_io_dumper):
 
 
 @pytest.fixture(scope='module')
-def model_io_exports(export, tmp_path_factory):
+def graph_io_exports(export, tmp_path_factory):
     """row id -> (graph, metadata) of a random-weight export at the production dimensions of config.ini."""
     pytest.importorskip('onnx')
     import onnx
     model_mod = dfn_pairs.import_family_module(FAMILY, 'model')
-    work = tmp_path_factory.mktemp('dfn2_model_io')
+    work = tmp_path_factory.mktemp('dfn2_graph_io')
     result = {}
-    for rid, mask_only, sr, fft, n_erb, mask_la, df_la, n in MODEL_IO_CASES:
+    for rid, mask_only, sr, fft, n_erb, mask_la, df_la, n in GRAPH_IO_CASES:
         torch.manual_seed(7)
         model = model_mod.DeepFilterNet2(
             n_fft=fft, sr=sr, n_erb=n_erb, df_bins=96, df_order=5, enc_ch=64, emb_size=256, df_hidden=256,
@@ -251,15 +251,15 @@ def model_io_exports(export, tmp_path_factory):
     return result
 
 
-def test_the_sample_rows_are_exactly_the_registered_rows(model_io_rows):
-    assert sorted(model_io_rows) == sorted(case[0] for case in MODEL_IO_CASES)
+def test_the_sample_rows_are_exactly_the_registered_rows(graph_io_rows):
+    assert sorted(graph_io_rows) == sorted(case[0] for case in GRAPH_IO_CASES)
 
 
-@pytest.mark.parametrize('case', MODEL_IO_CASES, ids=[case[0] for case in MODEL_IO_CASES])
-def test_sample_row_equals_a_fresh_export(case, model_io_rows, model_io_exports):
+@pytest.mark.parametrize('case', GRAPH_IO_CASES, ids=[case[0] for case in GRAPH_IO_CASES])
+def test_sample_row_equals_a_fresh_export(case, graph_io_rows, graph_io_exports):
     rid, mask_only, _sr, _fft, _n_erb, _mla, _dla, n = case
-    row = model_io_rows[rid]
-    graph, metadata = model_io_exports[rid]
+    row = graph_io_rows[rid]
+    graph, metadata = graph_io_exports[rid]
     in_names = [v.name for v in graph.input]
     out_names = [v.name for v in graph.output]
     shapes_in = [_dims(v) for v in graph.input]

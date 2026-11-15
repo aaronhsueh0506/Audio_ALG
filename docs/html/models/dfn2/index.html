@@ -11,7 +11,7 @@
 <main>
 <h1>DeepFilterNet2</h1>
 <p>單路 int16 PCM 進、同樣長度的 PCM 出。客戶只設三個值：<code>sr</code>、<code>fft</code>、<code>hop_in</code>。一個產品只含一種 DFN2（full 或 lite）；stream 由這三個值決定模型 hop（<code>fft / 2</code>）、每包張數 N（<code>hop_in / 模型 hop</code>）與要開的 graph。介面在 <code>stream/ainr/ainr.h</code>。開圖、送張量、執行與讀回是板端 sample 自己的程式，見<a href="reference/board.html">板端整合</a>。</p>
-<p>stream 只選圖並做 host 端的前後處理，不描述圖的埠。圖的埠順序只有一條規則，埠表在 <code>stream/ainr/ai3_model_io_dfn2.h</code>，sample 依位置綁埠、不比對名稱（見下方「Graph 接線」）。</p>
+<p>stream 只選圖並做 host 端的前後處理，不描述圖的埠。圖的埠順序只有一條規則，埠表在 <code>stream/ainr/graph_io_dfn2.h</code>，sample 依位置綁埠、不比對名稱（見下方「Graph 接線」）。</p>
 
 <h2>支援的組態</h2>
 <p>下表是各產品可啟動的組態。<code>trim_samples</code>、<code>queue_frames</code> 與 <code>tail_zero_blocks</code> 的意義見「延遲與檔案尾端」，數值以 <code>ainr_init()</code> 填的 <code>AinrInfo</code> 為準。</p>
@@ -38,7 +38,7 @@
 <p>其他回傳碼：<code>AINR_ERR_NULL</code>（-1，必要的指標參數為 NULL）、<code>AINR_ERR_MODEL_ID</code>（-2，產品綁定的模型不屬於這份 archive 的 full 或 lite 版本，屬建置設定錯誤，所有組態都回此碼）、<code>AINR_ERR_POOL</code>（-7，pool 小於 <code>ainr_get_mem_size()</code> 的位元組數或未對齊 <code>AINR_ALIGNMENT</code>；較大的 pool 可以）、<code>AINR_ERR_ERB_FILE</code>（-8，ERB 檔缺失、標頭或尺寸不符）、<code>AINR_ERR_SEQUENCE</code>（-9，每包 pre／post 沒有成對呼叫）、<code>AINR_ERR_NONFINITE_INPUT</code>（-10，只有 <code>ainr_preprocess_freq()</code> 會回：呼叫端的 E 或 P 頻譜有 NaN／Inf）。<code>ainr_status_text()</code> 給 log 用的短字串。</p>
 
 <h2 id="graph-wiring">Graph 接線</h2>
-<p><code>ainr_init()</code> 只回報選出的圖（<code>AinrInfo.graph_path</code>）與尾端長度，不回報埠表，函式庫也沒有任何只為 graph 接線存在的 state 尺寸常數。每個已交付 graph 的完整接線——訊號與 head 的數量及 shape、state 的 shape——放在 <code>stream/ainr/ai3_model_io_dfn2.h</code>：full 與 lite 共用一份，依 <code>-DDFN2_MASK_ONLY</code> 選產品，每個登錄的 (產品, sr, fft, N) 一列，列旁註明所對應的匯出器。共用的接線程式 <code>stream/common/ai3_model_io.h</code>（由 <code>make -C stream/common test-model-io</code> 測試）把一列展開成 <code>StreamWiring</code>，並做 state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對（見「初始化與每包呼叫」）。兩者都與 SDK 無關、只有標頭，<code>ainr.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
+<p><code>ainr_init()</code> 只回報選出的圖（<code>AinrInfo.graph_path</code>）與尾端長度，不回報埠表，函式庫也沒有任何只為 graph 接線存在的 state 尺寸常數。每個已交付 graph 的完整接線——訊號與 head 的數量及 shape、state 的 shape——放在 <code>stream/ainr/graph_io_dfn2.h</code>：full 與 lite 共用一份，依 <code>-DDFN2_MASK_ONLY</code> 選產品，每個登錄的 (產品, sr, fft, N) 一列，列旁註明所對應的匯出器。共用的接線程式 <code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）把一列展開成 <code>StreamWiring</code>，並做 state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對（見「初始化與每包呼叫」）。兩者都與 SDK 無關、只有標頭，<code>ainr.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
 <p>所有轉出的圖都照同一條規則排埠：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出。第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，兩端形狀相同。sample 依數量迴圈處理，full 與 lite 用同一段程式。訊息以位置稱呼埠，例如 <code>input 3 (state 0)</code>。</p>
 <table>
 <thead><tr><th>產品</th><th><code>signal_in_count</code></th><th><code>head_out_count</code></th><th>輸入／輸出埠數</th><th>state 組數與 shape</th></tr></thead>
@@ -55,7 +55,7 @@
 <tr><th>full 48 kHz／1024／N=1</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
 <tr><th>lite 48 kHz／1024／N=1</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td colspan="2">無</td></tr>
 </tbody></table>
-<p><code>AinrWork.inputs[i]</code> 是這一包的訊號輸入 i（兩個），<code>AinrWork.outputs[j]</code> 是 head j（full 三個，lite 一個）；它們的 shape 與元素數就是上表同一列的 signal i、head j，state 不在 <code>AinrWork</code> 裡。本庫的 <code>AINR/tests/test_dfn2_port_order.py</code> 把真實 pre 呼叫給出的 <code>AinrWork</code> 與匯出圖的訊號輸入、head 輸出逐位置比對。模型設定各列（<code>stream/ainr/ai3_model_io_dfn2.h</code>）與匯出器的對照也在本庫：同一個測試用 <code>make -C stream/ainr model-io-dumper</code> 傾印每一列，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 兩端同 shape），並要求列集合恰為登錄的四列；C 端的列對 <code>AinrWork</code> 由 <code>test-ainr-model-io</code> 檢查。<code>audio_sample/</code> 不在本庫。</p>
+<p><code>AinrWork.inputs[i]</code> 是這一包的訊號輸入 i（兩個），<code>AinrWork.outputs[j]</code> 是 head j（full 三個，lite 一個）；它們的 shape 與元素數就是上表同一列的 signal i、head j，state 不在 <code>AinrWork</code> 裡。本庫的 <code>AINR/tests/test_dfn2_port_order.py</code> 把真實 pre 呼叫給出的 <code>AinrWork</code> 與匯出圖的訊號輸入、head 輸出逐位置比對。模型設定各列（<code>stream/ainr/graph_io_dfn2.h</code>）與匯出器的對照也在本庫：同一個測試用 <code>make -C stream/ainr graph-io-dumper</code> 傾印每一列，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 兩端同 shape），並要求列集合恰為登錄的四列；C 端的列對 <code>AinrWork</code> 由 <code>test-ainr-graph-io</code> 檢查。<code>audio_sample/</code> 不在本庫。</p>
 
 <h2>初始化與每包呼叫</h2>
 <p>啟動做一次，之後每包三步：<code>ainr_preprocess()</code>、板端 sample 自己的 AI3 執行、<code>ainr_postprocess()</code>。每次成功的 pre 都對應一次加速器執行與一次 post，沒有「這拍不推論」的分支。</p>
@@ -71,13 +71,13 @@ int rc = ainr_init(&amp;cfg, pool, req.bytes, &amp;ctx, &amp;info);   /* 0 或�
 if (rc != AINR_OK) { log(ainr_status_text(rc)); return -1; }
 
 /* sample 的模型設定：這個產品、這個 grid 與 N 的接線列；沒有列就在開圖前拒絕 */
-Ai3ModelIoConfig model;
-if (ai3_model_io_dfn2_find(AI3_MODEL_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &amp;model) != AI3_MODEL_IO_OK) return -1;
+GraphIoConfig model;
+if (graph_io_dfn2_find(GRAPH_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &amp;model) != GRAPH_IO_OK) return -1;
 
 /* 板端：開圖、逐埠描述、與模型設定比對，再把 state 同步起點設為目前的 generation */
 open_graph(info.graph_path);
 char msg[160];
-if (ai3_model_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
+if (graph_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
 unsigned seen = ainr_state_generation(ctx);
 
 /* 每包（剛好 hop_in 個樣本） */
@@ -85,8 +85,8 @@ while (read_block(pcm_in, hop_in)) {
     AinrWork work;
     if (ainr_preprocess(ctx, pcm_in, &amp;work) != AINR_OK) return -1;   /* 1. 成功回 0 */
     int ai_rc = -1, chk;
-    AI3_MODEL_IO_CHECK_WORK(chk, &amp;model, &amp;work);               /* work 的數量與 shape 必須等於這一列 */
-    if (chk == AI3_MODEL_IO_OK) ai_rc = run_ai3(&amp;work);          /* 2. 板端 sample 自己的 AI3；不符就不送件 */
+    GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);               /* work 的數量與 shape 必須等於這一列 */
+    if (chk == GRAPH_IO_OK) ai_rc = run_ai3(&amp;work);          /* 2. 板端 sample 自己的 AI3；不符就不送件 */
     if (ainr_postprocess(ctx, ai_rc, pcm_out) != AINR_OK) return -1; /* 3. ai_rc != 0 也要呼叫 */
     write_block(pcm_out, hop_in);
 }</code></pre>
@@ -148,10 +148,10 @@ while (read_block(pcm_in, hop_in)) {
 <table>
 <thead><tr><th>組態</th><th>主機替身</th><th>PyTorch</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）兩包逐位元相同（commit 與 bypass 各一包）；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>已驗：PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：兩個家族的排尾；work 形狀（<code>test-ainr-model-io</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>已驗：PCM 與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-graph-io</code>）；連結往返</td><td>未驗（此 grid）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>已驗：PCM 兩包與 <code>dfn2_stream</code> 參考逐位元相同；PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）兩包逐位元相同（commit 與 bypass 各一包）；兩個家族的排尾；work 形狀（<code>test-ainr-graph-io</code>）</td><td>未驗（此 grid）</td><td>未驗</td><td>登錄的路徑存在；交付與是否相符未驗</td><td>未驗</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>已驗：PCM 與 <code>_freq</code>（呼叫端 AcStft／AcIstft）逐位元相同；兩個家族的排尾；work 形狀（<code>test-ainr-graph-io</code>）；連結往返</td><td>已驗（隨機小 checkpoint，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>已驗：兩個家族的排尾；work 形狀（<code>test-ainr-graph-io</code>）；產品綁定；連結往返</td><td>已驗（隨機小 checkpoint 的 mask-only 圖，同 grid、同 N）</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_ai_nr_stream</code>（PCM → PCM，48 kHz／1024／N=1）</th><td>PCM 家族的上述項目已驗；sample 本身的重採樣與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 <tr><th><code>uvc_audio_live2a</code>（E／P 頻譜 → 頻譜，經 rate bridge）</th><td><code>_freq</code> 家族的上述項目已驗；bridge 與 AI3 接線未在本庫建置或驗證</td><td>—</td><td>未驗</td><td>未驗</td><td>未驗</td></tr>
 </tbody></table>

@@ -1,6 +1,6 @@
-/* The board samples' AIAEC graph rows (ai3_model_io_deepvqes.h, ai3_model_io_alignulcnet.h) against the AiaecWork of
+/* The board samples' AIAEC graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the AiaecWork of
  * real pre calls (PCM, _spec, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
- * 10 Align-ULCNet): every SUBMIT block passes AI3_MODEL_IO_CHECK_WORK against the row of its configuration, and with
+ * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration, and with
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
  * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
  * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. A SUBMIT work has pairwise disjoint
@@ -14,18 +14,18 @@
 
 #include "aiaec.h"
 #include "aiaec_product.h"
-#include "ai3_model_io.h"
+#include "graph_io.h"
 #include "deepvqe_prepost.h"
 #include "ulcnet_model_io.h"
-#include "ai3_model_io_alignulcnet.h"
-#include "ai3_model_io_deepvqes.h"
+#include "graph_io_alignulcnet.h"
+#include "graph_io_deepvqes.h"
 #if AIAEC_PRODUCT_MODEL_ID == 10
-#define FIND(sr, fft, n, mc) ai3_model_io_alignulcnet_find(sr, fft, n, mc)
-#define ROW_COUNT AI3_MODEL_IO_ALIGNULCNET_ROW_COUNT
+#define FIND(sr, fft, n, mc) graph_io_alignulcnet_find(sr, fft, n, mc)
+#define ROW_COUNT GRAPH_IO_ALIGNULCNET_ROW_COUNT
 #define IS_ALIGN 1
 #else
-#define FIND(sr, fft, n, mc) ai3_model_io_deepvqes_find(sr, fft, n, mc)
-#define ROW_COUNT AI3_MODEL_IO_DEEPVQES_ROW_COUNT
+#define FIND(sr, fft, n, mc) graph_io_deepvqes_find(sr, fft, n, mc)
+#define ROW_COUNT GRAPH_IO_DEEPVQES_ROW_COUNT
 #define IS_ALIGN 0
 #endif
 
@@ -49,13 +49,13 @@ static int same_info(const AiaecInfo *a, const AiaecInfo *b)
            a->queue_frames == b->queue_frames && a->tail_zero_blocks == b->tail_zero_blocks;
 }
 
-static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const AiaecWork *work)
+static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWork *work)
 {
     int i, rc;
     const StreamWiring *w = &mc->wiring;
 #if !IS_ALIGN
-    CHECK(ai3_model_io_state_count(mc) == DEEPVQE_STATE_COUNT, "%s state count %d, the library has %d", tag,
-          ai3_model_io_state_count(mc), (int)DEEPVQE_STATE_COUNT);
+    CHECK(graph_io_state_count(mc) == DEEPVQE_STATE_COUNT, "%s state count %d, the library has %d", tag,
+          graph_io_state_count(mc), (int)DEEPVQE_STATE_COUNT);
 #endif
     CHECK(work->action == AIAEC_SUBMIT, "%s action %d", tag, (int)work->action);
     CHECK(work->input_count == w->signal_in_count, "%s input_count %d vs %d", tag, work->input_count, w->signal_in_count);
@@ -86,9 +86,9 @@ static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const Aiae
             CHECK(disjoint(work->outputs[i].data, work->outputs[i].elements, work->outputs[j].data, work->outputs[j].elements),
                   "%s outputs[%d] and outputs[%d] overlap", tag, i, j);
     }
-    AI3_MODEL_IO_CHECK_WORK(rc, mc, work);
-    CHECK(rc == AI3_MODEL_IO_OK, "%s AI3_MODEL_IO_CHECK_WORK rc %d", tag, rc);
-    CHECK(ai3_model_io_fits(mc, AIAEC_MAX_INPUT_TENSORS, AIAEC_MAX_OUTPUT_TENSORS) == AI3_MODEL_IO_OK, "%s fits", tag);
+    GRAPH_IO_CHECK_WORK(rc, mc, work);
+    CHECK(rc == GRAPH_IO_OK, "%s GRAPH_IO_CHECK_WORK rc %d", tag, rc);
+    CHECK(graph_io_fits(mc, AIAEC_MAX_INPUT_TENSORS, AIAEC_MAX_OUTPUT_TENSORS) == GRAPH_IO_OK, "%s fits", tag);
 }
 
 /* One pre call of `family` on a fresh init; event_hop < 0: no event. Returns the pre status. */
@@ -154,14 +154,14 @@ int main(void)
     int row;
 
     /* The wiring tables and the libraries name the same graph layouts. */
-    CHECK(AI3_MODEL_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION,
-          "DeepVQE-S layout version: table %d, deepvqe_prepost.h %d", (int)AI3_MODEL_IO_DEEPVQES_LAYOUT,
+    CHECK(GRAPH_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION,
+          "DeepVQE-S layout version: table %d, deepvqe_prepost.h %d", (int)GRAPH_IO_DEEPVQES_LAYOUT,
           (int)DEEPVQE_PREPOST_LAYOUT_VERSION);
-    CHECK(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION,
-          "Align-ULCNet one-frame layout: table %d, ulcnet_model_io.h %d", (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_ONE_FRAME,
+    CHECK(GRAPH_IO_ALIGNULCNET_LAYOUT_ONE_FRAME == ULCNET_MODEL_IO_LAYOUT_VERSION,
+          "Align-ULCNet one-frame layout: table %d, ulcnet_model_io.h %d", (int)GRAPH_IO_ALIGNULCNET_LAYOUT_ONE_FRAME,
           (int)ULCNET_MODEL_IO_LAYOUT_VERSION);
-    CHECK(AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
-          "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)AI3_MODEL_IO_ALIGNULCNET_LAYOUT_PACKET,
+    CHECK(GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
+          "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET,
           (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
     /* AiaecInfo is the init's slim result (graph, trim, queue, tail): no port list can sit inside it. */
     CHECK(sizeof(AiaecInfo) <= sizeof(const char *) + 4 * sizeof(int),
@@ -170,13 +170,13 @@ int main(void)
 
     for (si = 0; si < 2; ++si) for (fi = 0; fi < 4; ++fi) for (n = 1; n <= 8; ++n) {
         AiaecConfig cfg;
-        Ai3ModelIoConfig mc;
+        GraphIoConfig mc;
         StreamMemReq req;
         int lib_ok, row_ok;
 
         cfg.sr = srs[si]; cfg.fft = ffts[fi]; cfg.hop_in = n * (ffts[fi] / 2);
         lib_ok = aiaec_get_mem_size(&cfg, &req) == AIAEC_OK;
-        row_ok = FIND(cfg.sr, cfg.fft, ai3_model_io_frames(cfg.fft, cfg.hop_in), &mc) == AI3_MODEL_IO_OK;
+        row_ok = FIND(cfg.sr, cfg.fft, graph_io_frames(cfg.fft, cfg.hop_in), &mc) == GRAPH_IO_OK;
         accepted += lib_ok; rows_hit += row_ok;
 #ifdef AIAEC_TEST_CATALOG
         CHECK(lib_ok == row_ok, "sr %d fft %d N %d: library %s, model config %s", cfg.sr, cfg.fft, n,
@@ -202,7 +202,7 @@ int main(void)
                     /* an N = 1 event hop is BYPASS: no tensors, so no boundary check (and none would pass) */
                     CHECK(work.action == AIAEC_BYPASS && work.input_count == 0 && work.output_count == 0,
                           "%s expected BYPASS with an empty work", tag);
-                    CHECK(ai3_model_io_check_counts(&mc, work.input_count, work.output_count) == AI3_MODEL_IO_ERR_COUNT,
+                    CHECK(graph_io_check_counts(&mc, work.input_count, work.output_count) == GRAPH_IO_ERR_COUNT,
                           "%s the boundary check must reject an empty BYPASS work", tag);
                     ++compared;
                     continue;
@@ -225,7 +225,7 @@ int main(void)
     CHECK(rows_hit == ROW_COUNT && accepted == ROW_COUNT, "%d rows, %d hit, %d configs accepted", ROW_COUNT, rows_hit, accepted);
 #endif
     if (g_fail) return 1;
-    printf("test_aiaec_model_io[%s, %s catalog]: PASS (library-accepted configs %d, rows hit %d of %d, pre calls compared %d, frame_reset patterns %d)\n",
+    printf("test_aiaec_graph_io[%s, %s catalog]: PASS (library-accepted configs %d, rows hit %d of %d, pre calls compared %d, frame_reset patterns %d)\n",
            IS_ALIGN ? "align_ulcnet" : "deepvqe_s",
 #ifdef AIAEC_TEST_CATALOG
            "test",

@@ -4,7 +4,7 @@ The C side (stream/aiaec/aiaec.c, the _freq family, built into a small binary dr
 ``make -C stream/aiaec packet-driver`` with the test catalog) frames a packet of 8 hops: features, the
 frame_reset control, one job, the host back end, the error spectrum for event hops. Between its preprocess and
 postprocess requests this test runs the exported layout-19 graph (random weights, tiny) in ONNX Runtime and hands
-the output mask back, exactly as a board sample would with its AI3 run. The packet is compared, frame by frame, with
+the output mask back, exactly as a board sample would with its accelerator run. The packet is compared, frame by frame, with
 
   (a) the Python sequential N=1 stream that resets and bypasses at the event hops (the proof in
       test_align_ulcnet_frames_per_call.py), and

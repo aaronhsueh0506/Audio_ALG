@@ -5,7 +5,7 @@ the recurrent state belongs to the accelerator, so the library holds no port tab
 views with a fresh export of the same configuration. Every converted graph follows one order: inputs are the
 signal inputs, then the state inputs; outputs are the head outputs, then the state outputs; state k is input
 signal_in + k <-> output head_out + k. The ONNX names are read on the exporter side only, to prove the exporter follows that order (Align-ULCNet at N > 1 has frame_reset as the last signal
-input). The graph rows (stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h) are pinned below by the same exports.
+input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinned below by the same exports.
 
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
 ``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
@@ -20,8 +20,8 @@ N = 1 event hop are pinned as well.
 Set AIAEC_PIN_DUMPERS to ``<deepvqe_s dumper><pathsep><align_ulcnet dumper>`` to compare other
 builds (the mutation check of this test) instead of building the repository's.
 
-The graph rows are compared with the same exports: ``make -C stream/aiaec model-io-dumper`` prints every row of
-the two model-config headers (AIAEC_MODEL_IO_DUMPER compares another build), and each row must equal the fresh
+The graph rows are compared with the same exports: ``make -C stream/aiaec graph-io-dumper`` prints every row of
+the two model-config headers (AIAEC_GRAPH_IO_DUMPER compares another build), and each row must equal the fresh
 export: layout version, port counts and order, every input and output shape, the state names and their order, each
 state's shape at both ends, the state output name ``<input>_out`` and frame_reset as the last signal (Align-ULCNet
 N > 1). The row set must be exactly the exported cases.
@@ -280,7 +280,7 @@ def test_a_spectrum_family_refuses_what_the_pcm_family_refuses(dumpers):
         assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 256, family)['rc'] == -5   # N=2: no graph in the catalog
 
 
-# ---- the graph rows (ai3_model_io_deepvqes.h, ai3_model_io_alignulcnet.h) against the same exports ----
+# ---- the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the same exports ----
 
 # State inputs in graph order, spelled out here from the exporters, never from the headers
 DEEPVQE_S_STATES = ['state_align_key_ring', 'state_align_value_ring', 'state_align_score_history',
@@ -292,13 +292,13 @@ ALIGN_ULCNET_STATES = ['key_history', 'value_history', 'logit_history', 'h_gru']
 
 
 @pytest.fixture(scope='module')
-def model_io_rows():
+def graph_io_rows():
     """row id -> {'layout', 'counts' (signals, heads, inputs, outputs), 'in', 'out'} as the headers' rows expand."""
-    path = os.environ.get('AIAEC_MODEL_IO_DUMPER')
+    path = os.environ.get('AIAEC_GRAPH_IO_DUMPER')
     if not path:
         if shutil.which('make') is None or shutil.which('cc') is None:
             pytest.skip('no make / C compiler available')
-        out = subprocess.run(['make', '-s', '-C', str(STREAM_AIAEC), 'model-io-dumper'],
+        out = subprocess.run(['make', '-s', '-C', str(STREAM_AIAEC), 'graph-io-dumper'],
                              check=True, capture_output=True, text=True)
         path = out.stdout.strip().splitlines()[-1]
     rows = {}
@@ -323,14 +323,14 @@ def _row_id(case):
     return '%s_%d_%d_n%d' % (model, sr, fft, n)
 
 
-def test_the_sample_rows_are_exactly_the_exported_cases(model_io_rows):
-    assert sorted(model_io_rows) == sorted(_row_id(case) for case in CASES)
+def test_the_sample_rows_are_exactly_the_exported_cases(graph_io_rows):
+    assert sorted(graph_io_rows) == sorted(_row_id(case) for case in CASES)
 
 
 @pytest.mark.parametrize('case', CASES, ids=_case_id)
-def test_sample_row_equals_a_fresh_export(case, model_io_rows, exports):
+def test_sample_row_equals_a_fresh_export(case, graph_io_rows, exports):
     model_name, _sr, _fft, n = case
-    row = model_io_rows[_row_id(case)]
+    row = graph_io_rows[_row_id(case)]
     graph, metadata = exports[case]
     in_names = [v.name for v in graph.input]
     out_names = [v.name for v in graph.output]

@@ -90,8 +90,8 @@ LIB_OBJECTS := $(OBJ_DIR)/aiaec.o
 VPATH := .
 
 .PHONY: all lib print-lib-path print-cflags print-sources test deepvqe-lib ulcnet-lib \
-	test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec \
-	bind-dumpers model-io-dumper packet-driver test-single-model audit-no-stdio clean _cfg_guard
+	test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec \
+	bind-dumpers graph-io-dumper packet-driver test-single-model audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -217,28 +217,28 @@ test-aiaec-product: $(TEST_DEPS) | _cfg_guard
 	[ -n "$$h1" ] && [ -n "$$h2" ] && [ "$$h1" != "$$h2" ] || { echo "FAIL: the two products' pool sizes are equal or missing ($$h1 / $$h2)" >&2; exit 1; }; \
 	echo "test-aiaec-product: PASS (pool sizes differ: $$h1 vs $$h2)"
 
-# test-aiaec-model-io: the graph rows (ai3_model_io_deepvqes.h, ai3_model_io_alignulcnet.h) against the
+# test-aiaec-graph-io: the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the
 # AiaecWork of real pre calls, per product, with the test catalog and the production one. The port check of the
 # model-config header links ../common/stream_bind.c (samples only, not the archive).
-test-aiaec-model-io: $(TEST_DEPS) tests/test_aiaec_model_io.c ai3_model_io_deepvqes.h ai3_model_io_alignulcnet.h ../common/ai3_model_io.h | _cfg_guard
+test-aiaec-graph-io: $(TEST_DEPS) tests/test_aiaec_graph_io.c graph_io_deepvqes.h graph_io_alignulcnet.h ../common/graph_io.h | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
 	  for cat in test production; do \
 	    defs=""; [ "$$cat" = test ] && defs="-DAIAEC_TEST_CATALOG"; \
 	    $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $$defs -DAIAEC_PRODUCT_MODEL_ID=$$id -Ideepvqe_s -Iulcnet \
-	      tests/test_aiaec_model_io.c $(TEST_SOURCES) ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm \
-	      -o "$(OBJ_DIR)/test_aiaec_model_io_$${tag}_$$cat"; \
-	    "$(OBJ_DIR)/test_aiaec_model_io_$${tag}_$$cat"; \
+	      tests/test_aiaec_graph_io.c $(TEST_SOURCES) ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm \
+	      -o "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
+	    "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
 	  done; \
 	done
 
-# model-io-dumper: tests/dump_model_io.c prints the rows of both model-config headers and their layout constants;
+# graph-io-dumper: tests/dump_graph_io.c prints the rows of both model-config headers and their layout constants;
 # AIAEC/tests/test_aiaec_bind_info_pin.py compares them with a fresh export. Prints the binary path.
-$(OBJ_DIR)/dump_model_io: tests/dump_model_io.c ai3_model_io_deepvqes.h ai3_model_io_alignulcnet.h ../common/ai3_model_io.h ../common/stream_bind.c ../common/stream_bind.h | _cfg_guard
-	$(CC) $(CFLAGS) tests/dump_model_io.c ../common/stream_bind.c -lm -o "$@"
+$(OBJ_DIR)/dump_graph_io: tests/dump_graph_io.c graph_io_deepvqes.h graph_io_alignulcnet.h ../common/graph_io.h ../common/stream_bind.c ../common/stream_bind.h | _cfg_guard
+	$(CC) $(CFLAGS) tests/dump_graph_io.c ../common/stream_bind.c -lm -o "$@"
 
-model-io-dumper: $(OBJ_DIR)/dump_model_io
-	@echo "$(abspath $(OBJ_DIR))/dump_model_io"
+graph-io-dumper: $(OBJ_DIR)/dump_graph_io
+	@echo "$(abspath $(OBJ_DIR))/dump_graph_io"
 
 # bind-dumpers: builds tests/dump_bind_info.c once per product with the test catalog and prints the
 # two binary paths (deepvqe_s first). AIAEC/tests/test_aiaec_bind_info_pin.py runs them and compares
@@ -306,7 +306,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 # single-model `test` runs only `lib` (confirms aiaec.o itself still compiles clean under this
 # variant) and says plainly what covers that variant's contract: test-single-model.
 ifeq ($(AIAEC_MODEL),both)
-test: test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-model-io link-only-aiaec ulcnet-lib
+test: test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec ulcnet-lib
 else
 test: lib
 	@echo "test: AIAEC_MODEL=$(AIAEC_MODEL) -- the per-product tests and link-only-aiaec assume both models and are skipped; run 'make test-single-model' for this variant's coverage (built with AIAEC_MODEL=both, which exercises AIAEC_MODEL=deepvqe and =align internally)."

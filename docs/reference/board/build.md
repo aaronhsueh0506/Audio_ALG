@@ -200,10 +200,10 @@ grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on
 passes `{sr, fft, hop_in}` (`AinrConfig` / `AiaecConfig`) to its model stream, which resolves the grid, `N = hop_in / (fft / 2)`, the graph path
 and (DFN2) ERB matrices from its catalog and reports the graph and the stream timing in the `AinrInfo` / `AiaecInfo` that `*_init()` fills
 (`graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; no port list). The graph's wiring (signal, head and state shapes, one row per
-registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `ai3_model_io_<model>.h` next to each library (`stream/ainr/ai3_model_io_dfn2.h`,
-`stream/aiaec/ai3_model_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
-`stream/common/ai3_model_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
-against the row; tested by `make -C stream/common test-model-io`). A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
+registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`,
+`stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
+`stream/common/graph_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
+against the row; tested by `make -C stream/common test-graph-io`). A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
 `stream/common/stream_bind.c` for the checker; the stream libraries do not. The AI3 samples carry compile-time `#define FLOAT_IN 0` / `FLOAT_OUT 0` (default off) that let the NPU quantize the inputs and dequantize the heads; set both alike (a mixed setting only warns), see `docs/maintenance/graph-wiring.md`. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
 `stream/common/stream_mem.h`), and a
 configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is

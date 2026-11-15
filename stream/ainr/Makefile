@@ -87,8 +87,8 @@ VPATH := . ../common
 
 .PHONY: all lib print-lib-path print-cflags print-sources test dfn2-lib \
 	test-ainr-dfn2 test-ainr-spec-freq test-ainr-tail test-ainr-freq-nonfinite \
-	test-ainr-state-generation test-ainr-pool-gates test-ainr-product test-ainr-model-io \
-	test-link-only-ainr work-dumper model-io-dumper audit-no-stdio clean _cfg_guard
+	test-ainr-state-generation test-ainr-pool-gates test-ainr-product test-ainr-graph-io \
+	test-link-only-ainr work-dumper graph-io-dumper audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -270,28 +270,28 @@ endif
 	  "$(OBJ_DIR)/test_ainr_product_$$1"; \
 	done
 
-# test-ainr-model-io: the DFN2 graph rows (ai3_model_io_dfn2.h) against the AinrWork of real preprocess calls
+# test-ainr-graph-io: the DFN2 graph rows (graph_io_dfn2.h) against the AinrWork of real preprocess calls
 # for this variant, with the default product id and the three others of ainr_product.h (alt2, alt1, the other
 # variant's). The port check of the model-config header links ../common/stream_bind.c (samples only, not the archive).
-test-ainr-model-io: $(GENERIC_TEST_SOURCES) tests/test_ainr_model_io.c ai3_model_io_dfn2.h ../common/ai3_model_io.h $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+test-ainr-graph-io: $(GENERIC_TEST_SOURCES) tests/test_ainr_graph_io.c graph_io_dfn2.h ../common/graph_io.h $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
-	$(error test-ainr-model-io needs the file-loader entry points; run with NO_STDIO=0)
+	$(error test-ainr-graph-io needs the file-loader entry points; run with NO_STDIO=0)
 endif
 	@set -e; for spec in "0 " "1 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_ALT2)" "2 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_ALT1)" \
 	    "3 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_OTHER)"; do \
 	  set -- $$spec; tag=$$1; shift; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) "$$@" tests/test_ainr_model_io.c $(GENERIC_TEST_SOURCES) \
-	    ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_ainr_model_io_$$tag"; \
-	  "$(OBJ_DIR)/test_ainr_model_io_$$tag"; \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) "$$@" tests/test_ainr_graph_io.c $(GENERIC_TEST_SOURCES) \
+	    ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_ainr_graph_io_$$tag"; \
+	  "$(OBJ_DIR)/test_ainr_graph_io_$$tag"; \
 	done
 
-# model-io-dumper: tests/dump_model_io.c prints the rows of ai3_model_io_dfn2.h and the tables' layout constants;
+# graph-io-dumper: tests/dump_graph_io.c prints the rows of graph_io_dfn2.h and the tables' layout constants;
 # the Python pin AINR/tests/test_dfn2_port_order.py compares them with a fresh export. Prints the binary path.
-$(OBJ_DIR)/dump_model_io: tests/dump_model_io.c ai3_model_io_dfn2.h ../common/ai3_model_io.h ../common/stream_bind.c ../common/stream_bind.h | _cfg_guard
-	$(CC) $(CFLAGS) tests/dump_model_io.c ../common/stream_bind.c -lm -o "$@"
+$(OBJ_DIR)/dump_graph_io: tests/dump_graph_io.c graph_io_dfn2.h ../common/graph_io.h ../common/stream_bind.c ../common/stream_bind.h | _cfg_guard
+	$(CC) $(CFLAGS) tests/dump_graph_io.c ../common/stream_bind.c -lm -o "$@"
 
-model-io-dumper: $(OBJ_DIR)/dump_model_io
-	@echo "$(abspath $(OBJ_DIR))/dump_model_io"
+graph-io-dumper: $(OBJ_DIR)/dump_graph_io
+	@echo "$(abspath $(OBJ_DIR))/dump_graph_io"
 
 # test-link-only-ainr: builds BOTH full and mask-only dfn2/ archives (sub-make, as ainr.c is built here), then
 # links tests/link_only_ainr.c -- which #includes ONLY ainr.h -- against each; both must complete a real round trip.
@@ -336,10 +336,10 @@ endif
 # internally regardless of this directory's own MASK_ONLY).
 ifeq ($(MASK_ONLY),1)
 test: test-ainr-tail test-ainr-freq-nonfinite test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim \
-	test-ainr-product test-ainr-model-io test-link-only-ainr
+	test-ainr-product test-ainr-graph-io test-link-only-ainr
 else
 test: test-ainr-dfn2 test-ainr-spec-freq test-ainr-tail test-ainr-freq-nonfinite \
-	test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim test-ainr-product test-ainr-model-io test-link-only-ainr
+	test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim test-ainr-product test-ainr-graph-io test-link-only-ainr
 endif
 
 # audit-no-stdio: builds the NO_STDIO=1 archive here and asserts, via `nm`, that it exports no

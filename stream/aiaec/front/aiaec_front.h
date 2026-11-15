@@ -8,7 +8,7 @@
  *     bytes = aiaec_front_get_mem_size(&cfg);                     // 0: refused
  *     f = aiaec_front_init(pool, bytes, &cfg, &err);              // pool: AIAEC_FRONT_ALIGNMENT
  *     per block: aiaec_front_preprocess(f, ctx, mic, far, &work); // the linear AEC, then the block pre
- *                ...SUBMIT: the sample's AI3 run; BYPASS: none...
+ *                ...SUBMIT: the sample's accelerator run; BYPASS: none...
  *                aiaec_postprocess(ctx, ai_rc, pcm_out);          // exactly once per successful pre
  *
  * The AEC runs stage by stage at AEC_RESIDUAL_STATE (aec_process_linear, aec_process_residual: no gain, no output

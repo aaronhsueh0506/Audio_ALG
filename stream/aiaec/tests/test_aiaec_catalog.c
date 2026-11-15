@@ -6,7 +6,7 @@
  *     call and ctx / info are left untouched; the 16k/512 row with N=1 is delivered and constructs; N=8
  *     there is refused. The refusal order is model, grid, hop_in, frames_per_call.
  *   Align-ULCNet: every row, N=8 included, is refused with AIAEC_ERR_FRAMES_PER_CALL (no delivered graph).
- * The test-catalog behavior (every row resolving, work views, N derivation) is test_aiaec_model_io.c. */
+ * The test-catalog behavior (every row resolving, work views, N derivation) is test_aiaec_graph_io.c. */
 
 #include <stdint.h>
 #include <stdio.h>

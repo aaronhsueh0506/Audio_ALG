@@ -113,7 +113,7 @@ head/spectrum pairing cannot pass as a merely finite output.
 
 Every exported graph lists its ports in one order, and the board samples bind by position, never by name (`stream/ainr` keeps no
 port list: `AinrWork` carries the block's signals and heads, the graph's wiring and state shapes are the sample's model configuration,
-`stream/ainr/ai3_model_io_dfn2.h`, shared helper `stream/common/ai3_model_io.h`): inputs are the signal inputs, then the state inputs; outputs are the head outputs, then the state outputs; state `k`
+`stream/ainr/graph_io_dfn2.h`, shared helper `stream/common/graph_io.h`): inputs are the signal inputs, then the state inputs; outputs are the head outputs, then the state outputs; state `k`
 is input `signal_in + k` and output `head_out + k`, with equal shapes at both ends. Full: `erb`, `spec` | `h_gru`,
 `df_convp_history` in; `erb_mask`, `df_coefs`, `df_alpha` | `h_gru_out`, `df_convp_history_out` out (2 signals, 3 heads, 2 states).
 Mask-only: `erb`, `spec` | `h_gru` in; `erb_mask` | `h_gru_out` out (2 signals, 1 head, 1 state). Fixed-point state ports need

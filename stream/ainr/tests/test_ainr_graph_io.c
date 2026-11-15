@@ -1,7 +1,7 @@
-/* The board samples' DFN2 graph rows (stream/ainr/ai3_model_io_dfn2.h) against the AinrWork a real preprocess
+/* The board samples' DFN2 graph rows (stream/ainr/graph_io_dfn2.h) against the AinrWork a real preprocess
  * call returns, for this build's variant (full, or lite under -DDFN2_MASK_ONLY) and product id
  * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM and _freq block must pass
- * AI3_MODEL_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
+ * GRAPH_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
  * when the row exists (a product id with no catalog rows refuses every configuration). The other variant's row
  * of the same grid must reject this variant's work. The second block of a family carries the same shapes as the
  * first, and every refusal of ainr_get_mem_size() comes back from the two init families with *ctx NULL and
@@ -18,8 +18,8 @@
 #include "ainr_test.h"
 #include "ainr_product.h"
 #include "dfn2_model_io.h"
-#include "ai3_model_io.h"
-#include "ai3_model_io_dfn2.h"
+#include "graph_io.h"
+#include "graph_io_dfn2.h"
 
 /* The product id has catalog rows in this build (ainr.c: the default and _ALT2 of the variant; _ALT1 and the
  * other variant's ids are refused by every entry). */
@@ -47,7 +47,7 @@ static int write_erb(const char *path, int n_bins, int n_erb)
     return fclose(fp);
 }
 
-static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const AinrWork *work)
+static void compare_work(const char *tag, const GraphIoConfig *mc, const AinrWork *work)
 {
     const StreamWiring *w = &mc->wiring;
     int i, rc;
@@ -62,9 +62,9 @@ static void compare_work(const char *tag, const Ai3ModelIoConfig *mc, const Ainr
         CHECK(work->outputs[i].b == w->outputs[i].b && work->outputs[i].c == w->outputs[i].c &&
               work->outputs[i].h == w->outputs[i].h && work->outputs[i].w == w->outputs[i].w &&
               work->outputs[i].elements == w->outputs[i].elements, "%s head %d shape", tag, i);
-    AI3_MODEL_IO_CHECK_WORK(rc, mc, work);
-    CHECK(rc == AI3_MODEL_IO_OK, "%s AI3_MODEL_IO_CHECK_WORK rc %d", tag, rc);
-    CHECK(ai3_model_io_fits(mc, AINR_MAX_INPUT_TENSORS, AINR_MAX_OUTPUT_TENSORS) == AI3_MODEL_IO_OK, "%s fits", tag);
+    GRAPH_IO_CHECK_WORK(rc, mc, work);
+    CHECK(rc == GRAPH_IO_OK, "%s GRAPH_IO_CHECK_WORK rc %d", tag, rc);
+    CHECK(graph_io_fits(mc, AINR_MAX_INPUT_TENSORS, AINR_MAX_OUTPUT_TENSORS) == GRAPH_IO_OK, "%s fits", tag);
 }
 
 static void fill_heads(AinrWork *w)
@@ -111,7 +111,7 @@ static void check_refusals(const char *erb)
 
 /* One pre call of `family` (0 PCM, 1 _freq) on a fresh init; compares the work with the row, then closes the block and compares
  * the next one. */
-static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelIoConfig *mc, const char *tag)
+static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoConfig *mc, const char *tag)
 {
     AinrInfo info;
     AinrWork work;
@@ -127,7 +127,7 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
     rc = family == 0 ? ainr_get_mem_size(cfg, &req) : ainr_get_mem_size_freq(cfg, &req);
     CHECK(rc == AINR_OK, "%s mem size %d", tag, rc);
     if (rc != AINR_OK) return;
-    snprintf(erb, sizeof erb, "/tmp/ainr_model_io_erb_%d.bin", (int)getpid());
+    snprintf(erb, sizeof erb, "/tmp/ainr_graph_io_erb_%d.bin", (int)getpid());
     if (write_erb(erb, bins, (int)mc->wiring.outputs[0].w) != 0) exit(2);
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
     rc = family == 0 ? ainr_init_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
@@ -145,15 +145,15 @@ static void run_family(const AinrConfig *cfg, int family, int n, const Ai3ModelI
                          : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
         CHECK(rc == AINR_OK, "%s preprocess %d", tag, rc);
         if (rc == AINR_OK) {
-            Ai3ModelIoConfig other;
-            int other_model = AI3_MODEL_IO_DFN2_PRODUCT == AI3_MODEL_IO_DFN2_LITE ? AI3_MODEL_IO_DFN2_FULL
-                                                                                  : AI3_MODEL_IO_DFN2_LITE;
+            GraphIoConfig other;
+            int other_model = GRAPH_IO_DFN2_PRODUCT == GRAPH_IO_DFN2_LITE ? GRAPH_IO_DFN2_FULL
+                                                                                  : GRAPH_IO_DFN2_LITE;
             compare_work(tag, mc, &work);
             /* the other variant's row of the same grid must refuse this variant's work */
-            if (ai3_model_io_dfn2_find(other_model, cfg->sr, cfg->fft, n, &other) == AI3_MODEL_IO_OK) {
+            if (graph_io_dfn2_find(other_model, cfg->sr, cfg->fft, n, &other) == GRAPH_IO_OK) {
                 int rc2;
-                AI3_MODEL_IO_CHECK_WORK(rc2, &other, &work);
-                CHECK(rc2 != AI3_MODEL_IO_OK, "%s the other variant's row accepted this work", tag);
+                GRAPH_IO_CHECK_WORK(rc2, &other, &work);
+                CHECK(rc2 != GRAPH_IO_OK, "%s the other variant's row accepted this work", tag);
             }
             fill_heads(&work);
             rc = family == 0 ? ainr_postprocess(pcm, 0, pcm_in) : ainr_postprocess_freq(freq, 0, out_re, out_im);
@@ -175,23 +175,23 @@ int main(void)
     int si, fi, n, i, accepted = 0, own_rows = 0, compared = 0;
 
     /* The wiring table and the library name the same graph layouts. */
-    CHECK(AI3_MODEL_IO_DFN2_LAYOUT_FULL == DFN2_MODEL_IO_LAYOUT_VERSION_FULL,
-          "full layout version: table %d, dfn2_model_io.h %d", (int)AI3_MODEL_IO_DFN2_LAYOUT_FULL,
+    CHECK(GRAPH_IO_DFN2_LAYOUT_FULL == DFN2_MODEL_IO_LAYOUT_VERSION_FULL,
+          "full layout version: table %d, dfn2_model_io.h %d", (int)GRAPH_IO_DFN2_LAYOUT_FULL,
           (int)DFN2_MODEL_IO_LAYOUT_VERSION_FULL);
-    CHECK(AI3_MODEL_IO_DFN2_LAYOUT_LITE == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY,
-          "lite layout version: table %d, dfn2_model_io.h %d", (int)AI3_MODEL_IO_DFN2_LAYOUT_LITE,
+    CHECK(GRAPH_IO_DFN2_LAYOUT_LITE == DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY,
+          "lite layout version: table %d, dfn2_model_io.h %d", (int)GRAPH_IO_DFN2_LAYOUT_LITE,
           (int)DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY);
 
-    for (i = 0; i < AI3_MODEL_IO_DFN2_ROW_COUNT; ++i) {
-        Ai3ModelIoConfig c;
-        CHECK(ai3_model_io_dfn2_row(i, &c) == AI3_MODEL_IO_OK, "row %d expands", i);
-        own_rows += c.model == AI3_MODEL_IO_DFN2_PRODUCT;
+    for (i = 0; i < GRAPH_IO_DFN2_ROW_COUNT; ++i) {
+        GraphIoConfig c;
+        CHECK(graph_io_dfn2_row(i, &c) == GRAPH_IO_OK, "row %d expands", i);
+        own_rows += c.model == GRAPH_IO_DFN2_PRODUCT;
     }
-    CHECK(ai3_model_io_dfn2_row(AI3_MODEL_IO_DFN2_ROW_COUNT, NULL) == AI3_MODEL_IO_ERR_NULL, "row NULL cfg");
+    CHECK(graph_io_dfn2_row(GRAPH_IO_DFN2_ROW_COUNT, NULL) == GRAPH_IO_ERR_NULL, "row NULL cfg");
 
     if (ID_HAS_ROWS) {
         char erb[96];
-        snprintf(erb, sizeof erb, "/tmp/ainr_model_io_refusal_%d.bin", (int)getpid());
+        snprintf(erb, sizeof erb, "/tmp/ainr_graph_io_refusal_%d.bin", (int)getpid());
         if (write_erb(erb, 513, 32) != 0) exit(2);
         check_refusals(erb);
         unlink(erb);
@@ -199,22 +199,22 @@ int main(void)
 
     for (si = 0; si < 4; ++si) for (fi = 0; fi < 5; ++fi) for (n = 1; n <= 8; ++n) {
         AinrConfig cfg;
-        Ai3ModelIoConfig mc;
+        GraphIoConfig mc;
         StreamMemReq req;
         int lib_ok, row_ok, family;
 
         cfg.sr = srs[si]; cfg.fft = ffts[fi]; cfg.hop_in = n * (ffts[fi] / 2);
-        CHECK(ai3_model_io_frames(cfg.fft, cfg.hop_in) == n, "frames arithmetic");
+        CHECK(graph_io_frames(cfg.fft, cfg.hop_in) == n, "frames arithmetic");
         lib_ok = ainr_get_mem_size(&cfg, &req) == AINR_OK;
-        row_ok = ai3_model_io_dfn2_find(AI3_MODEL_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &mc) == AI3_MODEL_IO_OK;
+        row_ok = graph_io_dfn2_find(GRAPH_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &mc) == GRAPH_IO_OK;
         accepted += lib_ok;
         CHECK(lib_ok == (ID_HAS_ROWS && row_ok), "sr %d fft %d N %d: library %s, model config %s", cfg.sr, cfg.fft, n,
               lib_ok ? "accepts" : "refuses", row_ok ? "has a row" : "has no row");
         CHECK(row_ok || (mc.n == 0 && mc.wiring.input_count == 0), "a refused find leaves cfg zeroed");
         if (!lib_ok || !row_ok) continue;
-        CHECK(mc.model == AI3_MODEL_IO_DFN2_PRODUCT && mc.n == n && mc.sample_rate == cfg.sr && mc.fft == cfg.fft,
+        CHECK(mc.model == GRAPH_IO_DFN2_PRODUCT && mc.n == n && mc.sample_rate == cfg.sr && mc.fft == cfg.fft,
               "key echo");
-        CHECK(mc.layout_version == (AI3_MODEL_IO_DFN2_PRODUCT == AI3_MODEL_IO_DFN2_LITE ? DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
+        CHECK(mc.layout_version == (GRAPH_IO_DFN2_PRODUCT == GRAPH_IO_DFN2_LITE ? DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
                                                                                         : DFN2_MODEL_IO_LAYOUT_VERSION_FULL),
               "layout version");
         {   /* the row's state count against the library's: a build constant, so any valid grid of the row's rate and size asks it */
@@ -229,8 +229,8 @@ int main(void)
             gs.frames_per_call = n;
             CHECK(dfn2_grid_make(&grid, &gs) == DFN2_GRID_OK && dfn2_model_io_descriptor_default(&grid, &desc) == 0,
                   "sr %d fft %d N %d: no descriptor to compare the state count with", cfg.sr, cfg.fft, n);
-            CHECK(ai3_model_io_state_count(&mc) == desc.state_tensor_count, "sr %d fft %d N %d: row has %d states, the library %d",
-                  cfg.sr, cfg.fft, n, ai3_model_io_state_count(&mc), desc.state_tensor_count);
+            CHECK(graph_io_state_count(&mc) == desc.state_tensor_count, "sr %d fft %d N %d: row has %d states, the library %d",
+                  cfg.sr, cfg.fft, n, graph_io_state_count(&mc), desc.state_tensor_count);
         }
         for (family = 0; family < 2; ++family) {
             char tag[96];
@@ -244,14 +244,14 @@ int main(void)
           accepted, own_rows, ID_HAS_ROWS);
     /* the variant switch: a model with no row at a grid is refused, an unknown model id is refused */
     {
-        Ai3ModelIoConfig c;
-        CHECK(ai3_model_io_dfn2_find(AI3_MODEL_IO_DFN2_LITE, 16000, 256, 1, &c) == AI3_MODEL_IO_ERR_NO_ROW, "lite has no 16 kHz row");
-        CHECK(ai3_model_io_dfn2_find(AI3_MODEL_IO_DEEPVQE_S, 16000, 256, 1, &c) == AI3_MODEL_IO_ERR_NO_ROW, "foreign model");
-        CHECK(ai3_model_io_dfn2_find(AI3_MODEL_IO_DFN2_FULL, 16000, 256, 1, NULL) == AI3_MODEL_IO_ERR_NULL, "NULL cfg");
+        GraphIoConfig c;
+        CHECK(graph_io_dfn2_find(GRAPH_IO_DFN2_LITE, 16000, 256, 1, &c) == GRAPH_IO_ERR_NO_ROW, "lite has no 16 kHz row");
+        CHECK(graph_io_dfn2_find(GRAPH_IO_DEEPVQES, 16000, 256, 1, &c) == GRAPH_IO_ERR_NO_ROW, "foreign model");
+        CHECK(graph_io_dfn2_find(GRAPH_IO_DFN2_FULL, 16000, 256, 1, NULL) == GRAPH_IO_ERR_NULL, "NULL cfg");
     }
     if (g_fail) return 1;
-    printf("test_ainr_model_io[%s id %d]: PASS (library-accepted configs %d, rows %d, real pre calls compared %d)\n",
-           AI3_MODEL_IO_DFN2_PRODUCT == AI3_MODEL_IO_DFN2_LITE ? "lite" : "full", (int)AINR_PRODUCT_MODEL_ID, accepted,
+    printf("test_ainr_graph_io[%s id %d]: PASS (library-accepted configs %d, rows %d, real pre calls compared %d)\n",
+           GRAPH_IO_DFN2_PRODUCT == GRAPH_IO_DFN2_LITE ? "lite" : "full", (int)AINR_PRODUCT_MODEL_ID, accepted,
            own_rows, compared);
     return 0;
 }

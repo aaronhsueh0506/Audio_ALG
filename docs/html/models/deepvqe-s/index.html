@@ -36,7 +36,7 @@ cc app.c -Istream/aiaec \
 <p>漏掉 <code>libdeepvqe_stream.a</code> 會缺 <code>deepvqe_stream_*</code>。預設 <code>AIAEC_MODEL=both</code> 的 <code>libaiaec.a</code> 同時引用兩款 backend，只連 DeepVQE-S 的 backend 會缺 <code>ulcnet_stream_*</code>。</p>
 
 <h2 id="graph-wiring">Graph 接線</h2>
-<p><code>aiaec_init()</code> 只回報選出的圖（<code>AiaecInfo.graph_path</code>）與尾端長度，不回報埠表。每個已交付 graph 的完整接線——訊號與 head 的 shape、16 組 state 的 shape——放在 <code>stream/aiaec/ai3_model_io_deepvqes.h</code>，每個登錄的 (sr, fft, N) 一列，列旁註明所對應的匯出器；共用的接線程式 <code>stream/common/ai3_model_io.h</code>（由 <code>make -C stream/common test-model-io</code> 測試）負責列的展開、state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對。兩者與 SDK 無關、只有標頭，<code>aiaec.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/aiaec</code>並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
+<p><code>aiaec_init()</code> 只回報選出的圖（<code>AiaecInfo.graph_path</code>）與尾端長度，不回報埠表。每個已交付 graph 的完整接線——訊號與 head 的 shape、16 組 state 的 shape——放在 <code>stream/aiaec/graph_io_deepvqes.h</code>，每個登錄的 (sr, fft, N) 一列，列旁註明所對應的匯出器；共用的接線程式 <code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）負責列的展開、state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對。兩者與 SDK 無關、只有標頭，<code>aiaec.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/aiaec</code>並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或與 init 選出的 graph 不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
 <p>圖的埠順序只有一條規則：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出；第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，兩端同形狀。DeepVQE-S：<code>signal_in_count</code> 2（mic、far）、<code>head_out_count</code> 1（CCM taps）、16 組 state，所以輸入 18 個、輸出 17 個，N=1 與 N&gt;1 相同。sample 依數量迴圈處理，不比對名稱。N 改變 mic／far 與 CCM head 的時間軸，不改埠順序；state 的 shape 隨 grid 與延遲深度 D = ceil(0.5 s / hop) 而變：</p>
 <table>
 <thead><tr><th>組態</th><th>mic、far（輸入 0、1）</th><th>CCM taps（輸出 0）</th><th>state</th></tr></thead>
@@ -59,13 +59,13 @@ int rc = aiaec_init(&amp;cfg, pool, req.bytes, &amp;ctx, &amp;info);   /* 0 或�
 if (rc != AIAEC_OK) { log(aiaec_status_text(rc)); return -1; }
 
 /* sample 的模型設定：這個 grid 與 N 的接線列；沒有列就在開圖前拒絕 */
-int n = ai3_model_io_frames(cfg.fft, cfg.hop_in);  /* N = hop_in / (fft / 2) */
-Ai3ModelIoConfig model;
-if (ai3_model_io_deepvqes_find(cfg.sr, cfg.fft, n, &amp;model) != AI3_MODEL_IO_OK) return -1;
+int n = graph_io_frames(cfg.fft, cfg.hop_in);  /* N = hop_in / (fft / 2) */
+GraphIoConfig model;
+if (graph_io_deepvqes_find(cfg.sr, cfg.fft, n, &amp;model) != GRAPH_IO_OK) return -1;
 
 open_graph(info.graph_path);                       /* sample 的 AI3 */
 char msg[160];
-if (ai3_model_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
+if (graph_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) != STREAM_PORT_OK) return -1;
 
 unsigned seen = aiaec_state_generation(ctx);
 
@@ -78,8 +78,8 @@ while (read_blocks(mic, far, hop_in)) {
     int ai_rc = 0;
     if (work.action == AIAEC_SUBMIT) {             /* DeepVQE-S 每包都是 SUBMIT */
         int chk;
-        AI3_MODEL_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
-        if (chk != AI3_MODEL_IO_OK) ai_rc = -1;    /* 不符：不送件，仍呼叫 post */
+        GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
+        if (chk != GRAPH_IO_OK) ai_rc = -1;    /* 不符：不送件，仍呼叫 post */
         else {
             if (work.state_generation != seen) { clear_state_buffers(); seen = work.state_generation; }
             ai_rc = run_ai3(&amp;work);                /* 填 work.inputs，執行，讀回 work.outputs */
@@ -89,7 +89,7 @@ while (read_blocks(mic, far, hop_in)) {
     if (aiaec_postprocess(ctx, ai_rc, pcm_out) != AIAEC_OK) return -1;   /* 失敗也呼叫 */
     write_block(pcm_out, hop_in);
 }</code></pre>
-<p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>ai3_model_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>AI3_MODEL_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>
+<p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>
 <p>pool 大小（本庫 host 建置讀出，單位 bytes；16k／256 兩列只存在於測試登錄表）：</p>
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th><code>_spec</code></th><th><code>_freq</code></th></tr></thead>
@@ -127,7 +127,7 @@ while (read_blocks(mic, far, hop_in)) {
 <tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對三個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>ai3_model_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec model-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-model-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對三個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_deepvqe_frames_per_call.py</code> 匯出 16k／512 的 N=1、2、4，驗 state 就地契約並以 ONNX Runtime 對 PyTorch 驗證；<code>test_deepvqe_inference_frames_per_call.py</code> 在 16k／256 匯出 N=1 與 N=8 兩張圖，在 ONNX Runtime 串流同一段輸入，CCM taps 最大差小於 5e-5，加速器呼叫數分別為 hop 數與 hop 數除以 8 進位。兩者都不經 C 的 <code>aiaec_*</code> 家族。</li>
 </ul>
 
