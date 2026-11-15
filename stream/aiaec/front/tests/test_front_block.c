@@ -1,10 +1,10 @@
 /* aiaec_front feeding the real Align-ULCNet block entry (test catalog): the events the front derives
  * from the AEC drive exactly the block's own restart edges. One delay change is one CHANGED hop and
- * must cost exactly one event: one BYPASS block at N = 1, one frame_reset bit and one
- * synthesis_restart_mask bit at N = 8 -- the LOCKED hop after the CHANGED hop is an ordinary hop.
- * The accelerator is an identity mask, so the PCM the block returns is the front's float residual,
- * one hop late, except the event block, which is exactly silent (the PCM entry restarts its own
- * STFT/ISTFT at an event hop); N = 8 returns the same PCM as N = 1, sample for sample. */
+ * must cost exactly one event: one BYPASS block at N = 1, one frame_reset bit at N = 8 -- the LOCKED
+ * hop after the CHANGED hop is an ordinary hop. The accelerator is an identity mask, so the PCM the
+ * block returns is the front's float residual, one hop late, the event hops included (an event
+ * restarts only the model; the analysis and synthesis keep running); N = 8 returns the same PCM as
+ * N = 1, sample for sample. */
 
 #include <math.h>
 #include <stdio.h>
@@ -30,7 +30,6 @@ typedef struct Pass {
     int bypass_blocks;       /* BYPASS blocks */
     int submit_blocks;
     int reset_ones;          /* frame_reset values equal to 1 (N = 8) */
-    int mask_bits;           /* synthesis_restart_mask bits (N = 8 and N = 1) */
 } Pass;
 
 /* The accelerator of the graph with an identity mask: mask real = 1, imaginary = 0, for every frame. */
@@ -43,12 +42,6 @@ static void identity_mask(const AiaecWork *w, int n) {
             out[(size_t)k * BINS + b] = 1.0f;
             out[((size_t)n + (size_t)k) * BINS + b] = 0.0f;
         }
-}
-
-static int popcount64(uint64_t m) {
-    int c = 0;
-    for (; m; m >>= 1) c += (int)(m & 1u);
-    return c;
 }
 
 static void run_pass(const Scene *sc, int n, Pass *p) {
@@ -96,25 +89,20 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
         rc = aiaec_preprocess(ctx, &in, &work);
         CHECK(rc == AIAEC_OK, "N=%d preprocess rc=%d (%s)", n, rc, aiaec_front_status_text(rc));
         if (rc != AIAEC_OK) break;
-        p->mask_bits += popcount64(work.synthesis_restart_mask);
         if (n == 1) {
             CHECK((work.action == AIAEC_BYPASS) == (p->edge[b] != 0), "block %d: action %s but the events say edge=%d", b,
                   work.action == AIAEC_BYPASS ? "BYPASS" : "SUBMIT", p->edge[b]);
-            CHECK(work.synthesis_restart_mask == (uint64_t)(p->edge[b] != 0), "block %d: restart mask %llx", b,
-                  (unsigned long long)work.synthesis_restart_mask);
+            CHECK(work.synthesis_restart_mask == 0u, "block %d: restart mask %llx", b, (unsigned long long)work.synthesis_restart_mask);
         } else {
-            uint64_t want = 0;
             const float *reset = work.inputs[4].data;
             CHECK(work.action == AIAEC_SUBMIT && work.input_count == 5 && work.inputs[4].elements == (size_t)n,
                   "packet %d: action %d inputs %d", b, (int)work.action, work.input_count);
             for (k = 0; k < n; ++k) {
-                if (p->edge[b * n + k]) want |= (uint64_t)1u << k;
                 CHECK(reset[k] == (p->edge[b * n + k] ? 1.0f : 0.0f), "packet %d frame %d: frame_reset %g, edge %d", b, k,
                       (double)reset[k], p->edge[b * n + k]);
                 p->reset_ones += reset[k] == 1.0f;
             }
-            CHECK(work.synthesis_restart_mask == want, "packet %d: restart mask %llx want %llx", b,
-                  (unsigned long long)work.synthesis_restart_mask, (unsigned long long)want);
+            CHECK(work.synthesis_restart_mask == 0u, "packet %d: restart mask %llx", b, (unsigned long long)work.synthesis_restart_mask);
         }
         if (work.action == AIAEC_SUBMIT) {
             identity_mask(&work, n);
@@ -146,21 +134,19 @@ int main(void) {
     /* One delay change is one event: the CHANGED hop and nothing else. */
     CHECK(p1.bypass_blocks == p1.changed && edges1 == p1.changed, "N=1: %d BYPASS blocks, %d edges for %d CHANGED hops",
           p1.bypass_blocks, edges1, p1.changed);
-    CHECK(p8.reset_ones == p8.changed && p8.mask_bits == p8.changed && p8.bypass_blocks == 0,
-          "N=8: %d frame_reset ones, %d restart bits, %d BYPASS blocks for %d CHANGED hops", p8.reset_ones, p8.mask_bits,
-          p8.bypass_blocks, p8.changed);
-    CHECK(p1.mask_bits == p1.changed, "N=1: %d restart bits for %d CHANGED hops", p1.mask_bits, p1.changed);
+    CHECK(p8.reset_ones == p8.changed && p8.bypass_blocks == 0, "N=8: %d frame_reset ones, %d BYPASS blocks for %d CHANGED hops",
+          p8.reset_ones, p8.bypass_blocks, p8.changed);
     for (b = 1; b < BLOCKS; ++b) CHECK(!(p1.edge[b] && p1.edge[b - 1]), "hops %d and %d are both events", b - 1, b);
     CHECK(p1.submit_blocks == BLOCKS - p1.bypass_blocks, "N=1 submit blocks %d", p1.submit_blocks);
 
-    /* Every hop from 4 on is compared, the event hop included: an event hop returns exactly silence, every other hop the
-     * residual one hop late. */
+    /* Every hop from 4 on is compared, the event hop included: each returns the residual one hop late (an event hop is an
+     * identity hop through the running analysis and synthesis). */
     for (b = 4; b < BLOCKS; ++b) {
         for (i = 0; i < HOP; ++i) {
-            const float want = p1.edge[b] ? 0.0f : p1.resid[(size_t)(b - 1) * HOP + i] * 32768.0f;
+            const float want = p1.resid[(size_t)(b - 1) * HOP + i] * 32768.0f;
             const float got = (float)p1.pcm[(size_t)b * HOP + i];
-            CHECK(p1.edge[b] ? got == 0.0f : fabsf(got - want) <= 3.0f, "hop %d (edge=%d) sample %d: pcm %.0f vs %.2f", b, p1.edge[b], i, got, want);
-            if (!p1.edge[b] && fabsf((float)sc.mic[(size_t)(b - 1) * HOP + i] - want) > 500.0f) ++discriminating;
+            CHECK(fabsf(got - want) <= 3.0f, "hop %d (edge=%d) sample %d: pcm %.0f vs %.2f", b, p1.edge[b], i, got, want);
+            if (fabsf((float)sc.mic[(size_t)(b - 1) * HOP + i] - want) > 500.0f) ++discriminating;
         }
         ++compared;
         if (g_fail) break;

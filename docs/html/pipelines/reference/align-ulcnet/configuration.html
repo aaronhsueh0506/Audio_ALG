@@ -66,7 +66,7 @@
 <tr><td></td><td><code>aec_get_mem_requirements / aec_hop_size</code>;sample 碼:<code>array_sample_default_config</code>;<code>aec_get_mem_requirements / aec_init_ex / aec_destroy</code>、<code>array_sample_beam_default_params / _get_mem_size / _init / _process_with_activity / _process_front / _process_beam / _reset / _destroy</code></td><td>4ch array(<code>libaec.a</code>)與 helper(sample 碼不在 archive 內)</td></tr>
 <tr><td></td><td><code>ulcnet_stream_get_mem_size / _init_ex / _pre_process_freq / _post_process_freq / _reset / _state_generation / _hop_size</code></td><td>模型串流的頻譜進出口(沒有 destroy)</td></tr>
 <tr><td></td><td><code>ulcnet_grid_make / ulcnet_model_io_descriptor_default / ulcnet_model_io_descriptor_validate / ulcnet_model_io_descriptor_frames</code></td><td>grid 與 descriptor</td></tr>
-<tr><td>診斷(不必呼叫)</td><td><code>ulcnet_stream_restart_mask / aec_array_get_timing</code></td><td>檢查與診斷(頻譜進出口的 restart mask 恆為 0)</td></tr>
+<tr><td>診斷(不必呼叫)</td><td><code>aec_array_get_timing</code></td><td>檢查與診斷</td></tr>
 <tr><td>internal(.c 內 <code>static</code>)</td><td><code>ulcnet_stream.c: apply_alignment_edge / open_hop</code></td><td>alignment 邊界記帳、reprime 武裝、開幀；<code>stream/aiaec/ulcnet/ulcnet_stream.c</code></td></tr>
 </table>
 

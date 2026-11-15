@@ -294,7 +294,6 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 	for sym in ulcnet_stream_pre_process ulcnet_stream_pre_process_f32 ulcnet_stream_pre_process_freq ulcnet_stream_pre_process_packet_f32 ulcnet_stream_pre_process_packet_freq ulcnet_stream_get_mem_size ulcnet_prepost_frame_open ulcnet_prepost_init ulcnet_model_io_prepare ulcnet_model_io_prepare_packet ulcnet_model_io_descriptor_validate; do \
 	  nm "$$ul" 2>/dev/null | grep -Eq " T _?$$sym$$" || { echo "FAIL: $$sym not exported by $$ul" >&2; exit 1; }; \
 	done; \
-	nm "$$ul" 2>/dev/null | grep -Eq ' T _?ulcnet_stream_restart_mask$$' || { echo "FAIL: ulcnet_stream_restart_mask not exported by $$ul" >&2; exit 1; }; \
 	nm "$$dv" 2>/dev/null | grep -Eq ' T _?deepvqe_stream_init$$' || { echo "FAIL: deepvqe_stream_init not exported by $$dv" >&2; exit 1; }; \
 	nm "$$ul" 2>/dev/null | grep -Eq ' T _?ulcnet_stream_init$$' || { echo "FAIL: ulcnet_stream_init not exported by $$ul" >&2; exit 1; }; \
 	echo "link-only-aiaec: PASS ($(LIB) exports aiaec_*, $$dv exports deepvqe_stream_*, $$ul exports ulcnet_stream_*)"

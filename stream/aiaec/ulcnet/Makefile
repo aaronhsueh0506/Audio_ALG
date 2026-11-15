@@ -74,7 +74,7 @@ CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \
 	../../../lib/aiaec/ulcnet/ulcnet_prepost.h
 
 STREAM_SOURCES := ulcnet_stream.c
-STREAM_HEADERS := ulcnet_stream.h ../../common/stream_mem.h
+STREAM_HEADERS := ulcnet_stream.h ../../common/stream_mem.h ../../common/stream_run.h
 
 LIB := $(OBJ_DIR)/libulcnet_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o $(OBJ_DIR)/ulcnet_prepost.o $(OBJ_DIR)/ulcnet_stream.o
@@ -92,11 +92,15 @@ VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) ulcnet_stre
 STREAM_FREQ_BIN := $(OBJ_DIR)/test_ulcnet_stream_freq
 STREAM_FREQ_SOURCES := tests/test_ulcnet_stream_freq.c $(CORE_SOURCES) ulcnet_stream.c
 
+# The PCM entries through alignment events against the spectrum entries around the caller's own framing.
+PCM_EVENTS_BIN := $(OBJ_DIR)/test_ulcnet_pcm_events
+PCM_EVENTS_SOURCES := tests/test_ulcnet_pcm_events.c $(CORE_SOURCES) ulcnet_stream.c
+
 # The spectrum-only stream (cfg.freq_only) against a full one, in an exact pool between canaries.
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) ulcnet_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq test-freq-only \
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq test-pcm-events test-freq-only \
 	audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -162,10 +166,17 @@ $(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMO
 test-stream-freq: $(STREAM_FREQ_BIN)
 	"$(STREAM_FREQ_BIN)"
 
+$(PCM_EVENTS_BIN): $(PCM_EVENTS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(PCM_EVENTS_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+test-pcm-events: $(PCM_EVENTS_BIN)
+	"$(PCM_EVENTS_BIN)"
+
 test-freq-only: $(FREQ_ONLY_BIN)
 	"$(FREQ_ONLY_BIN)"
 
-test: smoke verify-vs-sample test-stream-freq test-freq-only
+test: smoke verify-vs-sample test-stream-freq test-pcm-events test-freq-only
 
 # audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
 # stdio symbol (nothing in this model needs stdio at all).

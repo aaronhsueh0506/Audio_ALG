@@ -10,10 +10,11 @@
  * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
  * continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the accelerator's state when
  * the generation differs from the value at the last zeroing.
- * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, resets the stream and arms
- * ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). Fail-OPEN: a bypassed frame is the
- * linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not finite is bypassed and advances the
- * generation, as does a dirty status.
+ * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, restarts the model (state, generation)
+ * and arms ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). The analysis and
+ * synthesis keep running: the PCM entries give the samples of the spectrum entries around an AcStft / AcIstft.
+ * Fail-OPEN: a bypassed frame is the linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not
+ * finite is bypassed and advances the generation, as does a dirty status.
  *
  * Packet streams (cfg.frames_per_call N >= 2, graph layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): each packet pre_process is
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries
@@ -39,7 +40,7 @@ extern "C" {
 #endif
 
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
-#define ULCNET_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define ULCNET_STREAM_LAYOUT_VERSION     5u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u
 /* Identity hops after an alignment boundary: each frame spans two hops, so only the boundary hop's frame straddles it. */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
@@ -86,18 +87,13 @@ UlcnetStream *ulcnet_stream_init_ex(const UlcnetStreamConfig *cfg, void *pool, s
                                     const UlcnetStreamMemReq *expected);
 
 /* Back to the start: framing (when the stream has it) and UlcnetPrepost reset (generation advanced), reprime countdown
- * cleared. The alignment-edge detector runs the same operation. */
+ * and the alignment-edge memory cleared. An alignment event restarts only the model. */
 void ulcnet_stream_reset(UlcnetStream *s);
 
 /* Generation of the recurrent state; 0 for NULL. */
 uint32_t ulcnet_stream_state_generation(const UlcnetStream *s);
 
 int ulcnet_stream_hop_size(const UlcnetStream *s);             /* samples per PCM hop; -1 on NULL */
-
-/* Hops of the last pre_process at which the stream restarted its own analysis framing (bit k = hop k; bit 0 only for a
- * one-hop stream). Set by the f32 / int16 entries; 0 after the freq entries, a reset and for NULL. A caller with its own
- * synthesis resets its ISTFT right before pushing each such hop. */
-uint64_t ulcnet_stream_restart_mask(const UlcnetStream *s);
 
 /* The tensor views of one open hop and the generation the accelerator's state must match. Valid only when pre_process
  * returned 1; zeroed on a reprime hop. */
@@ -107,7 +103,7 @@ typedef struct UlcnetHopIO {
     uint32_t             state_generation;
 } UlcnetHopIO;
 
-/* One hop in as full-scale float err_in and far_in (hop_size samples each): alignment-edge check (may reset), analysis,
+/* One hop in as full-scale float err_in and far_in (hop_size samples each): alignment-edge check (may restart the model), analysis,
  * pre_process_freq, then frame_bypass (reprime hop: io zeroed, returns 0) or frame_open (returns 1). -1: contract error
  * (a freq_only stream included). The int16 entry below round-trips float lanes through int16 (up to 4 LSB of PCM). */
 int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
@@ -118,20 +114,19 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
                               UlcnetStreamDelay delay, UlcnetHopIO *io);
 
 /* Closes the hop: ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail OPEN); a
- * reprime hop is already bypassed. pcm_out is a full hop (return 1). An alignment-event hop restarts the stream: its pcm_out is exactly zero and
- * the previous hop's audio is not output. -1 with zeros on a post_process_freq() error. Once per pre_process. A freq_only
- * stream: -1, pcm_out untouched and the hop still open (post_process_freq() closes it). */
+ * reprime hop is already bypassed. pcm_out is a full hop (return 1), an alignment-event hop included (its frame is the
+ * error spectrum). -1 with zeros on a post_process_freq() error. Once per pre_process. A freq_only stream: -1, pcm_out
+ * untouched and the hop still open (post_process_freq() closes it). */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
-/* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then the job; an event hop also
- * restarts the stream's framing (exactly zero output, the previous hop's audio lost; ulcnet_stream_restart_mask()), so the PCM
- * equals N one-hop calls. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a call before the
+/* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then the job; the PCM equals N
+ * one-hop calls, event hops included. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a call before the
  * matching post). */
 int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                          const UlcnetStreamDelay *delay, UlcnetHopIO *io);
 
 /* As the f32 packet entry with the N hops' spectra supplied (frame-major, N * n_bins per plane, the stream's scale), for
- * either kind of stream; restarts no framing. ulcnet_stream_reset() restarts everything, generation included. */
+ * either kind of stream. ulcnet_stream_reset() restarts everything, generation included. */
 int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, const float *err_im,
                                           const float *far_re, const float *far_im,
                                           const UlcnetStreamDelay *delay, UlcnetHopIO *io);

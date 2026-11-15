@@ -46,8 +46,7 @@ struct UlcnetStream {
     int hop_state;              /* ULCNET_STREAM_IDLE / _FRAME_OPEN / _FRAME_CLOSED */
     int had_hop;                 /* 0 until the first pre_process call completes */
     int prev_solid;               /* delay.solid as of the previous hop */
-    unsigned reprime_remaining;  /* identity hops still owed after an alignment-edge reset */
-    uint64_t restart_mask;       /* bit k: hop k of the last PCM-entry pre_process restarted the stream's own framing */
+    unsigned reprime_remaining;  /* identity hops still owed after an alignment-edge restart */
 };
 
 typedef struct UlcnetStreamLayout {
@@ -291,7 +290,6 @@ void ulcnet_stream_reset(UlcnetStream *s) {
      * stale prev_solid. */
     s->had_hop = 0;
     s->prev_solid = 0;
-    s->restart_mask = 0;
 }
 
 uint32_t ulcnet_stream_state_generation(const UlcnetStream *s) {
@@ -302,26 +300,21 @@ int ulcnet_stream_hop_size(const UlcnetStream *s) {
     return s ? s->grid.hop : -1;
 }
 
-uint64_t ulcnet_stream_restart_mask(const UlcnetStream *s) {
-    return s ? s->restart_mask : 0u;
+/* Restarts the model only (state, generation, reprime): the analysis and synthesis keep running. */
+static void restart_model(UlcnetStream *s) {
+    ulcnet_prepost_reset(s->prepost);
+    s->hop_state = ULCNET_STREAM_IDLE;
+    s->reprime_remaining = ULCNET_STREAM_REPRIME_FRAMES;
 }
 
 /* Alignment-edge detection, before the hop's own analysis: a new alignment generation, or the
  * first hop where `solid` turns true after a prior hop where it was false. Only the solid-transition
  * term is gated by s->had_hop (no prior value on the very first hop); delay.changed is NOT gated --
- * a fresh generation on hop 0 resets there too. Returns 1 on an edge (the stream was reset). */
-static int apply_alignment_edge(UlcnetStream *s, UlcnetStreamDelay delay) {
-    int edge = delay.changed || (s->had_hop && !s->prev_solid && delay.solid);
-
-    if (edge) {
-        /* ulcnet_stream_reset() itself clears reprime_remaining; re-arm strictly after it
-         * returns, or the arm below would be immediately undone. */
-        ulcnet_stream_reset(s);
-        s->reprime_remaining = ULCNET_STREAM_REPRIME_FRAMES;
-    }
+ * a fresh generation on hop 0 restarts there too. */
+static void apply_alignment_edge(UlcnetStream *s, UlcnetStreamDelay delay) {
+    if (delay.changed || (s->had_hop && !s->prev_solid && delay.solid)) restart_model(s);
     s->had_hop = 1;
     s->prev_solid = delay.solid;
-    return edge;
 }
 
 /* Shared tail of every pre_process entry, from the analysed (or supplied) spectra on. */
@@ -354,7 +347,7 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
                                   UlcnetStreamDelay delay, UlcnetHopIO *io) {
     if (!s || !err_in || !far_in || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
 
-    s->restart_mask = apply_alignment_edge(s, delay) ? 1u : 0u;
+    apply_alignment_edge(s, delay);
 
     /* err_in/far_in are read once each, here, and never stored -- the scratch slab exists only
      * for ulcnet_stream_pre_process()'s int16 conversion below. */
@@ -371,8 +364,7 @@ int ulcnet_stream_pre_process_freq(UlcnetStream *s, const float *err_re, const f
         s->frames != 1)
         return -1;
 
-    (void)apply_alignment_edge(s, delay);
-    s->restart_mask = 0;   /* the caller owns the analysers and the ISTFT */
+    apply_alignment_edge(s, delay);
     return open_hop(s, err_re, err_im, far_re, far_im, io);
 }
 
@@ -405,15 +397,7 @@ int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, c
     if (!s || !err_in || !far_in || !delay || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames < 2)
         return -1;
     packet_events(s, delay, events);
-    s->restart_mask = 0;
     for (k = 0; k < (size_t)s->frames; ++k) {
-        /* An event hop restarts the stream's own analysis exactly where the one-hop stream does: before the hop's
-         * push, so the hops before it are analysed from the incoming history and the hops after it from this one. */
-        if (events[k]) {
-            ac_stft_reset(s->stft_err);
-            ac_stft_reset(s->stft_far);
-            s->restart_mask |= (uint64_t)1u << k;
-        }
         ac_stft_push_planar(s->stft_err, err_in + k * hop, s->err_re + k * bins, s->err_im + k * bins);
         ac_stft_push_planar(s->stft_far, far_in + k * hop, s->far_re + k * bins, s->far_im + k * bins);
     }
@@ -429,7 +413,6 @@ int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, 
         s->frames < 2)
         return -1;
     packet_events(s, delay, events);
-    s->restart_mask = 0;   /* the caller owns the analysers and the ISTFT */
     return open_packet(s, err_re, err_im, far_re, far_im, events, io);
 }
 
@@ -492,7 +475,6 @@ int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
      * as dfn2_stream.c's own post_process): the first real hop out of a fresh init/reset/reprime
      * is the model's actual half-window synthesis result (may be non-zero), not forced silence. */
     for (k = 0; k < s->frames; ++k) {
-        if ((s->restart_mask >> k) & 1u) ac_istft_reset(s->istft);   /* the hop's analysis was restarted */
         ac_istft_push_planar(s->istft, s->enh_re + (size_t)k * bins, s->enh_im + (size_t)k * bins, s->hop_out);
         for (i = 0; i < hop; ++i) pcm_out[(size_t)k * (size_t)hop + (size_t)i] = stream_saturate_s16(s->hop_out[i]);
     }

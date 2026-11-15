@@ -20,7 +20,7 @@ tensor invocation in `run_accelerator()` remains a board TODO. The runtime binds
 to the buffer of the state input of the same name (the graph shifts the windows itself, so
 nothing is copied) and reads every state input before it writes any state output. A fixed-point
 accelerator loads quantized zeros at start and whenever `UlcnetHopIO.state_generation`
-changes (a reset, an alignment boundary, or a frame whose output was refused).
+changes (a reset, an alignment boundary, a frame whose output was refused, or a run that reported a status other than `STREAM_RUN_NOT_STARTED`).
 Returning an error is intentionally fail-open and emits the linear error.
 
 The exported graph fixes `D`. The example constructs a `D=8` descriptor and checks it against the

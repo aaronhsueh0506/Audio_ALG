@@ -64,8 +64,7 @@ static int pre_three(Pair *p, const int16_t *mic, const int16_t *far, AiaecWork 
 static int same_work(const AiaecWork *a, const AiaecWork *b) {
     int i;
     if (a->action != b->action || a->input_count != b->input_count || a->output_count != b->output_count ||
-        a->state_generation != b->state_generation || a->synthesis_restart_mask != b->synthesis_restart_mask ||
-        a->synthesis_restarted != b->synthesis_restarted)
+        a->state_generation != b->state_generation)
         return 0;
     for (i = 0; i < a->input_count; ++i) {
         const AiaecTensorIn *x = &a->inputs[i], *y = &b->inputs[i];
@@ -77,6 +76,14 @@ static int same_work(const AiaecWork *a, const AiaecWork *b) {
         if (x->elements != y->elements || x->w != y->w || x->h != y->h || x->c != y->c || x->b != y->b) return 0;
     }
     return 1;
+}
+
+/* Alignment events of a block: the BYPASS block at N = 1, the frame_reset ones at N > 1. */
+static int block_events(const AiaecWork *w, int n) {
+    int k, count = 0;
+    if (n == 1) return w->action == AIAEC_BYPASS;
+    for (k = 0; k < n; ++k) count += w->inputs[4].data[k] == 1.0f;
+    return count;
 }
 
 /* Deterministic non-identity mask, identical for both pairs. */
@@ -108,12 +115,11 @@ static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) 
         CHECK(ra == AIAEC_OK && rb == AIAEC_OK, "N=%d block %d: rc one-shot %d, three-call %d", n, b, ra, rb);
         if (ra != AIAEC_OK || rb != AIAEC_OK) break;
         if (!same_work(&wa, &wb)) {
-            CHECK(0, "N=%d block %d: work differs (action %d/%d, mask %llx/%llx, generation %u/%u)", n, b,
-                  (int)wa.action, (int)wb.action, (unsigned long long)wa.synthesis_restart_mask,
-                  (unsigned long long)wb.synthesis_restart_mask, wa.state_generation, wb.state_generation);
+            CHECK(0, "N=%d block %d: work differs (action %d/%d, generation %u/%u)", n, b,
+                  (int)wa.action, (int)wb.action, wa.state_generation, wb.state_generation);
             break;
         }
-        if (wa.synthesis_restart_mask) ++*events;
+        *events += block_events(&wa, n);
         if (wa.action == AIAEC_SUBMIT) {
             fill_mask(&wa, n, b);
             fill_mask(&wb, n, b);

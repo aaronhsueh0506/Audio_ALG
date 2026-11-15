@@ -55,7 +55,7 @@ Record file: one record per real model hop, in order (record k = STFT frame k = 
 
 Values are 0/1. No file carries a precomputed restart flag. Behaviour:
 
-- Inference prints `alignment events: ...` and, at N > 1, `packet K frame_reset 00100000` for the first packet and every packet holding an event. The streaming STFT/ISTFT keep running through an event (the C `_freq` flow); the PCM-family restart of the stream's own analysis is not mirrored. Not valid with `--mic-dir`.
+- Inference prints `alignment events: ...` and, at N > 1, `packet K frame_reset 00100000` for the first packet and every packet holding an event. The streaming STFT/ISTFT keep running through an event, as in every C entry. Not valid with `--mic-dir`.
 - Calib takes a file (one pair) or a directory with `<relative wav name without .wav>.events.json|csv|npz` per pair; a missing or wrong-length record is an error. N > 1 captures `frame_reset` as exact 0.0/1.0 (policy `binary_control_no_ptq`, no range, no quantization). N = 1 has no control input: an event hop restarts the state and is not captured (it is a bypass the accelerator never runs) and does not count in `--frames`. The report gains `alignment_events` with the number of replayed event frames. With `--events` the last real hops are kept: a short final packet is zero-completed to N and its padding slots carry `frame_reset` 0, so an event on the last real hop is captured.
 - Without `--events` nothing changes: no event ever occurs, only whole packets are captured (a short tail is dropped, as before) and the outputs are bit-identical to before.
 - Verified with random weights against the C `_freq` stream and ONNX Runtime (`tests/test_aiaec_packet_ort_events.py`); there is no formal quantized graph or board run yet.

@@ -3,15 +3,15 @@
  * -DAIAEC_TEST_CATALOG; the accelerator is a host stand-in (deterministic heads, an identity head, or a
  * bypass).
  *
- *   equivalence  the PCM block family, _spec + an external AcIstft (reset on synthesis_restarted), and
- *                _freq fed by an independent, never-restarted AcStft run in lockstep: the PCM output
- *                equals the externally synthesized _spec output sample for sample, and the _freq
- *                spectra equal the _spec spectra bit for bit on every hop except an Align-ULCNet
- *                restart hop (where _freq must return its input error spectrum unchanged). DeepVQE-S
+ *   equivalence  the PCM block family, _spec + an external AcIstft, and _freq fed by an independent AcStft run
+ *                in lockstep, none of them restarted at an alignment event: the PCM output equals the
+ *                externally synthesized _spec and _freq outputs sample for sample, and the _freq spectra
+ *                equal the _spec spectra bit for bit on every hop, an Align-ULCNet event hop included
+ *                (where both return the input error spectrum unchanged). DeepVQE-S
  *                at 16k/256 N=1 and N=8 and 16k/512 N=1 with a forced inference failure; Align-ULCNet
  *                with changed / solid events and a forced failure.
  *   events       Align-ULCNet: per hop SUBMIT or BYPASS (changed and solid false -> true hops bypass,
- *                the next hop submits) and synthesis_restarted (PCM and _spec; 0 for _freq).
+ *                the next hop submits); the restart fields of the work stay 0 in every family.
  *   continuity   Align-ULCNet _freq with never-restarted analysers and ISTFT, bypassing every hop
  *                across alignment events: the output is the input delayed by one hop throughout.
  *   scale        the spectra at the boundary are audio scale: an identity head returns the supplied
@@ -176,7 +176,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
     int16_t *p_blk = calloc((size_t)hop_in, sizeof(int16_t)), *p_spec = calloc((size_t)hop_in, sizeof(int16_t));
     int16_t *p_freq = calloc((size_t)hop_in, sizeof(int16_t));
     AiaecAlignEvent ev[8];
-    int b, k, i, bad = 0, had_hop = 0, prev_solid = 0, restarts = 0, fails = 0;
+    int b, k, i, bad = 0, had_hop = 0, prev_solid = 0, edges = 0, fails = 0;
     long long ghop = 0;
 
     (void)ev; (void)had_hop; (void)prev_solid;
@@ -207,7 +207,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         in.kind = AIAEC_INPUT_ALIGN_ULCNET;
         in.u.align_ulcnet.residual_in = resid; in.u.align_ulcnet.far_in = farf;
         in.u.align_ulcnet.events = ev; in.u.align_ulcnet.event_count = 1;
-        /* the front end's analysers are never restarted (aiaec.h, "Alignment restart") */
+        /* no analyser or synthesis is restarted at an event: the model alone is (aiaec.h) */
         edge = e->changed || (had_hop && !prev_solid && e->solid);
         had_hop = 1; prev_solid = e->solid;
         for (k = 0; k < n; ++k) {
@@ -238,11 +238,12 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         CHECK(aiaec_preprocess_freq(t.freq, &fin, &wf) == AIAEC_OK, "fft=%d N=%d block %d: freq preprocess", fft, n, b);
 
         CHECK(wb.action == ws.action && wb.action == wf.action &&
-              wb.synthesis_restarted == ws.synthesis_restarted && wf.synthesis_restarted == 0 &&
-              wb.synthesis_restarted == edge, "fft=%d N=%d block %d: action/restart differ across families (%d/%d/%d restart %d/%d/%d, edge %d)",
+              wb.synthesis_restarted == 0 && ws.synthesis_restarted == 0 && wf.synthesis_restarted == 0 &&
+              wb.synthesis_restart_mask == 0u && ws.synthesis_restart_mask == 0u && wf.synthesis_restart_mask == 0u,
+              "fft=%d N=%d block %d: action/restart differ across families (%d/%d/%d restart %d/%d/%d, edge %d)",
               fft, n, b, (int)wb.action, (int)ws.action, (int)wf.action, wb.synthesis_restarted, ws.synthesis_restarted,
               wf.synthesis_restarted, edge);
-        restarts += wb.synthesis_restarted;
+        edges += edge;
         if (wb.action == AIAEC_SUBMIT) {
             for (k = 0; k < NINPUTS; ++k)
                 CHECK(wb.inputs[k].elements == ws.inputs[k].elements && wb.inputs[k].elements == wf.inputs[k].elements &&
@@ -258,21 +259,19 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         CHECK(aiaec_postprocess_spec(t.spec, fail, s_re, s_im) == AIAEC_OK, "block %d: spec postprocess", b);
         CHECK(aiaec_postprocess_freq(t.freq, fail, f_re, f_im) == AIAEC_OK, "block %d: freq postprocess", b);
 
-        if (ws.synthesis_restarted) ac_istft_reset(ist_s.istft);   /* _freq's ISTFT is never restarted */
         synth_frames(&ist_s, n, hop, nb, s_re, s_im, p_spec, hopf);
         synth_frames(&ist_f, n, hop, nb, f_re, f_im, p_freq, hopf);
         if (memcmp(p_blk, p_spec, (size_t)hop_in * sizeof(int16_t)) != 0) {
             FAIL("fft=%d N=%d block %d: block PCM != _spec + external ISTFT", fft, n, b); bad = 1;
         }
-        if (edge) {
-            /* the restart hop: _freq passes the front end's error spectrum through unchanged */
-            if (memcmp(a_re, f_re, (size_t)nb * sizeof(float)) != 0 || memcmp(a_im, f_im, (size_t)nb * sizeof(float)) != 0) {
-                FAIL("fft=%d N=%d block %d: _freq restart hop is not its input error spectrum", fft, n, b); bad = 1;
-            }
-        } else if (memcmp(s_re, f_re, (size_t)n * nb * sizeof(float)) != 0 || memcmp(s_im, f_im, (size_t)n * nb * sizeof(float)) != 0) {
+        if (edge && (memcmp(a_re, f_re, (size_t)nb * sizeof(float)) != 0 || memcmp(a_im, f_im, (size_t)nb * sizeof(float)) != 0)) {
+            /* the event hop is an identity hop: _freq returns the front end's error spectrum unchanged */
+            FAIL("fft=%d N=%d block %d: _freq event hop is not its input error spectrum", fft, n, b); bad = 1;
+        }
+        if (memcmp(s_re, f_re, (size_t)n * nb * sizeof(float)) != 0 || memcmp(s_im, f_im, (size_t)n * nb * sizeof(float)) != 0) {
             FAIL("fft=%d N=%d block %d: _freq spectra != _spec spectra", fft, n, b); bad = 1;
         }
-        if (restarts == 0 && memcmp(p_blk, p_freq, (size_t)hop_in * sizeof(int16_t)) != 0) {
+        if (memcmp(p_blk, p_freq, (size_t)hop_in * sizeof(int16_t)) != 0) {
             FAIL("fft=%d N=%d block %d: block PCM != _freq + external ISTFT", fft, n, b); bad = 1;
         }
         if (PRODUCT_DV && n > 1 && b == 0) {
@@ -282,8 +281,8 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         }
         ghop += n;
     }
-    printf("section_equivalence(fft=%d N=%d): %d blocks (%d forced failures, %d restarts) block == spec+ISTFT == freq+ISTFT, spec == freq%s\n",
-           fft, n, blocks, fails, restarts, bad ? " -- DIVERGED" : "");
+    printf("section_equivalence(fft=%d N=%d): %d blocks (%d forced failures, %d events) block == spec+ISTFT == freq+ISTFT, spec == freq%s\n",
+           fft, n, blocks, fails, edges, bad ? " -- DIVERGED" : "");
     frame_free(&ist_s); frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b);
     trio_free(&t);
     free(mic); free(far16); free(resid); free(farf); free(a_re); free(a_im); free(b_re); free(b_im);
@@ -293,17 +292,17 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
 
 #if PRODUCT_AL
 /* ---------------------------------------------------------------------------------------------
- * events: SUBMIT / BYPASS per hop and synthesis_restarted, all three families
+ * events: SUBMIT / BYPASS per hop, all three families
  * ------------------------------------------------------------------------------------------- */
 static int section_events(void) {
     /* changed hop, solid false -> true hop, and the hop after each. */
-    static const struct { int changed, solid, submit, restarted; } h[] = {
-        { 0, 0, 1, 0 },
-        { 1, 0, 0, 1 },   /* changed */
-        { 0, 0, 1, 0 },   /* next hop: runs */
-        { 0, 1, 0, 1 },   /* solid false -> true */
-        { 0, 1, 1, 0 },   /* next hop: runs */
-        { 0, 1, 1, 0 },
+    static const struct { int changed, solid, submit; } h[] = {
+        { 0, 0, 1 },
+        { 1, 0, 0 },   /* changed */
+        { 0, 0, 1 },   /* next hop: runs */
+        { 0, 1, 0 },   /* solid false -> true */
+        { 0, 1, 1 },   /* next hop: runs */
+        { 0, 1, 1 },
     };
     const int hops = (int)(sizeof(h) / sizeof(h[0]));
     AiaecConfig cfg = make_cfg(256, 1);
@@ -342,9 +341,10 @@ static int section_events(void) {
                  ws.action == AIAEC_SUBMIT, wf.action == AIAEC_SUBMIT, h[i].submit);
             bad = 1;
         }
-        CHECK(wb.synthesis_restarted == h[i].restarted && ws.synthesis_restarted == h[i].restarted &&
-              wf.synthesis_restarted == 0, "events hop %d: synthesis_restarted %d/%d/%d, want %d/%d/0", i,
-              wb.synthesis_restarted, ws.synthesis_restarted, wf.synthesis_restarted, h[i].restarted, h[i].restarted);
+        CHECK(wb.synthesis_restarted == 0 && ws.synthesis_restarted == 0 && wf.synthesis_restarted == 0 &&
+              wb.synthesis_restart_mask == 0u && ws.synthesis_restart_mask == 0u && wf.synthesis_restart_mask == 0u,
+              "events hop %d: restart fields %d/%d/%d, want 0", i, wb.synthesis_restarted, ws.synthesis_restarted,
+              wf.synthesis_restarted);
         if (wb.action == AIAEC_BYPASS)
             CHECK(wb.input_count == 0 && wb.output_count == 0 && wb.state_generation == 0u &&
                   ws.input_count == 0 && wf.input_count == 0, "events hop %d: bypass work not zeroed", i);
@@ -356,7 +356,7 @@ static int section_events(void) {
     }
     CHECK(sub_blk == 4 && sub_spec == 4 && sub_freq == 4, "events: submissions block/spec/freq = %d/%d/%d, want 4 of %d hops",
           sub_blk, sub_spec, sub_freq, hops);
-    printf("section_events: %d hops, submissions %d/%d/%d (block/spec/freq), restart flags as scheduled\n", hops, sub_blk, sub_spec, sub_freq);
+    printf("section_events: %d hops, submissions %d/%d/%d (block/spec/freq), restart fields 0\n", hops, sub_blk, sub_spec, sub_freq);
     frame_free(&an_a); frame_free(&an_b); trio_free(&t);
     return bad;
 }

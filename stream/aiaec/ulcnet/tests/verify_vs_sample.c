@@ -1,5 +1,5 @@
 /* Verifies ulcnet_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): alignment-edge
- * check -> stream reset + armed reprime -> int16->float + two STFT pushes + pre_process_freq -> reprime bypass or
+ * check -> model restart + armed reprime -> int16->float + two STFT pushes + pre_process_freq -> reprime bypass or
  * frame_open / accelerator / frame_finish-or-fail -> post_process_freq -> ac_istft_push_planar -> int16
  * saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
  * ulcnet_stream.c, on the grid of the shipped model (16 kHz, FFT 512, delay_depth 32). Both drivers run the SAME
@@ -114,12 +114,9 @@ static int board_init(BoardDriver *d, const UlcnetGrid *grid) {
     return 0;
 }
 
-/* The 4-function reset stream_reset() performs (alg_ai3_alignulcnet.c:1304), in its exact order. */
-static void board_reset_only(BoardDriver *d) {
+/* What an alignment edge does: the model only (state, generation); the analysis and the synthesis keep running. */
+static void board_restart_model(BoardDriver *d) {
     ulcnet_prepost_reset(d->prepost);
-    ac_stft_reset(d->stft_err);
-    ac_stft_reset(d->stft_far);
-    ac_istft_reset(d->istft);
 }
 
 /* Explicit, caller-driven reset (NOT from an alignment edge): the board sample has no equivalent
@@ -127,7 +124,10 @@ static void board_reset_only(BoardDriver *d) {
  * ulcnet_stream_reset() -- also clears had_hop/prev_solid/reprime_remaining, so the next hop is
  * exactly like the first hop after init. */
 static void board_explicit_reset(BoardDriver *d) {
-    board_reset_only(d);
+    board_restart_model(d);
+    ac_stft_reset(d->stft_err);
+    ac_stft_reset(d->stft_far);
+    ac_istft_reset(d->istft);
     d->reprime_remaining = 0;
     d->had_hop = 0;
     d->prev_solid = 0;
@@ -156,7 +156,7 @@ static int board_pre_f32(BoardDriver *d, const float *err_in, const float *far_i
                          UlcnetStreamDelay delay, UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out) {
     int edge = delay.changed || (d->had_hop && !d->prev_solid && delay.solid);
     if (edge) {
-        board_reset_only(d);
+        board_restart_model(d);
         d->reprime_remaining = ULCNET_STREAM_REPRIME_FRAMES;
     }
     d->had_hop = 1;

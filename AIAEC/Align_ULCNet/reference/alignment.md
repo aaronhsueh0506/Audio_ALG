@@ -11,21 +11,15 @@ Python inference (`inference.py` -> `_streaming.py`) differ at alignment events:
 
 `inference.py --events RECORD` (and `calib --events`) replay recorded `(changed, solid)` pairs through the same edge rule as the C stream (`alignment_events.py`), at every `--frames-per-call`; see the README, "Alignment events in Python". Python still cannot derive the pairs from audio.
 
-Python replays the reset policy from a record file only (function map D-44, row
-PL-ULC-01); it cannot derive events from audio, because asking `lib/aec` for a
-Python event accessor is a separate decision. The replay follows the `_freq`
-flow of `stream/aiaec`: the model restarts at the event hop (at N = 1 the hop is
-a bypass, at N > 1 the graph's `frame_reset`), while Python's STFT and ISTFT keep
-running. The C PCM entries (the PCM family `aiaec_*`, and `_spec` with an external ISTFT reset at
-`AiaecWork.synthesis_restart_mask`) also restart their own analysis and
-synthesis at the event hop, so Python PCM at and just after an event hop is not
-equal to the C PCM family and `_spec`; it is the `_freq` flow that Python matches. The policy
-does not change the front-end contract or the model I/O layout.
-
-The C PCM entries drop one hop of audio at each event: the event hop's output is
-exactly silent (zero analysis history, discarded overlap) and the input hop before it
-is not output. Use `_freq` (as the desktop pipelines do) if a continuous signal is needed;
-the Python reference follows the `_freq` flow.
+Python replays the reset policy from a record file only (row PL-ULC-01 of the
+function map); it cannot derive events from audio, because asking `lib/aec` for a
+Python event accessor is a separate decision. An event restarts only the model, in
+Python and in every C entry: at N = 1 the hop is a bypass, at N > 1 the graph's
+`frame_reset`, while the STFT and ISTFT keep running. The C PCM entries (the PCM family
+`aiaec_*`, and `_spec` with an external ISTFT) give the same samples as the `_freq`
+entries around the caller's own framing, the event hop included: its frame is the error
+spectrum and its output carries the signal. The policy does not change the front-end
+contract or the model I/O layout.
 
 Consequently the C/Python inference comparison of a checkpoint is defined only
 over spans without alignment events:

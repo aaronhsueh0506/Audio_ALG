@@ -36,7 +36,7 @@
 </table>
 
 <h2 id="section-2">2. mono 範例</h2>
-<p>完整函式:grid、lane、descriptor 檢查、pool 切分、init、每 hop、destroy。<code>board_run_stateless()</code>、<code>board_sync_state()</code>、<code>board_refill_state_zero()</code>、<code>next_hop()</code>、<code>emit_hop()</code> 由板端提供;<code>board_run_stateless()</code> 讀完所有 state 輸入後才寫輸出,並把每個 <code>*_out</code> 寫到對應輸入的位址(見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>)。板端 state 在加速器裡:啟動時載入量化 0,之後每次跑加速器前比對 <code>io.state_generation</code>(init 後為 0,reset、alignment 邊界與被拒的 frame 各加 1),與上次看到的值不同就重載;推論失敗後也重填。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯。</p>
+<p>完整函式:grid、lane、descriptor 檢查、pool 切分、init、每 hop、destroy。<code>board_run_stateless()</code>、<code>board_sync_state()</code>、<code>next_hop()</code>、<code>emit_hop()</code> 由板端提供;<code>board_run_stateless()</code> 讀完所有 state 輸入後才寫輸出,並把每個 <code>*_out</code> 寫到對應輸入的位址(見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>)。板端 state 在加速器裡:啟動時載入量化 0,之後每次跑加速器前比對 <code>io.state_generation</code>(init 後為 0,reset、alignment 邊界與被拒的 frame 各加 1),與上次看到的值不同就重載;推論失敗後也重填。範例已在 <code>-Wall -Wextra -Werror</code> 下編譯。</p>
 <pre>#include "aec.h"
 #include "audio_stft.h"
 #include "ulcnet_stream.h"
@@ -47,7 +47,6 @@
 /* 板端提供:無狀態的單幀 tensor invocation(回 0 = 已寫滿 outputs)、state 同步、取 hop 與輸出 */
 extern int  board_run_stateless(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 extern void board_sync_state(uint32_t generation);      /* 與上次看到的值不同就把加速器的 state 重載為量化 0 */
-extern void board_refill_state_zero(void);              /* 推論失敗後:裝置端 state 可能寫了一半 */
 extern int  next_hop(float *mic, float *ref);
 extern void emit_hop(const float *out, int n);
 
@@ -141,7 +140,6 @@ int mono_ulcnet_run(void) {
 
 extern int  board_run_stateless(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 extern void board_sync_state(uint32_t generation);      /* 同 mono */
-extern void board_refill_state_zero(void);
 extern int  next_hop4(float *mics_interleaved, float *ref, int *vad);   /* mics: [grid.hop][4] */
 extern void emit_hop(const float *out, int n);
 

@@ -153,7 +153,7 @@ static int run_pair(UlcnetStream *slim, UlcnetStream *full, const UlcnetGrid *g,
             src = ulcnet_stream_pre_process_packet_freq(slim, er, ei, fr, fi, d, &sio);
             frc = ulcnet_stream_pre_process_packet_freq(full, er, ei, fr, fi, d, &fio);
         }
-        if (src < 0 || src != frc || ulcnet_stream_restart_mask(slim) != ulcnet_stream_restart_mask(full) ||
+        if (src < 0 || src != frc ||
             (src == 1 && !same_job(&sio, &fio)) || (src == 0 && memcmp(&sio, &fio, sizeof sio) != 0)) {
             ++bad;
             break;

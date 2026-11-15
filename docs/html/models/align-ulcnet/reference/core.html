@@ -333,14 +333,14 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
-<div class="note"><b>本節的流程圖與表格是單拍（N=1）stream。</b>封包 stream（<code>frames_per_call</code> N≥2，<code>ulcnet_stream_pre_process_packet_f32()</code>／<code>_freq()</code>）一包 N 個 hop 只做一次加速器呼叫。事件 hop 的模型 state 由 graph 內的 <code>frame_reset</code> 重設並直通該 hop，generation 不變，不是 BYPASS。PCM 入口（<code>_f32</code>）在該 hop 重啟自己的分析與 ISTFT，位置與 N=1 相同（<code>ulcnet_stream_restart_mask()</code> 回報哪些 hop），所以 N=8 的 PCM 與同樣事件的 N=1 逐樣本相同；頻譜入口（<code>_freq</code>）只重啟模型，呼叫端的分析器與 ISTFT 不重啟。</div>
+<div class="note"><b>本節的流程圖與表格是單拍（N=1）stream。</b>封包 stream（<code>frames_per_call</code> N≥2，<code>ulcnet_stream_pre_process_packet_f32()</code>／<code>_freq()</code>）一包 N 個 hop 只做一次加速器呼叫。事件 hop 的模型 state 由 graph 內的 <code>frame_reset</code> 重設並直通該 hop，generation 不變，不是 BYPASS。所有入口（PCM 的 <code>_f32</code> 與頻譜的 <code>_freq</code>）都只重啟模型，stream 自己或呼叫端的分析器與 ISTFT 不重啟；N=8 的 PCM 與同樣事件的 N=1 逐樣本相同，也等於 <code>_freq</code> 加上呼叫端的 <code>AcStft</code>／<code>AcIstft</code>。</div>
 <h3>流程圖（block diagram）</h3>
 <pre>
 PCM in (float AEC error, float raw far)
   |
   v
 對齊邊界檢查 (delay.changed || !prev_solid &amp;&amp; delay.solid)
-  |-- 是 --> 完整重置 (STFT x2 + ISTFT + UlcnetPrepost) + 武裝 1 個 reprime hop
+  |-- 是 --> 只重啟模型 (UlcnetPrepost reset, generation +1) + 武裝 1 個 reprime hop；STFT x2 與 ISTFT 照跑
   v
 float 直接送入分析（int16 wrapper 先除以 32768）
   |
@@ -385,7 +385,7 @@ hop   caller                         ulcnet_stream                         NPU
       ai_rc=run_accelerator ------------------------------------>  寫 mask + state
       post_process(ai_rc) --------------> frame_finish ---------->
       &lt;-- 1 (首拍即真實合成輸出) -------- ISTFT push=hop ----------
-n     err,far,delay={1,1} -> pre_process -> changed=1, 觸發完整重置 + 武裝 reprime
+n     err,far,delay={1,1} -> pre_process -> changed=1, 只重啟模型 + 武裝 reprime
                                       -> STFT x2, pre_process_freq
                                       -> reprime>0: frame_bypass (不開 frame)
       &lt;-- 0 (reprime hop, 無加速器工作) ---------------------------
@@ -411,10 +411,10 @@ k     pre_process -> open --------------------------------------->  替身回 ST
 <h2 id="section-12">State 表</h2>
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
-<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td>明確 <code>ulcnet_stream_reset()</code> 或對齊邊界觸發的重置</td></tr>
+<tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td>只有明確的 <code>ulcnet_stream_reset()</code>；對齊事件不重置它</td></tr>
 <tr><td>四組遞迴 state（key／value／logit history、h_gru）</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>attention K/V window、attention-logit window、GRU hidden</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零已登錄的部分</td></tr>
 <tr><td><code>state_generation</code></td><td>轉呼叫 <code>ulcnet_prepost_state_generation()</code></td><td>目前 generation 值</td><td>reset（含對齊觸發的）、非有限拒收、<code>ai_rc</code> 為 STREAM_RUN_NOT_STARTED 以外的非 0 值各 +1；STREAM_RUN_NOT_STARTED 不推進（封包 stream 有事件 hop 時例外，+1）；成功送件的封包事件 hop 不推進</td></tr>
-<tr><td>對齊記帳（<code>had_hop</code>／<code>prev_solid</code>／<code>reprime_remaining</code>）</td><td>本層內部，<b>這個模型特有</b></td><td>上一拍的 <code>solid</code> 值、是否已處理過第一拍、剩餘的 reprime 倒數</td><td><code>ulcnet_stream_reset()</code>（含內部自動呼叫）歸零 <code>had_hop</code>／<code>prev_solid</code>，確保重置後下一拍不會誤觸發第二次邊界</td></tr>
+<tr><td>對齊記帳（<code>had_hop</code>／<code>prev_solid</code>／<code>reprime_remaining</code>）</td><td>本層內部，<b>這個模型特有</b></td><td>上一拍的 <code>solid</code> 值、是否已處理過第一拍、剩餘的 reprime 倒數</td><td><code>ulcnet_stream_reset()</code> 歸零 <code>had_hop</code>／<code>prev_solid</code>，確保重置後下一拍不會誤觸發第二次邊界；對齊事件只重啟模型，不歸零它們</td></tr>
 </table></div>
 
 <h2 id="section-13">延遲與暖機</h2>

@@ -177,7 +177,6 @@ typedef struct Tally {
     int bad_identity;     /* an identity hop that is not the error spectrum bit for bit */
     int bad_enhanced;     /* an accepted hop that is not the mask arithmetic bit for bit, or equals the error spectrum */
     int bad_generation;   /* the generation is not edges + resets + refusals after the hop */
-    int bad_restart;      /* restart_mask not 0 after a spectrum entry */
     uint32_t generation;  /* expected, running */
 } Tally;
 
@@ -208,7 +207,6 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
         memset(&io, 0x5A, sizeof io);
         pre = ulcnet_stream_pre_process_freq(r->s, er, ei, fr, fi, d, &io);
         if (pre != (edge ? 0 : 1)) { t->bad_pre++; if (pre < 0) return -1; }
-        if (ulcnet_stream_restart_mask(r->s) != 0u) t->bad_restart++;
         if (pre == 1) {
             int ok = io.state_generation == t->generation && io.inputs.spectrum_bins_elements == (size_t)BINS &&
                      io.outputs.spectrum_ri_elements == 2u * (size_t)BINS && io.outputs.output != NULL &&
@@ -257,7 +255,7 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
 }
 
 static int tally_clean(const Tally *t) {
-    return !t->bad_pre && !t->bad_io && !t->bad_identity && !t->bad_enhanced && !t->bad_generation && !t->bad_restart;
+    return !t->bad_pre && !t->bad_io && !t->bad_identity && !t->bad_enhanced && !t->bad_generation;
 }
 
 /* ---- rows ---- */
@@ -429,8 +427,7 @@ static void row_reset(void) {
     CHECK(ulcnet_stream_state_generation(a.s) == 3u && ulcnet_stream_post_process_freq(a.s, 0, re, im) == -1,
           "reset: an open hop is dropped");
     ulcnet_stream_reset(NULL);
-    CHECK(ulcnet_stream_state_generation(NULL) == 0u && ulcnet_stream_hop_size(NULL) == -1 &&
-          ulcnet_stream_restart_mask(NULL) == 0u, "reset: NULL stream accessors");
+    CHECK(ulcnet_stream_state_generation(NULL) == 0u && ulcnet_stream_hop_size(NULL) == -1, "reset: NULL stream accessors");
 
     /* replay: the same hops after a reset equal the first pass and a new stream, outputs and frames alike */
     rig_free(&a);

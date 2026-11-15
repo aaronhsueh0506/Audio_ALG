@@ -19,7 +19,7 @@
 <tr><td>graph <b>內</b>(已由 <code>export_onnx.py</code> 匯出)</td><td>(四個壓縮域特徵輸入 error_mag/far_mag/error_cos/error_sin, 顯式 states) → output(複數 mask, planar [1,2,1,K]):reorient、attention、GRU、到 complex_mask 1×1 Conv 為止;learned compute only(model-I/O layout 18)。</td></tr>
 <tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_linear</code>)、rolling center=False sqrt-Hann STFT(<code>AcStft</code>,<code>center</code> 0,對最近 <code>grid.n_fft</code> 樣本做 transform,每次 push 恰一幀;與 <code>center</code> 1 對同一個 pushed hop 吐出的最後一幀逐 bit 相同,見 <a href="../../../start/reference/grids.html">訊號 grid、視窗與記憶體版號</a>)、delay-state policy、固定前端(signed |x|^0.3 壓縮 <code>ULCNET_MODEL_IO_COMPRESSION_EXP=0.3f</code>、magnitude、壓縮域相位 cos/sin;封在 <code>ulcnet_model_io_prepare()</code> 內,壓縮域 error 頻譜留在 model_io state)。</td></tr>
 <tr><td>graph <b>外</b>(C 後處理)</td><td>output(mask)× 壓縮域 error → 逆冪(皆在 <code>ulcnet_model_io_enhance_spectrum()</code> 內)→ WOLA(sqrt-Hann、前一幀後半窗疊加;應用端 <code>AcIstft</code> 的 <code>AC_OLA_ACCUMULATE</code>,<code>ac_istft_push()</code>,機制不因上游 analysis 排程改變)。</td></tr>
-<tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V window、attention-logit window、GRU hidden h(四個 state tensor)屬於應用端:範例的串流不登錄 state,state 在加速器裡(<code>UlcnetHopIO</code> 的 state 視圖為 NULL)。串流在 reset、alignment 邊界與拒收一幀時讓 state generation 加一,板端據 <code>io.state_generation</code> 的變化重載量化後的零。</td></tr>
+<tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V window、attention-logit window、GRU hidden h(四個 state tensor)屬於應用端:範例的串流不登錄 state,state 在加速器裡(<code>UlcnetHopIO</code> 的 state 視圖為 NULL)。串流在 reset、alignment 邊界、拒收一幀與執行回報髒狀態(STREAM_RUN_NOT_STARTED 以外的非 0)時讓 state generation 加一,板端據 <code>io.state_generation</code> 的變化重載量化後的零。</td></tr>
 </table>
 
 <h3>加速器邊界</h3>

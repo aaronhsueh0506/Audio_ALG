@@ -458,7 +458,7 @@ static void example_ulcnet_phased(void) {
     if (!p.stream || !off.stream) return;
     memset(line, 0, sizeof(line));
     for (h = 0; h < 60; ++h) {
-        int ai_rc = -1, pre;
+        int ai_rc = STREAM_RUN_NOT_STARTED, pre;
         for (i = 0; i < hop; ++i) {
             ref[i] = lcg();
             mic[i] = 0.3f * line[pos] + 0.02f * lcg();
@@ -468,7 +468,7 @@ static void example_ulcnet_phased(void) {
 
         pre = ulc_host_begin(&p, mic, ref, &io);                         /* AEC, analyses, pre_process_freq */
         if (pre == 1) {                                                  /* a frame to run                  */
-            ai_rc = run_ulcnet_npu(&io);                                 /* 0 = every tensor written        */
+            ai_rc = run_ulcnet_npu(&io);                                 /* STREAM_RUN_OK = all written     */
             ++ran;
         }
         ulcnet_stream_post_process_freq(p.stream, ai_rc, p.out_re, p.out_im);   /* accepted, else the error */
@@ -476,7 +476,7 @@ static void example_ulcnet_phased(void) {
 
         /* the same hop with a run that fails: the error spectrum */
         (void)ulc_host_begin(&off, mic, ref, &io);
-        ulcnet_stream_post_process_freq(off.stream, -1, off.out_re, off.out_im);
+        ulcnet_stream_post_process_freq(off.stream, STREAM_RUN_FAILED, off.out_re, off.out_im);
         synth &= ac_istft_push_planar(off.istft, off.out_re, off.out_im, out_off) == hop;
         if (memcmp(off.out_re, p.err_re, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0 ||
             memcmp(off.out_im, p.err_im, sizeof(float) * (size_t)g_ulc_grid.n_bins) != 0) identity = 0;

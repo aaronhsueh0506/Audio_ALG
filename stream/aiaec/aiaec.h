@@ -102,7 +102,7 @@ typedef struct AiaecInput {
 #define AIAEC_MAX_INPUT_TENSORS  5   /* DeepVQE-S: mic, far. Align-ULCNet: 4 spectra, plus frame_reset at N > 1 */
 #define AIAEC_MAX_OUTPUT_TENSORS 1   /* DeepVQE-S: CCM taps. Align-ULCNet: complex mask, planar */
 
-/* Whether this block carries an accelerator job. A BYPASS block's AiaecWork is zero except the synthesis restart fields. */
+/* Whether this block carries an accelerator job. A BYPASS block's AiaecWork is all zero. */
 typedef enum AiaecAction {
     AIAEC_BYPASS = 0,   /* no accelerator call (an Align-ULCNet N = 1 event hop); aiaec_postprocess() is still called once */
     AIAEC_SUBMIT = 1    /* run the accelerator, pass the outcome to aiaec_postprocess() */
@@ -123,9 +123,7 @@ typedef struct AiaecWork {
      * zero the accelerator's state before its next run.
      * All-zero bytes are the zero: the port check refuses a fixed-point state port with zero_point != 0. */
     unsigned int     state_generation;
-    /* Align-ULCNet PCM and _spec: bit k = model hop k (oldest first, N up to 64) restarted the stream's framing with the
-     * model state; synthesis_restarted = any bit set. A _spec caller calls ac_istft_reset right before that hop's frame.
-     * Kept on BYPASS blocks; always 0 for _freq and DeepVQE-S. */
+    /* Always 0: no entry restarts the analysis or synthesis at an alignment event (an event restarts only the model). */
     uint64_t         synthesis_restart_mask;
     int              synthesis_restarted;
 } AiaecWork;
@@ -168,7 +166,7 @@ unsigned int aiaec_state_generation(const AiaecCtx *ctx);
 
 /* One block in. AIAEC_OK: work is filled; call aiaec_postprocess() exactly once before the next preprocess. Errors
  * (NULL / SEQUENCE, then INPUT_KIND / INPUT_SIZE) come before any state change and open no block. Align-ULCNet: an event hop
- * also restarts the stream's framing, so its pcm_out is exactly zero and the previous hop's audio is lost (one hop per event). */
+ * restarts only the model; the analysis and synthesis keep running and its pcm_out is the hop's error spectrum through them. */
 int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, AiaecWork *work);
 
 /* Closes the block (infer_status read on SUBMIT only; ERR_SEQUENCE writes nothing); pcm_out gets hop_in samples. A failed or
@@ -201,7 +199,7 @@ int aiaec_preprocess_spec(AiaecSpecCtx *ctx, const AiaecInput *input, AiaecWork 
 
 /* As aiaec_postprocess(), writing the block's N enhanced frames to out_re / out_im (N * n_bins floats each). Through an
  * AcIstft(AC_OLA_ACCUMULATE, ispec_scale 1) they equal the PCM family's pcm_out (DeepVQE-S's first block starts with N - 1
- * zero frames; Align-ULCNet _spec: ISTFT reset at the synthesis_restart_mask hops, one hop of audio lost per event). */
+ * zero frames). */
 int aiaec_postprocess_spec(AiaecSpecCtx *ctx, int infer_status, float *out_re, float *out_im);
 
 /* One block's spectra, tagged by kind; frames must equal N, every plane holds frames * n_bins floats. DeepVQE-S: mic, far.
@@ -238,7 +236,7 @@ unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx);
 
 /* As aiaec_preprocess() with frames for samples: INPUT_KIND, INPUT_SIZE (frames or event_count != N), then NULL for a NULL plane.
  * An Align-ULCNet event restarts only the model: the caller's analysers and ISTFT keep running (do not reset the ISTFT),
- * and the output equals _spec's on every other hop. */
+ * and the output equals _spec's. */
 int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, AiaecWork *work);
 
 /* As aiaec_postprocess_spec(), for the block opened by aiaec_preprocess_freq(). */

@@ -224,12 +224,6 @@ static void aiaec_block_fill_deepvqe(const DeepVqeGrid *grid, const DeepVqePrepo
 #endif /* AIAEC_ENABLE_DEEPVQE_S */
 
 #if AIAEC_ENABLE_ALIGN_ULCNET
-static void aiaec_set_restart(AiaecWork *work, uint64_t mask)
-{
-    work->synthesis_restart_mask = mask;
-    work->synthesis_restarted = mask != 0u;
-}
-
 /* Four signals [1, 1, N, n_bins] (error_mag, far_mag, error_cos, error_sin; N frames, oldest first); at N > 1 a
  * fifth, frame_reset [1, 1, 1, N], the last signal; one head, the complex mask planar [1, 2, N, n_bins] (the real
  * plane of all N frames, then the imaginary). */
@@ -739,8 +733,7 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
 
         if (c->frames_per_call > 1) {
             /* A packet: one event per model hop, one job for all of them. The graph resets and bypasses an
-             * event hop itself (no generation change; a failed job advances it instead); a PCM entry restarts its own
-             * framing at those hops. */
+             * event hop itself (no generation change; a failed job advances it instead). */
             UlcnetStreamDelay delays[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
             int k;
 
@@ -758,7 +751,6 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
             if (rc != 1) return AIAEC_ERR_SEQUENCE;
             aiaec_block_fill_align(&c->u.align.grid, c->frames_per_call, &hio.inputs, &hio.outputs,
                                    hio.state_generation, work);
-            aiaec_set_restart(work, pin ? ulcnet_stream_restart_mask(c->u.align.inner) : 0u);
             c->block_open = 1;
             return AIAEC_OK;
         }
@@ -782,7 +774,6 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
         } else {
             aiaec_block_fill_align(&c->u.align.grid, 1, &hio.inputs, &hio.outputs, hio.state_generation, work);
         }
-        aiaec_set_restart(work, pin ? ulcnet_stream_restart_mask(c->u.align.inner) : 0u);
         c->block_open = 1;
         return AIAEC_OK;
     }

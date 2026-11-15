@@ -10,15 +10,14 @@
  *             solid carried across the packet boundary). One accelerator call per packet at N=8, none for an event hop at N=1.
  *   events    frame_reset carries exactly the edge pattern; the state generation never changes for an event at N=8;
  *             an all-event packet is still one SUBMIT job.
- *   families  _spec at N=8 equals _freq at N=8 fed by an independent analyser restarted at the event hops, and the
- *             PCM family equals _spec plus an external AcIstft reset at the hops AiaecWork.synthesis_restart_mask
- *             names, sample for sample, through the events.
+ *   families  _spec at N=8 equals _freq at N=8 fed by an independent analyser, and the PCM family equals _spec plus
+ *             an external AcIstft, sample for sample, through the events: no entry restarts an analysis or a synthesis.
  *   realign   the PCM family and _spec (+ external ISTFT) at N=8 equal the N=1 stream sample for sample with the same
  *             events (none, one hop, adjacent, first, last, across a packet boundary, solid false -> true after
  *             earlier hops, every hop, a full reset in the middle), with the accelerator's end-of-packet state and
  *             the vendor call count compared: one call per packet at N=8, one per non-event hop at N=1.
- *   pin       the PCM family returns exactly silence for an event hop and drops the audio of the hop before it; N = 8
- *             equals N = 1 through the event (the documented behaviour, pinned so a change must be deliberate).
+ *   pin       the PCM family returns the event hop's signal (the error spectrum through the running analysis and
+ *             synthesis) and keeps the audio of the hop before it; N = 8 equals N = 1 through the event.
  *   tail      a 16000-count sample at the last real input sample comes back model_hop later, through the zero block
  *             tail_zero_blocks asks for, and is lost without it.
  *   failure   an inference failure, a non-finite mask and a finite mask whose enhanced frame overflows pass all N error
@@ -50,7 +49,7 @@
 #define BINS 129
 #define NF 8
 #define HOP_IN (NF * HOP)
-#define MAX_PACKETS 6
+#define MAX_PACKETS 7
 #define MAX_HOPS (MAX_PACKETS * NF)
 
 static int g_fail = 0;
@@ -361,19 +360,17 @@ static void block_input(AiaecInput *in, int block, const AiaecAlignEvent *ev) {
     in->u.align_ulcnet.event_count = NF;
 }
 
-/* _freq at N=8 fed by an analyser that restarts (zero history) at every event hop of the schedule: what _spec must equal */
-static void run_freq_restarted_analyser(const Sched *s, Run *r) {
+/* _freq at N=8 fed by an analyser that is never restarted: what _spec must equal */
+static void run_freq_continuous_analyser(const Sched *s, Run *r) {
     static float ere[MAX_HOPS * BINS], eim[MAX_HOPS * BINS], fre[MAX_HOPS * BINS], fim[MAX_HOPS * BINS];
-    int edge[MAX_HOPS], h;
+    int h;
     Ext ae, af;
     Ctxs c;
     Accel acc;
     int p;
 
-    expected_edges(s, edge);
     ext_make(&ae, 1, 0); ext_make(&af, 1, 0);
     for (h = 0; h < s->packets * NF; ++h) {
-        if (edge[h]) { ac_stft_reset(ae.stft); ac_stft_reset(af.stft); }
         ac_stft_push_planar(ae.stft, g_resid + (size_t)h * HOP, ere + (size_t)h * BINS, eim + (size_t)h * BINS);
         ac_stft_push_planar(af.stft, g_far + (size_t)h * HOP, fre + (size_t)h * BINS, fim + (size_t)h * BINS);
     }
@@ -390,18 +387,11 @@ static void run_freq_restarted_analyser(const Sched *s, Run *r) {
         fin.u.align_ulcnet.far_re = fre + (size_t)p * NF * BINS; fin.u.align_ulcnet.far_im = fim + (size_t)p * NF * BINS;
         fin.u.align_ulcnet.events = s->ev + (size_t)p * NF; fin.u.align_ulcnet.event_count = NF;
         CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
-              "freq with a restarted analyser: packet %d (the _freq family never reports a restart)", p);
+              "freq with a continuous analyser: packet %d (no family reports a restart)", p);
         accel_run(&acc, &w, NF);
         CHECK(aiaec_postprocess_freq(c.freq, 0, r->re + (size_t)p * NF * BINS, r->im + (size_t)p * NF * BINS) == AIAEC_OK, "freq post %d", p);
     }
     ctxs_free(&c);
-}
-
-static uint64_t edge_mask(const int *edge, int packet) {
-    uint64_t m = 0;
-    int k;
-    for (k = 0; k < NF; ++k) if (edge[packet * NF + k]) m |= (uint64_t)1u << k;
-    return m;
 }
 
 static int section_families(void) {
@@ -413,15 +403,13 @@ static int section_families(void) {
     Accel a_blk, a_spec;
     Ext syn;
     float hopbuf[HOP];
-    int edge[MAX_HOPS];
     int p, k, i, h;
 
     sched_clear(&s, "families", 4);
     s.ev[2].changed = 1; s.ev[3].changed = 1; s.ev[9].changed = 1; s.ev[16].changed = 1;
     for (h = 12; h < 32; ++h) s.ev[h].solid = 1;   /* solid edge at hop 12 */
-    expected_edges(&s, edge);
 
-    run_freq_restarted_analyser(&s, &rf);
+    run_freq_continuous_analyser(&s, &rf);
     if (ctxs_make(&c, NF, 1, 1, 0) != 0) return 1;
     accel_init(&a_blk, aiaec_state_generation(c.blk), ACC_MODEL);
     accel_init(&a_spec, aiaec_state_generation_spec(c.spec), ACC_MODEL);
@@ -430,38 +418,34 @@ static int section_families(void) {
     for (p = 0; p < s.packets; ++p) {
         AiaecInput in;
         AiaecWork w;
-        const uint64_t want_mask = edge_mask(edge, p);
         int rc;
 
         block_input(&in, p, s.ev);
         rc = aiaec_preprocess_spec(c.spec, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == want_mask &&
-              w.synthesis_restarted == (want_mask != 0u), "spec packet %d rc=%d mask %llx want %llx", p, rc,
-              (unsigned long long)w.synthesis_restart_mask, (unsigned long long)want_mask);
+        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
+              "spec packet %d rc=%d mask %llx want 0", p, rc, (unsigned long long)w.synthesis_restart_mask);
         accel_run(&a_spec, &w, NF);
         rc = aiaec_postprocess_spec(c.spec, 0, sre + (size_t)p * NF * BINS, sim + (size_t)p * NF * BINS);
         CHECK(rc == AIAEC_OK, "postprocess_spec packet %d rc=%d", p, rc);
 
         rc = aiaec_preprocess(c.blk, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == want_mask &&
-              w.synthesis_restarted == (want_mask != 0u), "block packet %d rc=%d mask %llx", p, rc,
-              (unsigned long long)w.synthesis_restart_mask);
+        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
+              "block packet %d rc=%d mask %llx want 0", p, rc, (unsigned long long)w.synthesis_restart_mask);
         accel_run(&a_blk, &w, NF);
         rc = aiaec_postprocess(c.blk, 0, pcm + (size_t)p * HOP_IN);
         CHECK(rc == AIAEC_OK, "postprocess packet %d rc=%d", p, rc);
 
         for (k = 0; k < NF; ++k) {
             const size_t hop = (size_t)p * NF + (size_t)k;
-            if ((want_mask >> k) & 1u) ac_istft_reset(syn.istft);
             ac_istft_push_planar(syn.istft, sre + hop * BINS, sim + hop * BINS, hopbuf);
             for (i = 0; i < HOP; ++i) want_pcm[hop * HOP + (size_t)i] = stream_saturate_s16(hopbuf[i]);
         }
     }
     CHECK(memcmp(sre, rf.re, sizeof(float) * (size_t)s.packets * NF * BINS) == 0 &&
           memcmp(sim, rf.im, sizeof(float) * (size_t)s.packets * NF * BINS) == 0,
-          "_spec at N=8 differs from _freq at N=8 fed by an analyser restarted at the event hops");
+          "_spec at N=8 differs from _freq at N=8 fed by a continuous analyser");
     CHECK(memcmp(pcm, want_pcm, sizeof(int16_t) * (size_t)s.packets * HOP_IN) == 0,
-          "PCM family differs from _spec + an external AcIstft reset at synthesis_restart_mask");
+          "PCM family differs from _spec + an external AcIstft");
     CHECK(a_blk.calls == s.packets && a_spec.calls == s.packets && a_blk.gen_changes == 0 && a_spec.gen_changes == 0,
           "calls %d/%d generation changes %u/%u", a_blk.calls, a_spec.calls, a_blk.gen_changes, a_spec.gen_changes);
     {   /* the PCM output is not silence: it must carry the signal */
@@ -470,7 +454,7 @@ static int section_families(void) {
         CHECK(energy > 100000, "PCM output is (nearly) silent: energy %lld", energy);
     }
     ext_free(&syn); ctxs_free(&c);
-    printf("section_families: _spec == _freq(restarted analyser), PCM == _spec + ISTFT reset at the mask, through %d events at N=8\n", 5);
+    printf("section_families: _spec == _freq(continuous analyser), PCM == _spec + ISTFT, through %d events at N=8\n", 5);
     return 0;
 }
 
@@ -480,7 +464,6 @@ typedef struct PcmRun {
     int16_t pcm[MAX_HOPS * HOP];
     float spec_re[MAX_HOPS * BINS], spec_im[MAX_HOPS * BINS];   /* the _spec family, N=1 or N=8 */
     float st_end[MAX_PACKETS][BINS];                            /* the accelerator state at each packet end */
-    int restart[MAX_HOPS];                                      /* hop restarted (block family mask) */
     int calls, pre_ok, post_ok;
     unsigned gen_changes;
 } PcmRun;
@@ -490,7 +473,7 @@ static void effective_state(const Accel *a, unsigned gen_now, float *out) {
     if (gen_now != a->gen) memset(out, 0, sizeof(a->st)); else memcpy(out, a->st, sizeof(a->st));
 }
 
-/* n = 1 or NF; PCM block family when !spec, else the _spec family with an external ISTFT reset at the mask */
+/* n = 1 or NF; PCM block family when !spec, else the _spec family with an external ISTFT */
 static void run_pcm(const Sched *s, int n, int spec, PcmRun *r) {
     Ctxs c;
     Accel acc;
@@ -520,15 +503,13 @@ static void run_pcm(const Sched *s, int n, int spec, PcmRun *r) {
         CHECK(rc == AIAEC_OK, "%s n=%d: preprocess block %d rc=%d", s->name, n, b, rc);
         if (rc != AIAEC_OK) break;
         ++r->pre_ok;
-        CHECK(w.synthesis_restarted == (w.synthesis_restart_mask != 0u) && (n == NF || (w.synthesis_restart_mask >> 1) == 0u),
+        CHECK(w.synthesis_restarted == 0 && w.synthesis_restart_mask == 0u,
               "%s n=%d: block %d restart fields %d / %llx", s->name, n, b, w.synthesis_restarted, (unsigned long long)w.synthesis_restart_mask);
-        for (k = 0; k < n; ++k) r->restart[h0 + k] = (int)((w.synthesis_restart_mask >> k) & 1u);
         if (w.action == AIAEC_SUBMIT) accel_run(&acc, &w, n);
         if (spec) {
             float *re = r->spec_re + (size_t)h0 * BINS, *im = r->spec_im + (size_t)h0 * BINS;
             rc = aiaec_postprocess_spec(c.spec, 0, re, im);
             for (k = 0; k < n; ++k) {
-                if ((w.synthesis_restart_mask >> k) & 1u) ac_istft_reset(syn.istft);
                 ac_istft_push_planar(syn.istft, re + (size_t)k * BINS, im + (size_t)k * BINS, hopbuf);
                 for (i = 0; i < HOP; ++i) r->pcm[(size_t)(h0 + k) * HOP + (size_t)i] = stream_saturate_s16(hopbuf[i]);
             }
@@ -582,9 +563,6 @@ static void realign_case(const Sched *s, const PcmRun *none) {
           memcmp(n8.spec_im, p8.spec_im, sizeof(float) * (size_t)hops * BINS) == 0, "%s: _spec spectra N=8 differ from N=1", s->name);
     for (p = 0; p < s->packets; ++p)
         CHECK(memcmp(b1.st_end[p], b8.st_end[p], sizeof(b1.st_end[p])) == 0, "%s: accelerator state at the end of packet %d differs (N=1 vs N=8)", s->name, p);
-    for (h = 0; h < hops; ++h)
-        CHECK(b8.restart[h] == b1.restart[h] && b1.restart[h] == (edge[h] != 0) && p8.restart[h] == b1.restart[h],
-              "%s: hop %d restart flags N=1 %d N=8 %d _spec %d, edge %d", s->name, h, b1.restart[h], b8.restart[h], p8.restart[h], edge[h]);
     CHECK(b8.calls == s->packets && p8.calls == s->packets && b1.calls == hops - edges && n8.calls == hops - edges,
           "%s: vendor calls N=8 %d/%d (want %d), N=1 %d/%d (want %d)", s->name, b8.calls, p8.calls, s->packets, b1.calls, n8.calls, hops - edges);
     CHECK(b8.pre_ok == s->packets && b8.post_ok == s->packets && b1.pre_ok == hops && b1.post_ok == hops && p8.pre_ok == p8.post_ok &&
@@ -660,15 +638,14 @@ static long long hop_energy(const int16_t *pcm, int hop) {
     return e;
 }
 
-/* The PCM entries restart their own STFT/ISTFT at an event hop, so the hop that carries the event returns exactly
- * silence and the audio of the input hop before it is not output (one hop of audio per event); hops before the event are
- * those of the event-free stream, the hop after it is not. N = 8 returns the same PCM as N = 1. This is the documented
- * behaviour (aiaec.h "Alignment events"); the _freq family, which restarts nothing but the model, has no such gap. */
+/* The PCM entries restart only the model at an event hop: the analysis and synthesis keep running, so the event hop returns
+ * the error spectrum through them (it carries the signal, the audio of the hop before it is output); hops before the event
+ * are those of the event-free stream, the hop after it is not (the model restarted). N = 8 returns the same PCM as N = 1.
+ * Pinned so a change must be deliberate (aiaec.h "Alignment events"); section_families pins the sample values. */
 static int section_event_hop_pin(void) {
     static Sched none, ev;
     static PcmRun r_none, r_ev1, r_ev8;
     const int event = 11, hops = 3 * NF;
-    int h, i;
 
     sched_clear(&none, "pin_none", 3);
     sched_clear(&ev, "pin_event", 3);
@@ -677,19 +654,18 @@ static int section_event_hop_pin(void) {
     run_pcm(&ev, 1, 0, &r_ev1);
     run_pcm(&ev, NF, 0, &r_ev8);
 
-    for (i = 0; i < HOP; ++i) {
-        CHECK(r_ev1.pcm[event * HOP + i] == 0 && r_ev8.pcm[event * HOP + i] == 0, "event hop sample %d is not exactly zero (N=1 %d, N=8 %d)", i,
-              r_ev1.pcm[event * HOP + i], r_ev8.pcm[event * HOP + i]);
-    }
     CHECK(hop_energy(r_none.pcm, event) > 1000000, "control: the event-free stream is silent at hop %d (%lld)", event, hop_energy(r_none.pcm, event));
+    CHECK(hop_energy(r_ev1.pcm, event) > 1000000 && hop_energy(r_ev8.pcm, event) > 1000000,
+          "the event hop is silent: N=1 %lld N=8 %lld", hop_energy(r_ev1.pcm, event), hop_energy(r_ev8.pcm, event));
     CHECK(hop_energy(r_ev1.pcm, event - 1) > 1000000 && hop_energy(r_ev1.pcm, event + 1) > 1000000,
           "the hops around the event are silent: %lld / %lld", hop_energy(r_ev1.pcm, event - 1), hop_energy(r_ev1.pcm, event + 1));
     CHECK(memcmp(r_ev1.pcm, r_none.pcm, sizeof(int16_t) * (size_t)event * HOP) == 0, "hops before the event differ from the event-free stream");
+    CHECK(memcmp(r_ev1.pcm + (size_t)event * HOP, r_none.pcm + (size_t)event * HOP, sizeof(int16_t) * HOP) != 0,
+          "the event hop equals the event-free stream (the event had no effect)");
     CHECK(memcmp(r_ev1.pcm + (event + 1) * HOP, r_none.pcm + (event + 1) * HOP, sizeof(int16_t) * HOP) != 0,
-          "the hop after the event equals the event-free stream (the history was not discarded)");
+          "the hop after the event equals the event-free stream (the model was not restarted)");
     CHECK(memcmp(r_ev1.pcm, r_ev8.pcm, sizeof(int16_t) * (size_t)hops * HOP) == 0, "PCM at N=8 differs from N=1 through an event");
-    for (h = 0; h < hops; ++h) CHECK(r_ev1.restart[h] == (h == event), "restart flag at hop %d", h);
-    printf("section_event_hop_pin: the event hop is exactly silent, N=8 == N=1, neighbours carry signal\n");
+    printf("section_event_hop_pin: the event hop carries signal, N=8 == N=1, neighbours carry signal\n");
     return 0;
 }
 
@@ -856,12 +832,12 @@ static int section_failure(void) {
 
     /* A status other than OK: the packet passes through. A dirty status (a run that started) advances the generation,
      * with or without an event frame. NOT_STARTED leaves it alone, except that a packet with an event frame the graph never
-     * applied advances it once, so the accelerator restarts its state. Packets 0, 3 and 5 run; 3 and 5 must equal a run
+     * applied advances it once, so the accelerator restarts its state. Packets 0, 3 and 6 run; 3 and 6 must equal a run
      * that starts from a zero state. */
     {
-        enum { P = 6 };
-        static const int status[P] = { 0, 7, 7, 0, STREAM_RUN_NOT_STARTED, 0 };
-        static const unsigned step[P] = { 0u, 1u, 1u, 0u, 1u, 0u };   /* packet 1 holds the hop-10 event, packet 4 the hop-33 one */
+        enum { P = 7 };
+        static const int status[P] = { 0, 7, 7, 0, STREAM_RUN_NOT_STARTED, STREAM_RUN_NOT_STARTED, 0 };
+        static const unsigned step[P] = { 0u, 1u, 1u, 0u, 1u, 0u, 0u };   /* packet 1 holds the hop-10 event, packet 4 the hop-33 one */
         static float re[NF * BINS], im[NF * BINS], fresh_re[2][NF * BINS], fresh_im[2][NF * BINS];
         unsigned gen_seen[P], want;
         AiaecFreqInput fin;
@@ -872,7 +848,7 @@ static int section_failure(void) {
         s.ev[10].changed = 1;
         s.ev[33].changed = 1;
         for (f = 0; f < 2; ++f) {
-            const int fp = f ? 5 : 3;
+            const int fp = f ? 6 : 3;
             if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
             accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
             freq_input(&fin, fp * NF, NF, s.ev);
@@ -909,7 +885,7 @@ static int section_failure(void) {
         CHECK(acc.calls == 3 && acc.gen_changes == 2u, "failed packets: accelerator ran %d packets and saw %u generation changes",
               acc.calls, acc.gen_changes);
         CHECK(memcmp(re, fresh_re[1], sizeof(re)) == 0 && memcmp(im, fresh_im[1], sizeof(im)) == 0,
-              "packet 5 after the NOT_STARTED event packet did not start from a zero state");
+              "packet 6 after the NOT_STARTED packets did not start from a zero state");
         ctxs_free(&c);
     }
     printf("section_failure: failed, non-finite and overflowing packets pass all %d error spectra through\n", NF);
