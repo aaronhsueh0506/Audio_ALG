@@ -1,13 +1,15 @@
 /* Pool size of dfn2_stream: the STFT and ISTFT borrow the stream's one shared FFT handle, so the pool
  * carries a single FFT table, not three. For each grid row, in memory mode (caller ERB tables) and
  * file mode (pool-owned ERB storage):
- *   - get_mem_size() equals the literal byte count below;
+ *   - get_mem_size() equals the literal byte count below, and file mode is memory mode plus exactly the two ERB
+ *     tables (the file loader needs no table-sized scratch), for a full and a freq_only context alike;
  *   - that count is the byte count of a stream whose STFT and ISTFT each carry their own FFT table
  *     (before_*) less those two tables (2 * align16(fft_get_mem_size));
- *   - init_ex() succeeds on exactly that many bytes and refuses one aligned unit less;
+ *   - init_ex() succeeds on exactly that many bytes and refuses one aligned unit less, and a descriptor of the
+ *     previous DFN2_STREAM_LAYOUT_VERSION;
  *   - a freq_only context (cfg.freq_only) needs the literal freq_* byte count: the full count less the FFT table,
- *     the STFT, the ISTFT and the PCM scratch slab, and in file mode less the table-sized load scratch too, each
- *     taken from audiolib's own size queries;
+ *     the STFT, the ISTFT and the PCM scratch slab, in memory and file mode alike, each taken from audiolib's own
+ *     size queries;
  *   - 16 hops of a fixed input through a fixed stand-in accelerator hash to the golden value of
  *     that stream, with a stand-in inverse ERB table in which every bin splits 0.75 / 0.25 between
  *     two bands (a partition of unity, which init requires). The hash is the same for the NEON and the scalar kernels
@@ -36,13 +38,13 @@ typedef struct Row {
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 103936, 300928, 156640, 353632, 32320, 163648, 0x4e50404eea4130c5ull, 0 },
+    { 48000, 1024, 32, 1, 0, 1, 103936, 235264, 156640, 287968, 32320, 163648, 0x4e50404eea4130c5ull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 66448, 103600, 80752, 117904, 47824, 72592, 0xf1d08272f6a453e0ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 121824, 158976, 136128, 173280, 103200, 127968, 0xb48673d60e844efcull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 164304, 361296, 217008, 414000, 92688, 224016, 0x047a1f7cb0fca41cull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 66448, 91216, 80752, 105520, 47824, 72592, 0xf1d08272f6a453e0ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 121824, 146592, 136128, 160896, 103200, 127968, 0xb48673d60e844efcull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 164304, 295632, 217008, 348336, 92688, 224016, 0x047a1f7cb0fca41cull, 0 },
 };
 #endif
 
@@ -141,16 +143,26 @@ static void run_row(const Row *r, int idx) {
               "row %d (%d/%d N=%d): freq_only pools %llu / %llu, want %llu / %llu", idx, r->sr, r->fft, r->n,
               (unsigned long long)req_fm.bytes, (unsigned long long)req_ff.bytes,
               (unsigned long long)r->freq_mem, (unsigned long long)r->freq_file);
-        CHECK(r->bytes_mem - r->freq_mem == pcm_half && r->bytes_file - r->freq_file == pcm_half + erb,
-              "row %d: freq_only leaves out %llu / %llu, want %zu / %zu", idx,
+        CHECK(r->bytes_mem - r->freq_mem == pcm_half && r->bytes_file - r->freq_file == pcm_half,
+              "row %d: freq_only leaves out %llu / %llu, want %zu in both modes", idx,
               (unsigned long long)(r->bytes_mem - r->freq_mem), (unsigned long long)(r->bytes_file - r->freq_file),
-              pcm_half, pcm_half + erb);
+              pcm_half);
+        CHECK(req_file.bytes == req_mem.bytes + 2u * erb && req_ff.bytes == req_fm.bytes + 2u * erb,
+              "row %d: file mode is not memory mode plus two ERB tables (%zu each): full %llu / %llu, freq_only %llu / %llu",
+              idx, erb, (unsigned long long)req_mem.bytes, (unsigned long long)req_file.bytes,
+              (unsigned long long)req_fm.bytes, (unsigned long long)req_ff.bytes);
     }
 
     /* exact size initialises; one aligned unit less is refused */
     pool = NULL;
     if (posix_memalign(&pool, 16, (size_t)req_mem.bytes) != 0) exit(1);
     CHECK(dfn2_stream_init_ex(&cfg_mem, pool, (size_t)req_mem.bytes - 16u, &req_mem) == NULL, "row %d: undersized pool accepted", idx);
+    {   /* a descriptor of the previous layout is refused */
+        DFN2StreamMemReq stale = req_mem;
+        stale.layout_version = DFN2_STREAM_LAYOUT_VERSION - 1u;
+        CHECK(dfn2_stream_init_ex(&cfg_mem, pool, (size_t)req_mem.bytes, &stale) == NULL,
+              "row %d: a layout %u descriptor accepted", idx, (unsigned)stale.layout_version);
+    }
     s = dfn2_stream_init_ex(&cfg_mem, pool, (size_t)req_mem.bytes, &req_mem);
     CHECK(s != NULL, "row %d: init on the exact pool size failed", idx);
     if (!s) { free(pool); free(fwd); free(inv); return; }

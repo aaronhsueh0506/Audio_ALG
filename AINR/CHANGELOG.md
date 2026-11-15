@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### DFN2 file mode: one chunked ERB loader for both entry families
+
+`dfn2_stream_init_from_erb_file[_ex]` without `freq_only` (so `ainr_init()` and `ainr_init_from_erb_file()`) reads the inverse ERB table 64 floats at a time into band-major order, as a `freq_only` context does, and no longer carves a table-sized load scratch: the PCM pools are `n_bins * n_erb * 4` bytes smaller (`ainr_get_mem_size()` at 48 kHz / 1024 361,392 -> 295,728 B, mask-only 301,024 -> 235,360 B, 16 kHz / 256 103,696 -> 91,312 B). `DFN2_STREAM_LAYOUT_VERSION` 4 -> 5. Outputs are bit-identical; memory mode and the `_freq` pools are unchanged. Board samples on the PCM family size their pool at run time and only need a rebuild.
+
 ### `DFN2StreamConfig.freq_only`: spectrum-only stream contexts without the PCM half
 
 A stream built with `freq_only` set holds the `DFN2Prepost` (and, in file mode, the two ERB tables) and no FFT, STFT / ISTFT, PCM scratch or ERB load scratch; only the `_freq` entries run on it. The `_freq` family of `ainr` and the pool plan of the desktop DFN2 pipelines use it: `ainr_get_mem_size_freq()` at 48 kHz / 1024 is 232,320 B (was 369,600), the model stream of the pipelines 92,688 B (was 164,304). `DFN2_STREAM_LAYOUT_VERSION` is 4. Outputs are bit-identical and every PCM pool is unchanged; sizes, evidence and tests are in `pipelines/CHANGELOG.md`.

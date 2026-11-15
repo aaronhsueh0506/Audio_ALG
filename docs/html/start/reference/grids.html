@@ -213,7 +213,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <td>AEC 函式庫 <code>aec.h</code>（sibling 檢出）</td>
 <td><code>Aec</code> pool 的版號，單支與 4ch array（<code>AecConfig.n_mics = 4</code>：共享 delay + 4 lanes + 融合與增益級，全在同一塊 pool）共用 <code>AecMemReq</code>；SRP-PHAT/BF 在 sample helper <code>array_sample_beam.h</code>，沒有 descriptor</td></tr>
 <tr><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6</td>
-<td><code>pipelines/dfn/dfn_res_stage.h</code></td><td>DFN2 post-RES stage（舊物件；兩支 pipeline 範例改走模型串流，其版號為 <code>DFN2_STREAM_LAYOUT_VERSION</code> = 4，<code>stream/ainr/dfn2/dfn2_stream.h</code>）</td></tr>
+<td><code>pipelines/dfn/dfn_res_stage.h</code></td><td>DFN2 post-RES stage（舊物件；兩支 pipeline 範例改走模型串流，其版號為 <code>DFN2_STREAM_LAYOUT_VERSION</code> = 5，<code>stream/ainr/dfn2/dfn2_stream.h</code>）</td></tr>
 <tr><td><code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 7</td>
 <td><code>pipelines/dfn/dfn_rate_bridge.h</code></td><td>原生格點 ↔ 48 kHz stage 的 rate bridge 轉接層（舊物件；範例直接用 <code>AinrBridge</code>，<code>AINR_BRIDGE_LAYOUT_VERSION</code> = 1，<code>stream/ainr/bridge/ainr_bridge.h</code>）</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18</td>

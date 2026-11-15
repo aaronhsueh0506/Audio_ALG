@@ -3,6 +3,23 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — DFN2 file mode reads the ERB file in chunks for both entry families: the PCM pools lose the table-sized load scratch
+
+`dfn2_stream_init_from_erb_file[_ex]` on a context without `freq_only` (and so `ainr_init()` / `ainr_init_from_erb_file()`) now loads the inverse ERB table the way a `freq_only` context does: 64 floats at a time straight into band-major order. The table-sized load scratch (`n_bins * n_erb * 4` bytes: 65,664 B at 48 kHz / 1024 / 32 bands, 12,384 B at 16 kHz / 256 / 24) is no longer carved; one loader serves both kinds of context. Header, short-file, foreign-grid and partition-of-unity refusals are unchanged.
+
+- **Versions.** `DFN2_STREAM_LAYOUT_VERSION` 4 -> 5 (the file-mode carve of a full context changed; `build_flags_hash` folds the version, so every layout-4 descriptor is refused). `DFN2_PREPOST_CARVE_VERSION` 12 and `AINR_BRIDGE_LAYOUT_VERSION` 1 stay.
+- **Pool bytes (host arm64, NE10, from the size queries; the board ABI differs).** Memory mode and every `_freq` pool are unchanged.
+
+  | PCM pool | 16 kHz / 256 N=1 | 16 kHz / 256 N=8 | 48 kHz / 1024 full | 48 kHz / 1024 mask-only |
+  |---|---|---|---|---|
+  | `dfn2_stream`, file mode | 103,600 -> 91,216 | 158,976 -> 146,592 | 361,296 -> 295,632 | 300,928 -> 235,264 |
+  | `ainr_get_mem_size()` | 103,696 -> 91,312 | 160,864 -> 148,480 | 361,392 -> 295,728 | 301,024 -> 235,360 |
+
+- **Same output.** The digest harness of the `freq_only` change (return codes, job flag, state generation, model input tensors and outputs of every hop; three catalog grids and four more, full and mask-only, `SIMD=1` and `0`, seven scenarios) gives the digests of the previous commit on every line (273 + 141 per `SIMD` setting), PCM entries of the stream and of `ainr` included; the size lines move only for `stream_pcm_file` and `ainr_pcm`, each by exactly one table.
+- **Board impact.** No sample source changes: `alg_ai3_dfn`, `alg_ai3_dfn_lite` and `uvc_ai_nr_stream` size their pool with `ainr_get_mem_size()` at run time. They must be rebuilt with the library (the pool layout changed).
+- **Tests.** `stream/ainr/dfn2/tests/pool_size.c`: file-mode literals, file mode equal to memory mode plus exactly two ERB tables for a full and a `freq_only` context, the `freq_only` saving the same in both modes, and a descriptor of the previous layout version refused. `stream/ainr/tests/test_ainr_pool_gates.c`: the four PCM literals. `check_erb_file` (PCM file mode against memory mode, hop for hop) and `freq_only` (chunk loader against caller tables) cover the loader.
+- Docs: `docs/html/models/dfn2/reference/board.html`, `docs/html/pipelines/{mono,4ch}/dfn2/index.html`, `docs/html/pipelines/reference/dfn2/configuration.html`, `docs/html/start/reference/grids.html`.
+
 ## [Unreleased] — 2026-11-15 — AIAEC spectrum-only contexts carry no analysis, synthesis or PCM buffer (`UlcnetStreamConfig.freq_only`, `DeepVqeStreamConfig.freq_only`, `aiaec_*_freq`)
 
 An `UlcnetStream` or `DeepVqeStream` served both entry families from one pool, so a caller of the `_freq` entries alone still paid for the FFT table, two `AcStft`, one `AcIstft` and the PCM scratch slab of the PCM entries. Both config structs have a new field `freq_only` (`UlcnetStreamConfig`: after `frames_per_call`; `DeepVqeStreamConfig`: after `grid`): non-zero carves the stream header and the `UlcnetPrepost` / `DeepVqePrepost`, nothing else. Such a stream runs the `_freq` entries exactly as before; its PCM entries (`ulcnet_stream_pre_process_f32()`, `_pre_process()`, `_pre_process_packet_f32()`, `_post_process()`; `deepvqe_stream_pre_process()`, `_post_process()`) return -1 and change nothing (an open `_freq` hop stays open), and reset leaves out the framing it does not have. `ulcnet_stream_pre_process_packet_freq()` hands the caller's planes to `UlcnetPrepost` directly instead of copying them into the stream's scratch first (`UlcnetPrepost` copies them itself); outputs are unchanged on both kinds of stream.

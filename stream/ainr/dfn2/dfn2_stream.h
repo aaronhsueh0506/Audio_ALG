@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #define DFN2_STREAM_DESCRIPTOR_VERSION 1u
-#define DFN2_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define DFN2_STREAM_LAYOUT_VERSION     5u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define DFN2_STREAM_ALIGNMENT          16u   /* the one alignment of every module (audiolib mem_align.h) */
 
 /* Largest accepted |bin| of a MODEL-scale spectrum, as IEEE bits: 2^63, so the feature power re^2 + im^2 stays

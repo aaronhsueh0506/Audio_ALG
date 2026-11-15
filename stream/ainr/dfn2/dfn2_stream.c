@@ -56,7 +56,6 @@ typedef struct DFN2StreamLayout {
     /* File mode only (both NULL in memory mode): */
     float      *erb_fwd_storage;   /* [n_bins][n_erb], bin-major, kept */
     float      *erb_inv_storage;   /* [n_erb][n_bins], band-major, kept */
-    float      *erb_scratch;       /* [n_bins][n_erb], bin-major, transient load scratch; NULL when freq_only */
     uint32_t    prepost_build_hash; /* dfn2_prepost's own DFN2PrepostMemReq.build_flags_hash, folded
                                       * into this stream's own hash by dfn2_stream_get_mem_size() */
 } DFN2StreamLayout;
@@ -106,7 +105,7 @@ static int cfg_valid(const DFN2StreamConfig *cfg) {
  * matching across both calls with the same cfg. -1 on a bad config or an overflowing carve.
  * Carve order (part of DFN2_STREAM_LAYOUT_VERSION/build_flags_hash -- bump both if this changes):
  * self, hpf (if enabled), fft, stft, istft, prepost, scratch slab, then (file mode only)
- * erb_fwd_storage, erb_inv_storage, erb_scratch. freq_only: self, prepost, then (file mode only)
+ * erb_fwd_storage, erb_inv_storage. freq_only: self, prepost, then (file mode only)
  * erb_fwd_storage, erb_inv_storage. */
 static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
                               DFN2StreamLayout *out, size_t *total) {
@@ -192,10 +191,6 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
         out->erb_fwd_storage = (float *)ptr;
         if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
         out->erb_inv_storage = (float *)ptr;
-        if (!cfg->freq_only) {
-            if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
-            out->erb_scratch = (float *)ptr;
-        }
     }
 
     *total = ck_align16_size(cursor);
@@ -505,20 +500,8 @@ int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im
  * n_bins*n_erb float32 inverse (bin-major as the file stores it, transposed to band-major here,
  * as the library's erb_inv argument requires). */
 
-/* bin-major [n_bins][n_erb] -> band-major [n_erb][n_bins]. */
-static void transpose_band_major(const float *bin_major, float *band_major,
-                                 int n_bins, int n_erb) {
-    int bin, band;
-    for (bin = 0; bin < n_bins; ++bin) {
-        for (band = 0; band < n_erb; ++band) {
-            band_major[(size_t)band * (size_t)n_bins + (size_t)bin] =
-                bin_major[(size_t)bin * (size_t)n_erb + (size_t)band];
-        }
-    }
-}
-
-/* The file's inverse table (bin-major) read straight into its band-major place, a stack chunk at a time: the
- * freq_only load, which has no table-sized scratch. 0, or -1 on a short read. */
+/* The file's inverse table (bin-major) read straight into its band-major place, a stack chunk at a time, so the
+ * pool holds no table-sized load scratch. 0, or -1 on a short read. */
 static int read_inv_band_major(FILE *fp, const DFN2Grid *grid, float *band_major) {
     float chunk[64];
     const size_t n_bins = (size_t)grid->n_bins, n_erb = (size_t)grid->n_erb;
@@ -537,11 +520,9 @@ static int read_inv_band_major(FILE *fp, const DFN2Grid *grid, float *band_major
     return 0;
 }
 
-/* Reads n_bins*n_erb floats into fwd_out (kept bin-major) and the inverse table into inv_out, band-major:
- * through `scratch` (bin-major as stored, then transposed) or, scratch NULL, a chunk at a time. 0, or -1 after
- * closing the file on an open/header/short-read/dimension-mismatch failure. */
-static int load_erb_file(const char *path, const DFN2Grid *grid,
-                         float *fwd_out, float *inv_out, float *scratch) {
+/* Reads n_bins*n_erb floats into fwd_out (kept bin-major) and the inverse table into inv_out, band-major.
+ * 0, or -1 after closing the file on an open/header/short-read/dimension-mismatch failure. */
+static int load_erb_file(const char *path, const DFN2Grid *grid, float *fwd_out, float *inv_out) {
     FILE *fp;
     int32_t hdr[2];
     size_t want = (size_t)grid->n_bins * (size_t)grid->n_erb;
@@ -562,12 +543,7 @@ static int load_erb_file(const char *path, const DFN2Grid *grid,
         fclose(fp);
         return -1;
     }
-    if (scratch) {
-        rc = fread(scratch, sizeof(float), want, fp) == want ? 0 : -1;
-        if (rc == 0) transpose_band_major(scratch, inv_out, grid->n_bins, grid->n_erb);
-    } else {
-        rc = read_inv_band_major(fp, grid, inv_out);
-    }
+    rc = read_inv_band_major(fp, grid, inv_out);
     fclose(fp);
     return rc;
 }
@@ -583,8 +559,7 @@ DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const
     /* Loaded straight into pool-owned storage; a short read or mismatch returns NULL with no
      * DFN2Stream constructed -- a partial read left in the pool is harmless since no live
      * object is returned. */
-    if (load_erb_file(erb_path, &cfg->grid, layout.erb_fwd_storage, layout.erb_inv_storage,
-                      layout.erb_scratch) != 0)
+    if (load_erb_file(erb_path, &cfg->grid, layout.erb_fwd_storage, layout.erb_inv_storage) != 0)
         return NULL;
 
     return dfn2_stream_finish_init(cfg, (unsigned char *)pool, &layout,
