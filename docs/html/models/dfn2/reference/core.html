@@ -370,7 +370,7 @@ hop   caller                    dfn2_stream                       NPU
 <h2 id="section-12">State 表</h2>
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
-<tr><td>STFT／ISTFT 歷史</td><td>本層（<code>AcStft</code>／<code>AcIstft</code>，pool 內）</td><td>重疊相加的樣本歷史</td><td><code>dfn2_stream_reset()</code>；<code>AC_OLA_ACCUMULATE</code> 不需額外排水邏輯</td></tr>
+<tr><td>STFT／ISTFT 歷史</td><td>本層（<code>AcStft</code>／<code>AcIstft</code>，pool 內）；<code>DFN2StreamConfig.freq_only</code> 的串流沒有這一列，分析與合成在呼叫端</td><td>重疊相加的樣本歷史</td><td><code>dfn2_stream_reset()</code>；<code>AC_OLA_ACCUMULATE</code> 不需額外排水邏輯</td></tr>
 <tr><td>GRU／df_convp 遞迴 state</td><td>一律由加速器自行持有——<code>DFN2StreamConfig</code> 沒有狀態登錄欄位（跟 <code>dfn2_prepost</code> 自己的 <code>DFN2PrepostConfig.gru_hidden/df_convp_history</code> 不同，這層 stream SDK 從不設定它們，一律留空），呼叫端只能靠 <code>io.state_generation</code> 判斷要不要回填量化零</td><td>模型的遞迴記憶</td><td>reset、每個暖機 hop、被拒的 commit 各歸零一次並讓 <code>state_generation</code> +1</td></tr>
 <tr><td><code>state_generation</code></td><td>本層轉呼叫 <code>dfn2_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=1；之後每次上列事件 +1；<code>io.state_generation</code> 在 <code>frame_open()</code> 後才取樣，已反映上一 hop 的暖機／拒絕</td></tr>
 <tr><td>ERB 矩陣</td><td>記憶體模式：呼叫端；檔案模式：本層 pool</td><td>forward（bin-major）／inverse（band-major）</td><td>stream 的生命週期內不變</td></tr>

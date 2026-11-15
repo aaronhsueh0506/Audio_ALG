@@ -2,7 +2,9 @@
  * misaligned is refused (AINR_ERR_POOL) before anything is written; a larger pool is accepted; NULL
  * arguments are AINR_ERR_NULL; a missing ERB file is AINR_ERR_ERB_FILE. Every refusal leaves *ctx NULL
  * and *info untouched (a pool refusal also leaves the pool bytes unchanged), and the same pool then
- * initialises normally. Not built under NO_STDIO. */
+ * initialises normally. The size of each family is the literal of its case (_freq: no analysis, synthesis or PCM
+ * buffer, so the smaller one), and blocks run on a pool of exactly that size leave the bytes after it alone.
+ * Not built under NO_STDIO. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -73,7 +75,33 @@ static int refused(Fam f, const AinrConfig *cfg, const char *erb, unsigned char 
     return 0;
 }
 
-static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, const char *label) {
+/* A few blocks with a reset and a failed run in between, through the family's own entries. */
+static int run_blocks(Fam f, void *ctx, const AinrConfig *cfg) {
+    const int n = cfg->hop_in / (cfg->fft / 2), n_bins = cfg->fft / 2 + 1;
+    const size_t spec = (size_t)n * (size_t)n_bins;
+    int16_t *pcm = (int16_t *)calloc((size_t)cfg->hop_in * 2u, sizeof(int16_t));
+    float *x = (float *)calloc(spec * 4u, sizeof(float));
+    int t, k, j, rc = 0;
+    if (!pcm || !x) exit(1);
+    for (t = 0; t < 12 && rc == 0; ++t) {
+        AinrWork w;
+        for (k = 0; k < cfg->hop_in; ++k) pcm[k] = (int16_t)((k * 29 + t * 7) % 2001 - 1000);
+        for (k = 0; k < (int)(spec * 2u); ++k) x[k] = (float)((k * 13 + t * 5) % 97) / 97.0f - 0.5f;
+        if (t == 5) { if (f == FAM_PCM) ainr_reset((AinrCtx *)ctx); else ainr_reset_freq((AinrFreqCtx *)ctx); }
+        rc = f == FAM_PCM ? ainr_preprocess((AinrCtx *)ctx, pcm, &w)
+                          : ainr_preprocess_freq((AinrFreqCtx *)ctx, x, x + spec, x, x + spec, &w);
+        if (rc != AINR_OK) break;
+        for (j = 0; j < w.output_count; ++j)
+            for (k = 0; k < (int)w.outputs[j].elements; ++k) w.outputs[j].data[k] = 0.25f;
+        rc = f == FAM_PCM ? ainr_postprocess((AinrCtx *)ctx, t == 8, pcm + cfg->hop_in)
+                          : ainr_postprocess_freq((AinrFreqCtx *)ctx, t == 8, x + 2u * spec, x + 3u * spec);
+    }
+    free(pcm);
+    free(x);
+    return rc;
+}
+
+static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, uint64_t want_bytes, const char *label) {
     StreamMemReq req;
     unsigned char *buf;
     size_t bytes;
@@ -83,14 +111,25 @@ static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, 
 
     if (get_size(f, cfg, &req) != AINR_OK) { fprintf(stderr, "%s/%s: size fail\n", label, fam_name(f)); return 1; }
     REQUIRE(req.alignment == AINR_ALIGNMENT, "reported alignment is not AINR_ALIGNMENT");
+    if (req.bytes != want_bytes) {
+        fprintf(stderr, "%s/%s: pool is %llu bytes, want %llu\n", label, fam_name(f),
+                (unsigned long long)req.bytes, (unsigned long long)want_bytes);
+        return 1;
+    }
     bytes = (size_t)req.bytes;
     if (posix_memalign((void **)&buf, 64, bytes + 128) != 0) exit(1);
 
-    /* exact pool, then a larger one */
+    /* exact pool (blocks run on it stay inside it), then a larger one */
     memset(&info, 0, sizeof(info));
+    memset(buf + bytes, 0xC3, 128);
     rc = try_init(f, cfg, erb, buf, bytes, &ctx, &info);
     EXPECT(rc, AINR_OK, "exact pool");
     REQUIRE(ctx != NULL && info.graph_path != NULL && info.tail_zero_blocks >= 1, "exact pool: ctx/info not set");
+    EXPECT(run_blocks(f, ctx, cfg), AINR_OK, "blocks on the exact pool");
+    {
+        size_t k;
+        for (k = 0; k < 128; ++k) REQUIRE(buf[bytes + k] == 0xC3, "a write past the exact pool");
+    }
     rc = try_init(f, cfg, erb, buf, bytes + 64, &ctx, &info);
     EXPECT(rc, AINR_OK, "larger pool");
     REQUIRE(ctx != NULL, "larger pool: ctx NULL");
@@ -148,14 +187,15 @@ static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, 
     return 0;
 }
 
-static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
+static int run_case(int sr, int fft, int n_erb, int n, uint64_t pcm_bytes, uint64_t freq_bytes, const char *label) {
     AinrConfig cfg;
     char erb[160];
     int f, rc = 0;
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * (fft / 2);
     snprintf(erb, sizeof(erb), "/tmp/ainr_poolgates_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
     write_synthetic_erb(erb, fft / 2 + 1, n_erb);
-    for (f = FAM_PCM; f <= FAM_FREQ; ++f) rc |= run_family((Fam)f, &cfg, erb, n_erb, label);
+    for (f = FAM_PCM; f <= FAM_FREQ; ++f)
+        rc |= run_family((Fam)f, &cfg, erb, n_erb, f == FAM_PCM ? pcm_bytes : freq_bytes, label);
     unlink(erb);
     return rc;
 }
@@ -163,11 +203,11 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
 int main(void) {
     int rc = 0;
 #ifdef DFN2_MASK_ONLY
-    rc |= run_case(48000, 1024, 32, 1, "poolgates[lite 48k/1024 N=1]");
+    rc |= run_case(48000, 1024, 32, 1, 301024, 171952, "poolgates[lite 48k/1024 N=1]");
 #else
-    rc |= run_case(16000, 256, 24, 1, "poolgates[full 16k/256 N=1]");
-    rc |= run_case(16000, 256, 24, 8, "poolgates[full 16k/256 N=8]");
-    rc |= run_case(48000, 1024, 32, 1, "poolgates[full 48k/1024 N=1]");
+    rc |= run_case(16000, 256, 24, 1, 103696, 74752, "poolgates[full 16k/256 N=1]");
+    rc |= run_case(16000, 256, 24, 8, 160864, 137360, "poolgates[full 16k/256 N=8]");
+    rc |= run_case(48000, 1024, 32, 1, 361392, 232320, "poolgates[full 48k/1024 N=1]");
 #endif
     if (rc) { printf("test_ainr_pool_gates: FAIL\n"); return 1; }
     printf("test_ainr_pool_gates: PASS\n");

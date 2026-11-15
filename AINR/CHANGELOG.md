@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### `DFN2StreamConfig.freq_only`: spectrum-only stream contexts without the PCM half
+
+A stream built with `freq_only` set holds the `DFN2Prepost` (and, in file mode, the two ERB tables) and no FFT, STFT / ISTFT, PCM scratch or ERB load scratch; only the `_freq` entries run on it. The `_freq` family of `ainr` and the pool plan of the desktop DFN2 pipelines use it: `ainr_get_mem_size_freq()` at 48 kHz / 1024 is 232,320 B (was 369,600), the model stream of the pipelines 92,688 B (was 164,304). `DFN2_STREAM_LAYOUT_VERSION` is 4. Outputs are bit-identical and every PCM pool is unchanged; sizes, evidence and tests are in `pipelines/CHANGELOG.md`.
+
 ### The desktop DFN2 pipelines call `dfn2_stream_*_freq` (memory mode) and `AinrBridge` directly
 
 `pipelines/dfn/dfn_hop.h` / `dfn_hop_pool.h` and the two example mains (`mono_aec_dfn_res`, `4ch_aec_bf_dfn_res`) are now callers of `stream/ainr/dfn2` (`dfn2_stream_get_mem_size()`, `dfn2_stream_init_ex()` with caller ERB matrices, `dfn2_stream_pre_process_freq_dual()`, `dfn2_stream_post_process_freq()`, `dfn2_stream_reset()`, `dfn2_stream_set_atten_lim()`, `dfn2_stream_state_generation()`) and of `ainr_bridge_*`, instead of `DfnResStage` / `DfnRateBridge`. No change to `stream/ainr`, `lib/ainr`, `ainr.h` or any pool or layout version here: `dfn2_stream.c` and `ainr_bridge.c` are additionally compiled into the pipelines' archives (`libaudio_pipeline_dfn.a`, `libdfn_res_stage.a`; with `-DDFN2_STREAM_NO_STDIO` under `NO_STDIO=1`). Output is bit-identical to the stage path at SIMD=1 / 0 and mask-only; the DFN tail of those examples grows by 71,600 B (bridge) / 71,648 B (48 kHz host), since the stream's memory-mode pool (164,304 B at 48 kHz / 1024) also holds the analysis and synthesis of its PCM entries. Details in `pipelines/CHANGELOG.md`.

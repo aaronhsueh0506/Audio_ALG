@@ -230,7 +230,7 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages are separate blocks sized by their own queries
   (`anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_stream_get_mem_size()`, 103,312 B at 16 kHz/512 and 202,640 B at 48 kHz/1024, plus the application's `AcStft` / `AcIstft`; for DFN2 the tail `dfn_hop_pool_bytes()`
-  sizes: `dfn2_stream_get_mem_size()`, six `n_bins` float buffers, then `ainr_bridge_get_mem_requirements()` or the synthesis and the output
+  sizes: `dfn2_stream_get_mem_size()` (a `freq_only` stream), six `n_bins` float buffers, then `ainr_bridge_get_mem_requirements()` or the synthesis and the output
   spectrum: 294,480 B for a 16 kHz/256 host and 223,568 B for a 48 kHz host with the shipped 48 kHz / 1024 model, NE10)
   is one more block. The recurrent state of the network is in none of these pools: a float host registers
   its own buffers, a board's accelerator holds it.

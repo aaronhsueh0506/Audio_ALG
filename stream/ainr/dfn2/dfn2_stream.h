@@ -18,7 +18,10 @@
  * device_state_sync/refill_zero are the caller's code on accelerator memory this stream never touches;
  * skipping either leaves stale or garbage state live. io.state_generation is sampled every hop.
  * Warm-up (N == 1: mask_lookahead hops after init/reset; N > 1: none) runs the same loop and emits silence.
- * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one. */
+ * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one.
+ *
+ * A caller with its own analysis and synthesis uses dfn2_stream_pre_process_freq_dual() /
+ * dfn2_stream_post_process_freq() instead; cfg.freq_only then keeps the HPF, STFT/ISTFT and PCM buffers out of the pool. */
 
 #ifndef DFN2_STREAM_H
 #define DFN2_STREAM_H
@@ -34,7 +37,7 @@ extern "C" {
 #endif
 
 #define DFN2_STREAM_DESCRIPTOR_VERSION 1u
-#define DFN2_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define DFN2_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define DFN2_STREAM_ALIGNMENT          16u   /* the one alignment of every module (audiolib mem_align.h) */
 
 /* Largest accepted |bin| of a MODEL-scale spectrum, as IEEE bits: 2^63, so the feature power re^2 + im^2 stays
@@ -59,6 +62,9 @@ typedef struct DFN2StreamConfig {
     float    atten_lim_db;     /* 0 disables the attenuation limit, as dfn2_prepost */
     int      hpf_enable;       /* optional input high-pass, applied before analysis only */
     float    hpf_cutoff_hz;    /* > 0, read only when hpf_enable */
+    /* Non-zero: a spectrum-only context. Only the _freq entries run (the PCM entries return -1) and the pool holds no
+     * FFT, STFT/ISTFT or PCM buffer; hpf_enable must be 0. 0: both entry families. */
+    int      freq_only;
     /* Memory-init mode (dfn2_stream_init): both required, borrowed for the stream's life; erb_fwd bin-major
      * [n_bins][n_erb], erb_inv band-major [n_erb][n_bins] (transpose the on-disk table). Both NULL: file-init mode,
      * storage sized from the grid. */
@@ -66,12 +72,12 @@ typedef struct DFN2StreamConfig {
     const float *erb_inv;
 } DFN2StreamConfig;
 
-/* Fixed 32-byte descriptor; a pool sized for another grid, mode or build is refused by init. */
+/* Fixed 32-byte descriptor; a pool sized for another grid, mode (ERB source, freq_only) or build is refused by init. */
 typedef struct DFN2StreamMemReq {
     uint32_t descriptor_version;  /* DFN2_STREAM_DESCRIPTOR_VERSION          */
     uint32_t layout_version;      /* DFN2_STREAM_LAYOUT_VERSION              */
     uint32_t reserved0;           /* must be 0                                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, mode, variant and the folded DFN2Prepost hash */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, mode, freq_only, variant and the folded DFN2Prepost hash */
     uint32_t alignment;           /* DFN2_STREAM_ALIGNMENT                    */
     uint32_t reserved;            /* 0                                        */
     uint64_t bytes;
@@ -97,12 +103,13 @@ typedef struct DFN2Stream DFN2Stream;
 #define dfn2_stream_post_process_freq       dfn2_stream_post_process_freq_mask_only
 #endif
 
-/* Exact pool size for the mode erb_fwd/erb_inv imply (both NULL: file mode; both set: memory mode). -1
- * (req untouched) on NULL, an invalid grid, non-finite atten_lim_db, bad hpf_cutoff_hz or exactly one table. */
+/* Exact pool size for the mode erb_fwd/erb_inv imply (both NULL: file mode; both set: memory mode) and for freq_only.
+ * -1 (req untouched) on NULL, an invalid grid, non-finite atten_lim_db, bad hpf_cutoff_hz, exactly one table, or
+ * freq_only with hpf_enable. */
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
-/* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost,
- * no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or an erb_inv that
+/* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost
+ * (freq_only: DFN2Prepost alone), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or an erb_inv that
  * is not a partition of unity (a unit band mask must expand to exactly 1.0f in every bin, summed band-ascending in float32). */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
@@ -122,8 +129,8 @@ DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const
                                               void *pool, size_t pool_bytes,
                                               const DFN2StreamMemReq *expected);
 
-/* Back to the start: HPF, STFT/ISTFT and DFN2Prepost reset (state zeroed, generation advanced, warm-up due
- * again); ERB tables kept. */
+/* Back to the start: HPF, STFT/ISTFT (when the context has them) and DFN2Prepost reset (state zeroed, generation
+ * advanced, warm-up due again); ERB tables kept. */
 void dfn2_stream_reset(DFN2Stream *s);
 
 /* Generation of the recurrent state (dfn2_prepost_state_generation()); 0 for NULL. */
@@ -146,15 +153,16 @@ typedef struct DFN2HopIO {
 } DFN2HopIO;
 
 /* One PCM hop in (dfn2_stream_hop_size(s) samples): int16 -> float, HPF, STFT, pre_process_freq, frame_open
- * when io->job_ready. 1 with *io filled (warm-up included), or -1 on NULL args or no preceding post_process. */
+ * when io->job_ready. 1 with *io filled (warm-up included), or -1 on NULL args, no preceding post_process or a
+ * freq_only context. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
 /* Closes the hop, once per pre_process: with io->job_ready ai_rc 0 commits, else bypasses (otherwise ignored); one hop
  * is then drained to pcm_out through the ISTFT. Returns the spectral-validity flag (1/0) of
- * dfn2_prepost_post_process_freq(), -1 on error; it is not an alignment: count L + D + N hops. */
+ * dfn2_prepost_post_process_freq(), -1 on error (a freq_only context included); it is not an alignment: count L + D + N hops. */
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
 
-/* As dfn2_stream_pre_process() on spectra: est and app are n_bins floats each, MODEL scale; est drives features and
+/* As dfn2_stream_pre_process() on spectra, for either kind of context: est and app are n_bins floats each, MODEL scale; est drives features and
  * heads, app is what mask, deep filter and attenuation limit act on (est == app: one spectrum). -1, state untouched, on
  * NULL args, no preceding post_process, or a bin that is non-finite or beyond DFN2_STREAM_BIN_LIMIT_BITS. */
 int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,

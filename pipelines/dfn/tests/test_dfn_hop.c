@@ -588,6 +588,16 @@ static void test_model_hooks(void) {
     /* the pool plan refuses what the shipped stage refused */
     plan_for(&plan, model_of(counting_identity_infer, NULL));
     CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, 0) == 0, "plan: the shipped configuration");
+    {   /* the plan's stream is a freq_only one: smaller than the stream with the PCM entries (the Twin's kind) */
+        DFN2StreamConfig full = plan.stream_cfg, slim = plan.stream_cfg;
+        DFN2StreamMemReq full_req, slim_req;
+        full.freq_only = 0;
+        slim.freq_only = 1;
+        CHECK(dfn2_stream_get_mem_size(&full, &full_req) == 0 && dfn2_stream_get_mem_size(&slim, &slim_req) == 0 &&
+              plan.stream_bytes == (size_t)slim_req.bytes && slim_req.bytes < full_req.bytes &&
+              memcmp(&plan.stream_req, &slim_req, sizeof(slim_req)) == 0,
+              "plan: the model stream is sized without its PCM half");
+    }
     CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, DFN2_N_FFT * 2) == -1, "plan: another fft size on the model's own rate");
     plan_for(&plan, model_of(counting_identity_infer, NULL));
     plan.stream_cfg.erb_inv = NULL;

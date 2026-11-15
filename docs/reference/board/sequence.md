@@ -172,7 +172,7 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
     ac_istft_get_mem_size / ac_istft_init (the 4ch_static sample synthesis carries its own window table; optionally borrow aec_synthesis_window(a) as in mono),
     ulcnet_stream_get_mem_size(&cfg, &req) / ulcnet_stream_init_ex(&cfg, mem, bytes, &req) (cfg.grid from ulcnet_grid_make; the spectrum entries run no STFT, so an AcStft for the raw far hop and an AcIstft for the output come with ac_*_get_mem_size / init),
     for DFN2 the example tail of dfn/dfn_hop_pool.h: dfn_hop_pool_plan_init(&plan, &model_grid) / dfn_hop_pool_plan /
-    dfn_hop_pool_bytes / dfn_hop_pool_build (the model stream dfn2_stream in memory mode, the conversion buffers, then the
+    dfn_hop_pool_bytes / dfn_hop_pool_build (the model stream dfn2_stream in memory mode with freq_only, the conversion buffers, then the
     AinrBridge, or the synthesis when the host rate equals the model grid's; model_grid from dfn2_grid_make;
     plan.stream_cfg.erb_fwd / erb_inv point into the application's ERB data. A caller written against the older objects uses
     dfn_rate_bridge_default_config(host_rate, &model_grid) / dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init, or

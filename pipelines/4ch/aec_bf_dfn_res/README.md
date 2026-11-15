@@ -129,7 +129,7 @@ App          Aec (array)                   ArraySampleBeam   DfnHop + DFN2Stream
  |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
  |-- array_sample_default_config; aec_get_mem_requirements; aec_init_ex -->|
  |-- array_sample_beam_default_params; array_sample_beam_get_mem_size / _init(aec) -->|
- |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_build: dfn2_stream_* (memory mode) and the conversion buffers,
+ |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_build: dfn2_stream_* (memory mode, freq_only) and the conversion buffers,
  |     then ac_istft_init + dfn_hop_init_direct (48 kHz) or ainr_bridge_* + dfn_hop_init_bridge (16 kHz)
  |   per hop: array_sample_beam_process --> array_sample_beam_fuse (the array's gain stage runs on E)
  |            --> v.post_reset_serial moved: ainr_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
@@ -176,12 +176,11 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
 the P buffer, and the DFN tail of `dfn_hop_pool_bytes()`, each part 16-byte
-aligned; shipped pair): 1,788,192 bytes at the 16 kHz default (array plus helper 1,492,672 bytes, the P buffer, and a DFN tail of
-294,480 bytes: the model stream 164,304, the six conversion buffers 12,312 and the bridge 117,856) and
-5,763,776 bytes at 48 kHz (array plus helper 5,536,096 bytes; DFN tail 223,568: the stream and the buffers, the synthesis 42,832
-and the output spectrum 4,104). Against the stage these programs ran before, the tail is 71,600 bytes larger at 16 kHz and 71,648
-at 48 kHz (the stream's pool also holds the analysis and synthesis of its PCM entries, and the conversion buffers moved from the
-stage into the hop). The array's own pool is 700,480 bytes at
+aligned; shipped pair): 1,716,576 bytes at the 16 kHz default (array plus helper 1,492,672 bytes, the P buffer, and a DFN tail of
+222,864 bytes: the model stream 92,688, the six conversion buffers 12,312 and the bridge 117,856) and
+5,692,160 bytes at 48 kHz (array plus helper 5,536,096 bytes; DFN tail 151,952: the stream and the buffers, the synthesis 42,832
+and the output spectrum 4,104). The stream is a `freq_only` one (`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`):
+its pool holds the `DFN2Prepost` and no analysis, synthesis or PCM buffer. The array's own pool is 700,480 bytes at
 16 kHz/256 (the lanes 570,880 of it; `residual = STATE` 594,944 bytes).
 Model weights, accelerator activation/workspace memory and the recurrent state are external;
 adding int8 weights alone brings the pool plus weights to about 3.7 MiB at

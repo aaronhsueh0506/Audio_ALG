@@ -46,7 +46,7 @@ model-free `AinrBridge`; `make -C stream/ainr/bridge test` is the bridge's own g
 gain, formed into P in the example's `rig_process`; no denoiser; the host synthesis is
 the example's `AcIstft` on the direct path and the bridge's own otherwise) and
 `dfn/dfn_hop.h`. The example and `dfn_hop.h` run the model through the model stream
-(`dfn2_stream_*_freq` of `stream/ainr/dfn2`, memory mode) and `AinrBridge`, not through the stage;
+(`dfn2_stream_*_freq` of `stream/ainr/dfn2`, memory mode, `freq_only`) and `AinrBridge`, not through the stage;
 `test_dfn_hop` holds the hop to the stage and the rate bridge bit for bit, `test_dfn_stream_equivalence` the stream to the stage:
 
 ```bash

@@ -2,7 +2,7 @@
 
 The DeepFilterNet2 (DFN2) post-RES glue for the AEC pipelines and the two example programs that
 build on it. The examples run the model through the model-stream layer (`stream/ainr/dfn2`:
-`dfn2_stream_pre_process_freq_dual()` / `dfn2_stream_post_process_freq()`, memory mode) and, on a host
+`dfn2_stream_pre_process_freq_dual()` / `dfn2_stream_post_process_freq()`, memory mode, `freq_only`) and, on a host
 rate other than the model's, through the sample-rate bridge `stream/ainr/bridge` (`AinrBridge`); the
 headers here (`dfn_hop.h`, `dfn_hop_pool.h`) are the example code around them (header-only, no ABI,
 copy and adapt). Two older modules that carry a layout version and a 32-byte descriptor stay in
@@ -63,7 +63,7 @@ the library accepts (`dfn2_grid_make()`). `DFN2_TEST_GRID_KHZ=16|32` (default 48
 not with the 0/0 of those rows in the example's table: it shows that the same stage code runs another grid (finite output, latency
 equal to the grid's lookahead, the bridge refusing it), not that a table row works.
 
-The stream config (`DFN2StreamConfig` in memory mode, like the stage config) takes the ERB matrices as two borrowed pointers (`erb_fwd`, `erb_inv`; the inverse a partition of unity) and reads no file; the application loads and owns them and keeps them alive while the hop runs. A file whose values are not a partition of unity is refused when the pool is built (`pipeline init failed`, exit 1). The two mains
+The stream config (`DFN2StreamConfig` in memory mode, like the stage config; `dfn_hop_pool_plan()` sets its `freq_only`, so the stream's pool holds no analysis, synthesis or PCM buffer) takes the ERB matrices as two borrowed pointers (`erb_fwd`, `erb_inv`; the inverse a partition of unity) and reads no file; the application loads and owns them and keeps them alive while the hop runs. A file whose values are not a partition of unity is refused when the pool is built (`pipeline init failed`, exit 1). The two mains
 read them from two raw little-endian float32 files, `--erb-fwd FILE` and `--erb-inv FILE` (both or neither): the
 `--runtime-bins` pair of `AINR/DeepFilterNet2/export_erb_matrix.py`, `erb_fwd.bin` bin-major `[n_bins][n_erb]` and `erb_inv.bin` band-major `[n_erb][n_bins]`, each exactly
 `n_bins * n_erb * 4` bytes (65,664 B for the 48 kHz / 1024 / 32-band model). A file that cannot be opened, or that holds fewer or more values than the

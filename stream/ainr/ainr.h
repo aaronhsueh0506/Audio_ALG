@@ -144,7 +144,8 @@ int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
 
 typedef struct AinrFreqCtx AinrFreqCtx;
 
-/* As ainr_get_mem_size(), for the spectrum -> spectrum family. */
+/* As ainr_get_mem_size(), for the spectrum -> spectrum family: a smaller pool, with no analysis, synthesis or PCM
+ * buffer in it. */
 int ainr_get_mem_size_freq(const AinrConfig *cfg, StreamMemReq *req);
 
 /* As ainr_init(), for the spectrum -> spectrum family. */

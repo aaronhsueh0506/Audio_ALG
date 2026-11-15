@@ -1,5 +1,5 @@
 /* dfn_hop_pool.h -- example: the DeepFilterNet2 tail of an example program's pool, sized and
- * carved in one place: the model stream (stream/ainr/dfn2, memory mode), the audio-scale
+ * carved in one place: the model stream (stream/ainr/dfn2, memory mode, freq_only), the audio-scale
  * conversion buffers, and the synthesis with the output spectrum when the host runs the model's
  * grid, or the rate bridge (stream/ainr/bridge) when the host rate differs (the model is then on
  * its 48 kHz grid). Header-only, no ABI: copy and adapt.
@@ -60,6 +60,7 @@ static inline int dfn_hop_pool_plan(DfnHopPoolPlan* p, int host_rate, int fft_si
     if (grid->frames_per_call != 1 || !p->stream_cfg.erb_fwd || !p->stream_cfg.erb_inv ||
         !dfn_hop_model_valid(&p->model, grid))
         return -1;
+    p->stream_cfg.freq_only = 1;   /* the hop drives the _freq entries only */
     if (dfn2_stream_get_mem_size(&p->stream_cfg, &p->stream_req) != 0) return -1;
     p->stream_bytes = (size_t)p->stream_req.bytes;
     p->planar_bytes = (size_t)6 * (size_t)grid->n_bins * sizeof(float);

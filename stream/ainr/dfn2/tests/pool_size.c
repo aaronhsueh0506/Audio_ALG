@@ -5,6 +5,9 @@
  *   - that count is the byte count of a stream whose STFT and ISTFT each carry their own FFT table
  *     (before_*) less those two tables (2 * align16(fft_get_mem_size));
  *   - init_ex() succeeds on exactly that many bytes and refuses one aligned unit less;
+ *   - a freq_only context (cfg.freq_only) needs the literal freq_* byte count: the full count less the FFT table,
+ *     the STFT, the ISTFT and the PCM scratch slab, and in file mode less the table-sized load scratch too, each
+ *     taken from audiolib's own size queries;
  *   - 16 hops of a fixed input through a fixed stand-in accelerator hash to the golden value of
  *     that stream, with a stand-in inverse ERB table in which every bin splits 0.75 / 0.25 between
  *     two bands (a partition of unity, which init requires). The hash is the same for the NEON and the scalar kernels
@@ -16,6 +19,7 @@
 #include <string.h>
 
 #include "dfn2_stream.h"
+#include "audio_stft.h"
 #include "fft_wrapper.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"   /* SK_HAVE_NEON */
@@ -25,19 +29,20 @@ typedef struct Row {
     int sr, fft, n_erb, mask_lookahead, df_lookahead, n;
     uint64_t bytes_mem, bytes_file;       /* shared FFT handle */
     uint64_t before_mem, before_file;     /* STFT and ISTFT each with their own FFT table */
+    uint64_t freq_mem, freq_file;         /* freq_only context */
     uint64_t pcm_hash;                    /* scalar kernels (and NEON when it is not different) */
     uint64_t pcm_hash_neon;               /* 0: same as pcm_hash */
 } Row;
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 103936, 300928, 156640, 353632, 0x4e50404eea4130c5ull, 0 },
+    { 48000, 1024, 32, 1, 0, 1, 103936, 300928, 156640, 353632, 32320, 163648, 0x4e50404eea4130c5ull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 66448, 103600, 80752, 117904, 0xf1d08272f6a453e0ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 121824, 158976, 136128, 173280, 0xb48673d60e844efcull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 164304, 361296, 217008, 414000, 0x047a1f7cb0fca41cull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 66448, 103600, 80752, 117904, 47824, 72592, 0xf1d08272f6a453e0ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 121824, 158976, 136128, 173280, 103200, 127968, 0xb48673d60e844efcull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 164304, 361296, 217008, 414000, 92688, 224016, 0x047a1f7cb0fca41cull, 0 },
 };
 #endif
 
@@ -119,6 +124,28 @@ static void run_row(const Row *r, int idx) {
           "row %d: shrink is not exactly two FFT tables (%zu): %llu -> %llu / %llu -> %llu", idx, two_ffts,
           (unsigned long long)r->before_mem, (unsigned long long)r->bytes_mem,
           (unsigned long long)r->before_file, (unsigned long long)r->bytes_file);
+
+    {   /* freq_only: what is left out, from audiolib's size queries (STFT/ISTFT with their own FFT table less that table) */
+        DFN2StreamConfig fm = cfg_mem, ff = cfg_file;
+        DFN2StreamMemReq req_fm, req_ff;
+        AcStftConfig scfg;
+        size_t one_fft = two_ffts / 2u, pcm_half, erb;
+        ac_stft_config_default(&scfg, r->fft);
+        pcm_half = one_fft + (ac_stft_get_mem_size(&scfg) - one_fft) + (ac_istft_get_mem_size(&scfg) - one_fft) +
+                   ck_align16_size((size_t)(2 * (r->fft / 2) + 4 * n_bins) * sizeof(float));
+        erb = ck_align16_size((size_t)n_bins * (size_t)r->n_erb * sizeof(float));
+        fm.freq_only = 1;
+        ff.freq_only = 1;
+        CHECK(dfn2_stream_get_mem_size(&fm, &req_fm) == 0 && dfn2_stream_get_mem_size(&ff, &req_ff) == 0, "row %d: freq_only sizing", idx);
+        CHECK(req_fm.bytes == r->freq_mem && req_ff.bytes == r->freq_file,
+              "row %d (%d/%d N=%d): freq_only pools %llu / %llu, want %llu / %llu", idx, r->sr, r->fft, r->n,
+              (unsigned long long)req_fm.bytes, (unsigned long long)req_ff.bytes,
+              (unsigned long long)r->freq_mem, (unsigned long long)r->freq_file);
+        CHECK(r->bytes_mem - r->freq_mem == pcm_half && r->bytes_file - r->freq_file == pcm_half + erb,
+              "row %d: freq_only leaves out %llu / %llu, want %zu / %zu", idx,
+              (unsigned long long)(r->bytes_mem - r->freq_mem), (unsigned long long)(r->bytes_file - r->freq_file),
+              pcm_half, pcm_half + erb);
+    }
 
     /* exact size initialises; one aligned unit less is refused */
     pool = NULL;

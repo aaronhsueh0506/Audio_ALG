@@ -1,4 +1,4 @@
-/* DeepFilterNet2 PCM stream (dfn2_stream.h). -DDFN2_STREAM_NO_STDIO drops the file-loader entry
+/* DeepFilterNet2 model stream (dfn2_stream.h). -DDFN2_STREAM_NO_STDIO drops the file-loader entry
  * points (dfn2_stream_init_from_erb_file[_ex]) and every stdio call with them, for a NO_STDIO
  * build; see audit-no-stdio in the Makefile. */
 
@@ -19,14 +19,15 @@ struct DFN2Stream {
     DFN2Grid grid;
     int      hpf_enable;
 
+    /* hpf, fft, stft, istft: the PCM half, NULL in a freq_only context (the entries test stft / istft). */
     Hpf        *hpf;     /* NULL when !hpf_enable */
     FftHandle  *fft;     /* carved once, shared by stft and istft */
     AcStft     *stft;
     AcIstft    *istft;
     DFN2Prepost *prepost;
 
-    /* Per-hop scratch, one slab: hop_in/hop_out [hop] each, spec_re/spec_im/enh_re/enh_im
-     * [n_bins] each (pcm_in/pcm_out are the caller's own buffers, passed by pointer). */
+    /* Per-hop scratch of the PCM entries, one slab: hop_in/hop_out [hop] each, spec_re/spec_im/enh_re/enh_im
+     * [n_bins] each (pcm_in/pcm_out are the caller's own buffers, passed by pointer). NULL when freq_only. */
     float *hop_in;
     float *hop_out;
     float *spec_re;
@@ -42,6 +43,7 @@ struct DFN2Stream {
 
 typedef struct DFN2StreamLayout {
     DFN2Stream *self;
+    /* hpf_mem .. istft_mem and scratch_mem: NULL in a freq_only layout. */
     void       *hpf_mem;      /* NULL region when !cfg->hpf_enable */
     void       *fft_mem;
     void       *stft_mem;
@@ -54,7 +56,7 @@ typedef struct DFN2StreamLayout {
     /* File mode only (both NULL in memory mode): */
     float      *erb_fwd_storage;   /* [n_bins][n_erb], bin-major, kept */
     float      *erb_inv_storage;   /* [n_erb][n_bins], band-major, kept */
-    float      *erb_scratch;       /* [n_bins][n_erb], bin-major, transient load scratch only */
+    float      *erb_scratch;       /* [n_bins][n_erb], bin-major, transient load scratch; NULL when freq_only */
     uint32_t    prepost_build_hash; /* dfn2_prepost's own DFN2PrepostMemReq.build_flags_hash, folded
                                       * into this stream's own hash by dfn2_stream_get_mem_size() */
 } DFN2StreamLayout;
@@ -94,6 +96,8 @@ static int cfg_valid(const DFN2StreamConfig *cfg) {
     /* Exactly one of erb_fwd/erb_inv set is never valid: memory mode needs both, file mode needs
      * neither (dfn2_stream_is_file_mode() reads both NULL). */
     if ((cfg->erb_fwd == NULL) != (cfg->erb_inv == NULL)) return 0;
+    /* The HPF runs before the analysis, which a freq_only caller owns. */
+    if (cfg->freq_only && cfg->hpf_enable) return 0;
     return 1;
 }
 
@@ -102,7 +106,8 @@ static int cfg_valid(const DFN2StreamConfig *cfg) {
  * matching across both calls with the same cfg. -1 on a bad config or an overflowing carve.
  * Carve order (part of DFN2_STREAM_LAYOUT_VERSION/build_flags_hash -- bump both if this changes):
  * self, hpf (if enabled), fft, stft, istft, prepost, scratch slab, then (file mode only)
- * erb_fwd_storage, erb_inv_storage, erb_scratch. */
+ * erb_fwd_storage, erb_inv_storage, erb_scratch. freq_only: self, prepost, then (file mode only)
+ * erb_fwd_storage, erb_inv_storage. */
 static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
                               DFN2StreamLayout *out, size_t *total) {
     size_t cursor = 0;
@@ -123,32 +128,34 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
     if (stream_carve(base, &cursor, sizeof(DFN2Stream), &ptr) != 0) return -1;
     out->self = (DFN2Stream *)ptr;
 
-    if (cfg->hpf_enable) {
-        size_t hb = hpf_get_mem_size();
-        if (hb == 0 || stream_carve(base, &cursor, hb, &ptr) != 0) return -1;
-        out->hpf_mem = ptr;
+    if (!cfg->freq_only) {
+        if (cfg->hpf_enable) {
+            size_t hb = hpf_get_mem_size();
+            if (hb == 0 || stream_carve(base, &cursor, hb, &ptr) != 0) return -1;
+            out->hpf_mem = ptr;
+        }
+
+        fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
+        if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
+        out->fft_mem = ptr;
+
+        /* One AcStftConfig, reused for both the analysis and synthesis sizing calls -- window left
+         * NULL, each of AcStft/AcIstft carves its own window table independently. scfg.fft stays NULL
+         * (the shared handle doesn't exist yet), see borrowed_fft_size(). */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
+        scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
+
+        stft_bytes = borrowed_fft_size(ac_stft_get_mem_size(&scfg), cfg->grid.n_fft);
+        if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        out->stft_mem = ptr;
+        out->stft_bytes = stft_bytes;
+
+        istft_bytes = borrowed_fft_size(ac_istft_get_mem_size(&scfg), cfg->grid.n_fft);
+        if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        out->istft_mem = ptr;
+        out->istft_bytes = istft_bytes;
     }
-
-    fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
-    if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
-    out->fft_mem = ptr;
-
-    /* One AcStftConfig, reused for both the analysis and synthesis sizing calls -- window left
-     * NULL, each of AcStft/AcIstft carves its own window table independently. scfg.fft stays NULL
-     * (the shared handle doesn't exist yet), see borrowed_fft_size(). */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
-    scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
-
-    stft_bytes = borrowed_fft_size(ac_stft_get_mem_size(&scfg), cfg->grid.n_fft);
-    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-    out->stft_mem = ptr;
-    out->stft_bytes = stft_bytes;
-
-    istft_bytes = borrowed_fft_size(ac_istft_get_mem_size(&scfg), cfg->grid.n_fft);
-    if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-    out->istft_mem = ptr;
-    out->istft_bytes = istft_bytes;
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
     pcfg.atten_lim_db = cfg->atten_lim_db;
@@ -165,14 +172,16 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
 
-    /* hop_in, hop_out [hop] + spec_re, spec_im, enh_re, enh_im [n_bins], one slab; only the slab
-     * base is part of the pool ABI. */
-    scratch_bytes = ck_add_size(
-        ck_mul_size(2u, ck_mul_size((size_t)cfg->grid.hop, sizeof(float))),
-        ck_mul_size(4u, ck_mul_size(n_bins, sizeof(float))));
-    if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
-        return -1;
-    out->scratch_mem = ptr;
+    if (!cfg->freq_only) {
+        /* hop_in, hop_out [hop] + spec_re, spec_im, enh_re, enh_im [n_bins], one slab; only the slab
+         * base is part of the pool ABI. */
+        scratch_bytes = ck_add_size(
+            ck_mul_size(2u, ck_mul_size((size_t)cfg->grid.hop, sizeof(float))),
+            ck_mul_size(4u, ck_mul_size(n_bins, sizeof(float))));
+        if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
+            return -1;
+        out->scratch_mem = ptr;
+    }
 
     if (file_mode) {
         erb_elems = ck_mul_size(n_bins, n_erb);
@@ -183,8 +192,10 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
         out->erb_fwd_storage = (float *)ptr;
         if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
         out->erb_inv_storage = (float *)ptr;
-        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
-        out->erb_scratch = (float *)ptr;
+        if (!cfg->freq_only) {
+            if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
+            out->erb_scratch = (float *)ptr;
+        }
     }
 
     *total = ck_align16_size(cursor);
@@ -212,6 +223,7 @@ static uint32_t build_hash(const DFN2StreamConfig *cfg, uint32_t prepost_hash) {
 #endif
     h = stream_fnv1a_u32(h, dfn2_stream_is_file_mode(cfg) ? 1u : 0u);
     h = stream_fnv1a_u32(h, (uint32_t)(cfg->hpf_enable ? 1 : 0));
+    h = stream_fnv1a_u32(h, (uint32_t)(cfg->freq_only ? 1 : 0));
     h = stream_fnv1a_u32(h, prepost_hash);
     return ac_memreq_abi_hash(h);
 }
@@ -284,30 +296,35 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s->open = 0;
     s->pending = 0;
     s->hpf = NULL;
+    s->fft = NULL;
+    s->stft = NULL;
+    s->istft = NULL;
 
-    if (cfg->hpf_enable) {
-        s->hpf = hpf_init(layout->hpf_mem, hpf_get_mem_size(), cfg->hpf_cutoff_hz, cfg->grid.sample_rate);
-        if (!s->hpf) return NULL;
+    if (!cfg->freq_only) {
+        if (cfg->hpf_enable) {
+            s->hpf = hpf_init(layout->hpf_mem, hpf_get_mem_size(), cfg->hpf_cutoff_hz, cfg->grid.sample_rate);
+            if (!s->hpf) return NULL;
+        }
+
+        s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
+        if (!s->fft) return NULL;
+
+        /* The now-constructed handle, borrowed by both: each carved region must be exactly the
+         * borrowed-handle size. */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
+        scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
+        scfg.fft = s->fft;
+
+        if (ac_stft_get_mem_size(&scfg) != layout->stft_bytes ||
+            ac_istft_get_mem_size(&scfg) != layout->istft_bytes)
+            return NULL;
+        s->stft = ac_stft_init(layout->stft_mem, layout->stft_bytes, &scfg);
+        if (!s->stft) return NULL;
+
+        s->istft = ac_istft_init(layout->istft_mem, layout->istft_bytes, &scfg);
+        if (!s->istft) return NULL;
     }
-
-    s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
-    if (!s->fft) return NULL;
-
-    /* The now-constructed handle, borrowed by both: each carved region must be exactly the
-     * borrowed-handle size. */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.spec_scale = dfn2_stft_scale(cfg->grid.n_fft);
-    scfg.ispec_scale = dfn2_stft_unscale(cfg->grid.n_fft);
-    scfg.fft = s->fft;
-
-    if (ac_stft_get_mem_size(&scfg) != layout->stft_bytes ||
-        ac_istft_get_mem_size(&scfg) != layout->istft_bytes)
-        return NULL;
-    s->stft = ac_stft_init(layout->stft_mem, layout->stft_bytes, &scfg);
-    if (!s->stft) return NULL;
-
-    s->istft = ac_istft_init(layout->istft_mem, layout->istft_bytes, &scfg);
-    if (!s->istft) return NULL;
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return NULL;
     pcfg.atten_lim_db = cfg->atten_lim_db;
@@ -316,13 +333,15 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s->prepost = dfn2_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;
 
-    n_bins = (size_t)cfg->grid.n_bins;
-    s->hop_in = (float *)layout->scratch_mem;
-    s->hop_out = s->hop_in + cfg->grid.hop;
-    s->spec_re = s->hop_out + cfg->grid.hop;
-    s->spec_im = s->spec_re + n_bins;
-    s->enh_re = s->spec_im + n_bins;
-    s->enh_im = s->enh_re + n_bins;
+    if (!cfg->freq_only) {
+        n_bins = (size_t)cfg->grid.n_bins;
+        s->hop_in = (float *)layout->scratch_mem;
+        s->hop_out = s->hop_in + cfg->grid.hop;
+        s->spec_re = s->hop_out + cfg->grid.hop;
+        s->spec_im = s->spec_re + n_bins;
+        s->enh_re = s->spec_im + n_bins;
+        s->enh_im = s->enh_re + n_bins;
+    }
 
     return s;
 }
@@ -368,8 +387,10 @@ DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t poo
 void dfn2_stream_reset(DFN2Stream *s) {
     if (!s) return;
     if (s->hpf) hpf_reset(s->hpf);
-    ac_stft_reset(s->stft);
-    ac_istft_reset(s->istft);
+    if (s->stft) {   /* a freq_only context has no analysis or synthesis */
+        ac_stft_reset(s->stft);
+        ac_istft_reset(s->istft);
+    }
     dfn2_prepost_reset(s->prepost);
     s->open = 0;
     s->pending = 0;
@@ -405,7 +426,7 @@ static int open_hop(DFN2Stream *s, int rc, DFN2HopIO *io) {
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io) {
     int hop, i, rc;
 
-    if (!s || !pcm_in || !io || s->pending) return -1;
+    if (!s || !pcm_in || !io || s->pending || !s->stft) return -1;
     hop = s->grid.hop;
 
     for (i = 0; i < hop; ++i) s->hop_in[i] = (float)pcm_in[i] / 32768.0f;
@@ -434,7 +455,7 @@ static void dfn2_stream_close_frame(DFN2Stream *s, int ai_rc) {
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
     int hop, i, valid, prc;
 
-    if (!s || !pcm_out || !s->pending) return -1;
+    if (!s || !pcm_out || !s->pending || !s->istft) return -1;
     hop = s->grid.hop;
     s->pending = 0;
     dfn2_stream_close_frame(s, ai_rc);
@@ -484,15 +505,47 @@ int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im
  * n_bins*n_erb float32 inverse (bin-major as the file stores it, transposed to band-major here,
  * as the library's erb_inv argument requires). */
 
-/* Reads exactly n_bins*n_erb floats into fwd_out (kept bin-major) and n_bins*n_erb floats into
- * scratch_out (bin-major, as the file stores it -- transposed by the caller). 0, or -1 after
+/* bin-major [n_bins][n_erb] -> band-major [n_erb][n_bins]. */
+static void transpose_band_major(const float *bin_major, float *band_major,
+                                 int n_bins, int n_erb) {
+    int bin, band;
+    for (bin = 0; bin < n_bins; ++bin) {
+        for (band = 0; band < n_erb; ++band) {
+            band_major[(size_t)band * (size_t)n_bins + (size_t)bin] =
+                bin_major[(size_t)bin * (size_t)n_erb + (size_t)band];
+        }
+    }
+}
+
+/* The file's inverse table (bin-major) read straight into its band-major place, a stack chunk at a time: the
+ * freq_only load, which has no table-sized scratch. 0, or -1 on a short read. */
+static int read_inv_band_major(FILE *fp, const DFN2Grid *grid, float *band_major) {
+    float chunk[64];
+    const size_t n_bins = (size_t)grid->n_bins, n_erb = (size_t)grid->n_erb;
+    const size_t want = n_bins * n_erb;
+    size_t done = 0, k;
+
+    while (done < want) {
+        size_t n = want - done < 64u ? want - done : 64u;
+        if (fread(chunk, sizeof(float), n, fp) != n) return -1;
+        for (k = 0; k < n; ++k) {
+            size_t e = done + k;
+            band_major[(e % n_erb) * n_bins + e / n_erb] = chunk[k];
+        }
+        done += n;
+    }
+    return 0;
+}
+
+/* Reads n_bins*n_erb floats into fwd_out (kept bin-major) and the inverse table into inv_out, band-major:
+ * through `scratch` (bin-major as stored, then transposed) or, scratch NULL, a chunk at a time. 0, or -1 after
  * closing the file on an open/header/short-read/dimension-mismatch failure. */
 static int load_erb_file(const char *path, const DFN2Grid *grid,
-                         float *fwd_out, float *scratch_out) {
+                         float *fwd_out, float *inv_out, float *scratch) {
     FILE *fp;
     int32_t hdr[2];
     size_t want = (size_t)grid->n_bins * (size_t)grid->n_erb;
-    size_t got;
+    int rc;
 
     fp = fopen(path, "rb");
     if (!fp) return -1;
@@ -505,27 +558,18 @@ static int load_erb_file(const char *path, const DFN2Grid *grid,
         fclose(fp);
         return -1;
     }
-    got = fread(fwd_out, sizeof(float), want, fp);
-    if (got != want) {
+    if (fread(fwd_out, sizeof(float), want, fp) != want) {
         fclose(fp);
         return -1;
     }
-    got = fread(scratch_out, sizeof(float), want, fp);
-    fclose(fp);
-    if (got != want) return -1;
-    return 0;
-}
-
-/* bin-major [n_bins][n_erb] -> band-major [n_erb][n_bins]. */
-static void transpose_band_major(const float *bin_major, float *band_major,
-                                 int n_bins, int n_erb) {
-    int bin, band;
-    for (bin = 0; bin < n_bins; ++bin) {
-        for (band = 0; band < n_erb; ++band) {
-            band_major[(size_t)band * (size_t)n_bins + (size_t)bin] =
-                bin_major[(size_t)bin * (size_t)n_erb + (size_t)band];
-        }
+    if (scratch) {
+        rc = fread(scratch, sizeof(float), want, fp) == want ? 0 : -1;
+        if (rc == 0) transpose_band_major(scratch, inv_out, grid->n_bins, grid->n_erb);
+    } else {
+        rc = read_inv_band_major(fp, grid, inv_out);
     }
+    fclose(fp);
+    return rc;
 }
 
 DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const char *erb_path,
@@ -539,10 +583,9 @@ DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const
     /* Loaded straight into pool-owned storage; a short read or mismatch returns NULL with no
      * DFN2Stream constructed -- a partial read left in the pool is harmless since no live
      * object is returned. */
-    if (load_erb_file(erb_path, &cfg->grid, layout.erb_fwd_storage, layout.erb_scratch) != 0)
+    if (load_erb_file(erb_path, &cfg->grid, layout.erb_fwd_storage, layout.erb_inv_storage,
+                      layout.erb_scratch) != 0)
         return NULL;
-    transpose_band_major(layout.erb_scratch, layout.erb_inv_storage,
-                         cfg->grid.n_bins, cfg->grid.n_erb);
 
     return dfn2_stream_finish_init(cfg, (unsigned char *)pool, &layout,
                                    layout.erb_fwd_storage, layout.erb_inv_storage);

@@ -131,7 +131,7 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
 /* One context for both families (PCM, _freq): the public Ainr*Ctx types are one-member wrappers around
  * it. stash holds the (n - 1) pre-roll hops of a block: int16 PCM for the PCM family, MODEL-scale
  * spectra ([i][re(n_bins)][im(n_bins)]) for _freq; NULL when n == 1. scratch (_freq only) is one frame
- * of MODEL-scale est/app input, 4 * n_bins floats. */
+ * of MODEL-scale est/app input, 4 * n_bins floats. The _freq family's inner stream is freq_only. */
 typedef struct AinrCore {
     DFN2Stream  *inner;
     DFN2Grid     grid;
@@ -204,6 +204,22 @@ static int ainr_build_grid(const AinrDfn2ModelEntry *entry, int n, DFN2Grid *gri
     return dfn2_grid_make(grid, &spec) == DFN2_GRID_OK ? AINR_OK : AINR_ERR_GRID;
 }
 
+/* The inner stream's config (file mode: no ERB pointers), the same for sizing and init. _freq: a freq_only stream,
+ * and no HPF (it belongs before the caller's analysis). */
+static void ainr_stream_config(AinrFamily family, const AinrDfn2ModelEntry *entry, const DFN2Grid *grid,
+                               DFN2StreamConfig *scfg)
+{
+    memset(scfg, 0, sizeof(*scfg));
+    scfg->grid = *grid;
+    scfg->atten_lim_db = entry->atten_lim_db;
+    if (family == AINR_FAMILY_FREQ) {
+        scfg->freq_only = 1;
+    } else {
+        scfg->hpf_enable = entry->hpf_enable;
+        scfg->hpf_cutoff_hz = entry->hpf_cutoff_hz;
+    }
+}
+
 typedef struct AinrLayout {
     AinrCore         *core;
     void             *stash;
@@ -240,11 +256,7 @@ static int ainr_pool_layout(AinrFamily family, const AinrDfn2ModelEntry *entry, 
         out->scratch = (float *)p;
     }
 
-    memset(&scfg, 0, sizeof(scfg));
-    scfg.grid = *grid;
-    scfg.atten_lim_db = entry->atten_lim_db;
-    scfg.hpf_enable = entry->hpf_enable;
-    scfg.hpf_cutoff_hz = entry->hpf_cutoff_hz;
+    ainr_stream_config(family, entry, grid, &scfg);
     if (dfn2_stream_get_mem_size(&scfg, &out->sreq) != 0) return -1;
 
     if (stream_carve(base, &cursor, (size_t)out->sreq.bytes, &p) != 0) return -1;
@@ -326,11 +338,7 @@ static int ainr_init_common(AinrFamily family, const AinrConfig *cfg, const char
         lay.total != (size_t)req.bytes)   /* sizing/carve agreement */
         return AINR_ERR_POOL;
 
-    memset(&scfg, 0, sizeof(scfg));
-    scfg.grid = grid;
-    scfg.atten_lim_db = entry->atten_lim_db;
-    scfg.hpf_enable = entry->hpf_enable;
-    scfg.hpf_cutoff_hz = entry->hpf_cutoff_hz;
+    ainr_stream_config(family, entry, &grid, &scfg);
 
     lay.core->inner = dfn2_stream_init_from_erb_file(&scfg, erb_path, lay.inner_pool,
                                                     (size_t)lay.sreq.bytes);

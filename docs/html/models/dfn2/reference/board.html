@@ -14,15 +14,15 @@
 
 <h2 id="pool">Pool</h2>
 <p><code>ainr_get_mem_size()</code> 回 <code>StreamMemReq</code>（<code>bytes</code> 與 <code>alignment</code> 兩欄，定義在 <code>stream/common/stream_mem.h</code>，與接線型別無關；<code>ainr.h</code> 只引用它）。呼叫端配 <code>bytes</code> 個位元組、對齊 <code>alignment</code>（<code>AINR_ALIGNMENT</code> = 16），交給 <code>ainr_init()</code>。init 自己重算所需大小：pool 小於它或沒有對齊就回 <code>AINR_ERR_POOL</code>（pool 不會被寫入）；較大的 pool 可以。</p>
-<p>兩個家族（PCM、<code>_freq</code>）的 pool 都含完整的內層 stream，也就是 STFT 與 ISTFT；<code>_freq</code> 不跑內層的 STFT 也不會縮小。<code>_freq</code> 另外多一份跨 hop 的暫存，所以兩者大小不同。</p>
+<p>PCM 家族的 pool 含完整的內層 stream：FFT、STFT、ISTFT、PCM 緩衝，以及讀 ERB 檔用的一份暫存。<code>_freq</code> 家族的分析與合成在呼叫端，內層 stream 是 <code>freq_only</code>（<code>DFN2StreamConfig.freq_only</code>）：pool 只有前後處理、兩份 ERB 表，加上一幀換算暫存與 N &gt; 1 時跨 hop 的頻譜暫存，所以比 PCM 家族小。</p>
 <p>下表是在本庫 host 建置（arm64 macOS、<code>SIMD=1</code>、<code>BACKEND=ne10</code>）以 <code>ainr_get_mem_size()</code>、<code>ainr_get_mem_size_freq()</code> 實際讀出的值，單位 bytes。目標板的值隨指標寬度與編譯設定而異，請在板上呼叫同一組函式取得。</p>
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th>頻譜 → 頻譜（<code>_freq</code>）</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>103696</td><td>105760</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>160864</td><td>168368</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>361392</td><td>369600</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>301024</td><td>309232</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>103696</td><td>74752</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>160864</td><td>137360</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>361392</td><td>232320</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>301024</td><td>171952</td></tr>
 </tbody></table>
 
 <h2 id="info">AinrInfo 與 sample 模型設定</h2>
