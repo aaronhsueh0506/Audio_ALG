@@ -203,7 +203,7 @@ and (DFN2) ERB matrices from its catalog and reports the graph and the stream ti
 registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`,
 `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
 `stream/common/graph_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
-against the row; tested by `make -C stream/common test-graph-io`). A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
+against the row; tested by `make -C stream/common test-graph-io`). `stream/common/stream_run.h` (the block's `StreamWork` and the run status values) is included by `ainr.h` and `aiaec.h`: it adds a header, no source and no link input. A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
 `stream/common/stream_bind.c` for the checker; the stream libraries do not. The AI3 samples carry compile-time `#define FLOAT_IN 0` / `FLOAT_OUT 0` (default off) that let the NPU quantize the inputs and dequantize the heads; set both alike (a mixed setting only warns), see `docs/maintenance/graph-wiring.md`. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
 `stream/common/stream_mem.h`), and a
 configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is

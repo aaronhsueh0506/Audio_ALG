@@ -39,6 +39,7 @@
 <tr><td><code>stream/aiaec/front/aiaec_front.h</code></td><td>沒有自己 AEC 的 Align-ULCNet 獨立 sample</td></tr>
 <tr><td><code>stream/common/graph_io.h</code> 與 <code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/aiaec/graph_io_deepvqes.h</code>、<code>stream/aiaec/graph_io_alignulcnet.h</code></td><td>graph 接線表與埠檢查（只有標頭）</td></tr>
 <tr><td><code>stream/common/stream_bind.h</code></td><td>埠綁定；sample 另編譯 <code>stream/common/stream_bind.c</code></td></tr>
+<tr><td><code>stream/common/stream_run.h</code></td><td><code>StreamWork</code>（區塊的 tensor、action 與 state generation）與 run status（<code>STREAM_RUN_OK</code>／<code>NOT_STARTED</code>／<code>FAILED</code>）；<code>ainr.h</code>／<code>aiaec.h</code> 會引用它，只有標頭、與 SDK 無關</td></tr>
 <tr><td><code>stream/common/stream_mem.h</code></td><td><code>StreamMemReq</code>（<code>ainr.h</code>／<code>aiaec.h</code> 已引用）與 <code>stream_saturate_s16()</code></td></tr>
 </tbody></table>
 <p>include 路徑：所用標頭各自的目錄、<code>stream/common</code>、audiolib 的 <code>common/</code>（<code>stream_mem.h</code> 引用 <code>utility/mem_align.h</code>）；用 <code>ainr_bridge.h</code> 時再加 audiolib 的 <code>common/include</code>（<code>fft_wrapper.h</code>）。例：<code>cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common …</code>，完整建置指令見各模型首頁。<code>make -C stream/common check-public-headers</code>（包含在 <code>make -C stream/common test</code>）只用這些 include 路徑，把整組標頭當成一個 C99（<code>-Wpedantic -Werror</code>）與 C++11 的編譯單元編譯（DFN2 full 與 lite 各一次），並確認每個宣告的函式都是 C linkage（沒有被 mangle）。</p>

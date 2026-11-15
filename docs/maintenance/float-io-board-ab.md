@@ -14,7 +14,7 @@
 
 每支 sample 各做一輪，同一個板子、同一個輸入 wav、同一個 `model.bin`、同樣的 grid。
 
-1. 備份。`FLOAT_IN`／`FLOAT_OUT` 都留 0 建置，跑完整輸入，存 A 的輸出 wav 與 stdout log（`a.wav`、`a.log`）。這是現況，必須與改動前的輸出逐位元相同；不同就停下來，問題不在 float I/O。
+1. 備份。`FLOAT_IN`／`FLOAT_OUT` 都留 0 建置，跑完整輸入，存 A 的輸出 wav 與 stdout log（`a.wav`、`a.log`）。這是現況，必須與改動前的輸出逐位元相同；不同就停下來，問題不在 float I/O。參考錄音必須用同一份原始碼重錄：介面整理之後，`alg_ai3_alignulcnet.c` 在對齊事件的 hop 不再輸出 16 ms 的零（PCM 版也只重啟模型），`alg_ai3_aec_dfn.c` 在 AEC 硬重置附近的輸出也不同；舊錄音與這兩支新 sample 會在這些位置不同，不是 float I/O 的問題。
 2. 兩個都改 1 建置（只改這兩個 define，其他不動），啟動。預期 log 有 `[AI3] float_in=1 float_out=1`，沒有 `WARNING: mixed setting`，埠檢查通過（埠檢查不比對 float 與定點）。記下：每個訊號輸入與 head 的 `scale_ratio`／`zero_point`、state 埠回報的型別，都在 sample 開圖時印的 `[AI3] in[i]`／`out[i]` 行裡（`compare` 腳本只讀含 `scale_ratio`／`zero_point` 的行）。
 3. 跑同一個輸入，存 B 的輸出 wav 與 log（`b.wav`、`b.log`）。要比 head 時，兩邊都讓 sample 把每拍的 head 以 float32 依圖的順序寫到檔案（`a.f32`、`b.f32`）；沒有 dump 功能就略過 head 比對，只比音訊與時間。
 4. 比對：

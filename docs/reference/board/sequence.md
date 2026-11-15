@@ -240,10 +240,13 @@ library; the model callback reloads quantized zeros into the accelerator's state
 that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
 and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class a
 caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
-its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused
-commit (a non-finite head, and for Align-ULCNet also a finite head whose enhanced spectrum is not finite) of a real frame; a model
-failure on a real frame and a committed frame leave it alone. A failed run or readback (status != 0) leaves the generation unchanged
-(except an Align-ULCNet packet, N > 1, with an event hop: +1): zero the accelerator's state before its next run. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
+its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all), on a refused
+commit (a non-finite head, and for Align-ULCNet also a finite head whose enhanced spectrum is not finite) of a real frame, and on a run
+status that is neither 0 nor `STREAM_RUN_NOT_STARTED` (`stream/common/stream_run.h`: the callback reports `STREAM_RUN_NOT_STARTED` for a failure before the accelerator
+was started, `STREAM_RUN_FAILED` for one from the start on, 0 only when every head was read back); a committed frame leaves it alone, and so does
+`STREAM_RUN_NOT_STARTED` (except an Align-ULCNet packet, N > 1, with an event hop: +1). The callback keeps one value, the generation at the last zeroing, and zeroes the
+accelerator's state before a run when the generation it is handed differs; it records the value only when the zeroing succeeded, and reports
+`STREAM_RUN_NOT_STARTED` otherwise. No separate "recovery pending" flag exists. A block whose `StreamWork.action` is `STREAM_WORK_BYPASS` is not run. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
 compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config
 instead, and the library zeroes and checks them; the DFN2 stage and bridge register none.
 

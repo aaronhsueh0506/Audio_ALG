@@ -240,6 +240,7 @@ The product path of DFN2, DeepVQE-S and Align-ULCNet (`ainr.h` / `aiaec.h`) uses
 | `stream/common/graph_io.h` with `stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_deepvqes.h`, `stream/aiaec/graph_io_alignulcnet.h` | graph wiring tables and port checks (header-only) |
 | `stream/common/stream_bind.h` | port binding helpers; compile `stream/common/stream_bind.c` into the sample |
 | `stream/common/stream_mem.h` | `StreamMemReq` (included by `ainr.h` / `aiaec.h`) and `stream_saturate_s16()` |
+| `stream/common/stream_run.h` | `StreamWork` (the block's tensors, action and state generation) and the run status values `STREAM_RUN_OK`, `STREAM_RUN_NOT_STARTED`, `STREAM_RUN_FAILED` (included by `ainr.h` / `aiaec.h`; header-only, SDK-free) |
 
 Include roots: the directory of each header used, `stream/common`, audiolib `common/`
 (`stream_mem.h` includes `utility/mem_align.h`) and, with `ainr_bridge.h`, audiolib
