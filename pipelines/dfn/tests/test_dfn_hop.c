@@ -692,6 +692,38 @@ static void test_model_hooks(void) {
     }
 }
 
+/* The delay helper is dfn2_prepost_latency_frames(), and both inits refuse a grid of more than one frame per
+ * call (and NULL) without writing the hop. */
+static void test_frames_per_call_guard(void) {
+    DFN2Grid one = *dfn_test_grid();
+    DFN2Grid three = one;
+    DFN2Model model = model_of(NULL, NULL);
+    static float planar[6 * MAXB];
+    static Complex spec[MAXB];
+    DfnHop h, before;
+    three.frames_per_call = 3;
+    CHECK(dfn_hop_lookahead_frames(&one) == one.mask_lookahead + one.df_lookahead, "lookahead: L + D at N = 1");
+    CHECK(dfn_hop_lookahead_frames(&three) == dfn2_prepost_latency_frames(&three) &&
+          dfn_hop_lookahead_frames(&three) == three.mask_lookahead + three.df_lookahead + 2,
+          "lookahead: dfn2_prepost_latency_frames (L + D + N - 1) at N = 3");
+    CHECK(dfn_hop_lookahead_frames(NULL) == 0, "lookahead: 0 for NULL");
+
+    memset(&h, 0xA5, sizeof h);
+    before = h;
+    CHECK(dfn_hop_init_direct(&h, NULL, &three, &model, NULL, spec, planar) == -1 &&
+          memcmp(&h, &before, sizeof h) == 0, "init_direct: N = 3 refused, hop untouched");
+    CHECK(dfn_hop_init_bridge(&h, NULL, &three, &model, NULL, planar) == -1 &&
+          memcmp(&h, &before, sizeof h) == 0, "init_bridge: N = 3 refused, hop untouched");
+    CHECK(dfn_hop_init_direct(&h, NULL, NULL, &model, NULL, spec, planar) == -1 &&
+          dfn_hop_init_bridge(&h, NULL, &one, NULL, NULL, planar) == -1 &&
+          dfn_hop_init_direct(NULL, NULL, &one, &model, NULL, spec, planar) == -1,
+          "init: NULL hop, grid or model refused");
+    CHECK(dfn_hop_init_direct(&h, NULL, &one, &model, NULL, spec, planar) == 0 && h.n_bins == one.n_bins,
+          "init_direct: N = 1 accepted");
+    CHECK(dfn_hop_init_bridge(&h, NULL, &one, &model, NULL, planar) == 0 && h.n_bins == one.n_bins,
+          "init_bridge: N = 1 accepted");
+}
+
 int main(void) {
     dfn_unit_partition(g_erb_fwd, g_erb_inv, dfn_test_grid());
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &g_descriptor) != 0) {
@@ -704,6 +736,7 @@ int main(void) {
     else printf("dfn_hop: the test grid is not 48 kHz / 1024, so the bridge path (which needs it) is skipped\n");
     test_model_hooks();
     test_check_finite();
+    test_frames_per_call_guard();
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");
     return 0;

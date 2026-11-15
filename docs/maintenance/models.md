@@ -248,6 +248,7 @@ Include roots: the directory of each header used, `stream/common`, audiolib `com
 `stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
 
 - [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`
-      and as C++11, given only the include roots above.
+      and as C++11, given only the include roots above, and keeps C linkage:
+      `make -C stream/common check-public-headers` (part of `make -C stream/common test`).
 
 [返回本主題](README.md)

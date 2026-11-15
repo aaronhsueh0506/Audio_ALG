@@ -108,7 +108,7 @@ static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur
         if (!bridge || ainr_bridge_n_freqs(bridge) != n_freqs ||
             ainr_bridge_hop_size(bridge) != hop_size)
             return -1;
-        dfn_hop_init_bridge(hop, stream, grid, &p->model, bridge, planar);
+        return dfn_hop_init_bridge(hop, stream, grid, &p->model, bridge, planar);
     } else {
         AcStftConfig scfg;
         AcIstft* istft;
@@ -119,7 +119,7 @@ static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur
         cur += ALIGN16(p->istft_bytes);
         if (!istft) return -1;
         out_spec = (Complex*)cur;
-        dfn_hop_init_direct(hop, stream, grid, &p->model, istft, out_spec, planar);
+        if (dfn_hop_init_direct(hop, stream, grid, &p->model, istft, out_spec, planar) != 0) return -1;
         hop->check_finite = check_finite;
     }
     return 0;

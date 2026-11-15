@@ -77,10 +77,10 @@ typedef struct DfnHop {
     Complex* frame_out;           /* bridge path: the open frame's output spectrum */
 } DfnHop;
 
-/* Frames the emitted spectrum trails the newest input by: mask + deep-filter lookahead, valid only for
- * frames_per_call == 1 (the only grid dfn_hop_pool builds); dfn2_prepost_latency_frames() adds N - 1. */
+/* Frames the emitted spectrum trails the newest input by: dfn2_prepost_latency_frames(), L + D on the
+ * one-frame-per-call grids the init functions accept. 0 for NULL. */
 static inline int dfn_hop_lookahead_frames(const DFN2Grid* grid) {
-    return grid ? grid->mask_lookahead + grid->df_lookahead : 0;
+    return grid ? dfn2_prepost_latency_frames(grid) : 0;
 }
 
 /* 1 when the model is usable on `grid`: no infer needs no reset and no descriptor; an infer needs a
@@ -108,10 +108,11 @@ static inline int dfn_hop_infer(const DfnHop* h, DfnHopJob* job) {
 }
 
 /* Host on the model's grid. `planar` holds 6 * n_bins floats, `out_spec` n_bins bins; both are
- * zeroed here. */
-static inline void dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
-                                       const DFN2Model* model, AcIstft* istft, Complex* out_spec,
-                                       float* planar) {
+ * zeroed here. 0, or -1 (h untouched) for NULL h / grid / model or frames_per_call != 1. */
+static inline int dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
+                                      const DFN2Model* model, AcIstft* istft, Complex* out_spec,
+                                      float* planar) {
+    if (!h || !grid || !model || grid->frames_per_call != 1) return -1;
     memset(h, 0, sizeof(*h));
     h->stream = stream;
     h->model = *model;
@@ -124,11 +125,13 @@ static inline void dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2
     h->unscale = dfn2_stft_unscale(grid->n_fft);
     memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
     memset(out_spec, 0, (size_t)grid->n_bins * sizeof(Complex));
+    return 0;
 }
 
-/* Host rate differs from the model grid (bridge path). */
-static inline void dfn_hop_init_bridge(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
-                                       const DFN2Model* model, AinrBridge* bridge, float* planar) {
+/* Host rate differs from the model grid (bridge path). 0, or -1 as dfn_hop_init_direct(). */
+static inline int dfn_hop_init_bridge(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
+                                      const DFN2Model* model, AinrBridge* bridge, float* planar) {
+    if (!h || !grid || !model || grid->frames_per_call != 1) return -1;
     memset(h, 0, sizeof(*h));
     h->stream = stream;
     h->bridge = bridge;
@@ -138,6 +141,7 @@ static inline void dfn_hop_init_bridge(DfnHop* h, DFN2Stream* stream, const DFN2
     h->scale = dfn2_stft_scale(grid->n_fft);
     h->unscale = dfn2_stft_unscale(grid->n_fft);
     memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
+    return 0;
 }
 
 /* Back to hop #0: the stream, the model (reset callback), the bridge or the synthesis, and the

@@ -81,7 +81,9 @@ the handover documentation, and check them off here.
 - [ ] No `review_*.md`, review-round wording, or other development-process
       messages remain in release source, CLI output, or current user
       documentation.
-- [ ] Public headers compile from a clean external C99 consumer.
+- [ ] Public headers compile from a clean external C99 consumer: the customer
+      header set as C99 `-Wpedantic` and C++11 with C linkage,
+      `make -C stream/common check-public-headers` (in `make -C stream/common test`).
 - [ ] Every public API/ABI/layout break has a version bump, migration note,
       and negative compatibility test.
 - [ ] Third-party NE10 and other redistributed code has

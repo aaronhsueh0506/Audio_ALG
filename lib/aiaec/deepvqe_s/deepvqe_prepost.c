@@ -147,8 +147,8 @@ static uint32_t pp_build_hash(const DeepVqeGrid *grid) {
 static int pp_layout(DeepVqePrepost *p, unsigned char *base, const DeepVqeGrid *grid,
                      size_t *total) {
     size_t cursor = 0;
-    const size_t bins = (size_t)grid->n_bins * sizeof(float);
-    const size_t n_bins = (size_t)grid->frames_per_call * bins;   /* N frames, oldest first */
+    const size_t frame_bytes = (size_t)grid->n_bins * sizeof(float);
+    const size_t call_bytes = (size_t)grid->frames_per_call * frame_bytes;   /* N frames, oldest first */
     void *ptr;
 
     if (pp_carve(base, &cursor, sizeof(DeepVqePrepost), &ptr) != 0) return -1;
@@ -156,27 +156,27 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base, const DeepVqeGrid *
     if (pp_carve(base, &cursor, deepvqe_prepost_taps_elements(grid) * sizeof(float),
                  &ptr) != 0) return -1;
     if (base && p) p->taps = (float *)ptr;
-    if (pp_carve(base, &cursor, 2u * n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, 2u * call_bytes, &ptr) != 0) return -1;
     if (base && p) p->mic_ri = (float *)ptr;
-    if (pp_carve(base, &cursor, 2u * n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, 2u * call_bytes, &ptr) != 0) return -1;
     if (base && p) p->far_ri = (float *)ptr;
 
-    if (pp_carve(base, &cursor, (size_t)DEEPVQE_TIME_ORDER * bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, (size_t)DEEPVQE_TIME_ORDER * frame_bytes, &ptr) != 0) return -1;
     if (base && p) p->ccm.spectrum_re = (float *)ptr;
-    if (pp_carve(base, &cursor, (size_t)DEEPVQE_TIME_ORDER * bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, (size_t)DEEPVQE_TIME_ORDER * frame_bytes, &ptr) != 0) return -1;
     if (base && p) p->ccm.spectrum_im = (float *)ptr;
 
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->mic_re = (float *)ptr;
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->mic_im = (float *)ptr;
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->far_re = (float *)ptr;
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->far_im = (float *)ptr;
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->enh_re = (float *)ptr;
-    if (pp_carve(base, &cursor, n_bins, &ptr) != 0) return -1;
+    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
     if (base && p) p->enh_im = (float *)ptr;
 
     *total = ck_align16_size(cursor);
@@ -389,18 +389,18 @@ static void zero_state(DeepVqePrepost *p) {
 }
 
 void deepvqe_prepost_reset(DeepVqePrepost *p) {
-    size_t n_bins;
+    size_t call_bytes;
     if (!p) return;
-    n_bins = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
+    call_bytes = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
     zero_state(p);
     memset(p->taps, 0, p->taps_elements * sizeof(float));
     deepvqe_ccm_reset(&p->ccm);
-    memset(p->mic_re, 0, n_bins);
-    memset(p->mic_im, 0, n_bins);
-    memset(p->far_re, 0, n_bins);
-    memset(p->far_im, 0, n_bins);
-    memset(p->enh_re, 0, n_bins);
-    memset(p->enh_im, 0, n_bins);
+    memset(p->mic_re, 0, call_bytes);
+    memset(p->mic_im, 0, call_bytes);
+    memset(p->far_re, 0, call_bytes);
+    memset(p->far_im, 0, call_bytes);
+    memset(p->enh_re, 0, call_bytes);
+    memset(p->enh_im, 0, call_bytes);
     p->frame_open = 0;
     p->prepared = 0;
     p->pending = 0;
@@ -427,18 +427,18 @@ static int all_finite(const float *values, size_t elements) {
 int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
                                      const float *mic_re, const float *mic_im,
                                      const float *far_re, const float *far_im) {
-    size_t bins;
+    size_t frame_bytes;
     size_t at;
 
     if (!p || !mic_re || !mic_im || !far_re || !far_im) return -1;
     if (p->frame_open) return -1;   /* previous batch neither finished nor bypassed */
 
-    bins = (size_t)p->n_bins * sizeof(float);
+    frame_bytes = (size_t)p->n_bins * sizeof(float);
     at = (size_t)p->pending * (size_t)p->n_bins;
-    memcpy(p->mic_re + at, mic_re, bins);
-    memcpy(p->mic_im + at, mic_im, bins);
-    memcpy(p->far_re + at, far_re, bins);
-    memcpy(p->far_im + at, far_im, bins);
+    memcpy(p->mic_re + at, mic_re, frame_bytes);
+    memcpy(p->mic_im + at, mic_im, frame_bytes);
+    memcpy(p->far_re + at, far_re, frame_bytes);
+    memcpy(p->far_im + at, far_im, frame_bytes);
 
     p->pending += 1;
     if (p->pending < p->frames_per_call) return 0;   /* batch still gathering */
@@ -546,13 +546,13 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p) {
 }
 
 int deepvqe_prepost_frame_bypass(DeepVqePrepost *p) {
-    size_t bins;
+    size_t call_bytes;
     if (!p || !p->frame_open) return -1;
-    bins = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
+    call_bytes = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
     /* Fail closed: pass-through of the raw microphone would emit the uncancelled echo; emit
      * silence for every frame of the batch and leave the CCM ring and state as they are. */
-    memset(p->enh_re, 0, bins);
-    memset(p->enh_im, 0, bins);
+    memset(p->enh_re, 0, call_bytes);
+    memset(p->enh_im, 0, call_bytes);
     p->deliver_slot = 0;
     p->frame_open = 0;
     p->prepared = 0;
@@ -560,14 +560,14 @@ int deepvqe_prepost_frame_bypass(DeepVqePrepost *p) {
 }
 
 int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im) {
-    size_t bins;
+    size_t frame_bytes;
     size_t at;
     if (!p || !re || !im) return -1;
     if (p->frame_open) return -1;
-    bins = (size_t)p->n_bins * sizeof(float);
+    frame_bytes = (size_t)p->n_bins * sizeof(float);
     at = (size_t)p->deliver_slot * (size_t)p->n_bins;
-    memcpy(re, p->enh_re + at, bins);
-    memcpy(im, p->enh_im + at, bins);
+    memcpy(re, p->enh_re + at, frame_bytes);
+    memcpy(im, p->enh_im + at, frame_bytes);
     p->deliver_slot = (p->deliver_slot + 1) % p->frames_per_call;
     return 0;
 }

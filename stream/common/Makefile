@@ -1,8 +1,8 @@
 # Shared stream/ helpers: the header-only stream_mem.h (StreamMemReq, carve, hash, saturate), the
 # SDK-free port check stream_bind.{h,c}, which does not depend on stream_mem.h, and the header-only board
 # sample helper graph_io.h (row expansion, state pairing, boundary check) over it.
-# Standalone: `make -C stream/common test` builds and runs the three unit tests, the C++ header compile and the
-# no-stdio audit.
+# Standalone: `make -C stream/common test` builds and runs the three unit tests, the C++ header compile, the
+# customer header set check and the no-stdio audit.
 CC ?= cc
 CXX ?= c++
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
@@ -15,7 +15,7 @@ BUILD_DIR ?= build
 
 include ../../lib/deps.mk
 
-.PHONY: all test test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx audit-no-stdio clean
+.PHONY: all test test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx check-public-headers audit-no-stdio clean
 
 all: $(BUILD_DIR)/stream_bind.o
 
@@ -52,6 +52,11 @@ check-graph-io-cxx: graph_io.h stream_bind.h | $(BUILD_DIR)
 	$(CXX) -std=c++11 -Wall -Wextra -Wpedantic -Werror -I. -fsyntax-only "$(BUILD_DIR)/graph_io_cxx_probe.cpp"
 	@echo "check-graph-io-cxx: PASS"
 
+# The customer header set compiles as C99 -Wpedantic and as C++11 with only the documented include roots, and
+# every function it declares keeps C linkage (tests/check_public_headers.sh).
+check-public-headers: check-graph-io-cxx tests/check_public_headers.sh | $(BUILD_DIR)
+	sh tests/check_public_headers.sh "$(CC)" "$(CXX)" "$(COMMON_DIR)" "$(BUILD_DIR)/public_headers"
+
 # stream_bind.o must not reference any printf-family symbol; the positive control proves the scan
 # would see one.
 audit-no-stdio: $(BUILD_DIR)/stream_bind.o | $(BUILD_DIR)
@@ -63,7 +68,7 @@ audit-no-stdio: $(BUILD_DIR)/stream_bind.o | $(BUILD_DIR)
 	  echo "audit-no-stdio: positive control did not match"; exit 1; fi
 	@echo "audit-no-stdio: PASS"
 
-test: test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx audit-no-stdio
+test: test-stream-bind test-stream-mem test-graph-io check-graph-io-cxx check-public-headers audit-no-stdio
 
 clean:
 	rm -rf "$(BUILD_DIR)"
