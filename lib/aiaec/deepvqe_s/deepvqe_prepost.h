@@ -167,7 +167,7 @@ typedef struct DeepVqePrepostMemReq {
     uint32_t descriptor_version;  /* DEEPVQE_PREPOST_DESCRIPTOR_VERSION     */
     uint32_t layout_version;      /* DEEPVQE_PREPOST_LAYOUT_VERSION         */
     uint32_t reserved0;           /* 0 */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over sample rate, n_fft, D and versions */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over sample rate, n_fft, D, N and versions */
     uint32_t alignment;
     uint32_t reserved1;           /* 0 */
     uint64_t bytes;

@@ -49,7 +49,7 @@ typedef struct UlcnetPrepostConfig {
 
 typedef struct UlcnetPrepostMemReq {
     uint32_t descriptor_version;  /* ULCNET_PREPOST_DESCRIPTOR_VERSION      */
-    uint32_t layout_version;      /* ULCNET_MODEL_IO_LAYOUT_VERSION         */
+    uint32_t layout_version;      /* descriptor layout: 18, or 19 for a packet */
     uint32_t reserved0;           /* 0 */
     uint32_t build_flags_hash;    /* FNV-1a-32: sample rate, n_fft, layout, carve, D */
     uint32_t alignment;

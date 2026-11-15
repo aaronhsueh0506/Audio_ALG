@@ -41,7 +41,7 @@ Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個
 - 開關是每支 AI3 sample 開頭的編譯期 `#define FLOAT_IN 0`、`#define FLOAT_OUT 0`，預設關閉；沒有執行期旗標，也沒有全域模式結構。`FLOAT_IN` 管訊號輸入，`FLOAT_OUT` 管 head 輸出。
 - 這些 model 的 state 就地繼承 input／output 的型別（recurrent state 的輸入與輸出共用同一塊 buffer），所以**要求 `FLOAT_IN == FLOAT_OUT`**；混合設定只適用於不繼承 state 的模型，這裡的 AI3 sample 都不是。混合設定不會被編譯擋下，只有一個編譯警告（`#warning`，內容為 `FLOAT_IN != FLOAT_OUT: these models inherit the state port types, so FLOAT_IN must equal FLOAT_OUT; ...`）和啟動時 `[AI3] float_in=%d float_out=%d` 那行 log 後面的 `WARNING: mixed setting`。用 `-Werror` 建置時這個 `#warning` 會變成錯誤。
 - State 埠不受這兩個 define 管：它們維持 SDK 回報的型別。state 的清零一律是對 buffer 填位元組 0 並 flush cache，不分 float 與定點：float 的 `0.0f` 全為零位元組；定點則靠 `stream_check_ports()` 保證兩端 `zero_point` 為 0（`STREAM_PORT_ERR_STATE_ZERO_POINT`，-110），所以通過埠檢查的 graph 不會有需要非零量化零的 state 埠。
-- 開 float I/O 只省轉換，不省搬運：函式庫的資料在 host heap，NPU buffer 在 NPU 可見的記憶體，輸入的 `memcpy` 與 cache flush 仍在，head 讀回變成 flush 加 `memcpy(elem * 4 bytes)`。Host 端的 DFN2 `df_alpha` 夾到 [0, 1] 仍保留，NaN 預填與函式庫的有限值檢查仍在：float head 不會像定點那樣飽和，NPU 輸出的 NaN／Inf 由函式庫拒絕該拍（直通加 generation 前進，見上節 State 的回復）。
+- 開 float I/O 只省轉換，不省搬運：函式庫的資料在 host heap，NPU buffer 在 NPU 可見的記憶體，輸入的 `memcpy` 與 cache flush 仍在，head 讀回變成 flush 加 `memcpy(elem * 4 bytes)`。DFN2 的 `df_alpha` 由函式庫在混合時夾到 [0, 1]（`dfn2_process.c`，host 不必再夾），NaN 預填與函式庫的有限值檢查仍在：float head 不會像定點那樣飽和，NPU 輸出的 NaN／Inf 由函式庫拒絕該拍（直通加 generation 前進，見上節 State 的回復）。
 
 ### 啟動 log
 

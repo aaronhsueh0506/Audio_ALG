@@ -60,9 +60,9 @@ struct DeepVqePrepost {
     float *state[DEEPVQE_STATE_COUNT];
     size_t state_elements[DEEPVQE_STATE_COUNT];
 
-    float *taps;        /* [n_bins * TIME_ORDER * FREQ_TAPS * 2]            */
-    float *mic_ri;      /* [2 * n_bins] real plane, imaginary plane         */
-    float *far_ri;      /* [2 * n_bins] real plane, imaginary plane         */
+    float *taps;        /* [frames_per_call * n_bins * TIME_ORDER * FREQ_TAPS * 2] */
+    float *mic_ri;      /* [2 * frames_per_call * n_bins] real plane, imaginary plane */
+    float *far_ri;      /* [2 * frames_per_call * n_bins] real plane, imaginary plane */
 
     /* Raw-microphone spectrum ring the CCM taps convolve over (arrays carved from the pool). */
     DeepVqeCcmState ccm;
@@ -130,7 +130,7 @@ static uint32_t pp_fnv1a(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* Identity a pool is valid for: grid, layout and carve versions, D. The state registration is
+/* Identity a pool is valid for: grid, layout and carve versions, D, N. The state registration is
  * not in it: the buffers are borrowed and change no pool byte. */
 static uint32_t pp_build_hash(const DeepVqeGrid *grid) {
     uint32_t h = 2166136261u;

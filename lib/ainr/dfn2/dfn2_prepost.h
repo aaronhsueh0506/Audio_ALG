@@ -182,12 +182,14 @@ int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
  * frame, the first L being warm-up frames (their heads describe a frame before the stream start and are
  * discarded by frame_finish / frame_bypass); N > 1: 1 at the zero-indexed hop L + N - 1, then every N hops
  * after (L == 0 included, with no warm-up frames), 0 otherwise. -1 on NULL args or with a frame open. Flush:
- * push zero spectra and run the accelerator until the last real frame is emitted. */
+ * push zero spectra and run the accelerator until the last real frame is emitted. Bins are not checked: each must be
+ * finite with |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
                                   const float *spec_im);
 
 /* Dual input: `est` feeds the estimation branch (features, graph window, heads), `app` the application branch
- * (what the mask, deep filter and attenuation limit act on; kept per frame); else as pre_process_freq(). */
+ * (what the mask, deep filter and attenuation limit act on; kept per frame); else as pre_process_freq(), the bin
+ * precondition included, for both. */
 int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
                                        const float *est_im,
                                        const float *app_re,

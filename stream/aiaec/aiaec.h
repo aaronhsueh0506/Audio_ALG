@@ -16,7 +16,7 @@
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
  * calls aiaec_front_preprocess(). A configuration with no registered grid, hop_in or graph is refused by
  * aiaec_get_mem_size() and aiaec_init() before any SDK call. The PCM (no suffix), "_spec" and "_freq" families
- * share configuration, catalog, AiaecInfo and AiaecWork. */
+ * share configuration, catalog, AiaecInfo and AiaecWork. A context is used from one thread at a time. */
 
 #ifndef AIAEC_H
 #define AIAEC_H
@@ -110,7 +110,8 @@ typedef enum AiaecAction {
 
 /* Per-block tensor views, valid until the paired aiaec_postprocess(): signals then the head in graph order (the recurrent
  * state stays in the accelerator). DeepVQE-S: mic, far [1,2,N,bins]; CCM taps [1,N,bins,18]. Align-ULCNet: error_mag,
- * far_mag, error_cos, error_sin [1,1,N,bins], at N > 1 frame_reset [1,1,1,N]; complex mask [1,2,N,bins]. */
+ * far_mag, error_cos, error_sin [1,1,N,bins], at N > 1 frame_reset [1,1,1,N]; complex mask [1,2,N,bins]. A SUBMIT
+ * preprocess NaN-fills the head, so a head the accelerator leaves unwritten counts as a non-finite output. */
 typedef struct AiaecWork {
     AiaecAction action;
     AiaecTensorIn    inputs[AIAEC_MAX_INPUT_TENSORS];
@@ -119,7 +120,8 @@ typedef struct AiaecWork {
     int              output_count;
     /* Sampled every SUBMIT block (0 on BYPASS): zero the accelerator's state whenever it differs from the last value seen.
      * A failed run or readback (status != 0) leaves the generation unchanged (Align-ULCNet packet with an event hop: +1):
-     * zero the accelerator's state before its next run. */
+     * zero the accelerator's state before its next run.
+     * All-zero bytes are the zero: the port check refuses a fixed-point state port with zero_point != 0. */
     unsigned int     state_generation;
     /* Align-ULCNet PCM and _spec: bit k = model hop k (oldest first, N up to 64) restarted the stream's framing with the
      * model state; synthesis_restarted = any bit set. A _spec caller calls ac_istft_reset right before that hop's frame.
@@ -134,7 +136,7 @@ typedef struct AiaecWork {
 
 /* The graph and stream timing the init resolved for this configuration. */
 typedef struct AiaecInfo {
-    const char  *graph_path;           /* model.bin for this configuration; never NULL here */
+    const char  *graph_path;           /* model.bin for this configuration; a static string, never NULL here */
     int          trim_samples;         /* samples to drop from the start of the final PCM (after the caller's ISTFT for
                                         * _spec/_freq), all families: DeepVQE-S N * model_hop, Align-ULCNet model_hop */
     int          queue_frames;         /* model-queue frames between a frame in and its enhanced frame out:

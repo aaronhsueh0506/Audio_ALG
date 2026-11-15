@@ -28,7 +28,7 @@ flowchart LR
         STATE["state tensors, the application's<br/>K/V window + logit window<br/>one h_gru tensor"]
         CHECK["enhance_spectrum(): validate"]
         INV["complex multiply by the mask<br/>+ inverse signed power, fp32<br/>(enhance_spectrum)"]
-        WOLA["application: AcIstft (audiolib)<br/>envelope-normalised overlap-add"]
+        WOLA["application: AcIstft (audiolib)<br/>overlap-add, AC_OLA_ACCUMULATE"]
         OUT["enhanced PCM hop"]
         MIC --> AEC
         FAR --> AEC
@@ -118,7 +118,10 @@ state. The runtime must finish reading every state input before it writes any
 state output. There is no copy path and no ping-pong. A refused
 `enhance_spectrum()` cannot roll back: the registered state tensors are zeroed
 (a board registers none), the state generation advances, and a run that
-reported failure is taken not to have written.
+reported failure is taken not to have written. With in-place state a failed run
+may still have overwritten the state tensors, so a board zeroes them before the
+next run after any failed run or readback (`aiaec.h`); the generation does not
+move then.
 
 The window shift happens inside the graph, on the input side. K/V (newest
 first) keep the input's slots `0..D-2` through a Slice (axis 2, step 1, end
@@ -139,7 +142,8 @@ debug-only and is not part of the production ABI.
 restarted the state: `reset` and each refused frame add one, whether or not
 state is registered; it is 0 after init. A board whose accelerator keeps
 fixed-point state loads the quantized representation of zero into its state
-inputs at start and whenever the value differs from the one it last saw.
+inputs at start, whenever the value differs from the one it last saw, and
+before the next run after any failed run or readback.
 
 A board that calls the model I/O layer directly uses it in this order (error
 paths fail open and must not call `enhance_spectrum` with incomplete
@@ -372,14 +376,18 @@ never composes `ulcnet_model_io` by hand. It is frequency domain only. The
 application frames with audiolib as `ulcnet_prepost.h` states: the analysis
 `AcStft` per stream from `ac_stft_config_default(&sc, grid.n_fft)` (sqrt-Hann,
 `spec_scale` 1, center 0, one frame per hop from hop 0) and one `AcIstft` with
-`ola = AC_OLA_ENV_NORM`, `ispec_scale` 1, whose first frame emits nothing (latency
-`grid.hop`). The center-0 frame is bit-identical to the last frame per hop of
+`ola = AC_OLA_ACCUMULATE`, `ispec_scale` 1: every push emits a full hop, hop 0
+included (latency `grid.hop`). This is the C convention. The Python reference
+normalises by the window envelope like `torch.istft`; with periodic sqrt-Hann at
+50 % overlap that envelope is 1 up to rounding, so the two differ only in how
+hop 0 starts and by about one ulp. The center-0 frame is bit-identical to the last frame per hop of
 the centered schedule, which `tests/test_ulcnet_prepost_c.py` pins. The
 lifecycle and per-hop sequence shared by every class are described once, in
 `../README.md` ("C pre/post-processing"). Specific to this one:
 `frame_bypass` is the pass-through identity because stream 0 is a residual, and
 it leaves every state tensor as the accelerator wrote it (a runtime that
-reported failure is taken not to have written); the pool's `build_flags_hash`
+reported failure is taken not to have written; with in-place state the board
+zeroes the state before the next run); the pool's `build_flags_hash`
 still folds D, so `_init_ex` refuses a pool recorded for another D although the
 bytes are equal. The class gate is `tests/test_ulcnet_prepost_c.py`.
 

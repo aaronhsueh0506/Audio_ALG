@@ -17,7 +17,7 @@
  * A failed run or readback still calls ainr_postprocess() with the failure status. An unregistered
  * config is refused before any SDK call. Every successful preprocess pairs with one run and one
  * postprocess. AinrWork has the same size in the full and the lite archive: a client linked to the
- * wrong variant sees another input_count/output_count, not an overrun.
+ * wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
  * File mode only: the pool size assumes the ERB tables load from a file. Under -DDFN2_STREAM_NO_STDIO
  * no init function is compiled in; use dfn2_stream_init() (dfn2/dfn2_stream.h) directly. */
 
@@ -75,7 +75,8 @@ typedef struct AinrTensorOut {
 
 /* One block's tensors: inputs[i] is signal input i of the graph, outputs[j] head output j; the accelerator keeps the
  * recurrent state, state_generation says when to reload it with quantized zero. The data pointers are stream-owned,
- * valid until the matching postprocess: do not free them or write the inputs (the accelerator fills the outputs). */
+ * valid until the matching postprocess: do not free them or write the inputs (the accelerator fills the outputs).
+ * Preprocess NaN-fills the outputs, so a head the accelerator leaves unwritten counts as non-finite. */
 typedef struct AinrWork {
     AinrTensorIn  inputs[AINR_MAX_INPUT_TENSORS];
     int           input_count;
@@ -91,13 +92,14 @@ typedef struct AinrWork {
 
 /* Result of one init, the same for both families of a config. */
 typedef struct AinrInfo {
-    const char  *graph_path;           /* model.bin of this configuration */
+    const char  *graph_path;           /* model.bin of this configuration; a static string */
     int          trim_samples;         /* samples dropped from the start of the final PCM: (queue_frames + 1) * model_hop */
     int          queue_frames;         /* mask_lookahead + df_lookahead + N - 1 */
     int          tail_zero_blocks;     /* zero hop_in blocks after the last real block: ceil(trim_samples / hop_in) */
 } AinrInfo;
 
-/* ---- PCM family ---- */
+/* ---- PCM family ----
+ * int16 in and out (/ 32768 in, clipped out): a float caller pays one 16-bit requantization, about 1 LSB, per side. */
 
 typedef struct AinrCtx AinrCtx;
 
@@ -120,7 +122,8 @@ int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
 
 /* Current state generation (0 for NULL): seeds the sample's sync after init or reset; advances on reset, each
  * warm-up hop and a refused commit (non-finite heads): reload quantized zero on a change. A failed run or
- * readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run. */
+ * readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
+ * All-zero bytes are that zero: the port check refuses a fixed-point state port with zero_point != 0. */
 unsigned int ainr_state_generation(const AinrCtx *ctx);
 
 /* One block in: exactly cfg->hop_in samples. AINR_OK: work holds the block's one job; run the accelerator,
@@ -140,7 +143,8 @@ int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
  * it supplies an estimate spectrum E (features, mask, deep filter) and an apply spectrum P (what mask, deep
  * filter and attenuation limit act on) and does the ISTFT/OLA of the result; E == P (same pointers) is the
  * single-spectrum case. After ainr_reset_freq() reset the analyser too (ac_stft_reset()). A bypass delivers
- * P-aligned near-identity. */
+ * P-aligned near-identity. Direct (non-bridge) caller: an upstream restart at block t belongs to the frame delivered
+ * at block t + (queue_frames - (N - 1)); clear the caller's synthesis (ac_istft_reset()) just before pushing it. */
 
 typedef struct AinrFreqCtx AinrFreqCtx;
 
