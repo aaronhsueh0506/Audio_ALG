@@ -16,6 +16,7 @@ cat > "$HDR" <<'EOF'
 #include "aiaec.h"
 #include "aiaec_front.h"
 #include "stream_mem.h"
+#include "stream_run.h"
 #include "stream_bind.h"
 #include "graph_io.h"
 #include "graph_io_dfn2.h"
