@@ -75,17 +75,20 @@ while (read_blocks(mic, far, hop_in)) {
     in.u.deepvqe_s.far_in = far;
     StreamWork work;
     if (aiaec_preprocess(ctx, &amp;in, &amp;work) != AIAEC_OK) return -1;
-    int ai_rc = 0;
+    int run_status = STREAM_RUN_NOT_STARTED;
     if (work.action == STREAM_WORK_SUBMIT) {             /* DeepVQE-S 每包都是 SUBMIT */
         int chk;
         GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
-        if (chk != GRAPH_IO_OK) ai_rc = -1;    /* 不符：不送件，仍呼叫 post */
+        if (chk != GRAPH_IO_OK) run_status = STREAM_RUN_NOT_STARTED;    /* 不符：不送件，仍呼叫 post */
+        else if (work.state_generation != seen &amp;&amp; zero_state_buffers() != 0) run_status = STREAM_RUN_NOT_STARTED;   /* 清零失敗：seen 不更新，下一包再清 */
         else {
-            if (work.state_generation != seen) { clear_state_buffers(); seen = work.state_generation; }
-            ai_rc = run_ai3(&amp;work);                /* 填 work.inputs，執行，讀回 work.outputs */
+            seen = work.state_generation;
+            /* 填 work.inputs，執行，讀回 work.outputs；net_proc 之前的失敗回 STREAM_RUN_NOT_STARTED，
+             * 之後的失敗回 STREAM_RUN_FAILED，全部讀回才是 0 */
+            run_status = run_ai3(&amp;work);
         }
     }
-    if (aiaec_postprocess(ctx, ai_rc, pcm_out) != AIAEC_OK) return -1;   /* 失敗也呼叫 */
+    if (aiaec_postprocess(ctx, run_status, pcm_out) != AIAEC_OK) return -1;   /* 失敗也呼叫 */
     write_block(pcm_out, hop_in);
 }</code></pre>
 <p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>

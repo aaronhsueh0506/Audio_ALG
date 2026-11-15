@@ -9,7 +9,7 @@
  *     f = aiaec_front_init(pool, bytes, &cfg, &err);              // pool: AIAEC_FRONT_ALIGNMENT
  *     per block: aiaec_front_preprocess(f, ctx, mic, far, &work); // the linear AEC, then the block pre
  *                ...SUBMIT: the sample's accelerator run; BYPASS: none...
- *                aiaec_postprocess(ctx, ai_rc, pcm_out);          // exactly once per successful pre
+ *                aiaec_postprocess(ctx, run_status, pcm_out);     // exactly once per successful pre
  *
  * The AEC runs stage by stage at AEC_RESIDUAL_STATE (aec_process_linear, aec_process_residual: no gain, no output
  * stage); the residual is the analysis seam (AecResidualView.formed_hop). int16 input is scaled by 1/32768 once; float input is used as is; no

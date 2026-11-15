@@ -321,7 +321,7 @@ static int section_events(void) {
         if (wb.action == STREAM_WORK_BYPASS)
             CHECK(wb.input_count == 0 && wb.output_count == 0 && wb.state_generation == 0u && wf.input_count == 0,
                   "events hop %d: bypass work not zeroed", i);
-        /* infer_status is not read on a bypass hop */
+        /* the run status is not read on a bypass hop */
         CHECK(aiaec_postprocess(t.blk, wb.action == STREAM_WORK_SUBMIT ? 1 : 0xBAD1, pcm) == AIAEC_OK &&
               aiaec_postprocess_freq(t.freq, wf.action == STREAM_WORK_SUBMIT ? 1 : 0xBAD1, re, im) == AIAEC_OK,
               "events hop %d: postprocess", i);
@@ -461,7 +461,7 @@ static int check_pulse(const float *out, size_t n, size_t idx, const char *label
 }
 
 /* The accelerator stand-in of the tail test: identity head for DeepVQE-S, a bypass for Align-ULCNet
- * (fail open: the error spectrum passes through). Returns the infer_status to close the block with. */
+ * (fail open: the error spectrum passes through). Returns the run status to close the block with. */
 static int tail_accel(StreamWork *w, int n) {
     if (PRODUCT_DV) { identity_head(w, n); return 0; }
     return 1;
@@ -760,7 +760,7 @@ static int section_gates(void) {
 }
 
 #if PRODUCT_DV
-typedef enum FailKind { FAIL_STATUS = 0, FAIL_NONFINITE = 1, FAIL_BOTH = 2 } FailKind;
+typedef enum FailKind { FAIL_STATUS = 0, FAIL_NONFINITE = 1, FAIL_BOTH = 2, FAIL_NOT_STARTED = 3 } FailKind;
 
 static int frame_is_zero(const float *re, const float *im, int nb) {
     int i;
@@ -781,9 +781,10 @@ static float frame_max_diff(const float *a_re, const float *a_im, const float *b
 
 /* The _freq entry fails closed too. An identity accelerator returns the mic spectrum, delayed by N - 1 frames; the
  * failed job's N frames are zero spectra: the failed block's last frame and the next block's first N - 1 frames, which
- * must be exactly zero, with a normal frame on either side. The failure is a reported infer_status != 0 with valid
- * taps, non-finite taps with infer_status 0, and both. The state generation each SUBMIT block carries must be the
- * live one, across the refused commit and a reset. */
+ * must be exactly zero, with a normal frame on either side. The failure is a dirty run status with valid taps,
+ * non-finite taps with status OK, both, and STREAM_RUN_NOT_STARTED with valid taps. The state generation each SUBMIT
+ * block carries must be the live one, across the failure and a reset: it moves by one for a dirty status or a refused
+ * commit (both together count once) and stays for a run that never started. */
 static int section_fail_closed_freq(int fft, int n, FailKind kind) {
     enum { BLOCKS = 6, FAILED = 2 };
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n, frames = BLOCKS * n;
@@ -821,9 +822,9 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
         CHECK(w.state_generation == aiaec_state_generation_freq(t.freq), "fail_closed block %d: work generation %u, live %u", b,
               w.state_generation, aiaec_state_generation_freq(t.freq));
         identity_head(&w, n);
-        if (fail && kind != FAIL_STATUS) w.outputs[0].data[w.outputs[0].elements / 3] = NAN;
+        if (fail && (kind == FAIL_NONFINITE || kind == FAIL_BOTH)) w.outputs[0].data[w.outputs[0].elements / 3] = NAN;
         {
-            const int status = fail && kind != FAIL_NONFINITE ? 1 : 0;
+            const int status = !fail ? STREAM_RUN_OK : kind == FAIL_NOT_STARTED ? STREAM_RUN_NOT_STARTED : kind == FAIL_NONFINITE ? STREAM_RUN_OK : 1;
             float *re = o_re + (size_t)b * n * nb, *im = o_im + (size_t)b * n * nb;
             rc = aiaec_postprocess_freq(t.freq, status, re, im);
         }
@@ -841,10 +842,10 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
                   fft, n, (int)kind, p, (double)d, (double)peak);
         }
     }
-    if (kind == FAIL_NONFINITE)
-        CHECK(gen_seen[FAILED + 1] != gen_seen[FAILED] && gen_seen[FAILED + 1] != 0u && gen_seen[FAILED + 2] == gen_seen[FAILED + 1],
-              "fail_closed(N=%d): generation %u -> %u -> %u around the refused job", n,
-              gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
+    CHECK(gen_seen[FAILED + 1] == gen_seen[FAILED] + (kind == FAIL_NOT_STARTED ? 0u : 1u) && gen_seen[FAILED + 2] == gen_seen[FAILED + 1] &&
+          gen_seen[FAILED] == gen_seen[FAILED - 1],
+          "fail_closed(N=%d kind=%d): generation %u -> %u -> %u around the failed job", n, (int)kind,
+          gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
     {   /* a reset advances the generation and the next SUBMIT block carries it */
         AiaecFreqInput fin;
         StreamWork w;
@@ -875,7 +876,7 @@ static int section_fail_closed_all(void) {
     static const struct { int fft, n; } grids[3] = { { 256, 1 }, { 256, 8 }, { 512, 1 } };
     int g, k, bad = 0;
     for (g = 0; g < 3; ++g)
-        for (k = FAIL_STATUS; k <= FAIL_BOTH; ++k) bad |= section_fail_closed_freq(grids[g].fft, grids[g].n, (FailKind)k);
+        for (k = FAIL_STATUS; k <= FAIL_NOT_STARTED; ++k) bad |= section_fail_closed_freq(grids[g].fft, grids[g].n, (FailKind)k);
     return bad;
 }
 #endif /* PRODUCT_DV */

@@ -8,7 +8,7 @@
  *     driven directly with the same stash/drain loop, bit-exact PCM and identical accelerator-side
  *     tensors; batching against an independent N=1 stream; fail-closed; identity-accelerator delay.
  *   Align-ULCNet (N=1): normal, realignment-bypass and forced-failure hops against ulcnet_stream_*
- *     driven directly; infer_status ignored on a bypass hop; identity delay.
+ *     driven directly; run status ignored on a bypass hop; identity delay.
  *   Both: live work-view shapes, kind/size rejection before any state write, reset, and the pool
  *     size / alignment gates of init. */
 
@@ -281,9 +281,10 @@ static float g_poison_value = NAN;
 static int g_poison_at = 1;   /* 0 first element, 1 a third of the way in, 2 last element */
 
 typedef enum FailKind {
-    FAIL_STATUS = 0,       /* the run reports infer_status != 0 and its taps are valid and finite */
-    FAIL_NONFINITE = 1,    /* infer_status 0, the taps are not finite (the library refuses the commit) */
-    FAIL_BOTH = 2          /* both */
+    FAIL_STATUS = 0,       /* the run reports a dirty status (1) and its taps are valid and finite: generation +1 */
+    FAIL_NONFINITE = 1,    /* status OK, the taps are not finite (the library refuses the commit): generation +1 */
+    FAIL_BOTH = 2,         /* both: generation +1, once */
+    FAIL_NOT_STARTED = 3   /* STREAM_RUN_NOT_STARTED, valid taps: bypassed, generation unchanged */
 } FailKind;
 
 static int all_zero16(const int16_t *x, size_t n) {
@@ -303,8 +304,9 @@ static long long energy16(const int16_t *x, size_t n) {
  * block's input (delay-aligned), except the samples the failed job owns. The failed job's N frames are zero spectra; in
  * the PCM family that is the last hop of the failing block (half of it still the previous frame's overlap) and the
  * first N - 1 hops of the next block, which are exactly zero; the next block's last hop is again half. Everything else
- * is the delayed mic. The failure is made unmistakable: valid finite taps with infer_status != 0 (the library must act on
- * the status), and non-finite taps with infer_status 0 (the library must refuse them), and both. */
+ * is the delayed mic. The failure is made unmistakable: valid finite taps with a dirty status (the library must act on
+ * the status), non-finite taps with status OK (the library must refuse them), both, and a run that never started
+ * (the same silent batch, but the state generation must not move). */
 static int section_fail_closed_one(FailKind kind) {
     enum { N = 8, HOP = 128, BS = N * HOP, BLOCKS = 6, FAILED = 2 };
     AiaecConfig cfg = make_cfg(256, N);
@@ -329,12 +331,15 @@ static int section_fail_closed_one(FailKind kind) {
         CHECK(work.state_generation == aiaec_state_generation(ctx), "fail_closed block %d: work generation %u, live %u", b,
               work.state_generation, aiaec_state_generation(ctx));
         fill_identity_taps((float *)work.outputs[0].data, work.outputs[0].elements, N);
-        if (fail && kind != FAIL_STATUS) {
+        if (fail && kind != FAIL_STATUS && kind != FAIL_NOT_STARTED) {
             const size_t n_el = work.outputs[0].elements;
             ((float *)work.outputs[0].data)[g_poison_at == 0 ? 0u : g_poison_at == 2 ? n_el - 1u : n_el / 3u] = g_poison_value;
         }
-        CHECK(aiaec_postprocess(ctx, fail && kind != FAIL_NONFINITE ? 1 : 0, pcm_out + (size_t)b * BS) == AIAEC_OK,
-              "fail_closed block %d: postprocess", b);
+        {
+            const int status = !fail ? STREAM_RUN_OK : kind == FAIL_NOT_STARTED ? STREAM_RUN_NOT_STARTED
+                             : kind == FAIL_NONFINITE ? STREAM_RUN_OK : 1;
+            CHECK(aiaec_postprocess(ctx, status, pcm_out + (size_t)b * BS) == AIAEC_OK, "fail_closed block %d: postprocess", b);
+        }
     }
     for (b = 1; b < BLOCKS; ++b) {
         const int16_t *out = pcm_out + (size_t)b * BS, *want = mic_in + (size_t)(b - 1) * BS;
@@ -353,11 +358,11 @@ static int section_fail_closed_one(FailKind kind) {
             }
         }
     }
-    if (kind == FAIL_NONFINITE) {
-        /* a refused commit (a reported failure only bypasses) advances the generation, and the block carries the new value */
-        CHECK(gen_seen[FAILED + 1] != gen_seen[FAILED] && gen_seen[FAILED + 1] != 0u && gen_seen[FAILED + 2] == gen_seen[FAILED + 1],
-              "fail_closed(%d): generation %u -> %u -> %u around the refused job", (int)kind, gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
-    }
+    /* a dirty status or a refused commit advances the generation by one (a status and a refused commit together count
+     * once), and the next block carries the new value; a run that never started leaves it alone */
+    CHECK(gen_seen[FAILED + 1] == gen_seen[FAILED] + (kind == FAIL_NOT_STARTED ? 0u : 1u) && gen_seen[FAILED + 2] == gen_seen[FAILED + 1] &&
+          gen_seen[FAILED] == gen_seen[FAILED - 1],
+          "fail_closed(%d): generation %u -> %u -> %u around the failed job", (int)kind, gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
     {   /* a reset advances the generation and the next SUBMIT block carries it */
         AiaecInput input;
         StreamWork work;
@@ -371,13 +376,15 @@ static int section_fail_closed_one(FailKind kind) {
         CHECK(aiaec_postprocess(ctx, 0, pcm_out) == AIAEC_OK, "fail_closed: postprocess after reset");
     }
     printf("section_fail_closed(%s): failed batch exactly silent (N-1 hops), neighbours are the delayed mic, generation tracked\n",
-           kind == FAIL_STATUS ? "infer_status" : kind == FAIL_NONFINITE ? "non-finite taps" : "both");
+           kind == FAIL_STATUS ? "dirty status" : kind == FAIL_NONFINITE ? "non-finite taps" : kind == FAIL_BOTH ? "both"
+                                                                                               : "not started");
     free(mic_in); free(far_zero); free(pcm_out); free(pool);
     return g_fail != bad;
 }
 
 static int section_fail_closed(void) {
-    int rc = section_fail_closed_one(FAIL_STATUS) | section_fail_closed_one(FAIL_NONFINITE) | section_fail_closed_one(FAIL_BOTH);
+    int rc = section_fail_closed_one(FAIL_STATUS) | section_fail_closed_one(FAIL_NONFINITE) | section_fail_closed_one(FAIL_BOTH) |
+             section_fail_closed_one(FAIL_NOT_STARTED);
     g_poison_value = INFINITY; g_poison_at = 0;
     rc |= section_fail_closed_one(FAIL_NONFINITE);
     g_poison_value = -INFINITY; g_poison_at = 2;
@@ -450,13 +457,15 @@ static int section_align_block(void) {
     int16_t *pcm_blk, *pcm_ref;
     float *residual, *far;
     long long ghop = 0;
-    /* changed, solid, force_fail. Hop 2 is a changed=1 realignment; hop 4 the first solid=1 after a
-     * false->true edge; hop 7 a normal submit hop whose inference is forced to fail. */
-    const struct { int changed, solid, force_fail; } hops[8] = {
+    /* changed, solid, force_fail (0 none, 1 a dirty status, 2 STREAM_RUN_NOT_STARTED). Hop 2 is a changed=1
+     * realignment; hop 4 the first solid=1 after a false->true edge; hop 7 a normal submit hop whose inference is
+     * forced to fail, hop 9 one that never started. */
+    const struct { int changed, solid, force_fail; } hops[10] = {
         { 0, 0, 0 }, { 0, 0, 0 }, { 1, 0, 0 }, { 0, 0, 0 },
         { 0, 1, 0 }, { 0, 1, 0 }, { 0, 1, 0 }, { 0, 1, 1 },
+        { 0, 1, 0 }, { 0, 1, 2 },
     };
-    const int n_hops = 8;
+    const int n_hops = 10;
 
     if (!ctx) return 1;
     memset(&gspec, 0, sizeof(gspec));
@@ -482,6 +491,7 @@ static int section_align_block(void) {
         UlcnetStreamDelay rdelay;
         UlcnetHopIO rio;
         int rc, rrc, k, ai_rc, all_zero;
+        unsigned int gen_before = aiaec_state_generation(ctx);
 
         for (k = 0; k < hop; ++k) {
             residual[k] = 0.001f * (float)(((long long)k * 5 + ghop * 3) % 97 - 48);
@@ -504,7 +514,7 @@ static int section_align_block(void) {
             fake_mask(ghop, work.outputs[0].data, work.outputs[0].elements);
             fake_mask(ghop, rio.outputs.output, rio.outputs.spectrum_ri_elements);
             submit_calls++;
-            ai_rc = hops[i].force_fail ? 1 : 0;
+            ai_rc = hops[i].force_fail == 2 ? STREAM_RUN_NOT_STARTED : hops[i].force_fail ? 1 : STREAM_RUN_OK;
         } else {
             CHECK(work.action == STREAM_WORK_BYPASS, "align hop %d: expected BYPASS, got %d", i, (int)work.action);
             CHECK(work.input_count == 0 && work.output_count == 0 && work.state_generation == 0u, "align hop %d: bypass work not zeroed", i);
@@ -512,6 +522,13 @@ static int section_align_block(void) {
         }
         CHECK(aiaec_postprocess(ctx, ai_rc, pcm_blk) == AIAEC_OK, "align hop %d: postprocess", i);
         CHECK(ulcnet_stream_post_process(ref, ai_rc, pcm_ref) == 1, "align hop %d: ref post", i);
+        CHECK(aiaec_state_generation(ctx) == (unsigned int)ulcnet_stream_state_generation(ref),
+              "align hop %d: generation %u, the stream driven directly has %u", i, aiaec_state_generation(ctx),
+              (unsigned int)ulcnet_stream_state_generation(ref));
+        if (hops[i].force_fail)
+            CHECK(aiaec_state_generation(ctx) == gen_before + (hops[i].force_fail == 2 ? 0u : 1u),
+                  "align hop %d: a %s status moved the generation %u -> %u", i, hops[i].force_fail == 2 ? "not-started" : "dirty",
+                  gen_before, aiaec_state_generation(ctx));
         if (memcmp(pcm_blk, pcm_ref, (size_t)hop * sizeof(int16_t)) != 0) {
             FAIL("align hop %d: block path differs from ulcnet_stream_* driven directly", i);
             bad = 1;
@@ -526,15 +543,15 @@ static int section_align_block(void) {
         }
         ghop++;
     }
-    CHECK(submit_calls == 6, "align: expected 6 submits across %d hops, got %d", n_hops, submit_calls);
-    printf("section_align_block: %d hops, %d submits, bit-exact vs ulcnet_stream_* (2 bypass hops, 1 forced-failure submit)\n", n_hops, submit_calls);
+    CHECK(submit_calls == 8, "align: expected 8 submits across %d hops, got %d", n_hops, submit_calls);
+    printf("section_align_block: %d hops, %d submits, bit-exact vs ulcnet_stream_* (2 bypass hops, a dirty and a not-started submit)\n", n_hops, submit_calls);
     free(residual); free(far); free(pcm_blk); free(pcm_ref); free(pool); free(rpool);
     return bad;
 }
 
-/* infer_status must be truly ignored on a bypass hop, not just conventionally 0: two contexts get
+/* The run status must be truly ignored on a bypass hop, not just conventionally 0: two contexts get
  * the same hops; at the bypass hop one is closed with 0 and one with garbage. */
-static int section_bypass_ignores_infer_status(void) {
+static int section_bypass_ignores_run_status(void) {
     AiaecConfig cfg = make_cfg(256, 1);
     void *pool_a = NULL, *pool_b = NULL;
     AiaecCtx *ctx_a = make_ctx(&cfg, &pool_a, "bypass_a"), *ctx_b = make_ctx(&cfg, &pool_b, "bypass_b");
@@ -568,14 +585,16 @@ static int section_bypass_ignores_infer_status(void) {
         }
         CHECK(aiaec_postprocess(ctx_a, ai_a, pcm_a) == AIAEC_OK, "bypass hop %d: post a", i);
         CHECK(aiaec_postprocess(ctx_b, ai_b, pcm_b) == AIAEC_OK, "bypass hop %d: post b", i);
-        if (memcmp(pcm_a, pcm_b, sizeof(pcm_a)) != 0) { FAIL("bypass hop %d: infer_status leaked into a bypass hop", i); bad = 1; }
+        if (memcmp(pcm_a, pcm_b, sizeof(pcm_a)) != 0) { FAIL("bypass hop %d: the run status leaked into a bypass hop", i); bad = 1; }
+        CHECK(aiaec_state_generation(ctx_a) == aiaec_state_generation(ctx_b), "bypass hop %d: a garbage status moved the generation (%u vs %u)",
+              i, aiaec_state_generation(ctx_a), aiaec_state_generation(ctx_b));
     }
-    printf("section_bypass_ignores_infer_status: bypass hop identical with infer_status 0 and 0xBAD1\n");
+    printf("section_bypass_ignores_run_status: bypass hop identical with run status 0 and 0xBAD1\n");
     free(pool_a); free(pool_b);
     return bad;
 }
 
-/* Fail-OPEN identity: infer_status != 0 every hop, so pcm_out must equal the previous hop's
+/* Fail-OPEN identity: a non-OK status every hop, so pcm_out must equal the previous hop's
  * residual_in (int16, saturated). */
 static int section_trim_align(void) {
     AiaecConfig cfg = make_cfg(256, 1);
@@ -810,7 +829,7 @@ int main(void) {
 #endif
 #if PRODUCT_AL
     g_fail |= section_align_block();
-    g_fail |= section_bypass_ignores_infer_status();
+    g_fail |= section_bypass_ignores_run_status();
     g_fail |= section_trim_align();
 #endif
     g_fail |= section_work_views();

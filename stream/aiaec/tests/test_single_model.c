@@ -96,7 +96,7 @@ static int run_roundtrip(void) {
 
     rc = aiaec_preprocess(ctx, &input, &work);
     CHECK(rc == AIAEC_OK, "preprocess (bypass setup) rc=%d", rc);
-    rc = aiaec_postprocess(ctx, -1, pcm_out);   /* infer_status != 0: forced bypass */
+    rc = aiaec_postprocess(ctx, STREAM_RUN_FAILED, pcm_out);   /* a failed run: bypass */
     CHECK(rc == AIAEC_OK, "postprocess (bypass) rc=%d", rc);
 
     free(pool);

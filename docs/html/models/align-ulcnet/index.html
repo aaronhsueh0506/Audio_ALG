@@ -95,17 +95,20 @@ while (read_blocks(mic, far, hop_in)) {
     StreamWork work;
     /* 線性 AEC，再接 pre；mic、far 各 hop_in 個 int16 */
     if (aiaec_front_preprocess(front, ctx, mic, far, &amp;work) != AIAEC_OK) return -1;
-    int ai_rc = 0;
+    int run_status = STREAM_RUN_NOT_STARTED;       /* BYPASS 區塊不讀 */
     if (work.action == STREAM_WORK_SUBMIT) {
         int chk;
         GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
-        if (chk != GRAPH_IO_OK) ai_rc = STREAM_RUN_NOT_STARTED;    /* 不符：不送件，仍呼叫 post */
+        if (chk != GRAPH_IO_OK) run_status = STREAM_RUN_NOT_STARTED;    /* 不符：不送件，仍呼叫 post */
+        else if (work.state_generation != seen &amp;&amp; zero_state_buffers() != 0) run_status = STREAM_RUN_NOT_STARTED;   /* 清零失敗：seen 不更新，下一包再清 */
         else {
-            if (work.state_generation != seen) { clear_state_buffers(); seen = work.state_generation; }
-            ai_rc = run_ai3(&amp;work);                /* 填 work.inputs（含 N&gt;1 的 frame_reset），執行，讀回 work.outputs[0]（複數 mask） */
+            seen = work.state_generation;
+            /* 填 work.inputs（含 N&gt;1 的 frame_reset），執行，讀回 work.outputs[0]（複數 mask）；
+             * net_proc 之前的失敗回 STREAM_RUN_NOT_STARTED，之後的失敗回 STREAM_RUN_FAILED，全部讀回才是 0 */
+            run_status = run_ai3(&amp;work);
         }
     }                                              /* BYPASS：不呼叫加速器 */
-    if (aiaec_postprocess(ctx, ai_rc, pcm_out) != AIAEC_OK) return -1;   /* 兩種 action 都剛好呼叫一次 */
+    if (aiaec_postprocess(ctx, run_status, pcm_out) != AIAEC_OK) return -1;   /* 兩種 action 都剛好呼叫一次 */
     write_block(pcm_out, hop_in);
 }</code></pre>
 <p><b>已有自己的線性 AEC 的 pipeline</b> 略過 front，把殘差、raw far 與事件直接填進輸入，再呼叫 <code>aiaec_preprocess()</code>，中間不經 int16：</p>

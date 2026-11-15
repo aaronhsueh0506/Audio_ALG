@@ -6,7 +6,7 @@
  *   PRE   cmd=2, slot, err_re err_im far_re far_im [n * 129 floats each], changed[n], solid[n] (int32)
  *                                             -> rc, action, work.state_generation, live generation, input_count,
  *                                                (elements, floats) per input tensor, output elements
- *   POST  cmd=3, slot, infer_status, mask_elements, mask floats
+ *   POST  cmd=3, slot, run_status, mask_elements, mask floats
  *                                             -> rc, live generation, re[n * 129], im[n * 129]
  *   QUIT  cmd=9
  * Slots share nothing; a slot's pool is allocated at OPEN and kept. */

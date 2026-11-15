@@ -8,9 +8,15 @@
  *     per block of hop_in samples:
  *         aiaec_preprocess(ctx, &in, &work);        // work.action: SUBMIT or BYPASS
  *         ...SUBMIT: the sample's accelerator run on work; BYPASS: no accelerator call...
- *         aiaec_postprocess(ctx, ai_rc, pcm_out);   // once per successful preprocess, failed run or BYPASS included
+ *         aiaec_postprocess(ctx, run_status, pcm_out);   // once per successful preprocess, failed run or BYPASS included
  *     after the last real block (zero-padded to hop_in): info.tail_zero_blocks all-zero blocks through the same
  *     sequence, then drop info.trim_samples from the start of the output.
+ *
+ * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
+ * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
+ * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
+ * accelerator's state when the generation differs from the value at the last zeroing. The status of a BYPASS block is
+ * not read.
  *
  * Align-ULCNet takes the linear AEC's float residual, the raw far of the same hop and one AiaecAlignEvent per model
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
@@ -134,10 +140,12 @@ unsigned int aiaec_state_generation(const AiaecCtx *ctx);
  * restarts only the model; the analysis and synthesis keep running and its pcm_out is the hop's error spectrum through them. */
 int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, StreamWork *work);
 
-/* Closes the block (infer_status read on SUBMIT only; ERR_SEQUENCE writes nothing); pcm_out gets hop_in samples. A failed or
- * non-finite block is bypassed: DeepVQE-S silence, Align-ULCNet the error spectrum. A non-finite output, or a failed Align-ULCNet
- * packet with an event hop, also zeroes the model state and advances the generation. */
-int aiaec_postprocess(AiaecCtx *ctx, int infer_status, int16_t *pcm_out);
+/* Closes the block with its run status (read on SUBMIT only; ERR_SEQUENCE writes nothing); pcm_out gets hop_in samples.
+ * A block whose run did not succeed, or whose heads or enhanced spectrum are not finite, is bypassed: DeepVQE-S silence,
+ * Align-ULCNet the error spectrum. A dirty status or a non-finite result also zeroes the model state and advances the
+ * generation; STREAM_RUN_NOT_STARTED leaves it, except for an Align-ULCNet packet with an event frame, whose restart
+ * the graph never applied (generation +1). */
+int aiaec_postprocess(AiaecCtx *ctx, int run_status, int16_t *pcm_out);
 
 /* ---------------------------------------------------------------------------------------------
  * _freq family (AiaecFreqInput spectra in, no STFT / ISTFT): the same hop_in, catalog, AiaecInfo and StreamWork as the
@@ -186,7 +194,7 @@ int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, Stream
 /* As aiaec_postprocess(), writing the block's N enhanced frames to out_re / out_im (N * n_bins floats each), for the
  * block opened by aiaec_preprocess_freq(). Through an AcIstft(AC_OLA_ACCUMULATE, ispec_scale 1) they equal the PCM family's
  * pcm_out (DeepVQE-S's first block starts with N - 1 zero frames). */
-int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int infer_status, float *out_re, float *out_im);
+int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int run_status, float *out_re, float *out_im);
 
 #ifdef __cplusplus
 }

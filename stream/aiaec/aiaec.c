@@ -616,23 +616,23 @@ static int aiaec_deepvqe_pre(AiaecCore *c, const int16_t *mic_in, const int16_t 
         if (i == n - 1) return rc == 1 ? AIAEC_OK : AIAEC_ERR_SEQUENCE;
         if (rc != 0) return AIAEC_ERR_SEQUENCE;
         if (c->family == AIAEC_FAMILY_PCM) {
-            if (deepvqe_stream_post_process(inner, 0, c->u.deepvqe.stash + (size_t)i * (size_t)hop) < 0)
+            if (deepvqe_stream_post_process(inner, STREAM_RUN_OK, c->u.deepvqe.stash + (size_t)i * (size_t)hop) < 0)
                 return AIAEC_ERR_SEQUENCE;
         } else {
             float *stash_re = c->u.deepvqe.stash_f, *stash_im = stash_re + (size_t)(n - 1) * (size_t)nb;
-            if (deepvqe_stream_post_process_freq(inner, 0, stash_re + fo, stash_im + fo) < 0)
+            if (deepvqe_stream_post_process_freq(inner, STREAM_RUN_OK, stash_re + fo, stash_im + fo) < 0)
                 return AIAEC_ERR_SEQUENCE;
         }
     }
     return AIAEC_ERR_SEQUENCE;
 }
 
-static int aiaec_deepvqe_post_pcm(AiaecCore *c, int infer_status, int16_t *pcm_out)
+static int aiaec_deepvqe_post_pcm(AiaecCore *c, int run_status, int16_t *pcm_out)
 {
     const int n = c->frames_per_call, hop = c->hop;
     int i;
 
-    if (deepvqe_stream_post_process(c->u.deepvqe.inner, infer_status,
+    if (deepvqe_stream_post_process(c->u.deepvqe.inner, run_status,
                                     pcm_out + (size_t)(n - 1) * (size_t)hop) < 0)
         return AIAEC_ERR_SEQUENCE;
     for (i = 0; i < n - 1; ++i) {
@@ -642,13 +642,13 @@ static int aiaec_deepvqe_post_pcm(AiaecCore *c, int infer_status, int16_t *pcm_o
     return AIAEC_OK;
 }
 
-static int aiaec_deepvqe_post_freq(AiaecCore *c, int infer_status, float *out_re, float *out_im)
+static int aiaec_deepvqe_post_freq(AiaecCore *c, int run_status, float *out_re, float *out_im)
 {
     const int n = c->frames_per_call, nb = c->n_bins;
     const size_t last = (size_t)(n - 1) * (size_t)nb;
     int i;
 
-    if (deepvqe_stream_post_process_freq(c->u.deepvqe.inner, infer_status, out_re + last, out_im + last) < 0)
+    if (deepvqe_stream_post_process_freq(c->u.deepvqe.inner, run_status, out_re + last, out_im + last) < 0)
         return AIAEC_ERR_SEQUENCE;
     for (i = 0; i < n - 1; ++i) {
         const size_t fo = (size_t)i * (size_t)nb;
@@ -791,7 +791,7 @@ int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, Stream
 }
 
 /* pcm_out (PCM family) or out_re/out_im (_freq family); the unused outputs are NULL. */
-static int aiaec_core_postprocess(AiaecCore *c, int infer_status, int16_t *pcm_out,
+static int aiaec_core_postprocess(AiaecCore *c, int run_status, int16_t *pcm_out,
                                   float *out_re, float *out_im)
 {
     int rc;
@@ -801,18 +801,18 @@ static int aiaec_core_postprocess(AiaecCore *c, int infer_status, int16_t *pcm_o
 
     if (c->model_id == AIAEC_MODEL_ID_DEEPVQE_S) {
 #if AIAEC_ENABLE_DEEPVQE_S
-        return pcm_out ? aiaec_deepvqe_post_pcm(c, infer_status, pcm_out)
-                       : aiaec_deepvqe_post_freq(c, infer_status, out_re, out_im);
+        return pcm_out ? aiaec_deepvqe_post_pcm(c, run_status, pcm_out)
+                       : aiaec_deepvqe_post_freq(c, run_status, out_re, out_im);
 #else
         return AIAEC_ERR_MODEL_ID;
 #endif
     }
 
-    /* Align-ULCNet: the stream itself ignores infer_status when the block was a bypass; it returns 1
+    /* Align-ULCNet: the stream itself ignores run_status when the block was a bypass; it returns 1
      * on success. */
 #if AIAEC_ENABLE_ALIGN_ULCNET
-    rc = pcm_out ? ulcnet_stream_post_process(c->u.align.inner, infer_status, pcm_out)
-                 : ulcnet_stream_post_process_freq(c->u.align.inner, infer_status, out_re, out_im);
+    rc = pcm_out ? ulcnet_stream_post_process(c->u.align.inner, run_status, pcm_out)
+                 : ulcnet_stream_post_process_freq(c->u.align.inner, run_status, out_re, out_im);
     return rc == 1 ? AIAEC_OK : AIAEC_ERR_SEQUENCE;
 #else
     (void)rc; (void)out_re; (void)out_im;
@@ -820,16 +820,16 @@ static int aiaec_core_postprocess(AiaecCore *c, int infer_status, int16_t *pcm_o
 #endif
 }
 
-int aiaec_postprocess(AiaecCtx *ctx, int infer_status, int16_t *pcm_out)
+int aiaec_postprocess(AiaecCtx *ctx, int run_status, int16_t *pcm_out)
 {
     if (!ctx || !pcm_out) return AIAEC_ERR_NULL;
-    return aiaec_core_postprocess(&ctx->core, infer_status, pcm_out, (float *)0, (float *)0);
+    return aiaec_core_postprocess(&ctx->core, run_status, pcm_out, (float *)0, (float *)0);
 }
 
-int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int infer_status, float *out_re, float *out_im)
+int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int run_status, float *out_re, float *out_im)
 {
     if (!ctx || !out_re || !out_im) return AIAEC_ERR_NULL;
-    return aiaec_core_postprocess(&ctx->core, infer_status, (int16_t *)0, out_re, out_im);
+    return aiaec_core_postprocess(&ctx->core, run_status, (int16_t *)0, out_re, out_im);
 }
 
 const char *aiaec_status_text(int code)
