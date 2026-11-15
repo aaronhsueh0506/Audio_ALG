@@ -98,7 +98,7 @@ CORE_HEADERS := ../../../lib/ainr/dfn2/dfn2_grid.h \
 	../../../lib/ainr/dfn2/dfn2_prepost.h
 
 STREAM_SOURCES := dfn2_stream.c
-STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h
+STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h ../../common/stream_run.h
 TEST_HEADERS := tests/erb_fixture.h
 
 LIB := $(OBJ_DIR)/libdfn2_stream.a
@@ -124,6 +124,10 @@ VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) dfn2_stream
 ERB_PARTITION_BIN := $(OBJ_DIR)/erb_partition
 ERB_PARTITION_SOURCES := tests/erb_partition.c $(CORE_SOURCES) dfn2_stream.c
 
+# Run-status table of dfn2_stream_post_process() against a stand-in accelerator that keeps its own state.
+FAIL_TABLE_BIN := $(OBJ_DIR)/fail_table
+FAIL_TABLE_SOURCES := tests/fail_table.c $(CORE_SOURCES) dfn2_stream.c
+
 POOL_SIZE_BIN := $(OBJ_DIR)/pool_size
 POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 
@@ -131,7 +135,7 @@ POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -195,6 +199,13 @@ verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
 	"$(VERIFY_VS_SAMPLE_BIN)"
 	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
 
+$(FAIL_TABLE_BIN): $(FAIL_TABLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(FAIL_TABLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+fail-table: $(FAIL_TABLE_BIN)
+	"$(FAIL_TABLE_BIN)"
+
 $(POOL_SIZE_BIN): $(POOL_SIZE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(POOL_SIZE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
@@ -216,7 +227,7 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample pool-size freq-only erb-partition test-variant-guard check-header-cxx
+test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only erb-partition test-variant-guard check-header-cxx
 
 # check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
 # a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.

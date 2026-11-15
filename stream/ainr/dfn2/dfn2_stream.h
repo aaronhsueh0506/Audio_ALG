@@ -8,16 +8,18 @@
  *         if (dfn2_stream_pre_process(ctx, pcm_in, &io) != 1) break;   // -1 is a contract error
  *         int ai_rc = 0;
  *         if (io.job_ready) {
- *             device_state_sync(io.state_generation);      // reload accelerator state on change
+ *             device_state_sync(io.state_generation);      // zero the accelerator state when the generation changed
  *             ai_rc = run_accelerator(&io.inputs, &io.outputs);
- *             if (ai_rc != 0) device_state_refill_zero();   // zero before the next run
  *         }
  *         if (dfn2_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
  *     }
  *
- * device_state_sync/refill_zero are the caller's code on accelerator memory this stream never touches;
- * skipping either leaves stale or garbage state live. io.state_generation is sampled every hop.
- * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
+ * device_state_sync is the caller's code on accelerator memory this stream never touches; skipping it leaves
+ * stale or garbage state live. io.state_generation is sampled every hop.
+ * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
+ * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
+ * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
+ * accelerator's state when the generation differs from the value at the last zeroing.
  * Warm-up (N == 1: mask_lookahead hops after init/reset; N > 1: none) runs the same loop and emits silence.
  * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one.
  *
@@ -32,6 +34,7 @@
 #include <string.h>
 
 #include "dfn2_prepost.h"   /* DFN2Grid, DFN2PrepostInputs/Outputs */
+#include "stream_run.h"     /* STREAM_RUN_OK, STREAM_RUN_NOT_STARTED, STREAM_RUN_FAILED */
 
 #ifdef __cplusplus
 extern "C" {
@@ -159,9 +162,10 @@ typedef struct DFN2HopIO {
  * freq_only context. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
-/* Closes the hop, once per pre_process: with io->job_ready ai_rc 0 commits, else bypasses (otherwise ignored); one hop
- * is then drained to pcm_out through the ISTFT. Returns the spectral-validity flag (1/0) of
- * dfn2_prepost_post_process_freq(), -1 on error (a freq_only context included); it is not an alignment: count L + D + N hops. */
+/* Closes the hop, once per pre_process: with io->job_ready ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other
+ * value bypasses and advances the generation (otherwise ai_rc is ignored); one hop is then drained to pcm_out through
+ * the ISTFT. Returns the spectral-validity flag (1/0) of dfn2_prepost_post_process_freq(), -1 on error (a freq_only
+ * context included); it is not an alignment: count L + D + N hops. */
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
 
 /* As dfn2_stream_pre_process() on spectra, for either kind of context: est and app are n_bins floats each, MODEL scale; est drives features and

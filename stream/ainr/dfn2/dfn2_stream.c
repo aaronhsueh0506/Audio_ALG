@@ -12,6 +12,7 @@
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+#include "stream_run.h"
 
 #define DFN2_STREAM_ALIGN DFN2_STREAM_ALIGNMENT
 
@@ -436,14 +437,17 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
     return open_hop(s, rc, io);
 }
 
-/* Frame-close half of post_process, shared by PCM and spectrum-only entry points: frame_finish()
- * can itself fail (non-finite despite ai_rc == 0) and leaves the frame open, so a failure here
- * still bypasses to close it and keep `s->open` synced with DFN2Prepost's; no-op if no frame is open. */
+/* Frame-close half of post_process, shared by PCM and spectrum-only entry points; no-op if no frame is open.
+ * STREAM_RUN_OK commits (a refused commit bypasses: frame_finish() leaves the frame open and has already zeroed
+ * the state and advanced the generation); any other status closes the frame with frame_fail(), which zeroes and
+ * advances unless the run never started. */
 static void dfn2_stream_close_frame(DFN2Stream *s, int ai_rc) {
-    int rc;
     if (!s->open) return;
-    rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(s->prepost) : -1;
-    if (rc != 0) dfn2_prepost_frame_bypass(s->prepost);
+    if (ai_rc == STREAM_RUN_OK) {
+        if (dfn2_prepost_frame_finish(s->prepost) != 0) dfn2_prepost_frame_bypass(s->prepost);
+    } else {
+        (void)dfn2_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+    }
     s->open = 0;
 }
 

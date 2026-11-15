@@ -1167,8 +1167,8 @@ def test_registration_is_all_or_none(state_pool):
 
 def test_board_form_moves_the_generation_as_documented(state_pool):
     """Nothing registered, on a pool an earlier instance used with registered state: the views hold NULL and
-    0, the generation is 1 after init and moves by one per reset, per warm-up frame and per refused finish only
-    (not on a commit, a bypass, a second finish of a refused frame or a failing model), every status is the
+    0, the generation is 1 after init and moves by one per reset, per warm-up frame, per refused finish and per
+    failing model (not on a commit, a bypass or a second finish of a refused frame), every status is the
     documented one, and no buffer the library was not handed is touched. Every lookahead pair of the build, and
     the shipped grid."""
     variant, pool = state_pool
@@ -1179,10 +1179,10 @@ def test_board_form_moves_the_generation_as_documented(state_pool):
     # m = mask_lookahead, each warm-up frame is one step (also with nothing registered), twice: after init
     # and after the reset; the real frames move it as before:
     #   init 1 | warm-up m -> 1+m | commit 1+m | bypass 1+m | refused finish 2+m | second finish 2+m |
-    #   bypass 2+m | reset 3+m | warm-up m + failing model 3+2m | NaN head 4+2m | commit 4+2m
+    #   bypass 2+m | reset 3+m | warm-up m + failing model 4+2m | NaN head 5+2m | commit 5+2m
     for grid, line in zip(grids, pool.run(['board %s' % _Pool.grid_text(g) for g in grids])):
         m = grid[4]
-        steps = (1, 1, 1 + m, 1 + m, 2 + m, 2 + m, 2 + m, 3 + m, 3 + 2 * m, 4 + 2 * m, 4 + 2 * m, 1, 1)
+        steps = (1, 1, 1 + m, 1 + m, 2 + m, 2 + m, 2 + m, 3 + m, 4 + 2 * m, 5 + 2 * m, 5 + 2 * m, 1, 1)
         want = ['board'] + [str(n) for n in steps]
         assert line.split() == want, (variant, grid, line)
 

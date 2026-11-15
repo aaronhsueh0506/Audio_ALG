@@ -1095,6 +1095,7 @@ static int case_model_run(void) {
     DFN2Model bad;
     DFN2ModelIoDescriptor descriptor;
     int t, v, valid = -1, calls;
+    unsigned int gen;
 
     config_freq(&cfg);
     CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
@@ -1166,19 +1167,35 @@ static int case_model_run(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru1, convp1);
     CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
-    /* A refused inference (nonzero return, nothing written) is taken as the
-     * identity: state frozen, frame closed, the hop still emits. */
+    /* A failed inference (nonzero return) is a run that started: taken as the identity, frame closed, the hop
+     * still emits, both recurrent tensors zeroed and the generation advanced. */
     stub.mode = 1;
     calls = stub.calls;
+    gen = dfn2_prepost_state_generation(p);
     CHECK(dfn2_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == calls + 1);
+    CHECK(dfn2_prepost_state_generation(p) == gen + 1u);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
-    CHECK(identical(gru0, gru1, TEST_GRU_ELEMENTS));
-    CHECK(identical(convp0, convp1, TEST_CONVP_WINDOW_ELEMENTS));
+    CHECK(all_zero(gru0, TEST_GRU_ELEMENTS));
+    CHECK(all_zero(convp0, TEST_CONVP_WINDOW_ELEMENTS));
+    CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
+    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    stub.mode = 0;
+    CHECK(dfn2_model_run_frame(&model, p) == 1);   /* a full write steps the zeroed state again */
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    snapshot_state(p, gru1, convp1);
+    CHECK(!all_zero(gru1, TEST_GRU_ELEMENTS));
+    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     /* A partial write (one head left unwritten) is refused by commit and
      * taken as the identity the same way -- but the accelerator already wrote
      * the state in place, so the refusal zeroes both recurrent tensors. */
@@ -2591,6 +2608,72 @@ static int case_warmup(void) {
     return 0;
 }
 
+/* ---- frame_fail: closing a frame after a run that did not succeed -------- */
+
+/* Output = frame_bypass()'s, bit for bit. run_started != 0 zeroes the registered state and advances the generation
+ * by one (a warm-up frame already does both: still one); run_started == 0 leaves state and generation. */
+static int case_frame_fail(void) {
+    static float re[DFN2_N_BINS], im[DFN2_N_BINS];
+    static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS], ref_re[DFN2_N_BINS], ref_im[DFN2_N_BINS];
+    static float gru_before[TEST_GRU_ELEMENTS], convp_before[TEST_CONVP_WINDOW_ELEMENTS];
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out;
+    DFN2Prepost *p, *q;
+    unsigned int g;
+    int t, started, valid_p = -1, valid_q = -1;
+    const int m = DFN2_MASK_LOOKAHEAD;
+
+    p = warm_instance(1);
+    q = warm_instance(1);
+    CHECK(p != NULL && q != NULL);
+    /* contract: NULL, and no open frame (nothing moves) */
+    CHECK(dfn2_prepost_frame_fail(NULL, 1) == -1);
+    CHECK(dfn2_prepost_frame_fail(NULL, 0) == -1);
+    g = dfn2_prepost_state_generation(p);
+    CHECK(dfn2_prepost_frame_fail(p, 1) == -1);
+    CHECK(dfn2_prepost_frame_fail(p, 0) == -1);
+    CHECK(dfn2_prepost_state_generation(p) == g);
+
+    for (started = 1; started >= 0; --started) {
+        treset(p);
+        treset(q);
+        g = dfn2_prepost_state_generation(p);
+        for (t = 0; t < m + 6; ++t) {   /* m warm-up frames, then steady ones; every frame closes on frame_fail */
+            const int warm = t < m;
+            frame_spectrum(t, re, im);
+            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+            CHECK(dfn2_prepost_pre_process_freq(q, re, im) == 1);
+            CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+            fake_run(&in, &out);                              /* the accelerator moved the state in place */
+            memcpy(gru_before, in.gru_hidden, sizeof gru_before);
+            memcpy(convp_before, in.df_convp_window, sizeof convp_before);
+            CHECK(dfn2_prepost_frame_fail(p, started) == 0);
+            if (warm || started) {
+                CHECK(state_all_zero(&in));
+                CHECK(dfn2_prepost_state_generation(p) == g + 1u);
+                ++g;
+            } else {
+                CHECK(identical(in.gru_hidden, gru_before, TEST_GRU_ELEMENTS));
+                CHECK(identical(in.df_convp_window, convp_before, TEST_CONVP_WINDOW_ELEMENTS));
+                CHECK(!state_all_zero(&in));
+                CHECK(dfn2_prepost_state_generation(p) == g);
+            }
+            CHECK(dfn2_prepost_frame_fail(p, started) == -1);   /* closed: refused, nothing moves */
+            CHECK(dfn2_prepost_state_generation(p) == g);
+            CHECK(dfn2_prepost_frame_open(q, &in, &out) == 0);
+            fake_run(&in, &out);
+            CHECK(dfn2_prepost_frame_bypass(q) == 0);
+            CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid_p) == 0);
+            CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
+            CHECK(valid_p == valid_q);
+            CHECK(identical(got_re, ref_re, DFN2_N_BINS) && identical(got_im, ref_im, DFN2_N_BINS));
+        }
+    }
+    stop(p);
+    stop(q);
+    return 0;
+}
+
 /* The caller pushes the synthesis on every hop, valid or not: the warm-up hops carry a zero
  * spectrum, which plain overlap-add turns into zeros, so the stream equals the one that pushes
  * only valid hops. */
@@ -2750,6 +2833,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "generation") == 0)    status = case_generation();
     else if (strcmp(argv[1], "warmup") == 0)        status = case_warmup();
     else if (strcmp(argv[1], "warmup_synthesis") == 0) status = case_warmup_synthesis();
+    else if (strcmp(argv[1], "frame_fail") == 0)    status = case_frame_fail();
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
         status = 2;
@@ -2949,10 +3033,10 @@ def test_model_run_frame_finishes_or_takes_the_identity(driver):
     model/instance, no infer callback, a NULL io_descriptor or one whose
     mask_lookahead or df_lookahead differs from the instance's grid, or one
     made for a grid that differs in any other value; a full write returns 1 and steps the
-    recurrent state; a refused inference (nothing written) returns 0, leaves
-    every recurrent tensor byte-identical and still emits; a partial write
+    recurrent state; a failed inference returns 0, zeroes both recurrent
+    tensors, advances the generation and still emits; a partial write
     (state written in place, one head unwritten) returns 0 with both
-    recurrent tensors zeroed and still emits; a model that always refuses is
+    recurrent tensors zeroed and still emits; a model that always fails emits
     exactly the all-frame_bypass stream."""
     assert 'model_run:' in _run(driver, 'model_run')
 
@@ -3001,6 +3085,15 @@ def test_warmup_frames_are_opened_and_their_heads_discarded(driver):
     (a NaN head is refused) and a reset makes the warm-up due again; a reset
     inside a warm-up frame drops it. With mask_lookahead 0 nothing changes."""
     _run(driver, 'warmup')
+
+
+def test_frame_fail_closes_as_bypass_and_zeroes_only_a_started_run(driver):
+    """dfn2_prepost_frame_fail: -1 for NULL or no open frame, moving nothing; the
+    output is frame_bypass()'s bit for bit; run_started 1 zeroes both registered
+    tensors and advances the generation by one, run_started 0 leaves the state
+    and the generation; a warm-up frame steps the generation by exactly one
+    either way. Dropping the zeroing or the generation step fails it."""
+    _run(driver, 'frame_fail')
 
 
 def test_synthesis_may_be_pushed_on_every_hop(driver):

@@ -77,12 +77,12 @@
 | `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 277 | 54 | 34 | 20 | 223 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
-| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 145 | 48 | 25 | 23 | 97 | 0 | 2 | 17 |
+| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 146 | 49 | 25 | 24 | 97 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 96 | 35 | 14 | 21 | 61 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 871 | 176 | 92 | 84 | 695 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 872 | 177 | 92 | 85 | 695 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：871 個 C 函式中，176 個有 Python 對應（mirror 92、partial 84），其中 62 個的配對是推論；695 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：872 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；695 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -162,7 +162,7 @@
 | `audiolib/common/src/hpf.c` | all | 8 |
 | `lib/ainr/dfn2/dfn2_model_io.c` | all | 18 |
 | `lib/ainr/dfn2/dfn2_model_io_priv.h` | all | 1 |
-| `lib/ainr/dfn2/dfn2_prepost.c` | all | 35 |
+| `lib/ainr/dfn2/dfn2_prepost.c` | all | 36 |
 | `lib/ainr/dfn2/dfn2_prepost.h` | all | 6 |
 | `lib/ainr/dfn2/dfn2_process.c` | all | 24 |
 | `lib/ainr/gtcrn/gtcrn_process.c` | all | 29 |
@@ -318,7 +318,7 @@
 | AINR-DFN2-13 | `lib/ainr/dfn2/dfn2_model_io.c: dfn2_model_io_push_erb_window, dfn2_model_io_push_spec_window, dfn2_model_io_push_features` | `AINR/DeepFilterNet2/export_onnx.py:feature_windows`<br>`pipelines/dfn/dfn2_stage.py:Dfn2Stage._push_window` | mirror | T-14 | — | [t-1, t, t+1] 圖輸入視窗滑動；40 窗含零 flush 逐位元相同（一次性量測）。每次 invocation N 個 frame（`grid.frames_per_call`）時視窗為 N+2 個 frame，第一次呼叫在推入 M+N 個 frame 後就緒、之後每 N 個一次；Python 孿生是 `export_onnx.py:feature_chunk_windows`（見 AINR-DFN2-26）。 |
 | AINR-DFN2-14 | `lib/ainr/dfn2/dfn2_model_io.c: dfn2_model_io_mem_size, io_carve, io_layout, dfn2_model_io_init, zero_registered, dfn2_model_io_ready_frames, dfn2_model_io_descriptor_default, dfn2_model_io_descriptor_validate, all_finite, dfn2_model_io_validate_arrays, dfn2_model_io_validate_state, dfn2_model_io_reset, dfn2_model_io_zero_recurrent, dfn2_model_io_state_generation`<br>`lib/ainr/dfn2/dfn2_model_io_priv.h: dfn2_registration_check` | — | C-only | T-14 | — | 描述子驗證（描述子的 grid 欄位取自呼叫端傳入的 `DFN2Grid`）、視窗區塊的大小與切分（`dfn2_model_io_mem_size` 與 init 走同一次 `io_layout`）、第一次加速器呼叫需要的 feature frame 數（`dfn2_model_io_ready_frames()` = `mask_lookahead` + `frames_per_call`）、已註冊遞迴狀態的有限性檢查與歸零、state generation、註冊規則檢查（`dfn2_registration_check`，函式庫私有的 inline 函式，`dfn2_model_io.c` 與 `dfn2_prepost.c` 共用；h_gru 一組、完整版再加 df_convp_history 一組，全有或全無，`DFN2_MASK_ONLY` 時任何 df_convp_history 值都無效）；只有 C 對 C 或錄製 digest 的測試。 |
 | AINR-DFN2-15 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_pre_process_freq, dfn2_prepost_pre_process_freq_dual, dfn2_prepost_frame_open, dfn2_prepost_frame_finish, dfn2_prepost_post_process_freq, pp_begin_frame, pp_close_frame` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | partial | D-42 | `pipelines/dfn/tests/test_dfn2_stage.py`（Py 契約） | 頻域入口；Python 的孿生是雙輸入版（估計頻譜 A、應用頻譜 B），C 類別的單一暫存對在孿生中拆成兩個。 |
-| AINR-DFN2-16 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_frame_bypass` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | partial | D-42 | — | fail-open：單位 mask、零 tap、alpha 0。C 在 `dfn2_prepost_frame_finish` 被拒時就地歸零已註冊的遞迴狀態並遞增 state generation，Python 不步進狀態。N = 1 且 M ≥ 1 時，C 對每個暖機幀（init 或 reset 後前 M 拍）的 `frame_finish`／`frame_bypass` 同樣歸零並遞增 generation（丟棄 heads、回 0），Python 沒有暖機幀。 |
+| AINR-DFN2-16 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_frame_bypass, dfn2_prepost_frame_fail` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | partial | D-42 | — | fail-open：單位 mask、零 tap、alpha 0。C 在 `dfn2_prepost_frame_finish` 被拒時就地歸零已註冊的遞迴狀態並遞增 state generation，Python 不步進狀態。N = 1 且 M ≥ 1 時，C 對每個暖機幀（init 或 reset 後前 M 拍）的 `frame_finish`／`frame_bypass` 同樣歸零並遞增 generation（丟棄 heads、回 0），Python 沒有暖機幀。`dfn2_prepost_frame_fail(p, run_started)` 以同一份 fail-open 輸出關閉一個加速器沒成功的幀；`run_started` 非 0（執行可能已改寫狀態）時歸零已註冊的遞迴狀態並遞增 generation（暖機幀本來就如此，仍只加一），為 0（沒有執行）時狀態與 generation 都不動；`dfn2_model_run_frame` 的 `infer()` 回傳非 0 即走 `frame_fail(p, 1)`。Python 沒有加速器執行失敗。 |
 | AINR-DFN2-17 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_reset` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.reset` | partial | D-42 | — | （推論）重置類別與其 DFN2State；Python 重置自己的環與狀態，fail-open 後的狀態語意見 D-42。 |
 | AINR-DFN2-18 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |
 | AINR-DFN2-19 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput.frame_index`。 |

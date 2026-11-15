@@ -676,6 +676,13 @@ int dfn2_prepost_frame_bypass(DFN2Prepost *p) {
 #endif
 }
 
+int dfn2_prepost_frame_fail(DFN2Prepost *p, int run_started) {
+    if (!p || !p->frame_open) return -1;
+    /* A warm-up frame is closed by pp_close_frame, which zeroes the state and advances the generation itself. */
+    if (run_started && !PP_IN_WARMUP(p)) dfn2_model_io_zero_recurrent(p->io);
+    return dfn2_prepost_frame_bypass(p);
+}
+
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
                                    int *valid) {
     size_t bins;
@@ -698,7 +705,7 @@ int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
         return -1;
     if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
     if (model->infer(model->user, &inputs, &outputs) != 0) {
-        return dfn2_prepost_frame_bypass(p) == 0 ? 0 : -1;
+        return dfn2_prepost_frame_fail(p, 1) == 0 ? 0 : -1;   /* infer() is the run itself: it started */
     }
     if (dfn2_prepost_frame_finish(p) != 0) {
         /* refused commit: take the frame as the identity so the clocks advance once */

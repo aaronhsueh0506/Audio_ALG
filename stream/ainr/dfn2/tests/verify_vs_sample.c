@@ -1,5 +1,5 @@
 /* Verifies dfn2_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): features ->
- * dfn2_prepost_frame_open -> accelerator -> dfn2_prepost_frame_finish/frame_bypass -> post_process_freq ->
+ * dfn2_prepost_frame_open -> accelerator -> dfn2_prepost_frame_finish/frame_fail -> post_process_freq ->
  * ac_istft_push_planar -> int16 saturate. The oracle is built directly against lib/ainr/dfn2/dfn2_prepost.h and
  * audiolib, never against dfn2_stream.c. The two drivers run the SAME deterministic fake accelerator (a pure
  * function of a global hop counter, ignoring its own input argument so its output cannot depend on which driver
@@ -22,10 +22,10 @@
 #include "hpf.h"
 #include "erb_fixture.h"
 
-/* ---- shared deterministic fake accelerator: pure function of (global hop, force_fail) ---- */
-static int shared_fake(long long ghop, int force_fail, DFN2PrepostOutputs *out) {
+/* ---- shared deterministic fake accelerator: pure function of (global hop, fail_status) ---- */
+static int shared_fake(long long ghop, int fail_status, DFN2PrepostOutputs *out) {
     size_t i;
-    if (force_fail) return -1;   /* writes nothing: mirrors fetch_heads() leaving the NaN prefill */
+    if (fail_status) return fail_status;   /* writes nothing: mirrors fetch_heads() leaving the NaN prefill */
     for (i = 0; i < out->erb_mask_elements; ++i)
         out->erb_mask[i] = 0.1f + 0.001f * (float)((ghop + (long long)i) % 97);
 #ifndef DFN2_MASK_ONLY
@@ -116,9 +116,12 @@ static int board_pre(BoardDriver *d, const int16_t *pcm_in, DFN2PrepostInputs *i
 }
 
 static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *valid_out) {
-    int rc, prc, valid = 0, hop = d->grid.hop, k;
-    rc = (ai_rc == 0) ? dfn2_prepost_frame_finish(d->prepost) : -1;
-    if (rc != 0) dfn2_prepost_frame_bypass(d->prepost);
+    int prc, valid = 0, hop = d->grid.hop, k;
+    if (ai_rc == STREAM_RUN_OK) {
+        if (dfn2_prepost_frame_finish(d->prepost) != 0) dfn2_prepost_frame_bypass(d->prepost);
+    } else {
+        dfn2_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+    }
     prc = dfn2_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im, &valid);
     if (prc == 0) {
         ac_istft_push_planar(d->istft, d->enh_re, d->enh_im, d->hop_out);
@@ -178,7 +181,9 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
     int16_t *pcm_in, *pcm_out_a, *pcm_out_b, *prev_pcm_out_b;
     long long L, D;
     long long warm_hops, post_reset_hops, drain_hops;
-    long long fault_hop_index = -1;
+    unsigned int gen_prev = 0;
+    long long fault_hop_index = -1;    /* a run that started and failed */
+    long long no_start_hop_index = -1; /* a run that never started */
 
     memset(&st, 0, sizeof(st));
     st.first_valid_a = st.first_valid_b = -1;
@@ -230,6 +235,7 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
 
     warm_hops = L + 5;          /* warm-up (if any) + 5 steady hops, one of them fault-injected */
     fault_hop_index = L + 2;    /* a steady hop, well past warm-up */
+    no_start_hop_index = L + 3; /* the next one: the state must survive it */
     post_reset_hops = L + 4;    /* after reset: warm-up again + 4 steady hops */
     drain_hops = L + D + 1;     /* documented tail-drain length */
 
@@ -247,9 +253,11 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                 DFN2PrepostOutputs out_a;
                 int pre_rc_a, pre_rc_b, post_rc_a, post_rc_b, ai_rc;
                 int valid_a = 0, valid_b = 0;
-                int force_fail = (phase == 0 && hop_in_phase == fault_hop_index) ? 1 : 0;
+                int force_fail = (phase == 0 && hop_in_phase == fault_hop_index) ? STREAM_RUN_FAILED :
+                                 (phase == 0 && hop_in_phase == no_start_hop_index) ? STREAM_RUN_NOT_STARTED : 0;
                 int zero_hop = (phase == 2);
                 int k;
+                gen_prev = board_generation(&A);
 
                 if (zero_hop) memset(pcm_in, 0, (size_t)hop * sizeof(int16_t));
                 else for (k = 0; k < hop; ++k)
@@ -303,6 +311,13 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                 if (board_generation(&A) != dfn2_stream_state_generation(B)) {
                     fprintf(stderr, "[%s] hop %lld: generation mismatch A=%u B=%u\n",
                            label, ghop, board_generation(&A), dfn2_stream_state_generation(B));
+                    st.mismatches++;
+                }
+                /* absolute generation steps: a started failure +1, a never-started run 0 */
+                if ((force_fail == STREAM_RUN_FAILED && board_generation(&A) != gen_prev + 1u) ||
+                    (force_fail == STREAM_RUN_NOT_STARTED && board_generation(&A) != gen_prev)) {
+                    fprintf(stderr, "[%s] hop %lld: generation step %u -> %u wrong for run status %d\n",
+                            label, ghop, gen_prev, board_generation(&A), force_fail);
                     st.mismatches++;
                 }
                 st.hops++;
