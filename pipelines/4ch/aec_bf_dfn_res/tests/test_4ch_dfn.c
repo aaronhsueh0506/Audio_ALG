@@ -98,8 +98,11 @@ static ConvChain *oracle_create(const AecConfig *cfg, int enable_res, int enable
  * The composition under test, built from heap pieces as main.c builds it from one pool.
  * --------------------------------------------------------------------------------------- */
 
-/* Deliberate defects the array-reset row plants to show it can fail. */
-enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2 };
+/* Deliberate defects the array-reset rows plant to show they can fail. LATE_CLEAR is the bridge path's (a clear one hop
+ * after the event); NO_CLEAR applies to both paths. NO_DELAY and WHOLE_HOP are the direct path's: the clear on the hop
+ * of the event instead of lookahead hops later (a defect only when the lookahead is non-zero), and a reset of the
+ * whole DFN hop (stream, model state, synthesis) on the event. */
+enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2, FDFN_SAB_NO_DELAY = 4, FDFN_SAB_WHOLE_HOP = 8 };
 
 typedef struct FourDfn {
     ArraySampleBeam *unit;
@@ -110,6 +113,10 @@ typedef struct FourDfn {
     Complex *post;
     void *post_mem;
     uint32_t reset_handled;   /* AecResidualView.post_reset_serial last followed */
+    uint32_t reset_pending;   /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
+    int reset_delay;          /* hops the direct path delays a frame by (the model's lookahead) */
+    long hops_begun;          /* fdfn_begin() calls so far */
+    long clears, last_clear;  /* direct path: ac_istft_reset() calls, and the hop index of the last one */
     long reset_hops;          /* hops on which the serial had moved */
     const Complex *estimate;  /* E of the last hop (array memory, until the next hop) */
     int sabotage;             /* negative controls (FDFN_SAB_*), 0 in the composition */
@@ -146,6 +153,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
 
     m->n_freqs = n_freqs;
     m->enable_cng = enable_cng;
+    m->reset_delay = dfn_hop_lookahead_frames(dfn_test_grid());
     if (posix_memalign(&m->post_mem, 16, ALIGN16((size_t)n_freqs * sizeof(Complex))) != 0) {
         m->post_mem = NULL;
         goto fail;
@@ -172,6 +180,8 @@ fail:
 /* What an integrator does after a refused call or to start over: every stage together. */
 static void fdfn_reset(FourDfn *m) {
     array_sample_beam_reset(m->unit);
+    m->reset_handled = aec_post_reset_serial(m->aec);
+    m->reset_pending = 0u;
     dfn_hop_reset(&m->hop);
 }
 
@@ -179,6 +189,7 @@ static void fdfn_reset(FourDfn *m) {
 static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     AecResidualView f;
     int due;
+    ++m->hops_begun;
     if (array_sample_beam_process(m->unit, mics, ref, &m->beam, &m->info) != AEC_OK ||
         array_sample_beam_fuse(m->unit, &f) != AEC_OK ||
         f.res_gain == NULL)
@@ -194,8 +205,18 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
         if (m->sabotage & FDFN_SAB_LATE_CLEAR) { clear = m->bridge_clear_due; m->bridge_clear_due = due; }
         if (clear && !(m->sabotage & FDFN_SAB_NO_CLEAR) && ainr_bridge_reset_synthesis(m->hop.bridge) != 0)
             return -1;
-    } else if (due) {
-        dfn_hop_reset(&m->hop);
+    } else if (m->sabotage & FDFN_SAB_WHOLE_HOP) {
+        if (due) dfn_hop_reset(&m->hop);
+    } else if (m->hop.istft) {
+        /* the frame built on the hop of the event reaches the synthesis reset_delay hops later: clear only the
+         * synthesis just before that push, DFN2 keeps running */
+        m->reset_pending = (m->reset_pending << 1) | (uint32_t)due;
+        if (!(m->sabotage & FDFN_SAB_NO_CLEAR) &&
+            (m->reset_pending >> ((m->sabotage & FDFN_SAB_NO_DELAY) ? 0 : m->reset_delay)) & 1u) {
+            ac_istft_reset(m->hop.istft);
+            ++m->clears;
+            m->last_clear = m->hops_begun - 1;
+        }
     }
     if (aec_apply_gain(m->aec, NULL, m->post) != AEC_OK) return -1;
     if (m->enable_cng && aec_apply_cng(m->aec, NULL, m->post) != AEC_OK) return -1;
@@ -449,6 +470,58 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
     return 0;
 }
 
+/* The array reset at 48 kHz (the direct path): the application restarts the unit and the RES and nothing else. With the
+ * identity model the output equals the hand-written chain (restarted the same way, its overlap-add tail cleared at
+ * the event) delayed by lookahead hops, byte for byte, the hops around the event included: the hop clears only its own
+ * synthesis, just before the frame built on the event hop is pushed, and DFN2 keeps running (the state generation has
+ * no gap). A clear on the event hop itself, no clear, and a reset of the whole hop must differ. */
+static int run_array_reset_direct(int sabotage, long *diff_hops, long *resets, unsigned *generation,
+                                  long *clears, long *clear_hop) {
+    FourDfn *dfn = fdfn_create(DFN2_SR, DFN2_N_FFT, 1, NULL, 1);
+    AecConfig ccfg = core_config(DFN2_SR, DFN2_N_FFT);
+    ConvChain *conventional;
+    static float mics[DFN2_HOP_LEN * AEC_ARRAY_MICS], ref[DFN2_HOP_LEN], out[DFN2_HOP_LEN];
+    static float chain[160][DFN2_HOP_LEN];
+    static float tones[160 * DFN2_HOP_LEN];
+    int frame, i, ch, e, frames = 160, reset_at = 81;
+    *diff_hops = 0;
+    if (!dfn || dfn->hop.bridge || !dfn->hop.istft) return 1;
+    dfn->sabotage = sabotage;
+    conventional = oracle_create(&ccfg, 1, 1);
+    if (!conventional) return 2;
+    dfn_fixture_multitone(tones, (size_t)frames * DFN2_HOP_LEN, DFN2_SR);
+    e = ECHO_DELAY;
+    for (frame = 0; frame < frames; ++frame) {
+        for (i = 0; i < DFN2_HOP_LEN; ++i) {
+            int t = frame * DFN2_HOP_LEN + i;
+            ref[i] = tones[t];
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                mics[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
+                    (t >= e ? 0.5f * tones[t - e] : 0.0f) + 0.01f * sinf((float)t * 0.071f + (float)ch);
+        }
+        if (frame == reset_at) {          /* the application restarts the unit (the array and its gain stage), nothing downstream */
+            array_sample_beam_reset(dfn->unit);
+            conv_reset(conventional);
+        }
+        if (fdfn_process(dfn, mics, ref, out) != 0) return 10 + frame;
+        if (conv_hop(conventional, mics, ref, dfn->beam.weights, dfn->beam.spectrum, chain[frame]) != 0)
+            return 200 + frame;
+        {
+            const float *want = frame < DFN_TEST_LOOKAHEAD_FRAMES ? NULL : chain[frame - DFN_TEST_LOOKAHEAD_FRAMES];
+            int differs = 0;
+            for (i = 0; i < DFN2_HOP_LEN; ++i) if (out[i] != (want ? want[i] : 0.0f)) differs = 1;
+            *diff_hops += differs;
+        }
+    }
+    *resets = dfn->reset_hops;
+    *generation = dfn_hop_state_generation(&dfn->hop);
+    *clears = dfn->clears;
+    *clear_hop = dfn->last_clear;
+    conv_destroy(conventional);
+    fdfn_destroy(dfn);
+    return 0;
+}
+
 /* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
 static int run_rejections(void) {
     ArrayTestUnitConfig cfg = unit_config(8000, 0);
@@ -607,6 +680,33 @@ int main(void) {
                     return 1;
                 }
             }
+        }
+    }
+    {
+        static const int sabs[] = { FDFN_SAB_NO_CLEAR, FDFN_SAB_WHOLE_HOP, FDFN_SAB_NO_DELAY };
+        long diff, resets, clears, clear_hop;
+        unsigned generation = 0u;
+        size_t c, n_sab = sizeof sabs / sizeof sabs[0];
+        if (DFN_TEST_LOOKAHEAD_FRAMES == 0) --n_sab;   /* the delay defect needs a non-zero lookahead */
+        rc = run_array_reset_direct(0, &diff, &resets, &generation, &clears, &clear_hop);
+        /* the event is on hop 81: exactly one clear, on hop 81 + lookahead; DFN2's generation has no gap */
+        if (rc || diff != 0 || resets != 1 || clears != 1 || clear_hop != 81 + DFN_TEST_LOOKAHEAD_FRAMES ||
+            generation != 1u + (unsigned)DFN2_MASK_LOOKAHEAD) {
+            fprintf(stderr, "4ch DFN array reset 48 kHz: rc %d, %ld hops differ, %ld reset hop(s), %ld clear(s) at hop %ld, generation %u\n",
+                    rc, diff, resets, clears, clear_hop, generation);
+            return 1;
+        }
+        printf("4ch_aec_bf_dfn_res: array reset 48 kHz: event on hop 81, the hop's synthesis cleared once, on hop %ld; the output equals the "
+               "hand-written chain delayed by %d hops bit for bit and DFN2 was not reset (generation %u)\n",
+               clear_hop, DFN_TEST_LOOKAHEAD_FRAMES, generation);
+        for (c = 0; c < n_sab; ++c) {
+            rc = run_array_reset_direct(sabs[c], &diff, &resets, &generation, &clears, &clear_hop);
+            if (rc || diff == 0) {
+                fprintf(stderr, "4ch DFN array reset 48 kHz: planted defect %d not detected (rc %d)\n", sabs[c], rc);
+                return 1;
+            }
+            printf("4ch_aec_bf_dfn_res: array reset 48 kHz: planted defect %d reported on %ld hop(s) (clears %ld, generation %u)\n",
+                   sabs[c], diff, clears, generation);
         }
     }
     {

@@ -17,9 +17,10 @@
  * (host rate differs from the model grid) the host-grid synthesis is inside the bridge and runs at
  * the top of its begin(), so ainr_bridge_reset_synthesis() on that hop clears just its
  * overlap-add tail (DFN2 and the resamplers keep running, no delay line). On the direct path (host
- * rate equals the model grid's) the synthesis follows the model by its lookahead and this example
- * resets the whole hop instead. Here that serial moves only with an array reset, which the
- * refused-call path below already pairs with a hop reset.
+ * rate equals the model grid's) the frame built on the hop of the event reaches the synthesis
+ * dfn_hop_lookahead_frames() hops later: a per-hop shift register (starting at 0) delays the event
+ * and ac_istft_reset() clears only the hop's synthesis just before that push; DFN2 keeps running. Here
+ * that serial moves only with an array reset, which the refused-call path below pairs with a hop reset.
  *
  * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives the model stream
  * (stream/ainr/dfn2, memory mode) and synthesises through an AcIstft; any other host rate runs the
@@ -82,6 +83,8 @@ typedef struct DfnSample {
     ArraySampleBeam *unit;
     Complex *post;                    /* P */
     uint32_t reset_handled;           /* AecResidualView.post_reset_serial last followed */
+    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
+    int reset_delay;                  /* hops the direct path delays a frame by (the model's lookahead) */
     DfnHop hop;                       /* hop.bridge / hop.istft: the bridge, or the synthesis */
     const char *program;
     char rates_text[64];
@@ -175,6 +178,8 @@ static int dfn_plan(DfnSample *s) {
 /* A refused hop: back to the state of a fresh pipeline, every stage together. */
 static void dfn_reset(DfnSample *s) {
     array_sample_beam_reset(s->unit);
+    s->reset_handled=aec_post_reset_serial(s->aec);
+    s->reset_pending=0u;
     dfn_hop_reset(&s->hop);
 }
 
@@ -204,6 +209,8 @@ static int dfn_build(DfnSample *s) {
     if (!s->unit) return -1;
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
     s->reset_handled=0u;
+    s->reset_pending=0u;
+    s->reset_delay=dfn_hop_lookahead_frames(&s->args.model_grid);
     return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,&s->hop);
 }
 
@@ -265,12 +272,16 @@ static int dfn_read(void *user, int frame) {
     (void)user; return frame < 8;
 }
 /* P = B * G_res, plus comfort noise on the bins the gain cut when enabled (no denoiser: unity extra
- * gain); a lane's post-chain reset first clears the synthesis (the bridge's host-grid tail on the bridge
- * path, the whole hop on the direct path). Before the hop enters the DFN hop. 0, or -1 on a refusal. */
+ * gain); a lane's post-chain reset first clears the synthesis that receives the first post-reset frame: the
+ * bridge's host-grid tail now on the bridge path, the hop's own AcIstft dfn_hop_lookahead_frames() hops
+ * later on the direct path. Before the hop enters the DFN hop. 0, or -1 on a refusal. */
 static int dfn_form(DfnSample *s, const AecResidualView *f) {
-    if (array_sample_post_reset_due(&s->reset_handled,f)) {
-        if (s->hop.bridge) (void)ainr_bridge_reset_synthesis(s->hop.bridge);   /* between hops: cannot refuse */
-        else dfn_hop_reset(&s->hop);
+    uint32_t moved=(uint32_t)array_sample_post_reset_due(&s->reset_handled,f);
+    if (s->hop.bridge) {
+        if (moved) (void)ainr_bridge_reset_synthesis(s->hop.bridge);   /* between hops: cannot refuse */
+    } else if (s->hop.istft) {
+        s->reset_pending=(s->reset_pending<<1)|moved;
+        if ((s->reset_pending>>s->reset_delay)&1u) ac_istft_reset(s->hop.istft);
     }
     if (aec_apply_gain(s->aec,NULL,s->post) != AEC_OK) return -1;
     if (s->args.enable_cng && aec_apply_cng(s->aec,NULL,s->post) != AEC_OK) return -1;

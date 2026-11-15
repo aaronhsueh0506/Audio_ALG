@@ -121,7 +121,8 @@ int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out);
  * filter and attenuation limit act on) and does the ISTFT/OLA of the result; E == P (same pointers) is the
  * single-spectrum case. After ainr_reset_freq() reset the analyser too (ac_stft_reset()). A bypass delivers
  * P-aligned near-identity. Direct (non-bridge) caller: an upstream restart at block t belongs to the frame delivered
- * at block t + (queue_frames - (N - 1)); clear the caller's synthesis (ac_istft_reset()) just before pushing it. */
+ * at block t + (queue_frames - (N - 1)); clear the caller's synthesis (ac_istft_reset()) just before pushing it. Through
+ * AinrBridge, ainr_bridge_reset_synthesis() on the hop of the event is that same point; the model keeps running. */
 
 typedef struct AinrFreqCtx AinrFreqCtx;
 

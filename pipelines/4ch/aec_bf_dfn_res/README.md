@@ -133,7 +133,7 @@ App          Aec (array)                   ArraySampleBeam   DfnHop + DFN2Stream
  |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_build: dfn2_stream_* (memory mode, freq_only) and the conversion buffers,
  |     then ac_istft_init + dfn_hop_init_direct (48 kHz) or ainr_bridge_* + dfn_hop_init_bridge (16 kHz)
  |   per hop: array_sample_beam_process --> array_sample_beam_fuse (the array's gain stage runs on E)
- |            --> v.post_reset_serial moved: ainr_bridge_reset_synthesis (16 kHz) | dfn_hop_reset (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
+ |            --> v.post_reset_serial moved: ainr_bridge_reset_synthesis (16 kHz) | ac_istft_reset of the hop's synthesis dfn_hop_lookahead_frames() hops later (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
  |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
  |   refused call: array_sample_beam_reset (helper + array) + dfn_hop_reset   (dfn_reset())
  |   never reset the hop on the shared aligner's delay change
@@ -146,9 +146,11 @@ The model estimates on the analysis beam `E` (`v.error_spec`) and is applied on 
 estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
 `ainr_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
 its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the model
-by its lookahead and this example resets the whole hop (the delayed tail clear of `mono_aec_dfn_res` is not ported). In
-this flow the serial moves only with an array reset (the lanes take an aligned far), which the refused-call path already
-pairs with a hop reset.
+by its lookahead: the frame built on the hop of the event is pushed `dfn_hop_lookahead_frames()` hops later, so the example
+clears only its own synthesis (`ac_istft_reset()` on `hop.istft`) just before that push, through a per-hop shift register
+that starts at 0 (the same rule as `mono_aec_dfn_res`: the synthesis that receives the first post-reset frame is cleared just before
+it enters). DFN2 keeps running and the hop is not reset. In this flow the serial moves only with an array reset (the lanes
+take an aligned far), which the refused-call path pairs with a hop reset and a cleared shift register.
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
 48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the array's `AecConfig`

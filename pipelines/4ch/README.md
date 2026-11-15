@@ -183,8 +183,8 @@ the projected capture `|Y|^2` over the guard hops, while `|E|^2` (what the chain
 one synthesizer of the fused output keeps the value it last followed; when the view's value differs it clears
 its overlap-add tail before that hop's inverse transform (`array_sample_post_reset_due()`); the array reseeds its own
 comfort-noise generator to `AEC_CNG_SEED` (42) before that hop's draw. The array never resets a lane in response; whether the
-denoiser or a network follows is the application's policy (the DFN2 example resets its whole hop: the stage keeps its
-synthesis inside). The lanes take an aligned far (`EXTERNAL_ALIGNED`), so in this flow the serial moves only
+denoiser or a network follows is the application's policy (the DFN2 example clears only its own synthesis, on the hop the
+event reaches it at: the model keeps running). The lanes take an aligned far (`EXTERNAL_ALIGNED`), so in this flow the serial moves only
 with `aec_reset()`.
 
 | | External (a third party may tune) | Internal (exists, not recommended to open) |

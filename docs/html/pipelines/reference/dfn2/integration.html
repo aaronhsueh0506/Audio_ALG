@@ -210,6 +210,7 @@ int four_dfn_run(void) {
         aec_destroy(aec);  free(pool);  return -1;   /* DFN2 尾段不持有 heap,沒有東西要 destroy */
     }
     uint32_t handled = 0;                                      /* 已處理的 v.post_reset_serial(main.c 的 DfnSample.reset_handled) */
+    uint32_t reset_pending = 0;                                /* 48 kHz:bit k = k 個 hop 前見過硬重置(從 0 起;main.c 的 DfnSample.reset_pending) */
 
     /* 4. 每個 hop */
     float mics[4 * 512], ref[512], out[512];
@@ -218,15 +219,17 @@ int four_dfn_run(void) {
         ArraySampleBeamResult beam;  AecResidualView v;
         if (array_sample_beam_process_with_activity(unit, mics, ref, vad, vad, NULL, &amp;beam, NULL) == AEC_OK &amp;&amp;
             array_sample_beam_fuse(unit, &amp;v) == AEC_OK) {          /* delay、4 lane、SRP-PHAT、BF、融合與 G_res */
-            if (array_sample_post_reset_due(&amp;handled, &amp;v)) {            /* 某條 lane 本 hop 硬重置:在 CNG 第一次抽樣之前 */
-                if (hop.bridge) (void)ainr_bridge_reset_synthesis(hop.bridge);   /* 16 kHz:只清橋內原生合成的 OLA 尾巴 */
-                else dfn_hop_reset(&amp;hop);                                   /* 48 kHz:整個 hop 一起 reset */
+            int moved = array_sample_post_reset_due(&amp;handled, &amp;v);       /* 某條 lane 本 hop 硬重置:在 CNG 第一次抽樣之前 */
+            if (hop.bridge) { if (moved) (void)ainr_bridge_reset_synthesis(hop.bridge); }   /* 16 kHz:只清橋內原生合成的 OLA 尾巴 */
+            else {                                                              /* 48 kHz:模型把 frame 延後 L 個 hop,事件跟著延後 */
+                reset_pending = (reset_pending &lt;&lt; 1) | (uint32_t)moved;
+                if ((reset_pending &gt;&gt; dfn_hop_lookahead_frames(&amp;mg)) &amp; 1u) ac_istft_reset(hop.istft);   /* 只清合成;DFN2 照跑 */
             }
             if (aec_apply_gain(aec, NULL, post) == AEC_OK &amp;&amp;          /* P = B * G_res,B = v.base_spec;估計輸入仍是 v.error_spec */
                 (!cng_on || aec_apply_cng(aec, NULL, post) == AEC_OK) &amp;&amp;
                 dfn_hop_process(&amp;hop, v.error_spec, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }
         }
-        array_sample_beam_reset(unit);  handled = aec_post_reset_serial(aec);  dfn_hop_reset(&amp;hop);  /* 一起 reset */
+        array_sample_beam_reset(unit);  handled = aec_post_reset_serial(aec);  reset_pending = 0;  dfn_hop_reset(&amp;hop);  /* 一起 reset */
     }
 
     /* 5. hop 之間的 setter;結束(依序:helper、array;DFN2 尾段隨 pool 釋放) */
@@ -294,7 +297,7 @@ int four_dfn_run(void) {
   | v.error_spec = E(分析 seam)、v.base_spec = B(渲染基底;守衛未觸發時 = E)、v.res_gain(借用到下一次 process / reset)|
   |&lt;-------------------------|                          |                          |                          |
   | follow_post_reset:aec_post_reset_serial 變動 -> 清 OLA 尾巴(CNG 種子由 AEC 自己回 AEC_CNG_SEED) |       |
-  | (4ch:array_sample_post_reset_due(&amp;handled, &amp;v) -> 橋內合成 reset / 48 kHz dfn_hop_reset) |                |
+  | (4ch:array_sample_post_reset_due(&amp;handled, &amp;v) -> 橋內合成 reset / 48 kHz 延後 L 個 hop 清 hop.istft) |       |
   | aec_apply_gain(aec, NULL, P) -> P = B*G_res;cng_on 時 aec_apply_cng(aec, NULL, P)  |                          |
   |-- dfn_hop_begin(&amp;hop, B, P) ------------&gt;|                          |                          |
   |                          |                          | B、P 乘 dfn2_stft_scale;dfn2_stream_pre_process_freq_dual(est, app, &amp;job) |
