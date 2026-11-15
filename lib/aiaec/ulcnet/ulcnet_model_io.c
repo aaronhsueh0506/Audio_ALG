@@ -558,10 +558,11 @@ static inline void back_end(const UlcnetModelIoState *state, size_t frame,
 #endif
 }
 
-/* The finite gate shared by both boundaries. State is updated in place, so a bad frame cannot be rolled back: restart
- * the recurrent state (the registered buffers; a runtime that holds the state itself sees the generation). */
-static int finish_is_valid(UlcnetModelIoState *state) {
-    if (!frame_is_finite(state)) {
+/* The finite gate shared by both boundaries, for what the accelerator wrote and for the enhanced spectrum. State is
+ * updated in place, so a bad frame cannot be rolled back: restart the recurrent state (the registered buffers; a
+ * runtime that holds the state itself sees the generation). */
+static int finish_is_valid(UlcnetModelIoState *state, int finite) {
+    if (!finite) {
         clear_recurrent_state(state);
         state->prepared = 0;
         return 0;
@@ -571,12 +572,17 @@ static int finish_is_valid(UlcnetModelIoState *state) {
 
 int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
                                      float *enhanced_re, float *enhanced_im) {
+    const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
+
     if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames != 1) {
         return -1;
     }
-    if (!finish_is_valid(state)) return -1;
+    if (!finish_is_valid(state, frame_is_finite(state))) return -1;
 
+    /* A finite mask can still overflow the inverse power, and a non-finite error bin passes straight through it. */
     back_end(state, 0u, enhanced_re, enhanced_im);
+    if (!finish_is_valid(state, skn_all_finite_f32(enhanced_re, bins) && skn_all_finite_f32(enhanced_im, bins)))
+        return -1;
     state->prepared = 0;
     return 0;
 }
@@ -585,16 +591,21 @@ int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
                                    float *enhanced_re, float *enhanced_im) {
     const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
     size_t frame;
+    int finite = 1;
 
     if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames < 2) {
         return -1;
     }
-    if (!finish_is_valid(state)) return -1;
+    if (!finish_is_valid(state, frame_is_finite(state))) return -1;
 
+    /* Event frames are not written here, so they are not scanned either. */
     for (frame = 0; frame < (size_t)state->frames; ++frame) {
-        if (state->frame_reset[frame] == 0.0f)
-            back_end(state, frame, enhanced_re + frame * bins, enhanced_im + frame * bins);
+        if (state->frame_reset[frame] != 0.0f) continue;
+        back_end(state, frame, enhanced_re + frame * bins, enhanced_im + frame * bins);
+        finite = finite && skn_all_finite_f32(enhanced_re + frame * bins, bins) &&
+                 skn_all_finite_f32(enhanced_im + frame * bins, bins);
     }
+    if (!finish_is_valid(state, finite)) return -1;
     state->prepared = 0;
     return 0;
 }

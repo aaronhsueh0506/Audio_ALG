@@ -4,7 +4,8 @@
  * saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
  * ulcnet_stream.c, on the grid of the shipped model (16 kHz, FFT 512, delay_depth 32). Both drivers run the SAME
  * deterministic fake accelerator and must produce byte-identical PCM and an identical
- * (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop.
+ * (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop. One row needs no oracle: a finite mask whose
+ * enhanced spectrum overflows is checked in absolute terms on the _freq entries (run_refused_spectrum_row).
  *
  * The model's own AEC is not part of what is verified: the stream's contract starts at "the caller already has a
  * linear-error hop and a far hop", so both drivers take err_in/far_in directly.
@@ -679,6 +680,153 @@ static int run_float_entry_row(void) {
     return violations == 0 ? 0 : 1;
 }
 
+/* ---- Row 7: a finite mask whose enhanced spectrum is not finite (the inverse power overflows) is refused like a
+ * non-finite mask: the hop is the error spectrum bit for bit, the generation advances once, the next hop sees the new
+ * generation and is enhanced again. Sub-rows on the stream's _freq entries: a 3.0e30 mask bin at bin 0 of the real
+ * plane, then of the imaginary plane (the error's imaginary part is zero there, so exactly one output plane overflows:
+ * the real one, then the imaginary one); a NaN error bin under a plain mask; a 3.0e30 mask bin over a zero error
+ * spectrum, which stays finite and must be accepted. Then the bare
+ * class: a retried frame_finish does not advance the generation again, and a fresh frame_open recovers the frame. ---- */
+enum { REF_HUGE_RE, REF_HUGE_IM, REF_NAN_ERR, REF_HUGE_SILENT, REF_COUNT };
+enum { REF_BAD_HOP = 3, REF_HOPS = 6 };
+
+static void refused_row_spectra(int sub, int h, int bins, float *er, float *ei, float *fr, float *fi) {
+    int k;
+    for (k = 0; k < bins; ++k) {
+        const int edge_bin = (k == 0 || k == bins - 1);
+        er[k] = 0.05f * sinf(0.37f * (float)(k + 1) + (float)h);
+        ei[k] = edge_bin ? 0.0f : 0.04f * cosf(0.21f * (float)k + (float)h);
+        fr[k] = 0.03f * cosf(0.11f * (float)k + (float)h);
+        fi[k] = edge_bin ? 0.0f : 0.02f * sinf(0.19f * (float)k + (float)h);
+    }
+    if (h != REF_BAD_HOP) return;
+    if (sub == REF_NAN_ERR) er[9] = NAN;
+    if (sub == REF_HUGE_SILENT) { memset(er, 0, (size_t)bins * sizeof(float)); memset(ei, 0, (size_t)bins * sizeof(float)); }
+}
+
+static void refused_row_mask(int sub, int h, int bins, float *mask) {
+    int k;
+    for (k = 0; k < bins; ++k) {
+        mask[k] = 0.5f + 0.004f * (float)(k % 100);
+        mask[bins + k] = 0.1f;
+    }
+    if (h != REF_BAD_HOP) return;
+    if (sub == REF_HUGE_RE) mask[0] = 3.0e30f;
+    if (sub == REF_HUGE_IM) mask[bins] = 3.0e30f;
+    if (sub == REF_HUGE_SILENT) mask[9] = 3.0e30f;
+}
+
+static int spectrum_is_finite(const float *re, const float *im, int bins) {
+    int k;
+    for (k = 0; k < bins; ++k) if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
+    return 1;
+}
+
+static int run_refused_spectrum_row(void) {
+    static const char *const name[REF_COUNT] = { "3.0e30 mask bin, real plane", "3.0e30 mask bin, imaginary plane",
+                                                 "NaN error bin", "3.0e30 mask bin over a zero spectrum" };
+    UlcnetGrid grid = make_grid();
+    const int bins = grid.n_bins;
+    const size_t plane = (size_t)bins * sizeof(float);
+    UlcnetStreamConfig cfg;
+    UlcnetStreamMemReq req;
+    float *er = malloc(plane), *ei = malloc(plane), *fr = malloc(plane), *fi = malloc(plane);
+    float *re = malloc(plane), *im = malloc(plane);
+    int sub, h, violations = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = grid;
+    if (!er || !ei || !fr || !fi || !re || !im || ulcnet_stream_get_mem_size(&cfg, &req) != 0) return -1;
+
+    for (sub = 0; sub < REF_COUNT; ++sub) {
+        void *pool = NULL;
+        UlcnetStream *B;
+        UlcnetStreamDelay delay;
+        if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0) return -1;
+        B = ulcnet_stream_init_ex(&cfg, pool, (size_t)req.bytes, &req);
+        if (!B) return -1;
+        delay.changed = 0; delay.solid = 1;
+        for (h = 0; h < REF_HOPS; ++h) {
+            UlcnetHopIO io;
+            const uint32_t gen_before = ulcnet_stream_state_generation(B);
+            const int refused = (h == REF_BAD_HOP && sub != REF_HUGE_SILENT);
+            uint32_t gen_after;
+            int identity, ok;
+
+            refused_row_spectra(sub, h, bins, er, ei, fr, fi);
+            if (ulcnet_stream_pre_process_freq(B, er, ei, fr, fi, delay, &io) != 1 || io.state_generation != gen_before) {
+                fprintf(stderr, "refused-spectrum row (%s): hop %d did not open on generation %u\n", name[sub], h, gen_before);
+                violations++;
+                break;
+            }
+            refused_row_mask(sub, h, bins, io.outputs.output);
+            if (ulcnet_stream_post_process_freq(B, 0, re, im) != 1) {
+                fprintf(stderr, "refused-spectrum row (%s): hop %d post_process_freq failed\n", name[sub], h);
+                violations++;
+                break;
+            }
+            gen_after = ulcnet_stream_state_generation(B);
+            identity = memcmp(re, er, plane) == 0 && memcmp(im, ei, plane) == 0;
+            if (refused) ok = identity && gen_after == gen_before + 1u;
+            else if (h == REF_BAD_HOP) ok = identity && gen_after == gen_before;   /* zero in, zero out, accepted */
+            else ok = !identity && spectrum_is_finite(re, im, bins) && gen_after == gen_before;
+            if (!ok) {
+                fprintf(stderr, "refused-spectrum row (%s): hop %d expected %s, got identity=%d finite=%d generation "
+                                "%u -> %u\n", name[sub], h, refused ? "a refused frame (identity, generation +1)"
+                                                                    : "an accepted frame (generation unchanged)",
+                        identity, spectrum_is_finite(re, im, bins), gen_before, gen_after);
+                violations++;
+            }
+        }
+        free(pool);
+    }
+
+    {   /* the bare class */
+        UlcnetPrepostConfig pcfg;
+        UlcnetPrepostMemReq preq;
+        UlcnetPrepost *p;
+        UlcnetModelIoInputs in;
+        UlcnetModelIoOutputs out;
+        void *pool = NULL;
+        uint32_t gen;
+        if (ulcnet_prepost_config_defaults(&pcfg, &grid) != 0 || ulcnet_prepost_get_mem_size(&pcfg, &preq) != 0 ||
+            posix_memalign(&pool, (size_t)preq.alignment, (size_t)preq.bytes) != 0)
+            return -1;
+        p = ulcnet_prepost_init_ex(pool, (size_t)preq.bytes, &pcfg, &preq);
+        if (!p) return -1;
+        refused_row_spectra(REF_HUGE_RE, REF_BAD_HOP, bins, er, ei, fr, fi);
+        if (ulcnet_prepost_pre_process_freq(p, er, ei, fr, fi) != 1 || ulcnet_prepost_frame_open(p, &in, &out) != 0) return -1;
+        refused_row_mask(REF_HUGE_RE, REF_BAD_HOP, bins, out.output);
+        gen = ulcnet_prepost_state_generation(p);
+        if (ulcnet_prepost_frame_finish(p) != -1 || ulcnet_prepost_state_generation(p) != gen + 1u) {
+            fprintf(stderr, "refused-spectrum row (bare class): frame_finish accepted an overflowing frame or the "
+                            "generation did not advance by one\n");
+            violations++;
+        }
+        if (ulcnet_prepost_frame_finish(p) != -1 || ulcnet_prepost_state_generation(p) != gen + 1u ||
+            ulcnet_prepost_post_process_freq(p, re, im) != -1) {
+            fprintf(stderr, "refused-spectrum row (bare class): a retried frame_finish was accepted or advanced the "
+                            "generation again, or the refused frame could be read\n");
+            violations++;
+        }
+        /* a fresh frame_open on the still-open frame, a plain mask: accepted, enhanced, generation unchanged */
+        if (ulcnet_prepost_frame_open(p, &in, &out) != 0) return -1;
+        refused_row_mask(REF_HUGE_RE, 0, bins, out.output);
+        if (ulcnet_prepost_frame_finish(p) != 0 || ulcnet_prepost_post_process_freq(p, re, im) != 0 ||
+            ulcnet_prepost_state_generation(p) != gen + 1u || !spectrum_is_finite(re, im, bins) ||
+            (memcmp(re, er, plane) == 0 && memcmp(im, ei, plane) == 0)) {
+            fprintf(stderr, "refused-spectrum row (bare class): the frame did not recover through a fresh frame_open\n");
+            violations++;
+        }
+        free(pool);
+    }
+
+    printf("refused-spectrum row: %s (%d sub-rows of %d hops on the _freq entries, then the bare class's retry and "
+           "recovery)\n", violations == 0 ? "PASS" : "FAIL", (int)REF_COUNT, (int)REF_HOPS);
+    free(er); free(ei); free(fr); free(fi); free(re); free(im);
+    return violations == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     int inject_shift = (argc > 1 && strcmp(argv[1], "--inject-shift") == 0);
 
@@ -697,6 +845,7 @@ int main(int argc, char **argv) {
         int rc1 = run_matrix(0);
         int rc2 = run_explicit_reset_row();
         int rc3 = run_float_entry_row();
-        return (rc1 == 0 && rc2 == 0 && rc3 == 0) ? 0 : 1;
+        int rc4 = run_refused_spectrum_row();
+        return (rc1 == 0 && rc2 == 0 && rc3 == 0 && rc4 == 0) ? 0 : 1;
     }
 }

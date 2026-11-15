@@ -442,7 +442,7 @@ int ulcnet_stream_post_process_freq(UlcnetStream *s, int ai_rc, float *re, float
     if (!s || !re || !im || s->hop_state == ULCNET_STREAM_IDLE) return -1;
 
     if (s->hop_state == ULCNET_STREAM_FRAME_OPEN) {
-        /* A finish that itself fails (non-finite mask or state despite ai_rc == 0) leaves the
+        /* A finish that itself fails (non-finite mask, state or enhanced spectrum despite ai_rc == 0) leaves the
          * frame open per ulcnet_prepost_frame_finish()'s doc, so it still needs an explicit
          * bypass to close it and stay in sync with UlcnetPrepost. */
         int rc = (ai_rc == 0) ? ulcnet_prepost_frame_finish(s->prepost) : -1;

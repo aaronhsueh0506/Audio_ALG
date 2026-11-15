@@ -9,7 +9,8 @@
  *
  * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, resets the stream and arms
  * ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). Fail-OPEN: a bypassed frame is the
- * linear-error spectrum unchanged.
+ * linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not finite is bypassed and advances the
+ * generation.
  *
  * Packet streams (cfg.frames_per_call N >= 2, graph layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): each packet pre_process is
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries

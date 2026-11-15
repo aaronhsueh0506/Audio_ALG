@@ -9,7 +9,9 @@
  * state after each frame and every output spectrum are hashed bit by bit (a
  * NaN is one value). A non-finite value in the OLDEST slot of a window must be
  * refused like one in the newest: the hop that plants it asserts the refusal,
- * the zeroed state and the generation step.
+ * the zeroed state and the generation step. The Align-ULCNet chain asserts the
+ * same for a huge finite mask, whose enhanced spectrum overflows: refused, the
+ * error spectrum out; over a zero spectrum the same mask is accepted.
  *
  * Align-ULCNet runs at two delay depths on the grid given as grid=<sample
  * rate>,<n_fft> (default 16000,512); DeepVQE-S on its shipped grid.
@@ -233,6 +235,24 @@ static void require_old_slot_refusal(int rc, uint32_t generation_before,
 #if defined(CHAIN_ULCNET)
 /* ---- Align-ULCNet ------------------------------------------------------ */
 
+/* A huge finite mask (and finite state): over a zero spectrum the frame is
+ * finite and accepted with the generation unchanged; otherwise the inverse
+ * power overflows and the frame is refused like a non-finite mask. */
+static void require_huge_mask_verdict(int hop, int silent, int rc,
+                                      uint32_t generation_before,
+                                      uint32_t generation_after, int zeroed)
+{
+    const int ok = silent ? (rc == 0 && generation_after == generation_before)
+                          : (rc != 0 && generation_after == generation_before + 1u && zeroed);
+    if (!ok) {
+        fprintf(stderr, "FAIL: hop %d, a huge finite mask over a %s spectrum was %s "
+                        "(rc=%d, generation %u -> %u, zeroed=%d)\n",
+                hop, silent ? "zero" : "non-zero", rc == 0 ? "accepted" : "refused", rc,
+                (unsigned)generation_before, (unsigned)generation_after, zeroed);
+        exit(EXIT_FAILURE);
+    }
+}
+
 /* State table of the shipped graph (pinned to the exporter by
  * test_export_streaming_ulcnet.py). */
 #define STATE_CHANNELS 32
@@ -281,6 +301,7 @@ static uint64_t run_chain(int depth)
     UlcnetPrepost* p;
     Host host;
     Digest d;
+    int huge_silent = 0, huge_refused = 0, huge_accepted = 0;
     rng_state = RNG_SEED;
     digest_init(&d);
     if (ulcnet_grid_make(&g_grid, &spec) != ULCNET_GRID_OK || BINS > BINS_MAX) exit(2);
@@ -353,6 +374,14 @@ static uint64_t run_chain(int depth)
             require_old_slot_refusal(rc, generation_before,
                                      ulcnet_prepost_state_generation(p),
                                      host_zeroed(&host));
+        if (kind == K_HUGE) {
+            huge_silent = all_zero(e_re, (size_t)BINS) && all_zero(e_im, (size_t)BINS);
+            huge_refused += !huge_silent;
+            huge_accepted += huge_silent;
+            require_huge_mask_verdict(h, huge_silent, rc, generation_before,
+                                      ulcnet_prepost_state_generation(p),
+                                      host_zeroed(&host));
+        }
         if (rc != 0 && kind != K_SKIP) skipped = ulcnet_prepost_frame_bypass(p);
         hash_u32(&d.status, (uint32_t)rc);
         hash_u32(&d.status, (uint32_t)skipped);
@@ -362,8 +391,18 @@ static uint64_t run_chain(int depth)
         hash_f32(&d.state, out.logit_history_out, out.logit_history_elements);
         hash_f32(&d.state, out.h_gru_out, out.gru_hidden_elements);
         if (ulcnet_prepost_post_process_freq(p, o_re, o_im) != 0) exit(2);
+        if (kind == K_HUGE && !huge_silent &&
+            (memcmp(o_re, e_re, (size_t)BINS * sizeof(float)) != 0 ||
+             memcmp(o_im, e_im, (size_t)BINS * sizeof(float)) != 0)) {
+            fprintf(stderr, "FAIL: hop %d, the refused frame is not the error spectrum\n", h);
+            exit(EXIT_FAILURE);
+        }
         hash_f32(&d.post, o_re, (size_t)BINS);
         hash_f32(&d.post, o_im, (size_t)BINS);
+    }
+    if (huge_refused == 0 || huge_accepted == 0) {   /* both verdicts must have been exercised */
+        fprintf(stderr, "FAIL: huge-mask hops refused %d, accepted %d\n", huge_refused, huge_accepted);
+        exit(EXIT_FAILURE);
     }
     ulcnet_prepost_destroy(p);
     host_free(&host);

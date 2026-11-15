@@ -352,11 +352,15 @@ raw spectra and keeps the compressed error spectrum in the pool.
 finite and, when state is registered, that every element of every registered
 buffer is (a non-finite value left in an older window slot would reach `output`
 on a later frame), then multiplies the compressed error spectrum by the mask
-and applies the inverse signed power before unpacking `enhanced_re/im`. On any
-non-finite value the registered buffers are zeroed (cold start), the state
-generation advances, the transaction is discarded, the caller's outputs are
-untouched and -1 is returned; a partial write to state is detectable only as a
-non-finite value. `ulcnet_process.h` holds the `UlcnetModel` callback, the
+and applies the inverse signed power into `enhanced_re/im`, and checks that the
+enhanced spectrum is finite: a finite mask can overflow the inverse power
+(a mask bin of 3.0e30 does), and a non-finite error bin passes through it. On
+any non-finite value the registered buffers are zeroed (cold start), the state
+generation advances, the transaction is discarded and -1 is returned; the
+caller's outputs are untouched after a refused mask or state and hold no valid
+frame after a refused spectrum. A partial write to state is detectable only as
+a non-finite value. The enhanced-spectrum check is C only: the Python
+reference `host_back_end` returns the non-finite frame. `ulcnet_process.h` holds the `UlcnetModel` callback, the
 `UlcnetNnJob`, `ulcnet_frame_is_finite()` and the framing contract below, and
 no transform code. Board NPU drivers and mono/4ch pipeline wiring are outside
 this model-side deliverable.

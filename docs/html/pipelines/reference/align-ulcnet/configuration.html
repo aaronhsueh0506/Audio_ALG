@@ -95,8 +95,8 @@
  │      runtime 先讀完所有 state 輸入、再寫輸出(輸出位址 = 輸入位址)
  │      回非 0 → ulcnet_prepost_frame_bypass(prepost) 收掉交易,state 不動(回報失敗的 runtime 視同沒寫),回 -1
  ├─ ulcnet_prepost_frame_finish(prepost)
- │      output 有限,已登錄的 state 整塊有限?
- │        是 → 解包 enhanced_re/im(state 已由 runtime 就地寫好,finish 不位移、不複製)
+ │      output 有限,已登錄的 state 整塊有限,解包出的 enhanced_re/im 也有限?
+ │        是 → 交出 enhanced_re/im(state 已由 runtime 就地寫好,finish 不位移、不複製)
  │        否 → 已登錄的 state 歸零(state generation +1),frame_bypass 收尾,回 -1(pipeline fail-open)
  └─ ulcnet_prepost_post_process_freq(prepost, enhanced_re, enhanced_im)</pre>
 <p class="note">D(<code>delay_depth</code>)決定 K/V 與 logit window 的深度(依 export descriptor),但不進 pool 大小:adapter pool 只隨 grid,D=8 時為 14,864 B(16 kHz／512)與 29,200 B(48 kHz／1024),D=64 同大小、build_flags_hash 不同。遞迴 state 另由應用端持有,大小見 <a href="../../mono/align-ulcnet/index.html">Mono · Align-ULCNet</a> 的 State 表。adapter pool <b>不在</b>flow／helper／<code>Aec</code> 與 stage 的 pool 內，而是 caller 另外配置。實際產品一律以 <code>ulcnet_accelerator_adapter_get_mem_size()</code> 現查，不可跨 grid 沿用常數。</p>

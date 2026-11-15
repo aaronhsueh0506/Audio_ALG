@@ -148,7 +148,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <li>N=8 的事件由 graph 處理，generation 不變，一包仍是一次 AI3 呼叫。stream 把事件寫成 <code>frame_reset</code>：包內第 3 個 hop 是事件時為 <code>0 0 1 0 0 0 0 0</code>，sample 原樣搬進第五個訊號輸入。24 個 hop、第 3 個 hop 有事件的情境，N=1 送件 23 次（事件 hop 是 BYPASS，不送件，仍呼叫 post），N=8 每個完整包送一次、共 3 次。</li>
 <li>PCM 入口（<code>aiaec_*</code> PCM 家族，以及 <code>_spec</code> 加上外部 ISTFT 重設）每個事件少一個 hop 的音訊：事件 hop 輸出恰為靜音，前一個輸入 hop 不會輸出。需要連續訊號時改用 <code>_freq</code> 或 pipeline stage；Python 參考實作走的是 <code>_freq</code> 流程。</li>
 <li>事件由線性 AEC 的 delay 狀態轉成：CHANGED 同時設 <code>changed</code> 與 <code>solid</code>，LOCKED 只設 <code>solid</code>，UNLOCKED 兩者皆 0。CHANGED 的下一個 hop 是 LOCKED，不會再觸發第二個事件；<code>aiaec_front</code> 與各 pipeline 都用這個對應。</li>
-<li>執行失敗或加速器輸出非有限時為 fail-open：線性 AEC 的殘差頻譜不變地通過，模型失敗不會比沒有模型更糟。</li>
+<li>執行失敗、加速器輸出非有限，或 mask 有限但增強後的頻譜非有限時為 fail-open：線性 AEC 的殘差頻譜不變地通過，模型失敗不會比沒有模型更糟。</li>
 </ul>
 <h3>Python 的事件重播</h3>
 <p>C 的事件由線性 AEC 的 delay 狀態逐 hop 給出。Python 的線性 AEC 沒有這個存取器，無法從音訊推出事件，只能從記錄檔重播：<code>inference.py</code> 與 <code>inference.py calib</code> 的 <code>--events PATH</code>，N=1 與 N=8 共用同一條邊緣規則。記錄檔每個真實模型 hop 一筆 <code>(changed, solid)</code>，筆數等於 <code>ceil(樣本數 / hop_len)</code>：</p>

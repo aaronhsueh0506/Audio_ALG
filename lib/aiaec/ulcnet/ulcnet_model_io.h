@@ -235,16 +235,16 @@ int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
                                    UlcnetModelIoInputs *inputs,
                                    UlcnetModelIoOutputs *outputs);
 
-/* Call after a successful inference; one prepare() permits one call. Checks that the accelerator wrote a finite mask
- * and, when state is registered, finite state (every registered buffer scanned whole), then applies the mask and the
- * inverse signed power into the enhanced arrays. On a non-finite value the registered state is zeroed, the generation
- * advances, the caller's outputs stay untouched and -1 is returned. */
+/* Call after a successful inference; one prepare() permits one call. Checks a finite mask and registered state (each
+ * buffer scanned whole), applies the mask and inverse signed power into the enhanced arrays, then checks those are
+ * finite (a finite mask can overflow the power). On a non-finite value: registered state zeroed, generation advanced,
+ * -1; the arrays are untouched after a refused mask or state and hold no valid frame after a refused spectrum. */
 int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
                                      float *enhanced_re, float *enhanced_im);
 
 /* As enhance_spectrum() for a packet: enhanced_re / enhanced_im hold N * spectrum_bins floats, frame-major. The
  * frames marked as events are not written (the caller fills them with the error spectrum); the finite check covers the
- * whole mask, event frames included. */
+ * whole mask, event frames included, and the enhanced spectrum of every other frame. */
 int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
                                    float *enhanced_re, float *enhanced_im);
 

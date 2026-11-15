@@ -113,9 +113,9 @@ int ulcnet_prepost_frame_open(UlcnetPrepost *p,
                                 UlcnetModelIoOutputs *outputs);
 
 /* Call after a successful accelerator run (frame_bypass() after a failed one); needs an open frame from frame_open(),
- * else refused. Validates a finite mask and, when state is registered, finite state (every registered buffer scanned
- * whole), applies the mask and inverse compression, stages the enhanced spectrum. On failure (-1) the registered
- * state is zeroed, the generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
+ * else refused. Validates a finite mask and registered state (each buffer scanned whole), applies the mask and inverse
+ * compression, validates a finite enhanced spectrum and stages it. On failure (-1) the registered state is zeroed, the
+ * generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
 int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
 
 /* Identity for the current frame (after a failed run or a reprime): the error spectrum passes through without the AEC
