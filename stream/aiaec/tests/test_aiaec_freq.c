@@ -1,29 +1,27 @@
-/* Host coverage for the PCM -> spectrum ("_spec") and spectrum -> spectrum ("_freq") families through
+/* Host coverage for the spectrum -> spectrum ("_freq") family against the PCM block family through
  * the real public API, for the model the build binds (aiaec_product.h). Compiled once per product with
  * -DAIAEC_TEST_CATALOG; the accelerator is a host stand-in (deterministic heads, an identity head, or a
  * bypass).
  *
- *   equivalence  the PCM block family, _spec + an external AcIstft, and _freq fed by an independent AcStft run
- *                in lockstep, none of them restarted at an alignment event: the PCM output equals the
- *                externally synthesized _spec and _freq outputs sample for sample, and the _freq spectra
- *                equal the _spec spectra bit for bit on every hop, an Align-ULCNet event hop included
- *                (where both return the input error spectrum unchanged). DeepVQE-S
- *                at 16k/256 N=1 and N=8 and 16k/512 N=1 with a forced inference failure; Align-ULCNet
- *                with changed / solid events and a forced failure.
+ *   equivalence  the PCM block family and _freq fed by an independent AcStft run in lockstep, neither of them
+ *                restarted at an alignment event: the PCM output equals the externally synthesized _freq output
+ *                sample for sample, an Align-ULCNet event hop included (where the output is the input error
+ *                spectrum unchanged). DeepVQE-S at 16k/256 N=1 and N=8 and 16k/512 N=1 with a forced inference
+ *                failure; Align-ULCNet with changed / solid events and a forced failure.
  *   events       Align-ULCNet: per hop SUBMIT or BYPASS (changed and solid false -> true hops bypass,
- *                the next hop submits); the restart fields of the work stay 0 in every family.
+ *                the next hop submits), in both families.
  *   continuity   Align-ULCNet _freq with never-restarted analysers and ISTFT, bypassing every hop
  *                across alignment events: the output is the input delayed by one hop throughout.
  *   scale        the spectra at the boundary are audio scale: an identity head returns the supplied
  *                spectrum, a fail-open frame returns its input error spectrum bit for bit.
  *   tail         a single 16000-count sample at the last real input sample comes back at
- *                (real length - 1 + trim_samples) after the documented tail_zero_blocks, through every
- *                family; the queue-only drain with one zero spectrum loses it.
+ *                (real length - 1 + trim_samples) after the documented tail_zero_blocks, through both
+ *                families; the queue-only drain with one zero spectrum loses it.
  *   bind/pool    per-family trim / queue / tail, ports; pools: short / misaligned refused, larger constructs,
- *                also when the pool is undersized; the _freq pool is the pinned size and the _spec pool less
- *                the framing (FFT, two STFT, one ISTFT, PCM scratch). Every section runs each family in a pool of
+ *                also when the pool is undersized; the _freq pool is the pinned size and the PCM pool is larger
+ *                by the framing (FFT, two STFT, one ISTFT, PCM scratch). Every section runs each family in a pool of
  *                exactly its size with a canary zone behind it.
- *   gates        kind / size / null / sequence rejections for the new entries. */
+ *   gates        kind / size / null / sequence rejections for the _freq entries. */
 
 #include <math.h>
 #include <stdint.h>
@@ -53,55 +51,51 @@ static AiaecConfig make_cfg(int fft, int n) {
     return cfg;
 }
 
-/* One context per family on its own pool of exactly its size, followed by TRIO_CANARY bytes of 0xC3. */
-enum { TRIO_CANARY = 64 };
-typedef struct Trio {
+/* One context per family on its own pool of exactly its size, followed by PAIR_CANARY bytes of 0xC3. */
+enum { PAIR_CANARY = 64 };
+typedef struct Pair {
     AiaecCtx *blk;
-    AiaecSpecCtx *spec;
     AiaecFreqCtx *freq;
-    void *p_blk, *p_spec, *p_freq;
-    size_t b_blk, b_spec, b_freq;
-    AiaecInfo info_blk, info_spec, info_freq;
-} Trio;
+    void *p_blk, *p_freq;
+    size_t b_blk, b_freq;
+    AiaecInfo info_blk, info_freq;
+} Pair;
 
-static void *trio_pool(size_t bytes) {
-    unsigned char *p = (unsigned char *)alloc_aligned(bytes + TRIO_CANARY);
-    memset(p + bytes, 0xC3, TRIO_CANARY);
+static void *pair_pool(size_t bytes) {
+    unsigned char *p = (unsigned char *)alloc_aligned(bytes + PAIR_CANARY);
+    memset(p + bytes, 0xC3, PAIR_CANARY);
     return p;
 }
 
 static int canary_intact(const void *pool, size_t bytes) {
     const unsigned char *p = (const unsigned char *)pool + bytes;
     size_t k;
-    for (k = 0; k < TRIO_CANARY; ++k) if (p[k] != 0xC3) return 0;
+    for (k = 0; k < PAIR_CANARY; ++k) if (p[k] != 0xC3) return 0;
     return 1;
 }
 
-static int trio_make(Trio *t, const AiaecConfig *cfg) {
-    StreamMemReq rb, rs, rf;
+static int pair_make(Pair *t, const AiaecConfig *cfg) {
+    StreamMemReq rb, rf;
     int e;
     memset(t, 0, sizeof(*t));
-    if (aiaec_get_mem_size(cfg, &rb) != AIAEC_OK || aiaec_get_mem_size_spec(cfg, &rs) != AIAEC_OK ||
-        aiaec_get_mem_size_freq(cfg, &rf) != AIAEC_OK) {
-        FAIL("trio: get_mem_size failed for fft=%d hop_in=%d", cfg->fft, cfg->hop_in);
+    if (aiaec_get_mem_size(cfg, &rb) != AIAEC_OK || aiaec_get_mem_size_freq(cfg, &rf) != AIAEC_OK) {
+        FAIL("pair: get_mem_size failed for fft=%d hop_in=%d", cfg->fft, cfg->hop_in);
         return -1;
     }
-    t->b_blk = (size_t)rb.bytes; t->b_spec = (size_t)rs.bytes; t->b_freq = (size_t)rf.bytes;
-    t->p_blk = trio_pool(t->b_blk); t->p_spec = trio_pool(t->b_spec); t->p_freq = trio_pool(t->b_freq);
+    t->b_blk = (size_t)rb.bytes; t->b_freq = (size_t)rf.bytes;
+    t->p_blk = pair_pool(t->b_blk); t->p_freq = pair_pool(t->b_freq);
     e = aiaec_init(cfg, t->p_blk, (size_t)rb.bytes, &t->blk, &t->info_blk);
-    CHECK(e == AIAEC_OK && t->blk != NULL, "trio: init err=%d", e);
-    e = aiaec_init_spec(cfg, t->p_spec, (size_t)rs.bytes, &t->spec, &t->info_spec);
-    CHECK(e == AIAEC_OK && t->spec != NULL, "trio: init_spec err=%d", e);
+    CHECK(e == AIAEC_OK && t->blk != NULL, "pair: init err=%d", e);
     e = aiaec_init_freq(cfg, t->p_freq, (size_t)rf.bytes, &t->freq, &t->info_freq);
-    CHECK(e == AIAEC_OK && t->freq != NULL, "trio: init_freq err=%d", e);
-    return t->blk && t->spec && t->freq ? 0 : -1;
+    CHECK(e == AIAEC_OK && t->freq != NULL, "pair: init_freq err=%d", e);
+    return t->blk && t->freq ? 0 : -1;
 }
 
-static void trio_free(Trio *t) {
-    CHECK(canary_intact(t->p_blk, t->b_blk) && canary_intact(t->p_spec, t->b_spec) && canary_intact(t->p_freq, t->b_freq),
-          "trio: a context wrote past its pool (block/spec/freq canary %d/%d/%d)", canary_intact(t->p_blk, t->b_blk),
-          canary_intact(t->p_spec, t->b_spec), canary_intact(t->p_freq, t->b_freq));
-    free(t->p_blk); free(t->p_spec); free(t->p_freq);
+static void pair_free(Pair *t) {
+    CHECK(canary_intact(t->p_blk, t->b_blk) && canary_intact(t->p_freq, t->b_freq),
+          "pair: a context wrote past its pool (block/freq canary %d/%d)", canary_intact(t->p_blk, t->b_blk),
+          canary_intact(t->p_freq, t->b_freq));
+    free(t->p_blk); free(t->p_freq);
 }
 
 /* An external framing object of the customer's: default config, accumulate OLA, scale 1. */
@@ -159,35 +153,34 @@ static void identity_head(AiaecWork *w, int n) {
 typedef struct Ev { int changed, solid, fail; } Ev;
 
 /* ---------------------------------------------------------------------------------------------
- * equivalence: block == spec + external ISTFT; freq == spec
+ * equivalence: block == freq + external ISTFT
  * ------------------------------------------------------------------------------------------- */
 static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n;
     AiaecConfig cfg = make_cfg(fft, n);
-    Trio t;
-    Frame ist_s, ist_f, an_a, an_b;      /* external ISTFT for spec / freq; analysers for freq */
+    Pair t;
+    Frame ist_f, an_a, an_b;             /* external ISTFT and analysers for freq */
     int16_t *mic = calloc((size_t)hop_in, sizeof(int16_t)), *far16 = calloc((size_t)hop_in, sizeof(int16_t));
     float *resid = calloc((size_t)hop_in, sizeof(float)), *farf = calloc((size_t)hop_in, sizeof(float));
     float *a_re = calloc((size_t)n * nb, sizeof(float)), *a_im = calloc((size_t)n * nb, sizeof(float));
     float *b_re = calloc((size_t)n * nb, sizeof(float)), *b_im = calloc((size_t)n * nb, sizeof(float));
-    float *s_re = calloc((size_t)n * nb, sizeof(float)), *s_im = calloc((size_t)n * nb, sizeof(float));
     float *f_re = calloc((size_t)n * nb, sizeof(float)), *f_im = calloc((size_t)n * nb, sizeof(float));
     float *hopf = calloc((size_t)hop, sizeof(float)), *hopg = calloc((size_t)hop, sizeof(float));
-    int16_t *p_blk = calloc((size_t)hop_in, sizeof(int16_t)), *p_spec = calloc((size_t)hop_in, sizeof(int16_t));
+    int16_t *p_blk = calloc((size_t)hop_in, sizeof(int16_t));
     int16_t *p_freq = calloc((size_t)hop_in, sizeof(int16_t));
     AiaecAlignEvent ev[8];
     int b, k, i, bad = 0, had_hop = 0, prev_solid = 0, edges = 0, fails = 0;
     long long ghop = 0;
 
     (void)ev; (void)had_hop; (void)prev_solid;
-    if (trio_make(&t, &cfg) != 0) return 1;
-    frame_make(&ist_s, fft, 0, 1); frame_make(&ist_f, fft, 0, 1);
+    if (pair_make(&t, &cfg) != 0) return 1;
+    frame_make(&ist_f, fft, 0, 1);
     frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0);
 
     for (b = 0; b < blocks; ++b) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork wb, ws, wf;
+        AiaecWork wb, wf;
         const Ev *e = &sched[b % (PRODUCT_AL ? blocks : 1)];
         int fail = PRODUCT_DV ? (b == 3) : e->fail;
         int edge = 0;
@@ -234,65 +227,50 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         fin.u.deepvqe_s.far_re = b_re; fin.u.deepvqe_s.far_im = b_im;
 #endif
         CHECK(aiaec_preprocess(t.blk, &in, &wb) == AIAEC_OK, "fft=%d N=%d block %d: block preprocess", fft, n, b);
-        CHECK(aiaec_preprocess_spec(t.spec, &in, &ws) == AIAEC_OK, "fft=%d N=%d block %d: spec preprocess", fft, n, b);
         CHECK(aiaec_preprocess_freq(t.freq, &fin, &wf) == AIAEC_OK, "fft=%d N=%d block %d: freq preprocess", fft, n, b);
 
-        CHECK(wb.action == ws.action && wb.action == wf.action &&
-              wb.synthesis_restarted == 0 && ws.synthesis_restarted == 0 && wf.synthesis_restarted == 0 &&
-              wb.synthesis_restart_mask == 0u && ws.synthesis_restart_mask == 0u && wf.synthesis_restart_mask == 0u,
-              "fft=%d N=%d block %d: action/restart differ across families (%d/%d/%d restart %d/%d/%d, edge %d)",
-              fft, n, b, (int)wb.action, (int)ws.action, (int)wf.action, wb.synthesis_restarted, ws.synthesis_restarted,
-              wf.synthesis_restarted, edge);
+        CHECK(wb.action == wf.action, "fft=%d N=%d block %d: action differs across families (%d/%d, edge %d)",
+              fft, n, b, (int)wb.action, (int)wf.action, edge);
         edges += edge;
         if (wb.action == AIAEC_SUBMIT) {
             for (k = 0; k < NINPUTS; ++k)
-                CHECK(wb.inputs[k].elements == ws.inputs[k].elements && wb.inputs[k].elements == wf.inputs[k].elements &&
-                      memcmp(wb.inputs[k].data, ws.inputs[k].data, wb.inputs[k].elements * sizeof(float)) == 0 &&
+                CHECK(wb.inputs[k].elements == wf.inputs[k].elements &&
                       memcmp(wb.inputs[k].data, wf.inputs[k].data, wb.inputs[k].elements * sizeof(float)) == 0,
                       "fft=%d N=%d block %d: accelerator input %d differs across families", fft, n, b, k);
-            CHECK(wb.state_generation == ws.state_generation && wb.state_generation == wf.state_generation,
-                  "block %d: state_generation differs across families", b);
-            if (!fail) { fake_head(&wb, ghop); fake_head(&ws, ghop); fake_head(&wf, ghop); }
+            CHECK(wb.state_generation == wf.state_generation, "block %d: state_generation differs across families", b);
+            if (!fail) { fake_head(&wb, ghop); fake_head(&wf, ghop); }
         }
         fails += fail && wb.action == AIAEC_SUBMIT;
         CHECK(aiaec_postprocess(t.blk, fail, p_blk) == AIAEC_OK, "block %d: block postprocess", b);
-        CHECK(aiaec_postprocess_spec(t.spec, fail, s_re, s_im) == AIAEC_OK, "block %d: spec postprocess", b);
         CHECK(aiaec_postprocess_freq(t.freq, fail, f_re, f_im) == AIAEC_OK, "block %d: freq postprocess", b);
 
-        synth_frames(&ist_s, n, hop, nb, s_re, s_im, p_spec, hopf);
         synth_frames(&ist_f, n, hop, nb, f_re, f_im, p_freq, hopf);
-        if (memcmp(p_blk, p_spec, (size_t)hop_in * sizeof(int16_t)) != 0) {
-            FAIL("fft=%d N=%d block %d: block PCM != _spec + external ISTFT", fft, n, b); bad = 1;
-        }
         if (edge && (memcmp(a_re, f_re, (size_t)nb * sizeof(float)) != 0 || memcmp(a_im, f_im, (size_t)nb * sizeof(float)) != 0)) {
             /* the event hop is an identity hop: _freq returns the front end's error spectrum unchanged */
             FAIL("fft=%d N=%d block %d: _freq event hop is not its input error spectrum", fft, n, b); bad = 1;
-        }
-        if (memcmp(s_re, f_re, (size_t)n * nb * sizeof(float)) != 0 || memcmp(s_im, f_im, (size_t)n * nb * sizeof(float)) != 0) {
-            FAIL("fft=%d N=%d block %d: _freq spectra != _spec spectra", fft, n, b); bad = 1;
         }
         if (memcmp(p_blk, p_freq, (size_t)hop_in * sizeof(int16_t)) != 0) {
             FAIL("fft=%d N=%d block %d: block PCM != _freq + external ISTFT", fft, n, b); bad = 1;
         }
         if (PRODUCT_DV && n > 1 && b == 0) {
             int zero = 1;
-            for (i = 0; i < (n - 1) * nb; ++i) if (s_re[i] != 0.0f || s_im[i] != 0.0f) zero = 0;
+            for (i = 0; i < (n - 1) * nb; ++i) if (f_re[i] != 0.0f || f_im[i] != 0.0f) zero = 0;
             CHECK(zero, "N=%d: the first block's leading %d spectrum frames are not zero", n, n - 1);
         }
         ghop += n;
     }
-    printf("section_equivalence(fft=%d N=%d): %d blocks (%d forced failures, %d events) block == spec+ISTFT == freq+ISTFT, spec == freq%s\n",
+    printf("section_equivalence(fft=%d N=%d): %d blocks (%d forced failures, %d events) block == freq+ISTFT%s\n",
            fft, n, blocks, fails, edges, bad ? " -- DIVERGED" : "");
-    frame_free(&ist_s); frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b);
-    trio_free(&t);
+    frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b);
+    pair_free(&t);
     free(mic); free(far16); free(resid); free(farf); free(a_re); free(a_im); free(b_re); free(b_im);
-    free(s_re); free(s_im); free(f_re); free(f_im); free(hopf); free(hopg); free(p_blk); free(p_spec); free(p_freq);
+    free(f_re); free(f_im); free(hopf); free(hopg); free(p_blk); free(p_freq);
     return bad;
 }
 
 #if PRODUCT_AL
 /* ---------------------------------------------------------------------------------------------
- * events: SUBMIT / BYPASS per hop, all three families
+ * events: SUBMIT / BYPASS per hop, both families
  * ------------------------------------------------------------------------------------------- */
 static int section_events(void) {
     /* changed hop, solid false -> true hop, and the hop after each. */
@@ -306,18 +284,18 @@ static int section_events(void) {
     };
     const int hops = (int)(sizeof(h) / sizeof(h[0]));
     AiaecConfig cfg = make_cfg(256, 1);
-    Trio t;
+    Pair t;
     float resid[128], farf[128], re[129], im[129], a_re[129], a_im[129], b_re[129], b_im[129];
     int16_t pcm[128];
     Frame an_a, an_b;
-    int i, k, sub_blk = 0, sub_spec = 0, sub_freq = 0, bad = 0;
+    int i, k, sub_blk = 0, sub_freq = 0, bad = 0;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
+    if (pair_make(&t, &cfg) != 0) return 1;
     frame_make(&an_a, 256, 1, 0); frame_make(&an_b, 256, 1, 0);
     for (i = 0; i < hops; ++i) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork wb, ws, wf;
+        AiaecWork wb, wf;
         AiaecAlignEvent ev;
         for (k = 0; k < 128; ++k) { resid[k] = 0.002f * (float)((k * 5 + i * 3) % 97 - 48); farf[k] = 0.002f * (float)((k * 11 + i) % 89 - 44); }
         ev.changed = h[i].changed; ev.solid = h[i].solid;
@@ -332,32 +310,25 @@ static int section_events(void) {
         fin.u.align_ulcnet.err_re = a_re; fin.u.align_ulcnet.err_im = a_im;
         fin.u.align_ulcnet.far_re = b_re; fin.u.align_ulcnet.far_im = b_im;
         fin.u.align_ulcnet.events = &ev; fin.u.align_ulcnet.event_count = 1;
-        CHECK(aiaec_preprocess(t.blk, &in, &wb) == AIAEC_OK && aiaec_preprocess_spec(t.spec, &in, &ws) == AIAEC_OK &&
-              aiaec_preprocess_freq(t.freq, &fin, &wf) == AIAEC_OK, "events hop %d: preprocess", i);
-        sub_blk += wb.action == AIAEC_SUBMIT; sub_spec += ws.action == AIAEC_SUBMIT; sub_freq += wf.action == AIAEC_SUBMIT;
-        if ((wb.action == AIAEC_SUBMIT) != (h[i].submit != 0) || (ws.action == AIAEC_SUBMIT) != (h[i].submit != 0) ||
-            (wf.action == AIAEC_SUBMIT) != (h[i].submit != 0)) {
-            FAIL("events hop %d: submit block/spec/freq = %d/%d/%d, want %d", i, wb.action == AIAEC_SUBMIT,
-                 ws.action == AIAEC_SUBMIT, wf.action == AIAEC_SUBMIT, h[i].submit);
+        CHECK(aiaec_preprocess(t.blk, &in, &wb) == AIAEC_OK && aiaec_preprocess_freq(t.freq, &fin, &wf) == AIAEC_OK,
+              "events hop %d: preprocess", i);
+        sub_blk += wb.action == AIAEC_SUBMIT; sub_freq += wf.action == AIAEC_SUBMIT;
+        if ((wb.action == AIAEC_SUBMIT) != (h[i].submit != 0) || (wf.action == AIAEC_SUBMIT) != (h[i].submit != 0)) {
+            FAIL("events hop %d: submit block/freq = %d/%d, want %d", i, wb.action == AIAEC_SUBMIT,
+                 wf.action == AIAEC_SUBMIT, h[i].submit);
             bad = 1;
         }
-        CHECK(wb.synthesis_restarted == 0 && ws.synthesis_restarted == 0 && wf.synthesis_restarted == 0 &&
-              wb.synthesis_restart_mask == 0u && ws.synthesis_restart_mask == 0u && wf.synthesis_restart_mask == 0u,
-              "events hop %d: restart fields %d/%d/%d, want 0", i, wb.synthesis_restarted, ws.synthesis_restarted,
-              wf.synthesis_restarted);
         if (wb.action == AIAEC_BYPASS)
-            CHECK(wb.input_count == 0 && wb.output_count == 0 && wb.state_generation == 0u &&
-                  ws.input_count == 0 && wf.input_count == 0, "events hop %d: bypass work not zeroed", i);
+            CHECK(wb.input_count == 0 && wb.output_count == 0 && wb.state_generation == 0u && wf.input_count == 0,
+                  "events hop %d: bypass work not zeroed", i);
         /* infer_status is not read on a bypass hop */
         CHECK(aiaec_postprocess(t.blk, wb.action == AIAEC_SUBMIT ? 1 : 0xBAD1, pcm) == AIAEC_OK &&
-              aiaec_postprocess_spec(t.spec, ws.action == AIAEC_SUBMIT ? 1 : 0xBAD1, re, im) == AIAEC_OK &&
               aiaec_postprocess_freq(t.freq, wf.action == AIAEC_SUBMIT ? 1 : 0xBAD1, re, im) == AIAEC_OK,
               "events hop %d: postprocess", i);
     }
-    CHECK(sub_blk == 4 && sub_spec == 4 && sub_freq == 4, "events: submissions block/spec/freq = %d/%d/%d, want 4 of %d hops",
-          sub_blk, sub_spec, sub_freq, hops);
-    printf("section_events: %d hops, submissions %d/%d/%d (block/spec/freq), restart fields 0\n", hops, sub_blk, sub_spec, sub_freq);
-    frame_free(&an_a); frame_free(&an_b); trio_free(&t);
+    CHECK(sub_blk == 4 && sub_freq == 4, "events: submissions block/freq = %d/%d, want 4 of %d hops", sub_blk, sub_freq, hops);
+    printf("section_events: %d hops, submissions %d/%d (block/freq)\n", hops, sub_blk, sub_freq);
+    frame_free(&an_a); frame_free(&an_b); pair_free(&t);
     return bad;
 }
 
@@ -370,13 +341,13 @@ static int section_freq_continuity(int fft) {
         { 1, 1, 0 }, { 0, 1, 0 }, { 0, 0, 0 }, { 0, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 0, 0, 0 },
     };
     AiaecConfig cfg = make_cfg(fft, 1);
-    Trio t;
+    Pair t;
     Frame an_a, an_b, ist;
     float *resid = calloc((size_t)hop * blocks, sizeof(float)), *farf = calloc((size_t)hop, sizeof(float));
     float a_re[257], a_im[257], b_re[257], b_im[257], o_re[257], o_im[257], out[256];
     int b, k, bad = 0, events = 0;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
+    if (pair_make(&t, &cfg) != 0) return 1;
     frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0); frame_make(&ist, fft, 0, 1);
     for (k = 0; k < hop * blocks; ++k) resid[k] = 0.01f * (float)(((long long)k * 7 + 3) % 61 - 30);
     for (k = 0; k < hop; ++k) farf[k] = 0.003f * (float)((k * 11) % 53 - 26);
@@ -403,7 +374,7 @@ static int section_freq_continuity(int fft) {
         }
     }
     printf("section_freq_continuity(fft=%d): %d blocks across %d changed events, output == input delayed by one hop\n", fft, blocks, events);
-    frame_free(&an_a); frame_free(&an_b); frame_free(&ist); trio_free(&t); free(resid); free(farf);
+    frame_free(&an_a); frame_free(&an_b); frame_free(&ist); pair_free(&t); free(resid); free(farf);
     return bad;
 }
 #endif
@@ -414,13 +385,13 @@ static int section_freq_continuity(int fft) {
 static int section_scale(void) {
     const int fft = 256, hop = 128, nb = 129;
     AiaecConfig cfg = make_cfg(fft, 1);
-    Trio t;
+    Pair t;
     Frame an_a, an_b;
     float hopf[128], hopg[128], a_re[129], a_im[129], b_re[129], b_im[129], o_re[129], o_im[129];
     int b, k, bad = 0;
     double max_err = 0.0, max_abs = 0.0;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
+    if (pair_make(&t, &cfg) != 0) return 1;
     frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0);
     for (b = 0; b < 6; ++b) {
         AiaecFreqInput fin;
@@ -465,7 +436,7 @@ static int section_scale(void) {
     CHECK(max_err <= 1e-4 * max_abs, "scale: identity head returns a spectrum off by %.3g (max |re| %.3g)", max_err, max_abs);
     if (max_err > 1e-4 * max_abs) bad = 1;
     printf("section_scale: boundary spectra are audio scale (max |re| %.3g, identity/fail-open error %.3g)\n", max_abs, max_err);
-    frame_free(&an_a); frame_free(&an_b); trio_free(&t);
+    frame_free(&an_a); frame_free(&an_b); pair_free(&t);
     return bad;
 }
 
@@ -522,16 +493,14 @@ static void tail_input(AiaecInput *in, AiaecFreqInput *fin, const int16_t *pcm, 
 #endif
 }
 
-/* The info of one family (0 PCM, 1 _spec, 2 _freq) of cfg, from a throw-away init. */
+/* The info of one family (0 PCM, 1 _freq) of cfg, from a throw-away init. */
 static int family_info(const AiaecConfig *cfg, int family, AiaecInfo *info) {
     StreamMemReq rq;
     void *pool;
-    int rc = family == 0 ? aiaec_get_mem_size(cfg, &rq) : family == 1 ? aiaec_get_mem_size_spec(cfg, &rq)
-                                                                  : aiaec_get_mem_size_freq(cfg, &rq);
+    int rc = family == 0 ? aiaec_get_mem_size(cfg, &rq) : aiaec_get_mem_size_freq(cfg, &rq);
     if (rc != AIAEC_OK) return rc;
     pool = alloc_aligned((size_t)rq.bytes);
     if (family == 0) { AiaecCtx *c = NULL; rc = aiaec_init(cfg, pool, (size_t)rq.bytes, &c, info); }
-    else if (family == 1) { AiaecSpecCtx *c = NULL; rc = aiaec_init_spec(cfg, pool, (size_t)rq.bytes, &c, info); }
     else { AiaecFreqCtx *c = NULL; rc = aiaec_init_freq(cfg, pool, (size_t)rq.bytes, &c, info); }
     free(pool);
     return rc;
@@ -546,9 +515,9 @@ static int section_tail(int fft, int n) {
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n;
     const int want_trim = expected_trim(hop, n), want_queue = expected_queue(n);
     AiaecConfig cfg = make_cfg(fft, n);
-    AiaecInfo bi_pcm, bi_spec, bi_freq;
-    Trio t;
-    Frame ist_s, ist_f, an_a, an_b, ist_x;
+    AiaecInfo bi_pcm, bi_freq;
+    Pair t;
+    Frame ist_f, an_a, an_b, ist_x;
     int tail, total_blocks, b, f, k, bad = 0;
     size_t s_real = (size_t)BLOCKS_REAL * (size_t)hop_in, total, idx;
     int16_t *pcm, *out16, *zero16;
@@ -558,15 +527,14 @@ static int section_tail(int fft, int n) {
     char label[64];
 
     snprintf(label, sizeof(label), "tail(fft=%d N=%d)", fft, n);
-    if (family_info(&cfg, 0, &bi_pcm) != AIAEC_OK || family_info(&cfg, 1, &bi_spec) != AIAEC_OK ||
-        family_info(&cfg, 2, &bi_freq) != AIAEC_OK) { FAIL("%s: info", label); return 1; }
+    if (family_info(&cfg, 0, &bi_pcm) != AIAEC_OK || family_info(&cfg, 1, &bi_freq) != AIAEC_OK) { FAIL("%s: info", label); return 1; }
     tail = bi_pcm.tail_zero_blocks;
-    CHECK(tail == bi_spec.tail_zero_blocks && tail == bi_freq.tail_zero_blocks &&
-          tail == (want_trim + hop_in - 1) / hop_in, "%s: tail_zero_blocks %d/%d/%d", label, bi_pcm.tail_zero_blocks, bi_spec.tail_zero_blocks, bi_freq.tail_zero_blocks);
-    CHECK(bi_pcm.trim_samples == want_trim && bi_spec.trim_samples == want_trim && bi_freq.trim_samples == want_trim &&
-          bi_pcm.queue_frames == want_queue && bi_spec.queue_frames == want_queue && bi_freq.queue_frames == want_queue,
-          "%s: trim %d/%d/%d (want %d), queue frames %d/%d/%d (want %d)", label, bi_pcm.trim_samples, bi_spec.trim_samples,
-          bi_freq.trim_samples, want_trim, bi_pcm.queue_frames, bi_spec.queue_frames, bi_freq.queue_frames, want_queue);
+    CHECK(tail == bi_freq.tail_zero_blocks && tail == (want_trim + hop_in - 1) / hop_in, "%s: tail_zero_blocks %d/%d", label,
+          bi_pcm.tail_zero_blocks, bi_freq.tail_zero_blocks);
+    CHECK(bi_pcm.trim_samples == want_trim && bi_freq.trim_samples == want_trim &&
+          bi_pcm.queue_frames == want_queue && bi_freq.queue_frames == want_queue,
+          "%s: trim %d/%d (want %d), queue frames %d/%d (want %d)", label, bi_pcm.trim_samples, bi_freq.trim_samples,
+          want_trim, bi_pcm.queue_frames, bi_freq.queue_frames, want_queue);
     total_blocks = BLOCKS_REAL + tail;
     total = (size_t)total_blocks * (size_t)hop_in;
     idx = s_real - 1 + (size_t)want_trim;
@@ -580,8 +548,8 @@ static int section_tail(int fft, int n) {
     hopf = calloc((size_t)hop, sizeof(float)); zre = calloc((size_t)nb, sizeof(float)); zim = calloc((size_t)nb, sizeof(float));
     pcm[s_real - 1] = PULSE;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
-    frame_make(&ist_s, fft, 0, 1); frame_make(&ist_f, fft, 0, 1); frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0);
+    if (pair_make(&t, &cfg) != 0) return 1;
+    frame_make(&ist_f, fft, 0, 1); frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0);
 
     for (b = 0; b < total_blocks; ++b) {
         AiaecInput in;
@@ -601,12 +569,6 @@ static int section_tail(int fft, int n) {
         st = w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0;
         if (aiaec_postprocess(t.blk, st, out16 + (size_t)b * hop_in) != AIAEC_OK) { FAIL("%s: block post %d", label, b); return 1; }
 
-        if (aiaec_preprocess_spec(t.spec, &in, &w) != AIAEC_OK) { FAIL("%s: spec pre %d", label, b); return 1; }
-        st = w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0;
-        if (aiaec_postprocess_spec(t.spec, st, fre, fim) != AIAEC_OK) { FAIL("%s: spec post %d", label, b); return 1; }
-        for (f = 0; f < n; ++f)
-            ac_istft_push_planar(ist_s.istft, fre + (size_t)f * nb, fim + (size_t)f * nb, outf + (size_t)b * hop_in + (size_t)f * hop);
-
         if (aiaec_preprocess_freq(t.freq, &fin, &w) != AIAEC_OK) { FAIL("%s: freq pre %d", label, b); return 1; }
         st = w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0;
         if (aiaec_postprocess_freq(t.freq, st, fre, fim) != AIAEC_OK) { FAIL("%s: freq post %d", label, b); return 1; }
@@ -617,39 +579,42 @@ static int section_tail(int fft, int n) {
     for (k = 0; (size_t)k < total; ++k) pf[k] = (float)out16[k] / 32768.0f;
     bad |= check_pulse(pf, total, idx, label, &v);
     if (!bad) printf("%s: PCM family OK, out[%zu] = %.1f (tail blocks %d)\n", label, idx, v, tail);
-    bad |= check_pulse(outf, total, idx, label, &v);
-    if (!bad) printf("%s: _spec + external ISTFT OK, out[%zu] = %.1f\n", label, idx, v);
     bad |= check_pulse(outq, total, idx, label, &v);
     if (!bad) printf("%s: _freq (upstream analyser + external ISTFT) OK, out[%zu] = %.1f\n", label, idx, v);
-    frame_free(&ist_s); frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b); trio_free(&t);
+    frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b); pair_free(&t);
 
     /* The failing procedure (N = 1): only the reported queue_frames in zero PCM hops, then one zero
      * SPECTRUM to the external ISTFT -- the frame holding the last real hop is never analysed. */
     if (n == 1) {
-        const int zero_hops = bi_spec.queue_frames;
-        StreamMemReq rs;
+        const int zero_hops = bi_freq.queue_frames;
+        StreamMemReq rf;
         void *pool;
-        AiaecSpecCtx *cs = NULL;
+        AiaecFreqCtx *cs = NULL;
         AiaecInfo is;
-        if (aiaec_get_mem_size_spec(&cfg, &rs) != AIAEC_OK) return 1;
-        pool = alloc_aligned((size_t)rs.bytes);
-        if (aiaec_init_spec(&cfg, pool, (size_t)rs.bytes, &cs, &is) != AIAEC_OK) return 1;
-        frame_make(&ist_x, fft, 0, 1);
+        Frame ax_a, ax_b;
+        if (aiaec_get_mem_size_freq(&cfg, &rf) != AIAEC_OK) return 1;
+        pool = alloc_aligned((size_t)rf.bytes);
+        if (aiaec_init_freq(&cfg, pool, (size_t)rf.bytes, &cs, &is) != AIAEC_OK) return 1;
+        frame_make(&ist_x, fft, 0, 1); frame_make(&ax_a, fft, 1, 0); frame_make(&ax_b, fft, 1, 0);
         memset(outf, 0, total * sizeof(float));
         for (b = 0; b < BLOCKS_REAL + zero_hops; ++b) {
             AiaecInput in;
             AiaecFreqInput fin;
             AiaecWork w;
-            tail_input(&in, &fin, pcm + (size_t)b * hop_in, resid, hop_in, ev, a_re, a_im, b_re, b_im, n);
-            if (aiaec_preprocess_spec(cs, &in, &w) != AIAEC_OK) return 1;
-            if (aiaec_postprocess_spec(cs, w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0, fre, fim) != AIAEC_OK) return 1;
+            const int16_t *blk = pcm + (size_t)b * hop_in;
+            for (k = 0; k < hop; ++k) hopf[k] = (float)blk[k] / 32768.0f;
+            ac_stft_push_planar(ax_a.stft, hopf, a_re, a_im);
+            ac_stft_push_planar(ax_b.stft, hopf, b_re, b_im);
+            tail_input(&in, &fin, blk, resid, hop_in, ev, a_re, a_im, b_re, b_im, n);
+            if (aiaec_preprocess_freq(cs, &fin, &w) != AIAEC_OK) return 1;
+            if (aiaec_postprocess_freq(cs, w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0, fre, fim) != AIAEC_OK) return 1;
             ac_istft_push_planar(ist_x.istft, fre, fim, outf + (size_t)b * hop);
         }
         ac_istft_push_planar(ist_x.istft, zre, zim, outf + (size_t)b * hop);
         v = (double)outf[idx] * 32768.0;
         if (fabs(v - (double)PULSE) < 0.5 * PULSE) { FAIL("%s: the queue-only drain unexpectedly kept the pulse (%.1f)", label, v); bad = 1; }
         else printf("%s: queue-only drain + zero spectrum loses the tail: out[%zu] = %.1f (want %d)\n", label, idx, v, PULSE);
-        frame_free(&ist_x); free(pool);
+        frame_free(&ist_x); frame_free(&ax_a); frame_free(&ax_b); free(pool);
     }
     free(pcm); free(out16); free(zero16); free(outf); free(outq); free(pf); free(resid); free(fre); free(fim); free(a_re); free(a_im);
     free(b_re); free(b_im); free(hopf); free(zre); free(zim);
@@ -662,66 +627,56 @@ static int section_tail(int fft, int n) {
 static int section_bind_and_pool(int fft, int n) {
     const int hop = fft / 2, want_trim = expected_trim(hop, n), want_queue = expected_queue(n);
     AiaecConfig cfg = make_cfg(fft, n);
-    AiaecInfo pb, ps, pf;
-    StreamMemReq rb, rs, rf;
-    Trio t;
+    AiaecInfo pb, pf;
+    StreamMemReq rb, rf;
+    Pair t;
     unsigned char *pool;
     int rc, bad = 0;
-    unsigned int gen_s, gen_f;
+    unsigned int gen_f;
 
-    if (family_info(&cfg, 0, &pb) != AIAEC_OK || family_info(&cfg, 1, &ps) != AIAEC_OK ||
-        family_info(&cfg, 2, &pf) != AIAEC_OK) { FAIL("bind: info"); return 1; }
-    CHECK(memcmp(&pb, &ps, sizeof(pb)) == 0 && memcmp(&pb, &pf, sizeof(pb)) == 0,
-          "bind(fft=%d N=%d): the info (graph, trim, queue, tail) differs across families", fft, n);
-    CHECK(pb.graph_path && ps.graph_path && pf.graph_path && strcmp(pb.graph_path, ps.graph_path) == 0 && strcmp(pb.graph_path, pf.graph_path) == 0,
-          "bind: graph path differs across families");
+    if (family_info(&cfg, 0, &pb) != AIAEC_OK || family_info(&cfg, 1, &pf) != AIAEC_OK) { FAIL("bind: info"); return 1; }
+    CHECK(memcmp(&pb, &pf, sizeof(pb)) == 0, "bind(fft=%d N=%d): the info (graph, trim, queue, tail) differs across families", fft, n);
+    CHECK(pb.graph_path && pf.graph_path && strcmp(pb.graph_path, pf.graph_path) == 0, "bind: graph path differs across families");
     {
         AiaecConfig bad_cfg = make_cfg(fft, n);
-        AiaecSpecCtx *cs = NULL;
         AiaecFreqCtx *cf = NULL;
         AiaecInfo scratch;
         unsigned char small[64];
         bad_cfg.hop_in += 1;
-        CHECK(aiaec_init_spec(&bad_cfg, small, sizeof(small), &cs, &scratch) == AIAEC_ERR_IN_HOP && cs == NULL &&
-              aiaec_init_freq(&bad_cfg, small, sizeof(small), &cf, &scratch) == AIAEC_ERR_IN_HOP && cf == NULL &&
-              aiaec_get_mem_size_spec(&bad_cfg, &rs) == AIAEC_ERR_IN_HOP && aiaec_get_mem_size_freq(&bad_cfg, &rf) == AIAEC_ERR_IN_HOP,
+        CHECK(aiaec_init_freq(&bad_cfg, small, sizeof(small), &cf, &scratch) == AIAEC_ERR_IN_HOP && cf == NULL &&
+              aiaec_get_mem_size_freq(&bad_cfg, &rf) == AIAEC_ERR_IN_HOP,
               "bind: a bad hop_in must propagate AIAEC_ERR_IN_HOP through every family");
     }
 
-    if (trio_make(&t, &cfg) != 0) return 1;
-    CHECK(memcmp(&t.info_blk, &pb, sizeof(pb)) == 0 && memcmp(&t.info_spec, &pb, sizeof(pb)) == 0 &&
-          memcmp(&t.info_freq, &pb, sizeof(pb)) == 0, "bind: the init info equals the throw-away init's");
-    gen_s = aiaec_state_generation_spec(t.spec); gen_f = aiaec_state_generation_freq(t.freq);
-    CHECK(pb.trim_samples == want_trim && ps.trim_samples == want_trim && pf.trim_samples == want_trim &&
-          pb.queue_frames == want_queue && ps.queue_frames == want_queue && pf.queue_frames == want_queue,
-          "bind(fft=%d N=%d): trim %d/%d/%d (want %d), queue %d/%d/%d (want %d)", fft, n, pb.trim_samples, ps.trim_samples,
-          pf.trim_samples, want_trim, pb.queue_frames, ps.queue_frames, pf.queue_frames, want_queue);
-    CHECK(aiaec_state_generation_spec(NULL) == 0u && aiaec_state_generation_freq(NULL) == 0u, "bind: NULL ctx");
-    aiaec_reset_spec(t.spec); aiaec_reset_freq(t.freq);
-    CHECK(aiaec_state_generation_spec(t.spec) != gen_s && aiaec_state_generation_freq(t.freq) != gen_f, "bind: reset must advance the generation");
-    trio_free(&t);
+    if (pair_make(&t, &cfg) != 0) return 1;
+    CHECK(memcmp(&t.info_blk, &pb, sizeof(pb)) == 0 && memcmp(&t.info_freq, &pb, sizeof(pb)) == 0,
+          "bind: the init info equals the throw-away init's");
+    gen_f = aiaec_state_generation_freq(t.freq);
+    CHECK(pb.trim_samples == want_trim && pf.trim_samples == want_trim && pb.queue_frames == want_queue && pf.queue_frames == want_queue,
+          "bind(fft=%d N=%d): trim %d/%d (want %d), queue %d/%d (want %d)", fft, n, pb.trim_samples, pf.trim_samples,
+          want_trim, pb.queue_frames, pf.queue_frames, want_queue);
+    CHECK(aiaec_state_generation_freq(NULL) == 0u, "bind: NULL ctx");
+    aiaec_reset_freq(t.freq);
+    CHECK(aiaec_state_generation_freq(t.freq) != gen_f, "bind: reset must advance the generation");
+    pair_free(&t);
 
     /* pools: short and misaligned are refused per family, the exact size and a larger pool construct */
-    aiaec_get_mem_size(&cfg, &rb); aiaec_get_mem_size_spec(&cfg, &rs); aiaec_get_mem_size_freq(&cfg, &rf);
-    pool = alloc_aligned((size_t)(rb.bytes > rs.bytes ? rb.bytes : rs.bytes) + (size_t)(rf.bytes) + 64);
+    aiaec_get_mem_size(&cfg, &rb); aiaec_get_mem_size_freq(&cfg, &rf);
+    pool = alloc_aligned((size_t)(rb.bytes > rf.bytes ? rb.bytes : rf.bytes) + 64);
     {
         AiaecCtx *cb = NULL;
-        AiaecSpecCtx *cs = NULL;
         AiaecFreqCtx *cf = NULL;
         AiaecInfo info;
         rc = aiaec_init(&cfg, pool, (size_t)rb.bytes - 1u, &cb, &info);
         CHECK(rc == AIAEC_ERR_POOL && cb == NULL, "pool: undersized block rc=%d", rc);
-        rc = aiaec_init_spec(&cfg, pool, (size_t)rs.bytes - 1u, &cs, &info);
-        CHECK(rc == AIAEC_ERR_POOL && cs == NULL, "pool: undersized spec rc=%d", rc);
         rc = aiaec_init_freq(&cfg, pool, (size_t)rf.bytes - 1u, &cf, &info);
         CHECK(rc == AIAEC_ERR_POOL && cf == NULL, "pool: undersized freq rc=%d", rc);
         rc = aiaec_init_freq(&cfg, pool + 1, (size_t)rf.bytes, &cf, &info);
         CHECK(rc == AIAEC_ERR_POOL && cf == NULL, "pool: misaligned freq rc=%d", rc);
         CHECK(aiaec_init(&cfg, pool, (size_t)rb.bytes, &cb, &info) == AIAEC_OK && cb != NULL, "pool: the exact block size must construct");
-        CHECK(aiaec_init_spec(&cfg, pool, (size_t)rs.bytes, &cs, &info) == AIAEC_OK && cs != NULL, "pool: the exact spec size must construct");
         CHECK(aiaec_init_freq(&cfg, pool, (size_t)rf.bytes + 64u, &cf, &info) == AIAEC_OK && cf != NULL, "pool: a larger freq pool must construct");
     }
-    {   /* the _freq pool carries no framing: pinned (host, both models compiled) and _spec less the framing */
+    {   /* the _freq pool carries no framing: pinned (host, both models compiled); the PCM pool adds it where the stash is equal */
         AcStftConfig sc;
         const size_t plane = (size_t)(PRODUCT_AL ? n : 1) * (size_t)(fft / 2 + 1);
         size_t framing, pinned;
@@ -731,32 +686,29 @@ static int section_bind_and_pool(int fft, int n) {
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +
                   ck_align16_size((3u * (size_t)hop + 6u * plane) * sizeof(float));
         pinned = PRODUCT_DV ? (fft == 512 ? 35776u : n == 8 ? 126640u : 18368u) : (fft == 512 ? 15088u : 7920u);
-        CHECK(rs.bytes - rf.bytes == framing, "pool(fft=%d N=%d): _spec %llu - _freq %llu is not the framing %zu", fft, n,
-              (unsigned long long)rs.bytes, (unsigned long long)rf.bytes, framing);
+        if (PRODUCT_AL || n == 1)
+            CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
+                  (unsigned long long)rb.bytes, (unsigned long long)rf.bytes, framing);
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
               (unsigned long long)rf.bytes, pinned);
     }
-    printf("section_bind_and_pool(fft=%d N=%d): info shared, trim %d and queue %d frames in every family, pool sizes enforced"
-           " (block/spec/freq %llu/%llu/%llu)\n", fft, n, want_trim, want_queue, (unsigned long long)rb.bytes,
-           (unsigned long long)rs.bytes, (unsigned long long)rf.bytes);
+    printf("section_bind_and_pool(fft=%d N=%d): info shared, trim %d and queue %d frames in both families, pool sizes enforced"
+           " (block/freq %llu/%llu)\n", fft, n, want_trim, want_queue, (unsigned long long)rb.bytes, (unsigned long long)rf.bytes);
     free(pool);
     return bad;
 }
 
 static int section_gates(void) {
     AiaecConfig cfg = make_cfg(256, 1);
-    Trio t;
+    Pair t;
     float re[129], im[129], zeros[129];
-    int16_t pcm[128];
-    AiaecInput in;
     AiaecFreqInput fin;
     AiaecWork w;
     AiaecAlignEvent ev[2];
     unsigned int gen;
-    int rc;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
-    memset(zeros, 0, sizeof(zeros)); memset(ev, 0, sizeof(ev)); memset(pcm, 0, sizeof(pcm));
+    if (pair_make(&t, &cfg) != 0) return 1;
+    memset(zeros, 0, sizeof(zeros)); memset(ev, 0, sizeof(ev));
     gen = aiaec_state_generation_freq(t.freq);
 
     memset(&fin, 0, sizeof(fin));
@@ -792,10 +744,9 @@ static int section_gates(void) {
     CHECK(aiaec_state_generation_freq(t.freq) == gen, "gates: a rejected freq input advanced the state");
     CHECK(aiaec_preprocess_freq(NULL, &fin, &w) == AIAEC_ERR_NULL && aiaec_preprocess_freq(t.freq, NULL, &w) == AIAEC_ERR_NULL &&
           aiaec_preprocess_freq(t.freq, &fin, NULL) == AIAEC_ERR_NULL, "gates: NULL args freq");
-    CHECK(aiaec_postprocess_freq(t.freq, 0, re, im) == AIAEC_ERR_SEQUENCE && aiaec_postprocess_spec(t.spec, 0, re, im) == AIAEC_ERR_SEQUENCE,
-          "gates: postprocess without preprocess");
+    CHECK(aiaec_postprocess_freq(t.freq, 0, re, im) == AIAEC_ERR_SEQUENCE, "gates: postprocess without preprocess");
     CHECK(aiaec_postprocess_freq(NULL, 0, re, im) == AIAEC_ERR_NULL && aiaec_postprocess_freq(t.freq, 0, NULL, im) == AIAEC_ERR_NULL &&
-          aiaec_postprocess_spec(t.spec, 0, re, NULL) == AIAEC_ERR_NULL, "gates: NULL outputs");
+          aiaec_postprocess_freq(t.freq, 0, re, NULL) == AIAEC_ERR_NULL, "gates: NULL outputs");
 
     CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_OK, "gates: valid freq preprocess");
     CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_ERR_SEQUENCE, "gates: second freq preprocess before postprocess");
@@ -803,29 +754,8 @@ static int section_gates(void) {
     CHECK(aiaec_postprocess_freq(t.freq, 0, NULL, NULL) == AIAEC_ERR_NULL, "gates: NULL outputs keep the block open");
     CHECK(aiaec_postprocess_freq(t.freq, 0, re, im) == AIAEC_OK, "gates: freq postprocess after recovery");
 
-    /* spec: kind / size gates are the block family's */
-    memset(&in, 0, sizeof(in));
-    in.samples = 128;
-#if PRODUCT_DV
-    in.kind = AIAEC_INPUT_DEEPVQE_S; in.u.deepvqe_s.mic_in = pcm; in.u.deepvqe_s.far_in = pcm;
-#else
-    in.kind = AIAEC_INPUT_ALIGN_ULCNET; in.u.align_ulcnet.residual_in = zeros; in.u.align_ulcnet.far_in = zeros;
-    in.u.align_ulcnet.events = ev; in.u.align_ulcnet.event_count = 1;
-#endif
-    gen = aiaec_state_generation_spec(t.spec);
-    in.samples = 64;
-    CHECK(aiaec_preprocess_spec(t.spec, &in, &w) == AIAEC_ERR_INPUT_SIZE, "gates: spec wrong samples");
-    in.samples = 128; in.kind = PRODUCT_DV ? AIAEC_INPUT_ALIGN_ULCNET : AIAEC_INPUT_DEEPVQE_S;
-    CHECK(aiaec_preprocess_spec(t.spec, &in, &w) == AIAEC_ERR_INPUT_KIND, "gates: spec wrong kind");
-    CHECK(aiaec_state_generation_spec(t.spec) == gen, "gates: a rejected spec input advanced the state");
-    in.kind = PRODUCT_DV ? AIAEC_INPUT_DEEPVQE_S : AIAEC_INPUT_ALIGN_ULCNET;
-    rc = aiaec_preprocess_spec(t.spec, &in, &w);
-    CHECK(rc == AIAEC_OK, "gates: spec preprocess rc=%d", rc);
-    CHECK(aiaec_preprocess_spec(t.spec, &in, &w) == AIAEC_ERR_SEQUENCE, "gates: second spec preprocess");
-    if (w.action == AIAEC_SUBMIT) fake_head(&w, 0);
-    CHECK(aiaec_postprocess_spec(t.spec, 0, re, im) == AIAEC_OK, "gates: spec postprocess");
     printf("section_gates: kind/size/null/sequence rejections precede any state write\n");
-    trio_free(&t);
+    pair_free(&t);
     return 0;
 }
 
@@ -849,18 +779,18 @@ static float frame_max_diff(const float *a_re, const float *a_im, const float *b
     return d;
 }
 
-/* The spectrum entries fail closed too. An identity accelerator returns the mic spectrum, delayed by N - 1 frames; the
+/* The _freq entry fails closed too. An identity accelerator returns the mic spectrum, delayed by N - 1 frames; the
  * failed job's N frames are zero spectra: the failed block's last frame and the next block's first N - 1 frames, which
  * must be exactly zero, with a normal frame on either side. The failure is a reported infer_status != 0 with valid
  * taps, non-finite taps with infer_status 0, and both. The state generation each SUBMIT block carries must be the
- * live one, across the refused commit and a reset. `freq` selects the _freq entry (spectra in) over _spec (PCM in). */
-static int section_fail_closed_spec_freq(int fft, int n, int freq, FailKind kind) {
+ * live one, across the refused commit and a reset. */
+static int section_fail_closed_freq(int fft, int n, FailKind kind) {
     enum { BLOCKS = 6, FAILED = 2 };
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n, frames = BLOCKS * n;
     AiaecConfig cfg = make_cfg(fft, n);
-    Trio t;
+    Pair t;
     Frame an;
-    int16_t *mic = calloc((size_t)hop_in * BLOCKS, sizeof(int16_t)), *far = calloc((size_t)hop_in, sizeof(int16_t));
+    int16_t *mic = calloc((size_t)hop_in * BLOCKS, sizeof(int16_t));
     float *e_re = calloc((size_t)frames * nb, sizeof(float)), *e_im = calloc((size_t)frames * nb, sizeof(float));
     float *o_re = calloc((size_t)frames * nb, sizeof(float)), *o_im = calloc((size_t)frames * nb, sizeof(float));
     float *z = calloc((size_t)nb, sizeof(float)), *hopf = calloc((size_t)hop, sizeof(float));
@@ -868,7 +798,7 @@ static int section_fail_closed_spec_freq(int fft, int n, int freq, FailKind kind
     const int fail_lo = FAILED * n + n - 1, fail_hi = (FAILED + 1) * n + n - 2;   /* output frame positions of the failed job */
     int b, i, p, bad = g_fail;
 
-    if (trio_make(&t, &cfg) != 0) return 1;
+    if (pair_make(&t, &cfg) != 0) return 1;
     frame_make(&an, fft, 1, 0);
     for (i = 0; i < hop_in * BLOCKS; ++i) mic[i] = (int16_t)((((i * 977) % 20001) - 10000) / 2);
     for (p = 0; p < frames; ++p) {
@@ -876,85 +806,76 @@ static int section_fail_closed_spec_freq(int fft, int n, int freq, FailKind kind
         ac_stft_push_planar(an.stft, hopf, e_re + (size_t)p * nb, e_im + (size_t)p * nb);
     }
     for (b = 0; b < BLOCKS; ++b) {
-        AiaecInput in;
         AiaecFreqInput fin;
         AiaecWork w;
         const int fail = b == FAILED;
         int rc;
 
-        memset(&in, 0, sizeof(in));
-        in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = hop_in;
-        in.u.deepvqe_s.mic_in = mic + (size_t)b * hop_in; in.u.deepvqe_s.far_in = far;
         memset(&fin, 0, sizeof(fin));
         fin.kind = AIAEC_INPUT_DEEPVQE_S; fin.frames = n;
         fin.u.deepvqe_s.mic_re = e_re + (size_t)b * n * nb; fin.u.deepvqe_s.mic_im = e_im + (size_t)b * n * nb;
         fin.u.deepvqe_s.far_re = z; fin.u.deepvqe_s.far_im = z;   /* n * nb floats are read: the far stays silent */
-        if (freq) rc = aiaec_preprocess_freq(t.freq, &fin, &w); else rc = aiaec_preprocess_spec(t.spec, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT, "fail_closed_sf block %d: preprocess rc=%d", b, rc);
+        rc = aiaec_preprocess_freq(t.freq, &fin, &w);
+        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT, "fail_closed block %d: preprocess rc=%d", b, rc);
         gen_seen[b] = w.state_generation;
-        CHECK(w.state_generation == (freq ? aiaec_state_generation_freq(t.freq) : aiaec_state_generation_spec(t.spec)),
-              "fail_closed_sf block %d: work generation %u, live %u", b, w.state_generation,
-              freq ? aiaec_state_generation_freq(t.freq) : aiaec_state_generation_spec(t.spec));
+        CHECK(w.state_generation == aiaec_state_generation_freq(t.freq), "fail_closed block %d: work generation %u, live %u", b,
+              w.state_generation, aiaec_state_generation_freq(t.freq));
         identity_head(&w, n);
         if (fail && kind != FAIL_STATUS) w.outputs[0].data[w.outputs[0].elements / 3] = NAN;
         {
             const int status = fail && kind != FAIL_NONFINITE ? 1 : 0;
             float *re = o_re + (size_t)b * n * nb, *im = o_im + (size_t)b * n * nb;
-            rc = freq ? aiaec_postprocess_freq(t.freq, status, re, im) : aiaec_postprocess_spec(t.spec, status, re, im);
+            rc = aiaec_postprocess_freq(t.freq, status, re, im);
         }
-        CHECK(rc == AIAEC_OK, "fail_closed_sf block %d: postprocess rc=%d", b, rc);
+        CHECK(rc == AIAEC_OK, "fail_closed block %d: postprocess rc=%d", b, rc);
     }
     /* output frame p is the identity on input frame p - (N - 1), except what the failed job owns and the lead-in */
     for (p = 0; p < frames; ++p) {
         const float *ore = o_re + (size_t)p * nb, *oim = o_im + (size_t)p * nb;
         if (p < n - 1 || p == fail_lo || (p > fail_lo && p <= fail_hi)) {
-            CHECK(frame_is_zero(ore, oim, nb), "fail_closed_sf(%s fft=%d N=%d kind=%d): frame %d not exactly zero (a failed batch must be silent, not the mic)",
-                  freq ? "freq" : "spec", fft, n, (int)kind, p);
+            CHECK(frame_is_zero(ore, oim, nb), "fail_closed(fft=%d N=%d kind=%d): frame %d not exactly zero (a failed batch must be silent, not the mic)",
+                  fft, n, (int)kind, p);
         } else {
             float peak, d = frame_max_diff(ore, oim, e_re + (size_t)(p - (n - 1)) * nb, e_im + (size_t)(p - (n - 1)) * nb, nb, &peak);
-            CHECK(peak > 0.0f && d <= 2e-3f * peak, "fail_closed_sf(%s fft=%d N=%d kind=%d): frame %d is not the delayed mic spectrum (diff %g, peak %g)",
-                  freq ? "freq" : "spec", fft, n, (int)kind, p, (double)d, (double)peak);
+            CHECK(peak > 0.0f && d <= 2e-3f * peak, "fail_closed(fft=%d N=%d kind=%d): frame %d is not the delayed mic spectrum (diff %g, peak %g)",
+                  fft, n, (int)kind, p, (double)d, (double)peak);
         }
     }
     if (kind == FAIL_NONFINITE)
         CHECK(gen_seen[FAILED + 1] != gen_seen[FAILED] && gen_seen[FAILED + 1] != 0u && gen_seen[FAILED + 2] == gen_seen[FAILED + 1],
-              "fail_closed_sf(%s N=%d): generation %u -> %u -> %u around the refused job", freq ? "freq" : "spec", n,
+              "fail_closed(N=%d): generation %u -> %u -> %u around the refused job", n,
               gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
     {   /* a reset advances the generation and the next SUBMIT block carries it */
-        AiaecInput in;
         AiaecFreqInput fin;
         AiaecWork w;
-        const unsigned int before = freq ? aiaec_state_generation_freq(t.freq) : aiaec_state_generation_spec(t.spec);
+        const unsigned int before = aiaec_state_generation_freq(t.freq);
         unsigned int live;
         int rc;
-        if (freq) aiaec_reset_freq(t.freq); else aiaec_reset_spec(t.spec);
-        memset(&in, 0, sizeof(in));
-        in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = hop_in; in.u.deepvqe_s.mic_in = mic; in.u.deepvqe_s.far_in = far;
+        aiaec_reset_freq(t.freq);
         memset(&fin, 0, sizeof(fin));
         fin.kind = AIAEC_INPUT_DEEPVQE_S; fin.frames = n;
         fin.u.deepvqe_s.mic_re = e_re; fin.u.deepvqe_s.mic_im = e_im; fin.u.deepvqe_s.far_re = z; fin.u.deepvqe_s.far_im = z;
-        rc = freq ? aiaec_preprocess_freq(t.freq, &fin, &w) : aiaec_preprocess_spec(t.spec, &in, &w);
-        live = freq ? aiaec_state_generation_freq(t.freq) : aiaec_state_generation_spec(t.spec);
+        rc = aiaec_preprocess_freq(t.freq, &fin, &w);
+        live = aiaec_state_generation_freq(t.freq);
         CHECK(rc == AIAEC_OK && w.state_generation == live && w.state_generation != before && w.state_generation != 0u,
-              "fail_closed_sf(%s): after reset work generation %u, live %u, before %u", freq ? "freq" : "spec", w.state_generation, live, before);
+              "fail_closed: after reset work generation %u, live %u, before %u", w.state_generation, live, before);
         identity_head(&w, n);
-        rc = freq ? aiaec_postprocess_freq(t.freq, 0, o_re, o_im) : aiaec_postprocess_spec(t.spec, 0, o_re, o_im);
-        CHECK(rc == AIAEC_OK, "fail_closed_sf: postprocess after reset");
+        rc = aiaec_postprocess_freq(t.freq, 0, o_re, o_im);
+        CHECK(rc == AIAEC_OK, "fail_closed: postprocess after reset");
     }
-    printf("section_fail_closed_spec_freq(%s fft=%d N=%d kind=%d): failed job's frames exactly zero, others the delayed mic spectrum, generation tracked\n",
-           freq ? "freq" : "spec", fft, n, (int)kind);
+    printf("section_fail_closed_freq(fft=%d N=%d kind=%d): failed job's frames exactly zero, others the delayed mic spectrum, generation tracked\n",
+           fft, n, (int)kind);
     frame_free(&an);
-    trio_free(&t);
-    free(mic); free(far); free(e_re); free(e_im); free(o_re); free(o_im); free(z); free(hopf);
+    pair_free(&t);
+    free(mic); free(e_re); free(e_im); free(o_re); free(o_im); free(z); free(hopf);
     return g_fail != bad;
 }
 
 static int section_fail_closed_all(void) {
     static const struct { int fft, n; } grids[3] = { { 256, 1 }, { 256, 8 }, { 512, 1 } };
-    int g, f, k, bad = 0;
+    int g, k, bad = 0;
     for (g = 0; g < 3; ++g)
-        for (f = 0; f < 2; ++f)
-            for (k = FAIL_STATUS; k <= FAIL_BOTH; ++k) bad |= section_fail_closed_spec_freq(grids[g].fft, grids[g].n, f, (FailKind)k);
+        for (k = FAIL_STATUS; k <= FAIL_BOTH; ++k) bad |= section_fail_closed_freq(grids[g].fft, grids[g].n, (FailKind)k);
     return bad;
 }
 #endif /* PRODUCT_DV */
@@ -990,6 +911,6 @@ int main(void) {
     g_fail |= section_scale();
     g_fail |= section_gates();
 
-    printf("test_aiaec_spec_freq[%s]: %s\n", PRODUCT_DV ? "deepvqe_s" : "align_ulcnet", g_fail ? "FAIL" : "PASS");
+    printf("test_aiaec_freq[%s]: %s\n", PRODUCT_DV ? "deepvqe_s" : "align_ulcnet", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

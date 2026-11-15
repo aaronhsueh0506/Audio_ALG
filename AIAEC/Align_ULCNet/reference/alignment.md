@@ -16,7 +16,7 @@ function map); it cannot derive events from audio, because asking `lib/aec` for 
 Python event accessor is a separate decision. An event restarts only the model, in
 Python and in every C entry: at N = 1 the hop is a bypass, at N > 1 the graph's
 `frame_reset`, while the STFT and ISTFT keep running. The C PCM entries (the PCM family
-`aiaec_*`, and `_spec` with an external ISTFT) give the same samples as the `_freq`
+`aiaec_*`) give the same samples as the `_freq`
 entries around the caller's own framing, the event hop included: its frame is the error
 spectrum and its output carries the signal. The policy does not change the front-end
 contract or the model I/O layout.

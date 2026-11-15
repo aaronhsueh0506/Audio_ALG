@@ -1,7 +1,7 @@
 /* aiaec_front_preprocess() against the three calls it replaces. Two independent (front, block
  * context) pairs see the same scene: pair A through the one-shot entry, pair B through
  * aiaec_front_process_i16 + aiaec_front_fill_align_input + aiaec_preprocess. Every block the two
- * work structs must carry the same action, restart mask, state generation and, tensor by tensor, the same
+ * work structs must carry the same action, state generation and, tensor by tensor, the same
  * shapes and bit-identical float contents; after a deterministic non-identity accelerator the
  * postprocess PCM must be byte-equal. Run at N = 1 and N = 8 on the int16 path. The scene's delay change
  * makes one block an event (BYPASS at N = 1, a frame_reset bit at N = 8), so the events are in play. The

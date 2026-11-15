@@ -1,10 +1,10 @@
 /* The board samples' AIAEC graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the AiaecWork of
- * real pre calls (PCM, _spec, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
+ * real pre calls (PCM, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
  * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration, and with
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
  * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
  * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. A SUBMIT work has pairwise disjoint
- * buffers and empty slots beyond its signals, and the three families report one and the same AiaecInfo (trim, queue
+ * buffers and empty slots beyond its signals, and the two families report one and the same AiaecInfo (trim, queue
  * and tail of the 16 kHz rows pinned by the literals below). The rows
  * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
 
@@ -95,19 +95,17 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWo
 static int run_pre(const AiaecConfig *cfg, int family, int event_hop, AiaecWork *work, AiaecInfo *info)
 {
     StreamMemReq req;
-    AiaecCtx *pcm = NULL; AiaecSpecCtx *spec = NULL; AiaecFreqCtx *freq = NULL;
+    AiaecCtx *pcm = NULL; AiaecFreqCtx *freq = NULL;
     AiaecInput in; AiaecFreqInput fin;
     AiaecAlignEvent *events;
     int16_t *s16; float *f32;
     void *pool = NULL;
     int rc, n = cfg->hop_in / (cfg->fft / 2), bins = cfg->fft / 2 + 1;
 
-    rc = family == 0 ? aiaec_get_mem_size(cfg, &req) : family == 1 ? aiaec_get_mem_size_spec(cfg, &req)
-                                                                   : aiaec_get_mem_size_freq(cfg, &req);
+    rc = family == 0 ? aiaec_get_mem_size(cfg, &req) : aiaec_get_mem_size_freq(cfg, &req);
     if (rc != AIAEC_OK) return rc;
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
     rc = family == 0 ? aiaec_init(cfg, pool, (size_t)req.bytes, &pcm, info)
-       : family == 1 ? aiaec_init_spec(cfg, pool, (size_t)req.bytes, &spec, info)
                      : aiaec_init_freq(cfg, pool, (size_t)req.bytes, &freq, info);
     if (rc != AIAEC_OK) { free(pool); return rc; }
     events = (AiaecAlignEvent *)calloc((size_t)n, sizeof *events);
@@ -129,8 +127,7 @@ static int run_pre(const AiaecConfig *cfg, int family, int event_hop, AiaecWork 
     fin.kind = AIAEC_INPUT_DEEPVQE_S; fin.frames = n;
     fin.u.deepvqe_s.mic_re = fin.u.deepvqe_s.mic_im = fin.u.deepvqe_s.far_re = fin.u.deepvqe_s.far_im = f32;
 #endif
-    rc = family == 0 ? aiaec_preprocess(pcm, &in, work)
-       : family == 1 ? aiaec_preprocess_spec(spec, &in, work) : aiaec_preprocess_freq(freq, &fin, work);
+    rc = family == 0 ? aiaec_preprocess(pcm, &in, work) : aiaec_preprocess_freq(freq, &fin, work);
     if (rc == AIAEC_OK && IS_ALIGN && work->input_count == 5 && event_hop >= 0) {
         char pattern[65];   /* frame_reset is the last signal: 1.0 at the event hop only */
         int k;
@@ -150,7 +147,7 @@ int main(void)
     static const int ffts[] = { 128, 256, 512, 1024 };
     static const int srs[] = { 16000, 48000 };
     int si, fi, n, accepted = 0, rows_hit = 0, compared = 0, family;
-    AiaecInfo infos[3];
+    AiaecInfo infos[2];
     int row;
 
     /* The wiring tables and the libraries name the same graph layouts. */
@@ -187,7 +184,7 @@ int main(void)
 #endif
         if (!lib_ok || !row_ok) continue;
         memset(infos, 0, sizeof infos);
-        for (family = 0; family < 3; ++family) {
+        for (family = 0; family < 2; ++family) {
             AiaecWork work; AiaecInfo info;
             char tag[96];
             int rc, e, ev, n_events = IS_ALIGN ? 2 : 1;   /* no event, then (Align-ULCNet) an event at hop 2 or the last */
@@ -211,8 +208,8 @@ int main(void)
                 ++compared;
             }
         }
-        CHECK(infos[0].graph_path != NULL && same_info(&infos[0], &infos[1]) && same_info(&infos[0], &infos[2]),
-              "sr %d fft %d N %d: the three families report one and the same info", cfg.sr, cfg.fft, n);
+        CHECK(infos[0].graph_path != NULL && same_info(&infos[0], &infos[1]),
+              "sr %d fft %d N %d: the two families report one and the same info", cfg.sr, cfg.fft, n);
         for (row = 0; row < (int)(sizeof INFO_ROWS / sizeof INFO_ROWS[0]); ++row) {
             if (cfg.sr != 16000 || cfg.fft != INFO_ROWS[row].fft || n != INFO_ROWS[row].n) continue;
             CHECK(infos[0].trim_samples == (IS_ALIGN ? INFO_ROWS[row].trim_align : INFO_ROWS[row].trim_dv) &&

@@ -92,7 +92,6 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
         if (n == 1) {
             CHECK((work.action == AIAEC_BYPASS) == (p->edge[b] != 0), "block %d: action %s but the events say edge=%d", b,
                   work.action == AIAEC_BYPASS ? "BYPASS" : "SUBMIT", p->edge[b]);
-            CHECK(work.synthesis_restart_mask == 0u, "block %d: restart mask %llx", b, (unsigned long long)work.synthesis_restart_mask);
         } else {
             const float *reset = work.inputs[4].data;
             CHECK(work.action == AIAEC_SUBMIT && work.input_count == 5 && work.inputs[4].elements == (size_t)n,
@@ -102,7 +101,6 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
                       (double)reset[k], p->edge[b * n + k]);
                 p->reset_ones += reset[k] == 1.0f;
             }
-            CHECK(work.synthesis_restart_mask == 0u, "packet %d: restart mask %llx", b, (unsigned long long)work.synthesis_restart_mask);
         }
         if (work.action == AIAEC_SUBMIT) {
             identity_mask(&work, n);

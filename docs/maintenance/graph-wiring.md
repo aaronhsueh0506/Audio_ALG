@@ -81,7 +81,7 @@ make -C stream/ainr MASK_ONLY=1 test-ainr-graph-io
 make -C stream/aiaec test-aiaec-graph-io
 ```
 
-- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，三個家族各一次），把 `AiaecWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 16k/256 N=1、N=8、16k/512 N=1；Align-ULCNet 同三組）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
+- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `AiaecWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 16k/256 N=1、N=8、16k/512 N=1；Align-ULCNet 同三組）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
   （二）另用 `make -C stream/aiaec graph-io-dumper`（環境變數 `AIAEC_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_deepvqes.h`／`graph_io_alignulcnet.h` 的每一列，逐列比對全新匯出的圖：layout 版本、訊號／head／輸入／輸出的數量、每個輸入輸出的 shape、state 名稱與順序、輸出名稱 `<輸入>_out`、state 兩端同 shape，以及 Align-ULCNet N>1 的 `frame_reset` 為最後一個訊號；列集合必須恰為匯出的六個案例。
 - `test_dfn2_port_order.py` 對 DFN2 full 與 lite、N=1 與 8 的匯出圖做名稱順序與 state 形狀檢查，並用 `make -C stream/ainr [MASK_ONLY=1] work-dumper` 建的傾印程式，把四個登錄列（full 16 kHz/256 的 N=1 與 8、full 與 lite 48 kHz/1024 的 N=1）的 `AinrWork` 對匯出圖的訊號輸入與 head 輸出，另驗拒絕的組態回傳碼。它也用 `make -C stream/ainr graph-io-dumper`（`AINR_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_dfn2.h` 的每一列，逐列比對全新匯出的圖（`test_sample_row_equals_a_fresh_export`，項目同上），列集合必須恰為登錄的四列。
 - `test-ainr-graph-io` 另驗每個家族的第二個 block 與第一個同形狀，以及 `ainr_get_mem_size()` 的每個拒絕碼由三個 init 家族原樣回傳（`*ctx` 為 NULL、`*info` 不動）。

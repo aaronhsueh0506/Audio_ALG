@@ -251,9 +251,9 @@ static void aiaec_block_fill_align(const UlcnetGrid *grid, int n, const UlcnetMo
  * Context
  * ------------------------------------------------------------------------------------------- */
 
-/* One core serves all three families; the public context types are thin wrappers so a pool or ctx of
- * one family cannot be handed to another family's entry at compile time. */
-typedef enum AiaecFamily { AIAEC_FAMILY_PCM = 0, AIAEC_FAMILY_SPEC = 1, AIAEC_FAMILY_FREQ = 2 } AiaecFamily;
+/* One core serves both families; the public context types are thin wrappers so a pool or ctx of
+ * one family cannot be handed to the other family's entry at compile time. */
+typedef enum AiaecFamily { AIAEC_FAMILY_PCM = 0, AIAEC_FAMILY_FREQ = 1 } AiaecFamily;
 
 typedef struct AiaecCore {
     AiaecConfig cfg;
@@ -268,7 +268,7 @@ typedef struct AiaecCore {
             DeepVqeStream *inner;
             DeepVqeGrid    grid;
             int16_t       *stash;     /* PCM family: (N - 1) * hop; NULL when N == 1 */
-            float         *stash_f;   /* _spec/_freq: (N - 1) * n_bins real, then as many imaginary */
+            float         *stash_f;   /* _freq: (N - 1) * n_bins real, then as many imaginary */
         } deepvqe;
 #endif
 #if AIAEC_ENABLE_ALIGN_ULCNET
@@ -282,8 +282,7 @@ typedef struct AiaecCore {
 } AiaecCore;
 
 struct AiaecCtx { AiaecCore core; };
-struct AiaecSpecCtx  { AiaecCore core; };
-struct AiaecFreqCtx  { AiaecCore core; };
+struct AiaecFreqCtx { AiaecCore core; };
 
 #if AIAEC_ENABLE_DEEPVQE_S
 /* The inner stream's config, the one sizing and init both use; the _freq family's stream carries no framing. */
@@ -410,8 +409,8 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
     return AIAEC_OK;
 }
 
-/* Round trip on the final PCM, measured with an identity accelerator; the same for all three families
- * (the _spec/_freq caller's own ISTFT supplies the framing hop the PCM family has inside).
+/* Round trip on the final PCM, measured with an identity accelerator; the same for both families
+ * (the _freq caller's own ISTFT supplies the framing hop the PCM family has inside).
  * DeepVQE-S: N * hop -- one hop of STFT/ISTFT framing latency, present even at N == 1, plus (N - 1)
  * hops of model queue. Align-ULCNet: the packet graph returns the N enhanced frames of the N frames it
  * was given, so there is no queue: one hop of framing latency whatever N. */
@@ -562,18 +561,6 @@ int aiaec_init(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecCtx *
     return rc;
 }
 
-int aiaec_init_spec(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecSpecCtx **ctx, AiaecInfo *info)
-{
-    AiaecCore *core = (AiaecCore *)0;
-    int rc;
-
-    if (!ctx) return AIAEC_ERR_NULL;
-    *ctx = (AiaecSpecCtx *)0;
-    rc = aiaec_core_init(cfg, AIAEC_FAMILY_SPEC, pool, pool_bytes, &core, info);
-    if (rc == AIAEC_OK) *ctx = (AiaecSpecCtx *)core;
-    return rc;
-}
-
 int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecFreqCtx **ctx, AiaecInfo *info)
 {
     AiaecCore *core = (AiaecCore *)0;
@@ -591,23 +578,16 @@ int aiaec_get_mem_size(const AiaecConfig *cfg, StreamMemReq *req)
     return aiaec_core_mem_size(cfg, AIAEC_FAMILY_PCM, req);
 }
 
-int aiaec_get_mem_size_spec(const AiaecConfig *cfg, StreamMemReq *req)
-{
-    return aiaec_core_mem_size(cfg, AIAEC_FAMILY_SPEC, req);
-}
-
 int aiaec_get_mem_size_freq(const AiaecConfig *cfg, StreamMemReq *req)
 {
     return aiaec_core_mem_size(cfg, AIAEC_FAMILY_FREQ, req);
 }
 
 void aiaec_reset(AiaecCtx *ctx) { if (ctx) aiaec_core_reset(&ctx->core); }
-void aiaec_reset_spec(AiaecSpecCtx *ctx)   { if (ctx) aiaec_core_reset(&ctx->core); }
-void aiaec_reset_freq(AiaecFreqCtx *ctx)   { if (ctx) aiaec_core_reset(&ctx->core); }
+void aiaec_reset_freq(AiaecFreqCtx *ctx) { if (ctx) aiaec_core_reset(&ctx->core); }
 
 unsigned int aiaec_state_generation(const AiaecCtx *ctx) { return ctx ? aiaec_core_generation(&ctx->core) : 0u; }
-unsigned int aiaec_state_generation_spec(const AiaecSpecCtx *ctx)   { return ctx ? aiaec_core_generation(&ctx->core) : 0u; }
-unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx)   { return ctx ? aiaec_core_generation(&ctx->core) : 0u; }
+unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx) { return ctx ? aiaec_core_generation(&ctx->core) : 0u; }
 
 /* ---------------------------------------------------------------------------------------------
  * Block entries
@@ -615,7 +595,7 @@ unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx)   { return ctx
 
 #if AIAEC_ENABLE_DEEPVQE_S
 /* DeepVQE-S's N-hop stash/drain loop: the first N - 1 hops of a block never carry a real job (each
- * drains what the previous block's job left owed and stashes it); the last one does. The three
+ * drains what the previous block's job left owed and stashes it); the last one does. The two
  * families differ only in what is analysed (PCM or supplied spectra) and what is drained (PCM, or a
  * spectrum into the float stash). */
 static int aiaec_deepvqe_pre(AiaecCore *c, const int16_t *mic_in, const int16_t *far_in,
@@ -662,7 +642,7 @@ static int aiaec_deepvqe_post_pcm(AiaecCore *c, int infer_status, int16_t *pcm_o
     return AIAEC_OK;
 }
 
-static int aiaec_deepvqe_post_spec(AiaecCore *c, int infer_status, float *out_re, float *out_im)
+static int aiaec_deepvqe_post_freq(AiaecCore *c, int infer_status, float *out_re, float *out_im)
 {
     const int n = c->frames_per_call, nb = c->n_bins;
     const size_t last = (size_t)(n - 1) * (size_t)nb;
@@ -679,7 +659,7 @@ static int aiaec_deepvqe_post_spec(AiaecCore *c, int infer_status, float *out_re
 }
 #endif /* AIAEC_ENABLE_DEEPVQE_S */
 
-/* Shared by all three families. `pin` (PCM in) or `fin` (spectra in) is non-NULL, the other NULL;
+/* Shared by both families. `pin` (PCM in) or `fin` (spectra in) is non-NULL, the other NULL;
  * kind, size and NULL gates run in that order before the first call that advances any state. */
 static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const AiaecFreqInput *fin,
                                  AiaecWork *work)
@@ -804,19 +784,13 @@ int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, AiaecWork *work)
     return aiaec_core_preprocess(&ctx->core, input, (const AiaecFreqInput *)0, work);
 }
 
-int aiaec_preprocess_spec(AiaecSpecCtx *ctx, const AiaecInput *input, AiaecWork *work)
-{
-    if (!ctx || !input || !work) return AIAEC_ERR_NULL;
-    return aiaec_core_preprocess(&ctx->core, input, (const AiaecFreqInput *)0, work);
-}
-
 int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, AiaecWork *work)
 {
     if (!ctx || !input || !work) return AIAEC_ERR_NULL;
     return aiaec_core_preprocess(&ctx->core, (const AiaecInput *)0, input, work);
 }
 
-/* pcm_out (PCM family) or out_re/out_im (spectrum families); the unused outputs are NULL. */
+/* pcm_out (PCM family) or out_re/out_im (_freq family); the unused outputs are NULL. */
 static int aiaec_core_postprocess(AiaecCore *c, int infer_status, int16_t *pcm_out,
                                   float *out_re, float *out_im)
 {
@@ -828,7 +802,7 @@ static int aiaec_core_postprocess(AiaecCore *c, int infer_status, int16_t *pcm_o
     if (c->model_id == AIAEC_MODEL_ID_DEEPVQE_S) {
 #if AIAEC_ENABLE_DEEPVQE_S
         return pcm_out ? aiaec_deepvqe_post_pcm(c, infer_status, pcm_out)
-                       : aiaec_deepvqe_post_spec(c, infer_status, out_re, out_im);
+                       : aiaec_deepvqe_post_freq(c, infer_status, out_re, out_im);
 #else
         return AIAEC_ERR_MODEL_ID;
 #endif
@@ -850,12 +824,6 @@ int aiaec_postprocess(AiaecCtx *ctx, int infer_status, int16_t *pcm_out)
 {
     if (!ctx || !pcm_out) return AIAEC_ERR_NULL;
     return aiaec_core_postprocess(&ctx->core, infer_status, pcm_out, (float *)0, (float *)0);
-}
-
-int aiaec_postprocess_spec(AiaecSpecCtx *ctx, int infer_status, float *out_re, float *out_im)
-{
-    if (!ctx || !out_re || !out_im) return AIAEC_ERR_NULL;
-    return aiaec_core_postprocess(&ctx->core, infer_status, (int16_t *)0, out_re, out_im);
 }
 
 int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int infer_status, float *out_re, float *out_im)

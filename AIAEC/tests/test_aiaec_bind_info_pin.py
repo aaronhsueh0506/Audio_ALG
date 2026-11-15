@@ -10,10 +10,10 @@ input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinn
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
 ``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
 resolve) prints the AiaecInfo of a real init and the AiaecWork of the first real pre call for each family
-(PCM, PCM -> spectrum, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1
+(PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1
 and N=8, DeepVQE-S 16k/512 N=1, Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19) and 16k/512 N=1.
 The dumped signal inputs and head output are compared with the exported graph's leading inputs and outputs
-by position and exact padded shape, for all three families, and the three families must print one and the
+by position and exact padded shape, for both families, and the two families must print one and the
 same views and the same trim / queue / tail. Align-ULCNet's frame_reset values and the BYPASS block of an
 N = 1 event hop are pinned as well.
 
@@ -70,7 +70,7 @@ def signal_names(model_name, n):
 
 
 def expected_trim_queue(model_name, n, hop):
-    """(trim_samples, queue_frames), the same for all three families: DeepVQE-S N * hop and N - 1 frames;
+    """(trim_samples, queue_frames), the same for both families: DeepVQE-S N * hop and N - 1 frames;
     Align-ULCNet hop and no queue."""
     return (hop, 0) if model_name == 'align_ulcnet' else (n * hop, n - 1)
 
@@ -95,7 +95,7 @@ def dumpers():
     return {'deepvqe_s': paths[0], 'align_ulcnet': paths[1]}
 
 
-FAMILIES = (0, 1, 2)   # AiaecFamily: PCM, PCM -> spectrum, spectrum -> spectrum
+FAMILIES = (0, 1)   # AiaecFamily: PCM, spectrum -> spectrum
 
 
 def run_dumper(path, sr, fft, hop_in, family=0, event_hop=None):
@@ -178,7 +178,7 @@ def exports(tmp_path_factory):
     return result
 
 
-@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'spec', 'freq'))
+@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'freq'))
 @pytest.mark.parametrize('case', CASES, ids=_case_id)
 def test_c_work_views_equal_the_exported_graph(case, family, dumpers, exports):
     model_name, sr, fft, n = case
@@ -242,7 +242,7 @@ def test_the_customer_arithmetic_is_pinned_to_the_exported_n(dumpers, exports):
     assert dump['inputs'] == 5 and dump['in'][4][0] == (1, 1, 1, 8)        # frame_reset [1, N], the last signal
 
 
-@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'spec', 'freq'))
+@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'freq'))
 def test_align_event_hop_3_of_an_n8_packet_puts_frame_reset_00100000_in_the_fifth_signal(family, dumpers, exports):
     """The stream, not the graph or the sample, derives the control values: model hop 2 (the third) marked
     as an alignment change gives 0 0 1 0 0 0 0 0, still one SUBMIT with five signals (the packet graph)."""
@@ -253,7 +253,7 @@ def test_align_event_hop_3_of_an_n8_packet_puts_frame_reset_00100000_in_the_fift
     assert [p[0] for p in dump['in']] == [_dims(v) for v in graph.input][:5]
 
 
-@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'spec', 'freq'))
+@pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'freq'))
 def test_align_event_hop_of_an_n1_block_is_a_bypass_with_no_views(family, dumpers):
     """N = 1 (layout 18) has no frame_reset: an event hop is a BYPASS block with no accelerator job, so the
     sample binds and submits nothing, yet still calls post once."""
@@ -266,7 +266,7 @@ def test_align_event_hop_of_an_n1_block_is_a_bypass_with_no_views(family, dumper
 
 
 @pytest.mark.parametrize('case', CASES, ids=_case_id)
-def test_the_three_families_share_one_set_of_views(case, dumpers):
+def test_the_two_families_share_one_set_of_views(case, dumpers):
     model_name, sr, fft, n = case
     dumps = [run_dumper(dumpers[model_name], sr, fft, n * (fft // 2), f) for f in FAMILIES]
     for other in dumps[1:]:

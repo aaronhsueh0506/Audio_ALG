@@ -15,7 +15,7 @@
  * Align-ULCNet takes the linear AEC's float residual, the raw far of the same hop and one AiaecAlignEvent per model
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
  * calls aiaec_front_preprocess(). A configuration with no registered grid, hop_in or graph is refused by
- * aiaec_get_mem_size() and aiaec_init() before any SDK call. The PCM (no suffix), "_spec" and "_freq" families
+ * aiaec_get_mem_size() and aiaec_init() before any SDK call. The PCM (no suffix) and "_freq" families
  * share configuration, catalog, AiaecInfo and AiaecWork. A context is used from one thread at a time. */
 
 #ifndef AIAEC_H
@@ -123,9 +123,6 @@ typedef struct AiaecWork {
      * zero the accelerator's state before its next run.
      * All-zero bytes are the zero: the port check refuses a fixed-point state port with zero_point != 0. */
     unsigned int     state_generation;
-    /* Always 0: no entry restarts the analysis or synthesis at an alignment event (an event restarts only the model). */
-    uint64_t         synthesis_restart_mask;
-    int              synthesis_restarted;
 } AiaecWork;
 
 /* ---------------------------------------------------------------------------------------------
@@ -136,12 +133,12 @@ typedef struct AiaecWork {
 typedef struct AiaecInfo {
     const char  *graph_path;           /* model.bin for this configuration; a static string, never NULL here */
     int          trim_samples;         /* samples to drop from the start of the final PCM (after the caller's ISTFT for
-                                        * _spec/_freq), all families: DeepVQE-S N * model_hop, Align-ULCNet model_hop */
+                                        * _freq), both families: DeepVQE-S N * model_hop, Align-ULCNet model_hop */
     int          queue_frames;         /* model-queue frames between a frame in and its enhanced frame out:
                                         * DeepVQE-S N - 1, Align-ULCNet 0 */
     int          tail_zero_blocks;     /* all-zero hop_in blocks after the last real block: ceil(trim_samples / hop_in); no
-                                        * family flushes: _spec also pushes them through the caller's ISTFT, _freq's analyser
-                                        * must first deliver the final frames; queue_frames zero hops alone lose the last hop */
+                                        * family flushes: _freq's analyser must first deliver the final frames;
+                                        * queue_frames zero hops alone lose the last hop */
 } AiaecInfo;
 
 /* ---------------------------------------------------------------------------------------------
@@ -175,32 +172,12 @@ int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, AiaecWork *work);
 int aiaec_postprocess(AiaecCtx *ctx, int infer_status, int16_t *pcm_out);
 
 /* ---------------------------------------------------------------------------------------------
- * _spec (PCM in, the caller runs its own ISTFT) and _freq (AiaecFreqInput spectra in, no STFT / ISTFT) families: the
- * same hop_in, catalog, AiaecInfo and AiaecWork as the PCM family; the enhanced spectrum comes out.
+ * _freq family (AiaecFreqInput spectra in, no STFT / ISTFT): the same hop_in, catalog, AiaecInfo and AiaecWork as the
+ * PCM family; the enhanced spectrum comes out.
  * ------------------------------------------------------------------------------------------- */
 
 /* Spectra: frame-major, oldest first, N frames of n_bins = fft / 2 + 1 floats per plane, real and imaginary separate, in
  * audio scale (AcStft / AcIstft defaults: int16 / 32768, sqrt-Hann, unnormalised rfft). */
-typedef struct AiaecSpecCtx AiaecSpecCtx;
-
-/* As aiaec_get_mem_size(), for the _spec family. */
-int aiaec_get_mem_size_spec(const AiaecConfig *cfg, StreamMemReq *req);
-
-/* As aiaec_init(), for the _spec family. */
-int aiaec_init_spec(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecSpecCtx **ctx, AiaecInfo *info);
-
-/* Clears the family's own history (_spec: analysers, model state; _freq: model state) and advances the generation. */
-void aiaec_reset_spec(AiaecSpecCtx *ctx);
-unsigned int aiaec_state_generation_spec(const AiaecSpecCtx *ctx);
-
-/* As aiaec_preprocess(). Align-ULCNet event hop: N = 1 a BYPASS block; N > 1 one SUBMIT job (frame_reset 1.0, generation
- * unchanged). */
-int aiaec_preprocess_spec(AiaecSpecCtx *ctx, const AiaecInput *input, AiaecWork *work);
-
-/* As aiaec_postprocess(), writing the block's N enhanced frames to out_re / out_im (N * n_bins floats each). Through an
- * AcIstft(AC_OLA_ACCUMULATE, ispec_scale 1) they equal the PCM family's pcm_out (DeepVQE-S's first block starts with N - 1
- * zero frames). */
-int aiaec_postprocess_spec(AiaecSpecCtx *ctx, int infer_status, float *out_re, float *out_im);
 
 /* One block's spectra, tagged by kind; frames must equal N, every plane holds frames * n_bins floats. DeepVQE-S: mic, far.
  * Align-ULCNet: err_* is the linear AEC's error spectrum (its analysis seam, not the raw capture), far_* the raw far;
@@ -224,8 +201,7 @@ typedef struct AiaecFreqInput {
 
 typedef struct AiaecFreqCtx AiaecFreqCtx;
 
-/* As aiaec_get_mem_size(), for the _freq family; the pool holds no FFT, STFT / ISTFT or PCM scratch (smaller than
- * _spec). */
+/* As aiaec_get_mem_size(), for the _freq family; the pool holds no FFT, STFT / ISTFT or PCM scratch. */
 int aiaec_get_mem_size_freq(const AiaecConfig *cfg, StreamMemReq *req);
 
 /* As aiaec_init(), for the _freq family. */
@@ -236,10 +212,12 @@ unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx);
 
 /* As aiaec_preprocess() with frames for samples: INPUT_KIND, INPUT_SIZE (frames or event_count != N), then NULL for a NULL plane.
  * An Align-ULCNet event restarts only the model: the caller's analysers and ISTFT keep running (do not reset the ISTFT),
- * and the output equals _spec's. */
+ * and the output equals the PCM family's through the same AcStft / AcIstft. */
 int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, AiaecWork *work);
 
-/* As aiaec_postprocess_spec(), for the block opened by aiaec_preprocess_freq(). */
+/* As aiaec_postprocess(), writing the block's N enhanced frames to out_re / out_im (N * n_bins floats each), for the
+ * block opened by aiaec_preprocess_freq(). Through an AcIstft(AC_OLA_ACCUMULATE, ispec_scale 1) they equal the PCM family's
+ * pcm_out (DeepVQE-S's first block starts with N - 1 zero frames). */
 int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int infer_status, float *out_re, float *out_im);
 
 #ifdef __cplusplus

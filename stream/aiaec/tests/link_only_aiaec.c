@@ -32,15 +32,13 @@ int main(void) {
         fprintf(stderr, "link_only_aiaec: FAIL shipped 16kHz/512/N=1 row: rc=%d (%s)\n", rc, aiaec_status_text(rc));
         status = 1;
     } else {
-        void *pool = NULL, *pool_s = NULL, *pool_f = NULL;
+        void *pool = NULL, *pool_f = NULL;
         AiaecCtx *ctx = NULL;
-        AiaecSpecCtx *cs = NULL;
         AiaecFreqCtx *cf = NULL;
-        AiaecInfo info, is, if_;
-        StreamMemReq rs, rf;
-        if (aiaec_get_mem_size_spec(&cfg, &rs) != AIAEC_OK || aiaec_get_mem_size_freq(&cfg, &rf) != AIAEC_OK ||
+        AiaecInfo info, if_;
+        StreamMemReq rf;
+        if (aiaec_get_mem_size_freq(&cfg, &rf) != AIAEC_OK ||
             posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool ||
-            posix_memalign(&pool_s, (size_t)rs.alignment, (size_t)rs.bytes) != 0 || !pool_s ||
             posix_memalign(&pool_f, (size_t)rf.alignment, (size_t)rf.bytes) != 0 || !pool_f) {
             fprintf(stderr, "link_only_aiaec: FAIL shipped row pool allocation\n");
             status = 1;
@@ -65,19 +63,18 @@ int main(void) {
                     status = 1;
                 }
             }
-            /* the other two families answer for the same row */
-            if (aiaec_init_spec(&cfg, pool_s, (size_t)rs.bytes, &cs, &is) != AIAEC_OK ||
-                aiaec_init_freq(&cfg, pool_f, (size_t)rf.bytes, &cf, &if_) != AIAEC_OK ||
-                is.trim_samples != if_.trim_samples || is.queue_frames != if_.queue_frames || is.tail_zero_blocks != 1 ||
+            /* the _freq family answers for the same row */
+            if (aiaec_init_freq(&cfg, pool_f, (size_t)rf.bytes, &cf, &if_) != AIAEC_OK ||
+                if_.queue_frames != 0 || if_.tail_zero_blocks != 1 ||
                 if_.graph_path != info.graph_path || if_.trim_samples != 256) {
-                fprintf(stderr, "link_only_aiaec: FAIL shipped row _spec/_freq entries\n");
+                fprintf(stderr, "link_only_aiaec: FAIL shipped row _freq entries\n");
                 status = 1;
             } else {
-                printf("link_only_aiaec: shipped row _spec/_freq pools %llu/%llu bytes, trim %d samples, queue %d frames\n",
-                       (unsigned long long)rs.bytes, (unsigned long long)rf.bytes, is.trim_samples, is.queue_frames);
+                printf("link_only_aiaec: shipped row _freq pool %llu bytes, trim %d samples, queue %d frames\n",
+                       (unsigned long long)rf.bytes, if_.trim_samples, if_.queue_frames);
             }
         }
-        free(pool); free(pool_s); free(pool_f);
+        free(pool); free(pool_f);
     }
 
     printf("link_only_aiaec: %s (aiaec_* symbols link and run)\n", status ? "FAIL" : "PASS");

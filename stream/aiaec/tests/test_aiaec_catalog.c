@@ -32,7 +32,6 @@ static void expect_refused(const AiaecConfig *cfg, int want, const char *what) {
     StreamMemReq req;
     AiaecInfo info, info_ref;
     AiaecCtx *ctx;
-    AiaecSpecCtx *cs;
     AiaecFreqCtx *cf;
     unsigned char pool[256];
     int rc;
@@ -47,11 +46,9 @@ static void expect_refused(const AiaecConfig *cfg, int want, const char *what) {
     rc = aiaec_init(cfg, pool, sizeof(pool), &ctx, &info);
     CHECK(rc == want && ctx == NULL, "%s: init rc=%d (%s)", what, rc, aiaec_status_text(rc));
     CHECK(memcmp(&info, &info_ref, sizeof(info)) == 0, "%s: info touched on a refusal", what);
-    cs = (AiaecSpecCtx *)pool;
     cf = (AiaecFreqCtx *)pool;
-    CHECK(aiaec_init_spec(cfg, pool, sizeof(pool), &cs, &info) == want && cs == NULL &&
-          aiaec_init_freq(cfg, pool, sizeof(pool), &cf, &info) == want && cf == NULL, "%s: init_spec/_freq", what);
-    CHECK(memcmp(&info, &info_ref, sizeof(info)) == 0, "%s: info touched by _spec/_freq on a refusal", what);
+    CHECK(aiaec_init_freq(cfg, pool, sizeof(pool), &cf, &info) == want && cf == NULL, "%s: init_freq", what);
+    CHECK(memcmp(&info, &info_ref, sizeof(info)) == 0, "%s: info touched by _freq on a refusal", what);
 }
 
 static void section_refusal_order(void) {
@@ -81,11 +78,11 @@ static void section_refusal_order(void) {
 /* The one delivered row: DeepVQE-S 16k/512 N=1. */
 static void section_shipped_row(void) {
     AiaecConfig cfg = cfg_of(16000, 512, 256);
-    StreamMemReq req;
-    AiaecInfo info, info_s;
+    StreamMemReq req, req_f;
+    AiaecInfo info, info_f;
     AiaecCtx *ctx = NULL;
-    AiaecSpecCtx *cs = NULL;
-    void *pool = NULL, *pool_s = NULL;
+    AiaecFreqCtx *cf = NULL;
+    void *pool = NULL, *pool_f = NULL;
     int rc;
 
     rc = aiaec_get_mem_size(&cfg, &req);
@@ -117,16 +114,17 @@ static void section_shipped_row(void) {
             aiaec_reset(ctx);   /* closes the open block and restarts */
             CHECK(aiaec_state_generation(ctx) != 0u, "shipped row: a reset advances the generation");
         }
-        CHECK(posix_memalign(&pool_s, (size_t)req.alignment, (size_t)req.bytes) == 0, "shipped row: spec pool");
-        CHECK(aiaec_init_spec(&cfg, pool_s, (size_t)req.bytes, &cs, &info_s) == AIAEC_OK && cs != NULL &&
-              memcmp(&info, &info_s, sizeof(info)) == 0, "shipped row: the _spec family reports the same info");
+        CHECK(aiaec_get_mem_size_freq(&cfg, &req_f) == AIAEC_OK &&
+              posix_memalign(&pool_f, (size_t)req_f.alignment, (size_t)req_f.bytes) == 0, "shipped row: freq pool");
+        CHECK(aiaec_init_freq(&cfg, pool_f, (size_t)req_f.bytes, &cf, &info_f) == AIAEC_OK && cf != NULL &&
+              memcmp(&info, &info_f, sizeof(info)) == 0, "shipped row: the _freq family reports the same info");
     }
     CHECK(aiaec_init(NULL, pool, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL && ctx == NULL, "shipped row: NULL cfg");
     CHECK(aiaec_init(&cfg, NULL, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL, "shipped row: NULL pool");
     CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, NULL, &info) == AIAEC_ERR_NULL, "shipped row: NULL ctx");
     CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, NULL) == AIAEC_ERR_NULL && ctx == NULL, "shipped row: NULL info");
     free(pool);
-    free(pool_s);
+    free(pool_f);
     printf("section_shipped_row: DeepVQE-S 16k/512 N=1 constructs and reports its info\n");
 }
 #endif

@@ -118,13 +118,13 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。每包 pre／post 只交換這一包的特徵（前四個訊號輸入；N&gt;1 的最後一個訊號輸入是 <code>frame_reset</code>）與模型 head（複數 mask）。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。N=8 的每一包恆為一次 SUBMIT；N=1 時事件 hop 是 BYPASS。</p>
 <p>pool 大小（本庫 host 建置讀出，單位 bytes；正式登錄表目前沒有可建構的列，下列都是測試登錄表）：</p>
 <table>
-<thead><tr><th>組態</th><th>PCM</th><th><code>_spec</code></th><th><code>_freq</code></th></tr></thead>
+<thead><tr><th>組態</th><th>PCM</th><th><code>_freq</code></th></tr></thead>
 <tbody>
-<tr><td>16k／256／N=1</td><td>53744</td><td>53744</td><td>7920</td></tr>
-<tr><td>16k／256／N=8</td><td>125904</td><td>125904</td><td>58416</td></tr>
-<tr><td>16k／512／N=1</td><td>103408</td><td>103408</td><td>15088</td></tr>
+<tr><td>16k／256／N=1</td><td>53744</td><td>7920</td></tr>
+<tr><td>16k／256／N=8</td><td>125904</td><td>58416</td></tr>
+<tr><td>16k／512／N=1</td><td>103408</td><td>15088</td></tr>
 </tbody></table>
-<p><code>_freq</code> 的 pool 不含 FFT、STFT／ISTFT 與 PCM 暫存（呼叫端自己做分析與合成），所以比 PCM、<code>_spec</code> 小。</p>
+<p><code>_freq</code> 的 pool 不含 FFT、STFT／ISTFT 與 PCM 暫存（呼叫端自己做分析與合成），所以比 PCM 小。</p>
 
 <h2>State</h2>
 <ul>
@@ -140,13 +140,12 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <thead><tr><th>入口</th><th>N=1</th><th>N=8（封包 graph）</th></tr></thead>
 <tbody>
 <tr><th><code>aiaec_*</code>（PCM → PCM）</th><td>事件 hop 是 BYPASS，不呼叫加速器；只重啟模型，stream 自己的分析與 ISTFT 照跑，該 hop 的 PCM 輸出是殘差頻譜經過它們的結果（有訊號），前一個輸入 hop 的音訊照常輸出。</td><td>一包恆為一次 SUBMIT，graph 內以 <code>frame_reset</code>（0.0／1.0）重設 state 並直通該 hop；stream 自己的 STFT 分析與 ISTFT 合成不重啟。PCM 輸出與同樣事件的 N=1 逐樣本相同。</td></tr>
-<tr><th><code>_spec</code>（PCM → 頻譜）</th><td>同 PCM 家族：只重啟模型；ISTFT 在呼叫端，不必為事件重設（<code>work.synthesis_restart_mask</code> 恆為 0），輸出等於 PCM 家族。</td><td>同 N=1。</td></tr>
 <tr><th><code>_freq</code>（頻譜 → 頻譜，aiaec）</th><td>只重啟模型；呼叫端的分析器與 ISTFT 不重啟，overlap 連續。</td><td>同 N=1：只有模型在 graph 內重設，分析與 ISTFT 的 overlap 連續。不要為此重設 ISTFT。</td></tr>
 <tr><th>桌面 pipeline（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code> 經 <code>ulcnet_stream_*_freq</code>）</th><td>只重啟模型；應用端的分析器與 ISTFT 不重啟，overlap 連續。</td><td>不適用：兩支範例建的是一幀一包的 stream（<code>frames_per_call</code> 0），封包 graph（layout 19）的 descriptor 在啟動時被 <code>main.c</code> 拒絕。</td></tr>
 </tbody></table>
 <ul>
 <li>N=8 的事件由 graph 處理，generation 不變，一包仍是一次 AI3 呼叫。stream 把事件寫成 <code>frame_reset</code>：包內第 3 個 hop 是事件時為 <code>0 0 1 0 0 0 0 0</code>，sample 原樣搬進第五個訊號輸入。24 個 hop、第 3 個 hop 有事件的情境，N=1 送件 23 次（事件 hop 是 BYPASS，不送件，仍呼叫 post），N=8 每個完整包送一次、共 3 次。</li>
-<li>PCM 入口（<code>aiaec_*</code> PCM 家族，以及 <code>_spec</code> 加上外部 ISTFT）與 <code>_freq</code> 加上呼叫端的分析與合成逐樣本相同，事件 hop 沒有少音訊；Python 參考實作走的也是這個流程。</li>
+<li>PCM 入口（<code>aiaec_*</code> PCM 家族）與 <code>_freq</code> 加上呼叫端的分析與合成逐樣本相同，事件 hop 沒有少音訊；Python 參考實作走的也是這個流程。</li>
 <li>事件由線性 AEC 的 delay 狀態轉成：CHANGED 同時設 <code>changed</code> 與 <code>solid</code>，LOCKED 只設 <code>solid</code>，UNLOCKED 兩者皆 0。CHANGED 的下一個 hop 是 LOCKED，不會再觸發第二個事件；<code>aiaec_front</code> 與各 pipeline 都用這個對應。</li>
 <li>執行失敗、加速器輸出非有限，或 mask 有限但增強後的頻譜非有限時為 fail-open：線性 AEC 的殘差頻譜不變地通過，模型失敗不會比沒有模型更糟。</li>
 </ul>
@@ -159,10 +158,10 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <tr><th><code>.csv</code></th><td>標頭 <code>changed,solid</code>（可有從 0 起算的 <code>hop</code> 欄）</td></tr>
 <tr><th><code>.npz</code></th><td>一維整數陣列 <code>changed</code> 與 <code>solid</code></td></tr>
 </tbody></table>
-<p>Python 沿用 <code>_freq</code> 的流程：STFT 與 ISTFT 在事件 hop 繼續跑，所以<b>事件 hop 附近的 Python PCM 與 C 的 PCM 家族、<code>_spec</code> 不同</b>；與 C 的 <code>_freq</code> 才是同一個流程。沒有給 <code>--events</code> 時不會有任何事件。格式細節與行為見 <a href="../../../../AIAEC/Align_ULCNet/reference/alignment.md">alignment.md</a> 與 <a href="../../../../AIAEC/Align_ULCNet/README.md">README</a>。</p>
+<p>Python 沿用 <code>_freq</code> 的流程：STFT 與 ISTFT 在事件 hop 繼續跑，所以<b>事件 hop 附近的 Python PCM 與 C 的 PCM 家族不同</b>；與 C 的 <code>_freq</code> 才是同一個流程。沒有給 <code>--events</code> 時不會有任何事件。格式細節與行為見 <a href="../../../../AIAEC/Align_ULCNet/reference/alignment.md">alignment.md</a> 與 <a href="../../../../AIAEC/Align_ULCNet/README.md">README</a>。</p>
 
 <h2>延遲與檔案尾端</h2>
-<p><code>trim_samples</code> 是輸出相對輸入的總延遲，以最終 PCM 的樣本數計（<code>_spec</code>、<code>_freq</code> 是呼叫端自己的 ISTFT 之後），三個家族相同：只有 stream 自己的一個框化 hop（<code>model_hop = fft / 2</code>），與 N 無關。<code>queue_frames</code> 是模型佇列單獨保存的 frame 數，Align-ULCNet 在任何 N 都是 0。</p>
+<p><code>trim_samples</code> 是輸出相對輸入的總延遲，以最終 PCM 的樣本數計（<code>_freq</code> 是呼叫端自己的 ISTFT 之後），兩個家族相同：只有 stream 自己的一個框化 hop（<code>model_hop = fft / 2</code>），與 N 無關。<code>queue_frames</code> 是模型佇列單獨保存的 frame 數，Align-ULCNet 在任何 N 都是 0。</p>
 <table>
 <thead><tr><th>組態</th><th>model_hop</th><th><code>trim_samples</code></th><th><code>queue_frames</code></th><th><code>tail_zero_blocks</code></th></tr></thead>
 <tbody>
@@ -183,9 +182,9 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
-<li><b>主機替身</b>：<code>make -C stream/aiaec test</code> 涵蓋 catalog 拒絕順序、PCM／<code>_spec</code>／<code>_freq</code> 三個家族、N=8 封包（含事件與 N=1 逐樣本對照）、work 的形狀與 <code>frame_reset</code> 值，以及兩個單模型建置。替身加速器自己實作 <code>frame_reset</code> 語意，不是 AI3 的圖。</li>
+<li><b>主機替身</b>：<code>make -C stream/aiaec test</code> 涵蓋 catalog 拒絕順序、PCM／<code>_freq</code> 兩個家族、N=8 封包（含事件與 N=1 逐樣本對照）、work 的形狀與 <code>frame_reset</code> 值，以及兩個單模型建置。替身加速器自己實作 <code>frame_reset</code> 語意，不是 AI3 的圖。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_aiaec_packet_ort.py</code> 只涵蓋 16k／256，逐 frame 與 Python 逐 hop 串流及 C 的 N=1 串流比對，事件組合包含無事件、單一與多個事件、相鄰事件、每包一個、每 frame 都是、solid 邊緣與跨包邊緣，並驗證 N=8 每包只呼叫一次加速器、事件不改變 generation。<code>test_aiaec_packet_ort_events.py</code> 以同一份事件記錄檔，比對 <code>inference.py --events</code>（N=1、N=8）與 C 的 <code>frame_reset</code>、加速器呼叫數與 PCM。</li>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對三個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 </ul>
 
 <h2>參考</h2>

@@ -90,7 +90,7 @@ LIB_OBJECTS := $(OBJ_DIR)/aiaec.o
 VPATH := .
 
 .PHONY: all lib print-lib-path print-cflags print-sources test deepvqe-lib ulcnet-lib \
-	test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec \
+	test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec \
 	bind-dumpers graph-io-dumper packet-driver test-single-model audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -188,10 +188,10 @@ test-aiaec-catalog: $(TEST_DEPS) | _cfg_guard
 test-aiaec-block: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_block,-DAIAEC_TEST_CATALOG)
 
-# test_aiaec_spec_freq: the _spec and _freq families against the PCM block family and an external
-# AcIstft/AcStft, the tail drain, per-family info and pool sizes, with the test catalog.
-test-aiaec-spec-freq: $(TEST_DEPS) | _cfg_guard
-	$(call RUN_PER_PRODUCT,test_aiaec_spec_freq,-DAIAEC_TEST_CATALOG)
+# test_aiaec_freq: the _freq family against the PCM block family and an external AcStft/AcIstft, the tail
+# drain, per-family info and pool sizes, with the test catalog.
+test-aiaec-freq: $(TEST_DEPS) | _cfg_guard
+	$(call RUN_PER_PRODUCT,test_aiaec_freq,-DAIAEC_TEST_CATALOG)
 
 # test_aiaec_packet: Align-ULCNet's packet graph (N=8, layout 19) against a host accelerator that implements the
 # graph's frame_reset semantics; the Align-ULCNet product only (the test catalog opens its N=8 row).
@@ -268,7 +268,6 @@ LINK_ONLY_AIAEC_BIN := $(OBJ_DIR)/link_only_aiaec
 
 # Struct-taking entries aiaec.h exports.
 AIAEC_STRUCT_SYMS := aiaec_get_mem_size aiaec_init aiaec_preprocess \
-	aiaec_get_mem_size_spec aiaec_init_spec aiaec_preprocess_spec \
 	aiaec_get_mem_size_freq aiaec_init_freq aiaec_preprocess_freq
 
 $(LINK_ONLY_AIAEC_BIN): tests/link_only_aiaec.c aiaec.h $(LIB) deepvqe-lib ulcnet-lib $(COMMON_LIB) | _cfg_guard
@@ -284,9 +283,12 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 	for sym in $(AIAEC_STRUCT_SYMS); do \
 	  nm "$(LIB)" 2>/dev/null | grep -Eq " T _?$$sym$$" || { echo "FAIL: $$sym not exported by $(LIB)" >&2; exit 1; }; \
 	done; \
-	for sym in aiaec_status_text aiaec_postprocess aiaec_postprocess_spec aiaec_postprocess_freq; do \
+	for sym in aiaec_status_text aiaec_postprocess aiaec_postprocess_freq; do \
 	  nm "$(LIB)" 2>/dev/null | grep -Eq " T _?$$sym$$" || { echo "FAIL: $$sym not exported by $(LIB)" >&2; exit 1; }; \
 	done; \
+	if nm "$(LIB)" 2>/dev/null | grep -Eq ' T _?aiaec_[a-z_]*_spec$$'; then \
+	  echo "FAIL: $(LIB) exports an aiaec_*_spec entry (the family is retired)" >&2; exit 1; \
+	fi; \
 	if nm "$(LIB)" 2>/dev/null | grep -Eq 'stream_check_ports|stream_port_shape'; then \
 	  echo "FAIL: $(LIB) carries the sample-side port check (stream_bind)" >&2; exit 1; \
 	fi; \
@@ -304,7 +306,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 # single-model `test` runs only `lib` (confirms aiaec.o itself still compiles clean under this
 # variant) and says plainly what covers that variant's contract: test-single-model.
 ifeq ($(AIAEC_MODEL),both)
-test: test-aiaec-catalog test-aiaec-block test-aiaec-spec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec ulcnet-lib
+test: test-aiaec-catalog test-aiaec-block test-aiaec-freq test-aiaec-product test-aiaec-packet test-aiaec-graph-io link-only-aiaec ulcnet-lib
 else
 test: lib
 	@echo "test: AIAEC_MODEL=$(AIAEC_MODEL) -- the per-product tests and link-only-aiaec assume both models and are skipped; run 'make test-single-model' for this variant's coverage (built with AIAEC_MODEL=both, which exercises AIAEC_MODEL=deepvqe and =align internally)."

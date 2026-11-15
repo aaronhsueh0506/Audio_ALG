@@ -10,9 +10,9 @@
  *             solid carried across the packet boundary). One accelerator call per packet at N=8, none for an event hop at N=1.
  *   events    frame_reset carries exactly the edge pattern; the state generation never changes for an event at N=8;
  *             an all-event packet is still one SUBMIT job.
- *   families  _spec at N=8 equals _freq at N=8 fed by an independent analyser, and the PCM family equals _spec plus
- *             an external AcIstft, sample for sample, through the events: no entry restarts an analysis or a synthesis.
- *   realign   the PCM family and _spec (+ external ISTFT) at N=8 equal the N=1 stream sample for sample with the same
+ *   families  the PCM family equals _freq at N=8 fed by an independent, never restarted analyser plus an external
+ *             AcIstft, sample for sample, through the events: no entry restarts an analysis or a synthesis.
+ *   realign   the PCM family and _freq (+ external STFT and ISTFT) at N=8 equal the N=1 stream sample for sample with the same
  *             events (none, one hop, adjacent, first, last, across a packet boundary, solid false -> true after
  *             earlier hops, every hop, a full reset in the middle), with the accelerator's end-of-packet state and
  *             the vendor call count compared: one call per packet at N=8, one per non-event hop at N=1.
@@ -64,13 +64,12 @@ static AiaecConfig cfg_n(int n) {
 
 typedef struct Ctxs {
     AiaecCtx *blk;
-    AiaecSpecCtx *spec;
     AiaecFreqCtx *freq;
-    void *pb, *ps, *pf;
-    AiaecInfo ib, is, if_;
+    void *pb, *pf;
+    AiaecInfo ib, if_;
 } Ctxs;
 
-static int ctxs_make(Ctxs *c, int n, int want_blk, int want_spec, int want_freq) {
+static int ctxs_make(Ctxs *c, int n, int want_blk, int want_freq) {
     AiaecConfig cfg = cfg_n(n);
     StreamMemReq rq;
     int e = 0;
@@ -81,12 +80,6 @@ static int ctxs_make(Ctxs *c, int n, int want_blk, int want_spec, int want_freq)
         e = aiaec_init(&cfg, c->pb, (size_t)rq.bytes, &c->blk, &c->ib);
         CHECK(e == AIAEC_OK && c->blk != NULL, "init n=%d err=%d", n, e);
     }
-    if (want_spec) {
-        if (aiaec_get_mem_size_spec(&cfg, &rq) != AIAEC_OK) { FAIL("spec mem size n=%d", n); return -1; }
-        c->ps = alloc_aligned((size_t)rq.bytes);
-        e = aiaec_init_spec(&cfg, c->ps, (size_t)rq.bytes, &c->spec, &c->is);
-        CHECK(e == AIAEC_OK && c->spec != NULL, "init_spec n=%d err=%d", n, e);
-    }
     if (want_freq) {
         if (aiaec_get_mem_size_freq(&cfg, &rq) != AIAEC_OK) { FAIL("freq mem size n=%d", n); return -1; }
         c->pf = alloc_aligned((size_t)rq.bytes);
@@ -96,7 +89,7 @@ static int ctxs_make(Ctxs *c, int n, int want_blk, int want_spec, int want_freq)
     return 0;
 }
 
-static void ctxs_free(Ctxs *c) { free(c->pb); free(c->ps); free(c->pf); }
+static void ctxs_free(Ctxs *c) { free(c->pb); free(c->pf); }
 
 /* ---- the accelerator stand-in ------------------------------------------------------------------------------- */
 
@@ -241,7 +234,7 @@ static void run_freq_n1(const Sched *s, Run *r) {
     Accel acc;
     int h;
     memset(r, 0, sizeof(*r));
-    if (ctxs_make(&c, 1, 0, 0, 1) != 0) return;
+    if (ctxs_make(&c, 1, 0, 1) != 0) return;
     accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (h = 0; h < s->packets * NF; ++h) {
         AiaecFreqInput fin;
@@ -266,7 +259,7 @@ static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
     memset(r, 0, sizeof(*r));
     r->reset_pattern_ok = 1;
     expected_edges(s, edge);
-    if (ctxs_make(&c, NF, 0, 0, 1) != 0) return;
+    if (ctxs_make(&c, NF, 0, 1) != 0) return;
     accel_init(&acc, aiaec_state_generation_freq(c.freq), mode);
     r->first_gen = acc.gen;
     for (p = 0; p < s->packets; ++p) {
@@ -276,8 +269,8 @@ static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
         freq_input(&fin, p * NF, NF, s->ev);
         rc = aiaec_preprocess_freq(c.freq, &fin, &w);
         CHECK(rc == AIAEC_OK, "n8 %s: preprocess packet %d rc=%d", s->name, p, rc);
-        CHECK(w.action == AIAEC_SUBMIT && w.input_count == 5 && w.output_count == 1 && w.synthesis_restarted == 0,
-              "n8 %s: packet %d work action=%d inputs=%d restarted=%d", s->name, p, (int)w.action, w.input_count, w.synthesis_restarted);
+        CHECK(w.action == AIAEC_SUBMIT && w.input_count == 5 && w.output_count == 1,
+              "n8 %s: packet %d work action=%d inputs=%d", s->name, p, (int)w.action, w.input_count);
         for (k = 0; k < NF && w.input_count == 5; ++k) {
             const float want = edge[p * NF + k] ? 1.0f : 0.0f;
             if (w.inputs[4].data[k] != want) r->reset_pattern_ok = 0;
@@ -348,7 +341,7 @@ static int section_spectra(void) {
     return 0;
 }
 
-/* ---- the three families --------------------------------------------------------------------------------------- */
+/* ---- the two families --------------------------------------------------------------------------------------- */
 
 static void block_input(AiaecInput *in, int block, const AiaecAlignEvent *ev) {
     memset(in, 0, sizeof(*in));
@@ -360,7 +353,7 @@ static void block_input(AiaecInput *in, int block, const AiaecAlignEvent *ev) {
     in->u.align_ulcnet.event_count = NF;
 }
 
-/* _freq at N=8 fed by an analyser that is never restarted: what _spec must equal */
+/* _freq at N=8 fed by an analyser that is never restarted: what the PCM family must equal through an external ISTFT */
 static void run_freq_continuous_analyser(const Sched *s, Run *r) {
     static float ere[MAX_HOPS * BINS], eim[MAX_HOPS * BINS], fre[MAX_HOPS * BINS], fim[MAX_HOPS * BINS];
     int h;
@@ -376,7 +369,7 @@ static void run_freq_continuous_analyser(const Sched *s, Run *r) {
     }
     ext_free(&ae); ext_free(&af);
     memset(r, 0, sizeof(*r));
-    if (ctxs_make(&c, NF, 0, 0, 1) != 0) return;
+    if (ctxs_make(&c, NF, 0, 1) != 0) return;
     accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s->packets; ++p) {
         AiaecFreqInput fin;
@@ -386,8 +379,7 @@ static void run_freq_continuous_analyser(const Sched *s, Run *r) {
         fin.u.align_ulcnet.err_re = ere + (size_t)p * NF * BINS; fin.u.align_ulcnet.err_im = eim + (size_t)p * NF * BINS;
         fin.u.align_ulcnet.far_re = fre + (size_t)p * NF * BINS; fin.u.align_ulcnet.far_im = fim + (size_t)p * NF * BINS;
         fin.u.align_ulcnet.events = s->ev + (size_t)p * NF; fin.u.align_ulcnet.event_count = NF;
-        CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
-              "freq with a continuous analyser: packet %d (no family reports a restart)", p);
+        CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK, "freq with a continuous analyser: packet %d", p);
         accel_run(&acc, &w, NF);
         CHECK(aiaec_postprocess_freq(c.freq, 0, r->re + (size_t)p * NF * BINS, r->im + (size_t)p * NF * BINS) == AIAEC_OK, "freq post %d", p);
     }
@@ -397,22 +389,20 @@ static void run_freq_continuous_analyser(const Sched *s, Run *r) {
 static int section_families(void) {
     static Sched s;
     static Run rf;
-    static float sre[MAX_HOPS * BINS], sim[MAX_HOPS * BINS];
     static int16_t pcm[MAX_HOPS * HOP], want_pcm[MAX_HOPS * HOP];
     Ctxs c;
-    Accel a_blk, a_spec;
+    Accel a_blk;
     Ext syn;
     float hopbuf[HOP];
-    int p, k, i, h;
+    int p, i, h;
 
     sched_clear(&s, "families", 4);
     s.ev[2].changed = 1; s.ev[3].changed = 1; s.ev[9].changed = 1; s.ev[16].changed = 1;
     for (h = 12; h < 32; ++h) s.ev[h].solid = 1;   /* solid edge at hop 12 */
 
     run_freq_continuous_analyser(&s, &rf);
-    if (ctxs_make(&c, NF, 1, 1, 0) != 0) return 1;
+    if (ctxs_make(&c, NF, 1, 0) != 0) return 1;
     accel_init(&a_blk, aiaec_state_generation(c.blk), ACC_MODEL);
-    accel_init(&a_spec, aiaec_state_generation_spec(c.spec), ACC_MODEL);
     ext_make(&syn, 0, 1);
 
     for (p = 0; p < s.packets; ++p) {
@@ -421,40 +411,26 @@ static int section_families(void) {
         int rc;
 
         block_input(&in, p, s.ev);
-        rc = aiaec_preprocess_spec(c.spec, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
-              "spec packet %d rc=%d mask %llx want 0", p, rc, (unsigned long long)w.synthesis_restart_mask);
-        accel_run(&a_spec, &w, NF);
-        rc = aiaec_postprocess_spec(c.spec, 0, sre + (size_t)p * NF * BINS, sim + (size_t)p * NF * BINS);
-        CHECK(rc == AIAEC_OK, "postprocess_spec packet %d rc=%d", p, rc);
-
         rc = aiaec_preprocess(c.blk, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT && w.synthesis_restart_mask == 0u && w.synthesis_restarted == 0,
-              "block packet %d rc=%d mask %llx want 0", p, rc, (unsigned long long)w.synthesis_restart_mask);
+        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT, "block packet %d rc=%d", p, rc);
         accel_run(&a_blk, &w, NF);
         rc = aiaec_postprocess(c.blk, 0, pcm + (size_t)p * HOP_IN);
         CHECK(rc == AIAEC_OK, "postprocess packet %d rc=%d", p, rc);
-
-        for (k = 0; k < NF; ++k) {
-            const size_t hop = (size_t)p * NF + (size_t)k;
-            ac_istft_push_planar(syn.istft, sre + hop * BINS, sim + hop * BINS, hopbuf);
-            for (i = 0; i < HOP; ++i) want_pcm[hop * HOP + (size_t)i] = stream_saturate_s16(hopbuf[i]);
-        }
     }
-    CHECK(memcmp(sre, rf.re, sizeof(float) * (size_t)s.packets * NF * BINS) == 0 &&
-          memcmp(sim, rf.im, sizeof(float) * (size_t)s.packets * NF * BINS) == 0,
-          "_spec at N=8 differs from _freq at N=8 fed by a continuous analyser");
+    for (h = 0; h < s.packets * NF; ++h) {
+        ac_istft_push_planar(syn.istft, rf.re + (size_t)h * BINS, rf.im + (size_t)h * BINS, hopbuf);
+        for (i = 0; i < HOP; ++i) want_pcm[(size_t)h * HOP + (size_t)i] = stream_saturate_s16(hopbuf[i]);
+    }
     CHECK(memcmp(pcm, want_pcm, sizeof(int16_t) * (size_t)s.packets * HOP_IN) == 0,
-          "PCM family differs from _spec + an external AcIstft");
-    CHECK(a_blk.calls == s.packets && a_spec.calls == s.packets && a_blk.gen_changes == 0 && a_spec.gen_changes == 0,
-          "calls %d/%d generation changes %u/%u", a_blk.calls, a_spec.calls, a_blk.gen_changes, a_spec.gen_changes);
+          "PCM family differs from _freq (continuous analyser) + an external AcIstft");
+    CHECK(a_blk.calls == s.packets && a_blk.gen_changes == 0, "calls %d generation changes %u", a_blk.calls, a_blk.gen_changes);
     {   /* the PCM output is not silence: it must carry the signal */
         long long energy = 0;
         for (i = 0; i < s.packets * HOP_IN; ++i) energy += (long long)pcm[i] * pcm[i];
         CHECK(energy > 100000, "PCM output is (nearly) silent: energy %lld", energy);
     }
     ext_free(&syn); ctxs_free(&c);
-    printf("section_families: _spec == _freq(continuous analyser), PCM == _spec + ISTFT, through %d events at N=8\n", 5);
+    printf("section_families: PCM == _freq(continuous analyser) + ISTFT, through %d events at N=8\n", 5);
     return 0;
 }
 
@@ -462,7 +438,7 @@ static int section_families(void) {
 
 typedef struct PcmRun {
     int16_t pcm[MAX_HOPS * HOP];
-    float spec_re[MAX_HOPS * BINS], spec_im[MAX_HOPS * BINS];   /* the _spec family, N=1 or N=8 */
+    float spec_re[MAX_HOPS * BINS], spec_im[MAX_HOPS * BINS];   /* the _freq family's output spectra, N=1 or N=8 */
     float st_end[MAX_PACKETS][BINS];                            /* the accelerator state at each packet end */
     int calls, pre_ok, post_ok;
     unsigned gen_changes;
@@ -473,19 +449,21 @@ static void effective_state(const Accel *a, unsigned gen_now, float *out) {
     if (gen_now != a->gen) memset(out, 0, sizeof(a->st)); else memcpy(out, a->st, sizeof(a->st));
 }
 
-/* n = 1 or NF; PCM block family when !spec, else the _spec family with an external ISTFT */
-static void run_pcm(const Sched *s, int n, int spec, PcmRun *r) {
+/* n = 1 or NF; PCM block family when !freq, else the _freq family behind an external AcStft pair and an external ISTFT */
+static void run_pcm(const Sched *s, int n, int freq, PcmRun *r) {
+    static float ere[NF * BINS], eim[NF * BINS], fre[NF * BINS], fim[NF * BINS];
     Ctxs c;
     Accel acc;
-    Ext syn;
+    Ext syn, ae, af;
     float hopbuf[HOP];
     const int hops = s->packets * NF;
     int b, k, i;
 
     memset(r, 0, sizeof(*r));
-    if (ctxs_make(&c, n, !spec, spec, 0) != 0) return;
-    accel_init(&acc, spec ? aiaec_state_generation_spec(c.spec) : aiaec_state_generation(c.blk), ACC_MODEL);
-    ext_make(&syn, 0, spec);
+    if (ctxs_make(&c, n, !freq, freq) != 0) return;
+    accel_init(&acc, freq ? aiaec_state_generation_freq(c.freq) : aiaec_state_generation(c.blk), ACC_MODEL);
+    ext_make(&syn, 0, freq);
+    ext_make(&ae, freq, 0); ext_make(&af, freq, 0);
     for (b = 0; b < hops / n; ++b) {
         AiaecInput in;
         AiaecWork w;
@@ -493,22 +471,35 @@ static void run_pcm(const Sched *s, int n, int spec, PcmRun *r) {
         int rc;
 
         if (h0 == s->reset_hop) {
-            if (spec) { aiaec_reset_spec(c.spec); ac_istft_reset(syn.istft); } else aiaec_reset(c.blk);
+            if (freq) { aiaec_reset_freq(c.freq); ac_stft_reset(ae.stft); ac_stft_reset(af.stft); ac_istft_reset(syn.istft); }
+            else aiaec_reset(c.blk);
         }
-        memset(&in, 0, sizeof(in));
-        in.kind = AIAEC_INPUT_ALIGN_ULCNET; in.samples = HOP * n;
-        in.u.align_ulcnet.residual_in = g_resid + (size_t)h0 * HOP; in.u.align_ulcnet.far_in = g_far + (size_t)h0 * HOP;
-        in.u.align_ulcnet.events = s->ev + h0; in.u.align_ulcnet.event_count = n;
-        rc = spec ? aiaec_preprocess_spec(c.spec, &in, &w) : aiaec_preprocess(c.blk, &in, &w);
+        if (freq) {
+            AiaecFreqInput fin;
+            for (k = 0; k < n; ++k) {
+                ac_stft_push_planar(ae.stft, g_resid + (size_t)(h0 + k) * HOP, ere + (size_t)k * BINS, eim + (size_t)k * BINS);
+                ac_stft_push_planar(af.stft, g_far + (size_t)(h0 + k) * HOP, fre + (size_t)k * BINS, fim + (size_t)k * BINS);
+            }
+            memset(&fin, 0, sizeof(fin));
+            fin.kind = AIAEC_INPUT_ALIGN_ULCNET; fin.frames = n;
+            fin.u.align_ulcnet.err_re = ere; fin.u.align_ulcnet.err_im = eim;
+            fin.u.align_ulcnet.far_re = fre; fin.u.align_ulcnet.far_im = fim;
+            fin.u.align_ulcnet.events = s->ev + h0; fin.u.align_ulcnet.event_count = n;
+            rc = aiaec_preprocess_freq(c.freq, &fin, &w);
+        } else {
+            memset(&in, 0, sizeof(in));
+            in.kind = AIAEC_INPUT_ALIGN_ULCNET; in.samples = HOP * n;
+            in.u.align_ulcnet.residual_in = g_resid + (size_t)h0 * HOP; in.u.align_ulcnet.far_in = g_far + (size_t)h0 * HOP;
+            in.u.align_ulcnet.events = s->ev + h0; in.u.align_ulcnet.event_count = n;
+            rc = aiaec_preprocess(c.blk, &in, &w);
+        }
         CHECK(rc == AIAEC_OK, "%s n=%d: preprocess block %d rc=%d", s->name, n, b, rc);
         if (rc != AIAEC_OK) break;
         ++r->pre_ok;
-        CHECK(w.synthesis_restarted == 0 && w.synthesis_restart_mask == 0u,
-              "%s n=%d: block %d restart fields %d / %llx", s->name, n, b, w.synthesis_restarted, (unsigned long long)w.synthesis_restart_mask);
         if (w.action == AIAEC_SUBMIT) accel_run(&acc, &w, n);
-        if (spec) {
+        if (freq) {
             float *re = r->spec_re + (size_t)h0 * BINS, *im = r->spec_im + (size_t)h0 * BINS;
-            rc = aiaec_postprocess_spec(c.spec, 0, re, im);
+            rc = aiaec_postprocess_freq(c.freq, 0, re, im);
             for (k = 0; k < n; ++k) {
                 ac_istft_push_planar(syn.istft, re + (size_t)k * BINS, im + (size_t)k * BINS, hopbuf);
                 for (i = 0; i < HOP; ++i) r->pcm[(size_t)(h0 + k) * HOP + (size_t)i] = stream_saturate_s16(hopbuf[i]);
@@ -519,11 +510,11 @@ static void run_pcm(const Sched *s, int n, int spec, PcmRun *r) {
         CHECK(rc == AIAEC_OK, "%s n=%d: postprocess block %d rc=%d", s->name, n, b, rc);
         if (rc == AIAEC_OK) ++r->post_ok;
         if ((h0 + n) % NF == 0)
-            effective_state(&acc, spec ? aiaec_state_generation_spec(c.spec) : aiaec_state_generation(c.blk),
+            effective_state(&acc, freq ? aiaec_state_generation_freq(c.freq) : aiaec_state_generation(c.blk),
                             r->st_end[(h0 + n) / NF - 1]);
     }
     r->calls = acc.calls; r->gen_changes = acc.gen_changes;
-    ext_free(&syn); ctxs_free(&c);
+    ext_free(&syn); ext_free(&ae); ext_free(&af); ctxs_free(&c);
 }
 
 static int first_diff(const int16_t *a, const int16_t *b, int n, int *maxd, int *count) {
@@ -550,17 +541,17 @@ static void realign_case(const Sched *s, const PcmRun *none) {
     run_pcm(s, NF, 1, &p8);
     run_pcm(s, 1, 1, &n8);
 
-    CHECK(ctxs_make(&i1, 1, 1, 0, 0) == 0 && ctxs_make(&i8, NF, 1, 0, 0) == 0 &&
+    CHECK(ctxs_make(&i1, 1, 1, 0) == 0 && ctxs_make(&i8, NF, 1, 0) == 0 &&
           i1.ib.trim_samples == HOP && i8.ib.trim_samples == HOP, "%s: PCM trim N=1 %d N=8 %d", s->name, i1.ib.trim_samples, i8.ib.trim_samples);
     ctxs_free(&i1); ctxs_free(&i8);
     first = first_diff(b1.pcm, b8.pcm, hops * HOP, &maxd, &cnt);
     CHECK(first < 0, "%s: PCM N=8 differs from N=1 in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
     first = first_diff(b1.pcm, p8.pcm, hops * HOP, &maxd, &cnt);
-    CHECK(first < 0, "%s: _spec N=8 + external ISTFT differs from N=1 PCM in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
+    CHECK(first < 0, "%s: _freq N=8 + external STFT/ISTFT differs from N=1 PCM in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
     first = first_diff(b1.pcm, n8.pcm, hops * HOP, &maxd, &cnt);
-    CHECK(first < 0, "%s: _spec N=1 + external ISTFT differs from N=1 PCM in %d samples (first %d)", s->name, cnt, first);
+    CHECK(first < 0, "%s: _freq N=1 + external STFT/ISTFT differs from N=1 PCM in %d samples (first %d)", s->name, cnt, first);
     CHECK(memcmp(n8.spec_re, p8.spec_re, sizeof(float) * (size_t)hops * BINS) == 0 &&
-          memcmp(n8.spec_im, p8.spec_im, sizeof(float) * (size_t)hops * BINS) == 0, "%s: _spec spectra N=8 differ from N=1", s->name);
+          memcmp(n8.spec_im, p8.spec_im, sizeof(float) * (size_t)hops * BINS) == 0, "%s: _freq spectra N=8 differ from N=1", s->name);
     for (p = 0; p < s->packets; ++p)
         CHECK(memcmp(b1.st_end[p], b8.st_end[p], sizeof(b1.st_end[p])) == 0, "%s: accelerator state at the end of packet %d differs (N=1 vs N=8)", s->name, p);
     CHECK(b8.calls == s->packets && p8.calls == s->packets && b1.calls == hops - edges && n8.calls == hops - edges,
@@ -576,7 +567,7 @@ static void realign_case(const Sched *s, const PcmRun *none) {
             CHECK(memcmp(b8.pcm + (size_t)fe * HOP, none->pcm + (size_t)fe * HOP, sizeof(int16_t) * HOP) != 0 || fe >= hops,
                   "%s: the event hop %d left the output unchanged (the event had no effect)", s->name, fe);
     }
-    printf("section_realign[%s]: %d hops, %d events, PCM N=8 == N=1 (%d samples), _spec+ISTFT == PCM; vendor calls N=8 %d (packets %d), N=1 %d\n",
+    printf("section_realign[%s]: %d hops, %d events, PCM N=8 == N=1 (%d samples), _freq+STFT/ISTFT == PCM; vendor calls N=8 %d (packets %d), N=1 %d\n",
            s->name, hops, edges, hops * HOP, b8.calls, s->packets, b1.calls);
 }
 
@@ -625,7 +616,7 @@ static int section_realign(void) {
         CHECK(memcmp(full.pcm + (size_t)fe * HOP, fresh.pcm, sizeof(int16_t) * (size_t)(s->packets * NF - fe) * HOP) == 0,
               "after a full reset the PCM family differs from a fresh stream fed the same remaining input");
     }
-    printf("section_realign: %d scenarios, PCM and _spec at N=8 equal the N=1 stream\n", n);
+    printf("section_realign: %d scenarios, PCM and _freq at N=8 equal the N=1 stream\n", n);
     return 0;
 }
 
@@ -695,29 +686,27 @@ static int section_frame_reset_inputs(void) {
     static int16_t pcm[HOP_IN];
     static float ore[NF * BINS], oim[NF * BINS];
     Ctxs c, c1;
-    Accel acc[3];
+    Accel acc[2];
     int edge[MAX_HOPS], p, k, fam, h;
 
     sched_clear(&s, "reset_inputs", 3);
     s.ev[2].changed = 1; s.ev[8].changed = 1; s.ev[15].changed = 1; s.ev[16].changed = 1;
     for (h = 20; h < 3 * NF; ++h) s.ev[h].solid = 1;   /* a solid false -> true edge at hop 20 */
     expected_edges(&s, edge);
-    if (ctxs_make(&c, NF, 1, 1, 1) != 0) return 1;
-    CHECK(c.ib.graph_path == c.is.graph_path && c.ib.graph_path == c.if_.graph_path && c.ib.trim_samples == c.is.trim_samples &&
-          c.ib.trim_samples == c.if_.trim_samples && c.ib.tail_zero_blocks == c.is.tail_zero_blocks &&
-          c.ib.tail_zero_blocks == c.if_.tail_zero_blocks, "N=8: the three families report one info");
+    if (ctxs_make(&c, NF, 1, 1) != 0) return 1;
+    CHECK(c.ib.graph_path == c.if_.graph_path && c.ib.trim_samples == c.if_.trim_samples &&
+          c.ib.tail_zero_blocks == c.if_.tail_zero_blocks, "N=8: the two families report one info");
     accel_init(&acc[0], aiaec_state_generation(c.blk), ACC_MODEL);
-    accel_init(&acc[1], aiaec_state_generation_spec(c.spec), ACC_MODEL);
-    accel_init(&acc[2], aiaec_state_generation_freq(c.freq), ACC_MODEL);
+    accel_init(&acc[1], aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s.packets; ++p) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork w[3];
+        AiaecWork w[2];
         block_input(&in, p, s.ev);
         freq_input(&fin, p * NF, NF, s.ev);
-        CHECK(aiaec_preprocess(c.blk, &in, &w[0]) == AIAEC_OK && aiaec_preprocess_spec(c.spec, &in, &w[1]) == AIAEC_OK &&
-              aiaec_preprocess_freq(c.freq, &fin, &w[2]) == AIAEC_OK, "packet %d: preprocess", p);
-        for (fam = 0; fam < 3; ++fam) {
+        CHECK(aiaec_preprocess(c.blk, &in, &w[0]) == AIAEC_OK && aiaec_preprocess_freq(c.freq, &fin, &w[1]) == AIAEC_OK,
+              "packet %d: preprocess", p);
+        for (fam = 0; fam < 2; ++fam) {
             const float *reset = w[fam].inputs[4].data;
             check_work_views(&w[fam], NF, "N=8");
             if (p == 0) {   /* the event at hop 2 of packet 0 alone: frame_reset 00100000 */
@@ -729,32 +718,32 @@ static int section_frame_reset_inputs(void) {
                       (double)reset[k], edge[p * NF + k]);
             accel_run(&acc[fam], &w[fam], NF);
         }
-        CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_OK && aiaec_postprocess_spec(c.spec, 0, ore, oim) == AIAEC_OK &&
-              aiaec_postprocess_freq(c.freq, 0, ore, oim) == AIAEC_OK, "packet %d: postprocess", p);
+        CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_OK && aiaec_postprocess_freq(c.freq, 0, ore, oim) == AIAEC_OK,
+              "packet %d: postprocess", p);
     }
     ctxs_free(&c);
 
     /* N = 1: four signals, no frame_reset, nothing at inputs[4] */
-    if (ctxs_make(&c1, 1, 1, 1, 1) != 0) return 1;
+    if (ctxs_make(&c1, 1, 1, 1) != 0) return 1;
     {
         AiaecAlignEvent none[1] = { { 0, 0 } };
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork w[3];
+        AiaecWork w[2];
         block_input(&in, 0, none);
         in.samples = HOP; in.u.align_ulcnet.event_count = 1;
         freq_input(&fin, 0, 1, none);
-        CHECK(aiaec_preprocess(c1.blk, &in, &w[0]) == AIAEC_OK && aiaec_preprocess_spec(c1.spec, &in, &w[1]) == AIAEC_OK &&
-              aiaec_preprocess_freq(c1.freq, &fin, &w[2]) == AIAEC_OK, "N=1: preprocess");
-        for (fam = 0; fam < 3; ++fam) {
+        CHECK(aiaec_preprocess(c1.blk, &in, &w[0]) == AIAEC_OK && aiaec_preprocess_freq(c1.freq, &fin, &w[1]) == AIAEC_OK,
+              "N=1: preprocess");
+        for (fam = 0; fam < 2; ++fam) {
             check_work_views(&w[fam], 1, "N=1");
             memset(w[fam].outputs[0].data, 0, w[fam].outputs[0].elements * sizeof(float));
         }
-        CHECK(aiaec_postprocess(c1.blk, 0, pcm) == AIAEC_OK && aiaec_postprocess_spec(c1.spec, 0, ore, oim) == AIAEC_OK &&
-              aiaec_postprocess_freq(c1.freq, 0, ore, oim) == AIAEC_OK, "N=1: postprocess");
+        CHECK(aiaec_postprocess(c1.blk, 0, pcm) == AIAEC_OK && aiaec_postprocess_freq(c1.freq, 0, ore, oim) == AIAEC_OK,
+              "N=1: postprocess");
     }
     ctxs_free(&c1);
-    printf("section_frame_reset_inputs: work views equal the exporter's shapes in all three families, frame_reset is the last signal at N=8 and carries the %d edges\n",
+    printf("section_frame_reset_inputs: work views equal the exporter's shapes in both families, frame_reset is the last signal at N=8 and carries the %d edges\n",
            edge[2] + edge[8] + edge[15] + edge[16] + edge[20]);
     return 0;
 }
@@ -771,7 +760,7 @@ static int section_tail(void) {
     int blocks, b, i, peak = 0, tail;
     const int last_real = 3 * HOP_IN - 1;
 
-    if (ctxs_make(&c, NF, 1, 0, 0) != 0) return 1;
+    if (ctxs_make(&c, NF, 1, 0) != 0) return 1;
     bi = c.ib;
     tail = bi.tail_zero_blocks;
     CHECK(bi.trim_samples == HOP && bi.queue_frames == 0 && tail == 1, "trim %d queue %d tail %d", bi.trim_samples,
@@ -849,7 +838,7 @@ static int section_failure(void) {
         s.ev[33].changed = 1;
         for (f = 0; f < 2; ++f) {
             const int fp = f ? 6 : 3;
-            if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
+            if (ctxs_make(&c, NF, 0, 1) != 0) return 1;
             accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
             freq_input(&fin, fp * NF, NF, s.ev);
             CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK, "failure: fresh preprocess");
@@ -858,7 +847,7 @@ static int section_failure(void) {
             ctxs_free(&c);
         }
 
-        if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
+        if (ctxs_make(&c, NF, 0, 1) != 0) return 1;
         accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
         gen_before = aiaec_state_generation_freq(c.freq);
         want = gen_before;
@@ -906,7 +895,7 @@ static int section_gates(void) {
     unsigned int gen0;
 
     sched_clear(&s, "gates", 1);
-    if (ctxs_make(&c, NF, 1, 0, 0) != 0) return 1;
+    if (ctxs_make(&c, NF, 1, 0) != 0) return 1;
     gen0 = aiaec_state_generation(c.blk);
 
     block_input(&in, 0, s.ev);

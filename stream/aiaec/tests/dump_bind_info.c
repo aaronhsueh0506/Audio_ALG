@@ -4,7 +4,7 @@
  * rows without a delivered graph still resolve) and -DAIAEC_PRODUCT_MODEL_ID=<id>.
  *
  *   dump_bind_info <sr> <fft> <hop_in> [family [event_hop]]
- *       family 0 PCM (default), 1 _spec, 2 _freq; event_hop >= 0 (Align-ULCNet) marks that model hop of the block
+ *       family 0 PCM (default), 1 _freq; event_hop >= 0 (Align-ULCNet) marks that model hop of the block
  *       as an alignment change; all-zero input otherwise.
  *     rc <int>                          first refusal of aiaec_get_mem_size*() / aiaec_init*() / aiaec_preprocess*(),
  *                                       0 when all succeed (a refused config prints this line only)
@@ -31,7 +31,6 @@ int main(int argc, char **argv) {
     AiaecWork work;
     StreamMemReq req;
     AiaecCtx *pcm = NULL;
-    AiaecSpecCtx *spec = NULL;
     AiaecFreqCtx *freq = NULL;
     AiaecInput in;
     AiaecFreqInput fin;
@@ -45,14 +44,12 @@ int main(int argc, char **argv) {
     cfg.sr = atoi(argv[1]); cfg.fft = atoi(argv[2]); cfg.hop_in = atoi(argv[3]);
     family = argc >= 5 ? atoi(argv[4]) : 0;
     if (argc == 6) event_hop = atoi(argv[5]);
-    if (family < 0 || family > 2) return 2;
+    if (family < 0 || family > 1) return 2;
 
-    rc = family == 0 ? aiaec_get_mem_size(&cfg, &req)
-       : family == 1 ? aiaec_get_mem_size_spec(&cfg, &req) : aiaec_get_mem_size_freq(&cfg, &req);
+    rc = family == 0 ? aiaec_get_mem_size(&cfg, &req) : aiaec_get_mem_size_freq(&cfg, &req);
     if (rc == AIAEC_OK) {
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;
         rc = family == 0 ? aiaec_init(&cfg, pool, (size_t)req.bytes, &pcm, &info)
-           : family == 1 ? aiaec_init_spec(&cfg, pool, (size_t)req.bytes, &spec, &info)
                          : aiaec_init_freq(&cfg, pool, (size_t)req.bytes, &freq, &info);
     }
     if (rc != AIAEC_OK) { printf("rc %d\n", rc); free(pool); return 0; }
@@ -80,8 +77,7 @@ int main(int argc, char **argv) {
     fin.kind = AIAEC_INPUT_DEEPVQE_S; fin.frames = n;
     fin.u.deepvqe_s.mic_re = fin.u.deepvqe_s.mic_im = fin.u.deepvqe_s.far_re = fin.u.deepvqe_s.far_im = f32;
 #endif
-    rc = family == 0 ? aiaec_preprocess(pcm, &in, &work)
-       : family == 1 ? aiaec_preprocess_spec(spec, &in, &work) : aiaec_preprocess_freq(freq, &fin, &work);
+    rc = family == 0 ? aiaec_preprocess(pcm, &in, &work) : aiaec_preprocess_freq(freq, &fin, &work);
     printf("rc %d\n", rc);
     if (rc != AIAEC_OK) goto done;
     printf("graph %s\n", info.graph_path);

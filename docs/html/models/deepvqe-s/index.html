@@ -91,13 +91,13 @@ while (read_blocks(mic, far, hop_in)) {
 <p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。</p>
 <p>pool 大小（本庫 host 建置讀出，單位 bytes；16k／256 兩列只存在於測試登錄表）：</p>
 <table>
-<thead><tr><th>組態</th><th>PCM</th><th><code>_spec</code></th><th><code>_freq</code></th></tr></thead>
+<thead><tr><th>組態</th><th>PCM</th><th><code>_freq</code></th></tr></thead>
 <tbody>
-<tr><td>16k／512／N=1</td><td>124096</td><td>124096</td><td>35776</td></tr>
-<tr><td>16k／256／N=1</td><td>64192</td><td>64192</td><td>18368</td></tr>
-<tr><td>16k／256／N=8</td><td>167024</td><td>172464</td><td>126640</td></tr>
+<tr><td>16k／512／N=1</td><td>124096</td><td>35776</td></tr>
+<tr><td>16k／256／N=1</td><td>64192</td><td>18368</td></tr>
+<tr><td>16k／256／N=8</td><td>167024</td><td>126640</td></tr>
 </tbody></table>
-<p><code>_freq</code> 的 pool 不含 FFT、STFT／ISTFT 與 PCM 暫存（呼叫端自己做分析與合成），所以比 PCM、<code>_spec</code> 小。</p>
+<p><code>_freq</code> 的 pool 不含 FFT、STFT／ISTFT 與 PCM 暫存（呼叫端自己做分析與合成），所以比 PCM 小。</p>
 
 <h2>State</h2>
 <ul>
@@ -111,10 +111,10 @@ while (read_blocks(mic, far, hop_in)) {
 <ul>
 <li>執行失敗或加速器輸出非有限時為 fail-closed：當拍自己的頻譜貢獻歸零，不是直通。<code>pcm_out</code> 仍可能有非零樣本，因為 overlap-add 會加上前一包已提交的結果。失敗那一批 N 個 frame 的頻譜全為零：失敗那包的最後一個 hop 只剩前一個 frame 的 overlap（半個窗），下一包的前 N − 1 個 hop 恰為零，下一包的最後一個 hop 又只有半個窗，再往後恢復正常；N=1 時受影響的是失敗的 hop 與下一個 hop，各只有半個窗。</li>
 <li>N&gt;1 時第一包開頭的 <code>(N − 1) × 模型 hop</code> 個樣本依設計為零。</li>
-<li><code>trim_samples</code> = <code>N × 模型 hop</code>（含 stream 自己的一個 STFT／ISTFT hop），三個家族相同；<code>queue_frames</code> = <code>N − 1</code> 個 frame（模型佇列單獨保存的部分）。</li>
+<li><code>trim_samples</code> = <code>N × 模型 hop</code>（含 stream 自己的一個 STFT／ISTFT hop），兩個家族相同；<code>queue_frames</code> = <code>N − 1</code> 個 frame（模型佇列單獨保存的部分）。</li>
 <li>檔案尾端：最後一包補成完整 <code>hop_in</code>，再送 <code>info.tail_zero_blocks</code>（恆為 1）包全零，輸出去掉 <code>info.trim_samples</code> 個樣本，保留輸入長度。</li>
 </ul>
-<p>有自己合成器的應用可用 <code>aiaec_*_spec</code>（PCM 進、頻譜出）或 <code>aiaec_*_freq</code>（頻譜進、頻譜出）家族；邊界與 <code>AiaecInfo</code> 相同，延遲與尾端規則見 <a href="../../../../stream/aiaec/aiaec.h">aiaec.h</a> 的 "Tail" 一節。<code>AC_OLA_ACCUMULATE</code> 的 <code>ac_istft_flush()</code> 回 0，外部 ISTFT 要照常推全零頻譜。</p>
+<p>有自己分析與合成器的應用可用 <code>aiaec_*_freq</code>（頻譜進、頻譜出）家族；邊界與 <code>AiaecInfo</code> 相同，延遲與尾端規則見 <a href="../../../../stream/aiaec/aiaec.h">aiaec.h</a> 的 "Tail" 一節。<code>AC_OLA_ACCUMULATE</code> 的 <code>ac_istft_flush()</code> 回 0，外部 ISTFT 要照常推全零頻譜。</p>
 
 <h2>驗證狀態</h2>
 <p>目前所有驗證都在主機上：SDK 替身加速器（<code>stream/aiaec/tests</code>）與隨機權重的 ONNX。沒有正式量化 graph 的符合性驗證，沒有廠商 SDK 建置，沒有板端執行。</p>
@@ -127,7 +127,7 @@ while (read_blocks(mic, far, hop_in)) {
 <tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對三個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_deepvqe_frames_per_call.py</code> 匯出 16k／512 的 N=1、2、4，驗 state 就地契約並以 ONNX Runtime 對 PyTorch 驗證；<code>test_deepvqe_inference_frames_per_call.py</code> 在 16k／256 匯出 N=1 與 N=8 兩張圖，在 ONNX Runtime 串流同一段輸入，CCM taps 最大差小於 5e-5，加速器呼叫數分別為 hop 數與 hop 數除以 8 進位。兩者都不經 C 的 <code>aiaec_*</code> 家族。</li>
 </ul>
 
