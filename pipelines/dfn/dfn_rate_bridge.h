@@ -56,7 +56,7 @@ extern "C" {
  * 1024 grid with one frame per call: the resampling ratios, the per-hop inference schedule, the
  * prefill calibration and the FIFO capacities are written for it, so a bridge over another model
  * grid is refused (-1). Its 48 kHz AcStft / AcIstft run at audiolib's default scales: the stage
- * applies the grid's stft_scale / stft_unscale. */
+ * applies dfn2_stft_scale(n_fft) / dfn2_stft_unscale(n_fft). */
 typedef struct DfnRateBridgeConfig {
     int sample_rate;            /* 8000 or 16000 (48000 uses the stage directly) */
     int fft_size;               /* 0 = rate default (256); 16 kHz also 512     */

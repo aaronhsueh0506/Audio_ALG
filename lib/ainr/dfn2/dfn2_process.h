@@ -1,8 +1,8 @@
 /* DeepFilterNet2 signal path outside the network, on spectra (C twin of model.py).
  * Framing contract: the library holds no window, FFT or STFT object; the application frames with audiolib
  * (AcStft / AcIstft) as trained: sqrt-Hann (audiolib's default window), center 0, hop = n_fft / 2, plain
- * overlap-add (AC_OLA_ACCUMULATE), spec_scale = grid.stft_scale (1/sqrt(n_fft)), ispec_scale =
- * grid.stft_unscale (sqrt(n_fft)). A wrong window or scale is not detectable here. Against the training
+ * overlap-add (AC_OLA_ACCUMULATE), spec_scale = dfn2_stft_scale(n_fft) (1/sqrt(n_fft)), ispec_scale =
+ * dfn2_stft_unscale(n_fft) (sqrt(n_fft)). A wrong window or scale is not detectable here. Against the training
  * graph's center=True padding only the first frame of a clip differs. */
 
 #ifndef DFN2_PROCESS_H
@@ -106,7 +106,7 @@ void dfn2_compute_features(DFN2State *st,
                            const float *spec_re, const float *spec_im,
                            float *feat_erb, float *feat_spec);
 
-/* Mix noisy into enh by atten_lim_db (0 or non-finite: no-op), on the final complex spectrum. */
+/* Mix noisy into enh by a |atten_lim_db| dB limit (sign ignored; 0 or non-finite: no-op), on the final complex spectrum. */
 void dfn2_apply_atten_lim(int n_bins,
                           const float *noisy_re, const float *noisy_im,
                           float *enh_re, float *enh_im,
@@ -114,7 +114,8 @@ void dfn2_apply_atten_lim(int n_bins,
 
 /* Network outputs -> enhanced spectrum, model.py compose() (mask-only: compose_mask_only(), noisy *
  * mask, no delay or warm-up; `coefs`, `alpha` ignored). erb_mask [n_erb] in [0,1]; coefs [df_bins *
- * df_order * 2] as model.py's (df_bins, df_order, 2); alpha 0 = masked residual, 1 = deep filter;
+ * df_order * 2] as model.py's (df_bins, df_order, 2); alpha 0 = masked residual, 1 = deep filter, clamped to
+ * [0, 1] before use;
  * out_*: delayed by df_lookahead frames. Returns 1 when out is valid, 0 during warm-up (not for the
  * ISTFT) or on a NULL pointer or non-finite alpha. */
 int dfn2_enhance_spectrum(DFN2State *st,
@@ -126,8 +127,9 @@ int dfn2_enhance_spectrum(DFN2State *st,
  * heads are those of frame current - mask_lookahead; 0 only for the first mask_lookahead frames
  * (head pointers may then be NULL). A valid out is frame current - mask_lookahead - df_lookahead,
  * reported by output_frame_index (may be NULL). Mask-only: the masked noisy head frame. No right
- * flush: keep calling with zero spectra and the accelerator's heads for them. atten_lim_db 0 = off,
- * else mixed against the delayed noisy target. Returns 1 = valid out, 0 = warm-up, -1 = pointer,
+ * flush: keep calling with zero spectra and the accelerator's heads for them. alpha is clamped to [0, 1]
+ * before use. atten_lim_db 0 = off, else a |atten_lim_db| dB limit (sign ignored) mixed against the
+ * delayed noisy target. Returns 1 = valid out, 0 = warm-up, -1 = pointer,
  * timing or non-finite alpha / atten_lim_db error. */
 int dfn2_enhance_spectrum_stream(DFN2State *st,
                         const float *current_spec_re,

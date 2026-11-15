@@ -30,7 +30,7 @@
 COMMON_LIB="$(make -s -C $AUDIOLIB/common lib print-lib-path | tail -1)"
 make -C stream/aiaec AIAEC_MODEL=align COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
 make -C stream/aiaec/ulcnet COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
-cc app.c -Istream/aiaec \
+cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common \
    "$(make -s -C stream/aiaec AIAEC_MODEL=align COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
    "$(make -s -C stream/aiaec/ulcnet COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
    "$COMMON_LIB" -lm -o app</code></pre>
@@ -38,7 +38,7 @@ cc app.c -Istream/aiaec \
 <pre><code>AEC=/path/to/AEC/c_impl
 make -C stream/aiaec/front COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
 make -C $AEC COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" lib
-cc app.c -Istream/aiaec -Istream/aiaec/front \
+cc app.c -Istream/aiaec -Istream/aiaec/front -Istream/common -I$AUDIOLIB/common \
    "$(make -s -C stream/aiaec/front COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
    "$(make -s -C stream/aiaec AIAEC_MODEL=align COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \
    "$(make -s -C stream/aiaec/ulcnet COMMON_DIR=$AUDIOLIB/common COMMON_LIB="$COMMON_LIB" print-lib-path)" \

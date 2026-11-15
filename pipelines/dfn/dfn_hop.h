@@ -77,8 +77,8 @@ typedef struct DfnHop {
     Complex* frame_out;           /* bridge path: the open frame's output spectrum */
 } DfnHop;
 
-/* Frames the emitted spectrum trails the newest input by: the grid's mask + deep-filter lookahead
- * (one frame per call). */
+/* Frames the emitted spectrum trails the newest input by: mask + deep-filter lookahead, valid only for
+ * frames_per_call == 1 (the only grid dfn_hop_pool builds); dfn2_prepost_latency_frames() adds N - 1. */
 static inline int dfn_hop_lookahead_frames(const DFN2Grid* grid) {
     return grid ? grid->mask_lookahead + grid->df_lookahead : 0;
 }

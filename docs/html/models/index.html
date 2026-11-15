@@ -29,6 +29,19 @@
 <p><a href="reference/onnx.html">ONNX 張量邊界、state、匯出與 PTQ calibration</a></p>
 <p>DFN2、DeepVQE-S、Align-ULCNet 的客戶介面（<code>stream/ainr/ainr.h</code>、<code>stream/aiaec/aiaec.h</code>）以主機和替身加速器驗證，各模型首頁列出組態與驗證狀態。沒有交付 graph 的組態在 init 被拒絕。目標板上的真實 graph、量化、cache／DMA 與每 hop 耗時，需在部署時另外核對。</p>
 <p>三個模型的 init 都回 0 或負的錯誤碼，並填一份精簡的 info：圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code>。stream 函式庫不描述圖的埠：客戶只設 <code>sr、fft、hop_in</code>，N = <code>hop_in / (fft / 2)</code> 由 sample 從 config 算；每個已交付 graph 的訊號、head 與 state 的 shape 放在各函式庫旁的模型設定（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/aiaec/graph_io_deepvqes.h</code>、<code>stream/aiaec/graph_io_alignulcnet.h</code>，只有標頭，<code>ainr.h</code>／<code>aiaec.h</code> 不引用），共用的接線程式是 <code>stream/common/graph_io.h</code>。圖的埠順序是同一條規則：輸入為訊號再接 state、輸出為 head 再接 state，所以 sample 依位置綁埠並以 SDK 無關的檢查器 <code>stream_check_ports()</code>（<code>stream/common</code>）檢查，細節見<a href="dfn2/reference/board.html#info">板端整合</a>。</p>
+
+<h2 id="customer-headers">客戶標頭與 include 路徑</h2>
+<p>三個模型的板端 sample 只 include 下列本庫標頭，其餘（<code>lib/ainr/</code>、<code>lib/aiaec/</code> 與各模型的 <code>stream/*/*_stream.h</code>）是函式庫內部的。</p>
+<table><thead><tr><th>標頭</th><th>用途</th></tr></thead><tbody>
+<tr><td><code>stream/ainr/ainr.h</code></td><td>DFN2 產品介面</td></tr>
+<tr><td><code>stream/ainr/bridge/ainr_bridge.h</code></td><td>8／16 kHz host 經取樣率 bridge 接 48 kHz 模型</td></tr>
+<tr><td><code>stream/aiaec/aiaec.h</code></td><td>DeepVQE-S 與 Align-ULCNet 產品介面</td></tr>
+<tr><td><code>stream/aiaec/front/aiaec_front.h</code></td><td>沒有自己 AEC 的 Align-ULCNet 獨立 sample</td></tr>
+<tr><td><code>stream/common/graph_io.h</code> 與 <code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/aiaec/graph_io_deepvqes.h</code>、<code>stream/aiaec/graph_io_alignulcnet.h</code></td><td>graph 接線表與埠檢查（只有標頭）</td></tr>
+<tr><td><code>stream/common/stream_bind.h</code></td><td>埠綁定；sample 另編譯 <code>stream/common/stream_bind.c</code></td></tr>
+<tr><td><code>stream/common/stream_mem.h</code></td><td><code>StreamMemReq</code>（<code>ainr.h</code>／<code>aiaec.h</code> 已引用）與 <code>stream_saturate_s16()</code></td></tr>
+</tbody></table>
+<p>include 路徑：所用標頭各自的目錄、<code>stream/common</code>、audiolib 的 <code>common/</code>（<code>stream_mem.h</code> 引用 <code>utility/mem_align.h</code>）；用 <code>ainr_bridge.h</code> 時再加 audiolib 的 <code>common/include</code>（<code>fft_wrapper.h</code>）。例：<code>cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common …</code>，完整建置指令見各模型首頁。</p>
 </main>
 </body>
 </html>

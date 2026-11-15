@@ -208,7 +208,7 @@ static int ulc_setup(void *user, ArraySampleHopView *view) {
     printf("4ch_alignulcnet: application framing (far AcStft, output AcIstft, six spectrum planes) pool %zu bytes\n",
            s->frame_bytes);
 
-    /* The board loads this descriptor from the exported model metadata and refuses a graph of another
+    /* A host that reads the exported model metadata loads this descriptor and refuses a graph of another
      * layout, grid or far input, or a packet graph, before any hop runs; here it is the grid's own. */
     if (ulcnet_model_io_descriptor_default(&s->grid, &s->model_descriptor) != 0 ||
         ulcnet_model_io_descriptor_validate(&s->grid, &s->model_descriptor) != 0 ||

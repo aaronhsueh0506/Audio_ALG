@@ -227,4 +227,27 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
       (DeepVQE-S: `test_state_generation_counts_restarts`; Align-ULCNet: `test_reset_clears_state` and
       `test_frame_state_machine_guards`; 0 after init for both classes).
 
+## 13. Customer header set
+
+A board sample of DFN2, DeepVQE-S or Align-ULCNet includes only these project headers:
+
+| Header | For |
+|---|---|
+| `stream/ainr/ainr.h` | DFN2 product (PCM, PCM -> spectrum, spectrum -> spectrum) |
+| `stream/ainr/bridge/ainr_bridge.h` | DFN2 on an 8 / 16 kHz host (the 48 kHz model behind a rate bridge) |
+| `stream/aiaec/aiaec.h` | DeepVQE-S and Align-ULCNet product |
+| `stream/aiaec/front/aiaec_front.h` | Align-ULCNet standalone sample (links `libaiaec_front.a` and the AEC library) |
+| `stream/common/graph_io.h` with `stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_deepvqes.h`, `stream/aiaec/graph_io_alignulcnet.h` | graph wiring tables and port checks (header-only) |
+| `stream/common/stream_bind.h` | port binding helpers; compile `stream/common/stream_bind.c` into the sample |
+| `stream/common/stream_mem.h` | `StreamMemReq` (included by `ainr.h` / `aiaec.h`) and `stream_saturate_s16()` |
+
+Include roots: the directory of each header used, `stream/common`, audiolib `common/`
+(`stream_mem.h` includes `utility/mem_align.h`) and, with `ainr_bridge.h`, audiolib
+`common/include` (`fft_wrapper.h`). Library-internal headers (`lib/ainr/**`, `lib/aiaec/**`)
+and the per-model `stream/*/*_stream.h` are not part of this set; the one exception is a
+`-DDFN2_STREAM_NO_STDIO` build, which calls `stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
+
+- [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`
+      and as C++11, given only the include roots above.
+
 [返回本主題](README.md)

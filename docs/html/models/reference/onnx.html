@@ -205,7 +205,7 @@ RNNoise-ERB 為 24 byte、沒有 reserved 欄）當<b>陳舊 pool 閘</b>：<cod
 <code>state_tensor_count</code>），而且是<b>從剛建好的 graph 量出來</b>而不是手寫重述
 （<code>layout_version</code> 目前為 4，signal input 是 host 壓縮後的 planar 頻譜）。
 其中 <code>conv_window_frames</code>、<code>score_window_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code> 是模型內部，C 端不讀；
-板端用 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;d)</code> 比對其餘欄位（<code>delay_depth</code> 只檢範圍）。
+讀 metadata 的 host 用 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;d)</code> 比對其餘欄位（<code>delay_depth</code> 只檢範圍）；板端 sample 不讀 <code>c_descriptor</code>，只依位置核對埠的數量、shape、格式與配對。
 Align-CRUSE 與 CAGCRN 分別提供 real mask 和 complex mask 的頻域合成 helper。</p>
 
 <h2 id="section-6">Build</h2>

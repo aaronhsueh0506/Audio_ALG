@@ -8,6 +8,7 @@
  *              deepvqe_stream_post_process(ctx, ai_rc, pcm_out);
  *
  * io.state_generation is written every hop; the state sync is the caller's (also with the optional registered state).
+ * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
  * Bypass (ai_rc != 0) fails CLOSED: the batch's spectrum is zero, but the overlap-add still carries the previous hop, so
  * pcm_out is not fully zero except on the first bypass. No warm-up: a frame is ready from hop 0 (N == 1) or hop N - 1, over a
  * zero-filled CCM ring. The zero hops are the N - 1 pre-roll hops of the first batch. PCM delay is N * grid.hop samples. */
@@ -34,7 +35,7 @@ typedef struct DeepVqeStreamConfig {
      * pool holds no FFT, STFT / ISTFT or PCM scratch. 0: both entry families. */
     int freq_only;
     /* Optional borrowed state registration by DeepVqeStateId (see deepvqe_prepost.h): every pointer non-NULL with a
-     * nonzero count, or all NULL / 0 (the accelerator owns its state). Not in the pool size or hash. */
+     * nonzero count, or all NULL / 0 (the accelerator owns its state). Not in the pool size; the mode is in the hash. */
     float  *state[DEEPVQE_STATE_COUNT];
     size_t  state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqeStreamConfig;

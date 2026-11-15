@@ -27,7 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "stream_mem.h"    /* StreamMemReq */
+#include "stream_mem.h"    /* StreamMemReq; include roots: stream/common and audiolib common/ */
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,14 +113,14 @@ int ainr_init(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrCtx **ct
 /* Back to the start: state zeroed, generation advanced, a partly gathered block dropped; ERB tables kept. */
 void ainr_reset(AinrCtx *ctx);
 
-/* Attenuation limit in dB (0 disables, the default), between blocks only. AINR_ERR_SEQUENCE while a
- * preprocess awaits its postprocess, AINR_ERR_NONFINITE_INPUT for NaN/Inf, AINR_ERR_NULL for NULL; else
- * 0. Kept by ainr_reset(). The _freq variant is the same. */
+/* Attenuation limit of |atten_lim_db| dB (sign ignored; 0 disables, the default), between blocks only.
+ * AINR_ERR_SEQUENCE while a preprocess awaits its postprocess, AINR_ERR_NONFINITE_INPUT for NaN/Inf,
+ * AINR_ERR_NULL for NULL; else 0. Kept by ainr_reset(). The _freq variant is the same. */
 int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
 
-/* Current state generation (0 for NULL): seeds the sample's sync after init or reset. It advances on reset,
- * on each warm-up hop and on a refused commit (non-finite heads), not on a caller-signaled bypass. Reload
- * quantized zero on a change and after any failed run or readback. */
+/* Current state generation (0 for NULL): seeds the sample's sync after init or reset; advances on reset, each
+ * warm-up hop and a refused commit (non-finite heads): reload quantized zero on a change. A failed run or
+ * readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run. */
 unsigned int ainr_state_generation(const AinrCtx *ctx);
 
 /* One block in: exactly cfg->hop_in samples. AINR_OK: work holds the block's one job; run the accelerator,
@@ -128,9 +128,9 @@ unsigned int ainr_state_generation(const AinrCtx *ctx);
  * block is open. */
 int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, AinrWork *work);
 
-/* Closes the block: infer_status 0 commits, anything else bypasses with a near-identity pass-through (unit
- * ERB mask, alpha 0). Returns 0 with hop_in samples in pcm_out either way; AINR_ERR_SEQUENCE without a
- * matching preprocess (pcm_out untouched). */
+/* Closes the block: infer_status 0 commits (full: df_alpha clamped to [0, 1] before use), anything else bypasses
+ * with a near-identity pass-through (unit ERB mask, alpha 0). Returns 0 with hop_in samples in pcm_out either
+ * way; AINR_ERR_SEQUENCE without a matching preprocess (pcm_out untouched). */
 int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
 
 /* ---- Spectrum -> spectrum ("_freq") family ----

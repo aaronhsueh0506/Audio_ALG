@@ -10,13 +10,14 @@
  *         if (io.job_ready) {
  *             device_state_sync(io.state_generation);      // reload accelerator state on change
  *             ai_rc = run_accelerator(&io.inputs, &io.outputs);
- *             if (ai_rc != 0) device_state_refill_zero();   // partial write: reload now, same hop
+ *             if (ai_rc != 0) device_state_refill_zero();   // zero before the next run
  *         }
  *         if (dfn2_stream_post_process(ctx, ai_rc, pcm_out) < 0) break;
  *     }
  *
  * device_state_sync/refill_zero are the caller's code on accelerator memory this stream never touches;
  * skipping either leaves stale or garbage state live. io.state_generation is sampled every hop.
+ * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
  * Warm-up (N == 1: mask_lookahead hops after init/reset; N > 1: none) runs the same loop and emits silence.
  * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one.
  *
@@ -59,7 +60,7 @@ static inline int dfn2_stream_bins_in_range(const float *x, size_t n, float scal
 
 typedef struct DFN2StreamConfig {
     DFN2Grid grid;             /* dfn2_grid_make(); frames_per_call in [1, 64] */
-    float    atten_lim_db;     /* 0 disables the attenuation limit, as dfn2_prepost */
+    float    atten_lim_db;     /* |x| dB limit, sign ignored; 0 disables, as dfn2_prepost */
     int      hpf_enable;       /* optional input high-pass, applied before analysis only */
     float    hpf_cutoff_hz;    /* > 0, read only when hpf_enable */
     /* Non-zero: a spectrum-only context. Only the _freq entries run (the PCM entries return -1) and the pool holds no
@@ -136,7 +137,8 @@ void dfn2_stream_reset(DFN2Stream *s);
 /* Generation of the recurrent state (dfn2_prepost_state_generation()); 0 for NULL. */
 unsigned int dfn2_stream_state_generation(const DFN2Stream *s);
 
-/* Attenuation limit in dB (0 disables), between hops only; 0, or -1 on NULL, a non-finite value or an open
+/* Attenuation limit of |atten_lim_db| dB (sign ignored; 0 disables), between hops only; 0, or -1 on NULL, a
+ * non-finite value or an open
  * frame. Kept by reset. */
 int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db);
 

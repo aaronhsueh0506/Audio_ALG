@@ -7,6 +7,7 @@
  *                                 if (ai_rc != 0) device_state_refill_zero(); }
  *              ulcnet_stream_post_process(ctx, ai_rc, pcm_out);
  *
+ * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
  * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, resets the stream and arms
  * ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). Fail-OPEN: a bypassed frame is the
  * linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not finite is bypassed and advances the

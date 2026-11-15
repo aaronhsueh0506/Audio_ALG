@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
            example_cli_delay_mode_name(profile.mode), profile.num_filters,
            profile.fixed_samples, (unsigned long long)pool_bytes, 16ul);
 
-    /* The board loads this descriptor from the exported model metadata and refuses a graph of another
+    /* A host that reads the exported model metadata loads this descriptor and refuses a graph of another
      * layout, grid or far input, or a packet graph, before any hop runs; here it is the grid's own. */
     if (ulcnet_model_io_descriptor_default(&grid, &model_descriptor) != 0 ||
         ulcnet_model_io_descriptor_validate(&grid, &model_descriptor) != 0 ||

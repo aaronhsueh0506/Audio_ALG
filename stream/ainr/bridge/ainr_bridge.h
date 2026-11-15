@@ -39,7 +39,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "fft_wrapper.h"   /* Complex */
+#include "fft_wrapper.h"   /* Complex; include root: audiolib common/include */
 
 #ifdef __cplusplus
 extern "C" {

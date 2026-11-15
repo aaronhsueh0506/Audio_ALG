@@ -147,7 +147,7 @@ conv window = causal conv kernel 4 幀（3 幀過去加目前一幀）、alignme
 <code>deepvqe_prepost_descriptor_default(&amp;grid, &amp;desc)</code> 填外部欄位，<code>_descriptor_validate(&amp;grid, &amp;desc)</code>
 把<b>除 <code>delay_depth</code> 之外</b>的外部欄位釘在 grid 與本 build 的常數上（<code>delay_depth</code> 是 export 期的部署參數，只檢查範圍）；
 <code>conv_window_frames</code>／<code>score_window_frames</code>／<code>gru_layers</code>／<code>gru_hidden</code> 四欄屬於模型內部，default 給 0、validate 不讀。
-<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4（<code>mic</code>/<code>far</code> 的名稱與元素數 2×n_bins 不隨 layout 變，state 是完整 window、<code>h_gru</code> 是 rank 4，版號是唯一能攔下舊板綁新圖的閘門；1–3 已退役），且刻意<b>不</b>與
+<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4（<code>mic</code>/<code>far</code> 的名稱與元素數 2×n_bins 不隨 layout 變，state 是完整 window、<code>h_gru</code> 是 rank 4；1–3 已退役。版號由匯出器與 host 測試釘住；板端 sample 不讀版號，只依位置核對埠的數量、shape、格式與配對，shape 不變的 layout 變更在板端攔不下），且刻意<b>不</b>與
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 共用：兩個模型的 boundary 各走各的，共用號碼會讓
 一邊的 bump 看起來像另一邊的。D 範圍 <code>DEEPVQE_PREPOST_MIN_D</code>=1 …
 <code>MAX_D</code>=256，沒有預設值：應用端給匯出該模型時的 D（出貨 32 ＝ 這個 grid 上的 0.5 秒搜尋範圍，<code>ceil(0.5 × 16000/256)</code>）。</p>
@@ -157,7 +157,7 @@ conv window = causal conv kernel 4 幀（3 幀過去加目前一幀）、alignme
 window 深度、GRU 形狀、兩個 ring 的 D 與 model 自報的 D 必須一致、state 數 = input 數 − signal input
 數），再把 <code>metadata['state_layout_version']</code> 與
 <code>metadata['c_descriptor']</code> 一起寫進 ONNX props 與旁邊的 JSON。
-外部欄位（grid、<code>time_order</code>、<code>freq_taps</code>、<code>state_tensor_count</code>、layout）不符會在板端變成一次 <code>descriptor_validate()</code> 拒絕；四個內部欄位只記在 metadata，C 端不讀。</p>
+外部欄位（grid、<code>time_order</code>、<code>freq_taps</code>、<code>state_tensor_count</code>、layout）不符會被呼叫 <code>descriptor_validate()</code> 的 host 端（測試、浮點 host）拒絕，板端 sample 不讀 <code>c_descriptor</code>；四個內部欄位只記在 metadata，C 端不讀。</p>
 
 <h2 id="section-6">延遲與 warm-up</h2>
 <ul>
@@ -182,7 +182,7 @@ kernel 路徑。</li>
 <li><b>framing 由應用端做</b>：用 audiolib 建兩個 <code>AcStft</code>（mic、far）與一個 <code>AcIstft</code>，組態 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>（sqrt-Hann、center 0、<code>spec_scale</code> = <code>ispec_scale</code> = 1），合成端另設 <code>sc.ola = AC_OLA_ACCUMULATE</code>（<code>deepvqe_prepost.h</code> 檔頭；無首拍特例，見下方延遲表）。類別不持有 window、<code>FftHandle</code> 或 STFT 物件。</li>
 <li><b>16 個 state 歸應用端</b>（<code>DeepVqeStateId</code> 順序，形狀見 <a href="core.html">DeepVQE-S 頻域與模型契約</a> 的 State 表，函式庫只收元素數）：浮點 host 配 16 塊 float buffer，把 16 組（指標，元素數）登錄進 <code>cfg.state[]</code>／<code>cfg.state_elements[]</code>——全登錄或全不登錄，init 與 reset 時清零，每次 <code>frame_finish</code> 整塊檢查有限，不計入 pool 大小與 hash；目標平台不登錄，由加速器持有，把每個 state 輸入與其 <code>*_out</code> 綁在同一塊加速器 buffer。</li>
 <li><code>deepvqe_prepost_config_defaults(&amp;cfg, &amp;grid)</code>（grid 被複製）→ 登錄 state → <code>deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。D = 32 的 pool：16 kHz／512 為 35,504 B、48 kHz／1024 為 70,320 B（本機量測，不含應用端的 state 與 <code>AcStft</code>／<code>AcIstft</code>）。</li>
-<li>按名稱綁定 graph 的 state 時用 <code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>；啟動時把 ONNX／JSON 內的 <code>c_descriptor</code> 讀成 <code>DeepVqePrepostDescriptor</code>，以 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;meta)</code> 檢查。</li>
+<li>按名稱綁定 graph 的 state 的 host 用 <code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>；能讀 ONNX／JSON 的 host 可在啟動時把 <code>c_descriptor</code> 讀成 <code>DeepVqePrepostDescriptor</code>，以 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;meta)</code> 檢查。板端 sample 兩者都不做：它依位置綁定，以接線表核對埠（見<a href="../index.html#graph-wiring">Graph 接線</a>）。</li>
 <li>每個 hop（從 hop 0 起一次推論）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(mic, far)</code> 恆回 1 → <code>frame_open</code>（host 端做 power-law 壓縮 0.3，<code>mic</code>／<code>far</code> 是壓縮後的 planar <code>[1,2,1,n_bins]</code>；只有 <code>taps</code> 預填 NaN）→ 加速器 → <code>frame_finish</code>（失敗改 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
 <li>目標平台：每次 <code>deepvqe_prepost_state_generation()</code> 改變（<code>reset</code> 或被拒的 <code>frame_finish</code>），把加速器自己的 16 個 state 清成零（定點 state 埠兩端的 <code>zero_point</code> 須為 0，見<a href="../index.html">整合入口</a>的 State 一節；float 的 state 清零同樣是填位元組 0，與 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 無關）；新建實例的 generation 為 0，做法同 <a href="../../align-ulcnet/reference/core.html#frequency-api">Align-ULCNet 頻域與模型契約</a> 的目標平台片段。</li>
 <li>重新開始：<code>deepvqe_prepost_reset(p)</code>（登錄的 state、CCM ring 歸零，generation +1），並自行 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op，登錄的 buffer 與 pool 歸應用端）。</li>
@@ -296,7 +296,7 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
 <tr><td>出貨 grid</td><td>16000／512／256／257 bins</td><td><code>config.ini [signal]</code>、匯出的 graph</td><td>模型只訓練並驗證過這一組；頻率階梯 257→129→65→33→17 由此導出。函式庫不限定（run-time grid），但 graph 的頻率軸形狀隨 grid 變</td></tr>
-<tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code></td><td>4（1–3 已退役）</td><td><code>deepvqe_prepost.h</code></td><td>與 exporter 的 <code>DEEPVQE_C_LAYOUT_VERSION</code> 互鎖；擋下舊板綁新圖。刻意不與 ULCNet 版號共用</td></tr>
+<tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code></td><td>4（1–3 已退役）</td><td><code>deepvqe_prepost.h</code></td><td>與 exporter 的 <code>DEEPVQE_C_LAYOUT_VERSION</code> 互鎖，在匯出與 host 測試擋下不符的圖（板端 sample 不讀版號）。刻意不與 ULCNet 版號共用</td></tr>
 <tr><td><code>DEEPVQE_COMPRESSION_EXP</code></td><td>0.3</td><td><code>deepvqe_prepost.h</code></td><td>host 前端與訓練共用；<code>export_onnx.py</code> 拒絕其他指數的 checkpoint</td></tr>
 <tr><td><code>DEEPVQE_TIME_ORDER</code>／<code>DEEPVQE_FREQ_TAPS</code>、<code>deepvqe_prepost_taps_elements(grid)</code></td><td>3／3、n_bins×3×3×2</td><td><code>deepvqe_process.h</code>、<code>deepvqe_prepost.h</code></td><td>CCM 形狀；taps 末軸 <code>[time][frequency][RI]</code> 與 C 陣列同一塊記憶體</td></tr>
 <tr><td>state 形狀（conv window 4 幀、score window 5 幀、sim 通道 4、value 通道 24、GRU 1 層 192）</td><td>見 State 表</td><td>匯出的 graph</td><td>由 checkpoint 拓撲決定；函式庫不持有，descriptor 的四個 interior 欄位（<code>conv_window_frames</code>、<code>score_window_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>

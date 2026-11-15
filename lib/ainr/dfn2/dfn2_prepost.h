@@ -1,6 +1,6 @@
 /* DeepFilterNet2 pre/post class: one object between the caller's spectra and the accelerator's tensors.
  * Frequency domain only: the application frames with audiolib as dfn2_process.h states; spectra are
- * normalized=True (unnormalised: scale by grid.stft_scale in, grid.stft_unscale out). L, D, N = mask_lookahead,
+ * normalized=True (unnormalised: scale by dfn2_stft_scale(n_fft) in, dfn2_stft_unscale(n_fft) out). L, D, N = mask_lookahead,
  * df_lookahead, frames_per_call (as the graph's). The pool is the caller's and holds no recurrent state.
  *
  *     ac_stft_push_planar(stft, in_samples, re, im);
@@ -68,7 +68,7 @@ typedef struct DFN2PrepostConfig {
     DFN2Grid     grid;          /* the grid the instance runs (dfn2_grid_make); copied at init */
     const float *erb_fwd;       /* required, borrowed, bin-major [n_bins][n_erb] */
     const float *erb_inv;       /* required, borrowed, band-major [n_erb][n_bins] */
-    float        atten_lim_db;  /* 0 disables the attenuation limit         */
+    float        atten_lim_db;  /* |x| dB limit, sign ignored; 0 disables  */
     /* Optional recurrent-state registration (borrowed, element counts) under the rules of dfn2_model_io_init():
      * all pairs or none, a pointer with count 0 refused, df_convp_history NULL/0 with DFN2_MASK_ONLY. Zeroed at
      * init and reset, finite-checked at every commit; not in the pool size or hash. */
@@ -173,7 +173,7 @@ const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);   /* the grid it runs; 
 int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
                                   const float *erb_inv);
 
-/* Attenuation limit in dB (0 disables), between hops only; -1 on NULL, a non-finite value or with a frame open.
+/* |atten_lim_db| dB attenuation limit (sign ignored, 0 disables), between hops only; -1 on NULL, non-finite, a frame open.
  * With N frames per call the enhance stage runs at the commit, so the limit (and a new inverse ERB matrix)
  * applies to the whole next committed call, frames pushed earlier included. */
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);

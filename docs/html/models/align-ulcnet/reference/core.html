@@ -313,7 +313,7 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 <h3>內部：存在且可改，但不建議開放</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
-<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code></td><td>18（3–17 已退役）</td><td><code>ulcnet_model_io.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>LAYOUT_VERSION</code> 互鎖；是擋下相同張量名稱但邊界不同的舊圖的唯一閘門</td></tr>
+<tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code></td><td>18（3–17 已退役）</td><td><code>ulcnet_model_io.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>LAYOUT_VERSION</code> 互鎖，在匯出與 host 測試擋下相同張量名稱但邊界不同的舊圖（板端 sample 不讀版號）</td></tr>
 <tr><td>state 形狀（<code>TA_CHANNELS</code> 32、<code>SCORE_WINDOW_FRAMES</code> 5、GRU 2 subband×2 層×128、<code>ta_bins</code> = ⌈K/10⌉）</td><td>K/V <code>(1,32,D,TA)</code>、logit <code>(1,32,5,D)</code>、<code>h_gru (1,4,1,128)</code></td><td><code>export_onnx.py</code> 的 <code>state_shapes()</code></td><td>由模型拓撲決定；函式庫不持有這些形狀，descriptor 的五個 interior 欄位（<code>ta_channels</code>…<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td>0.3</td><td><code>ulcnet_model_io.h</code></td><td>host 前後端與訓練 loss 共用；<code>export_onnx.py</code> 拒絕其他指數</td></tr>
 <tr><td><code>ULCNET_FAR_RAW</code>／<code>ULCNET_FAR_ALIGNED</code></td><td>0／1</td><td><code>ulcnet_model_io.h</code></td><td>production descriptor 只驗證 raw；aligned 為診斷模式</td></tr>
@@ -459,7 +459,7 @@ calibration report（BIN 的 <code>manifest.json</code>、NPZ 的 <code>&lt;name
 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在
 <code>layout_version</code>；<code>ulcnet_prepost_get_mem_size()</code>／<code>_init()</code> 也拒絕非 0 又不等於本 build layout（單幀 18、封包 19）的 <code>model_layout_version</code>。
 state shape：K/V 是 <code>(1,32,D,TA)</code>、logit 是 <code>(1,32,5,D)</code>、兩顆 GRU hidden 併成單一
-<code>h_gru (1,4,1,128)</code>；<code>output</code> 元素數是 2·K，所以版本號是唯一能攔下舊板綁新圖的閘門。
+<code>h_gru (1,4,1,128)</code>；<code>output</code> 元素數是 2·K，所以 shape 不變的 layout 變更只有版本號分得出；版本號由匯出器與 host 測試釘住，板端 sample 不讀它，只依位置核對埠的數量、shape、格式與配對。
 D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或重新生成，
 但 calibration 資料與量化結果要對應該份 graph，加速器程式要對應該份 descriptor。</div>
 

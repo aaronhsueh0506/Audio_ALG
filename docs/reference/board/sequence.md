@@ -241,7 +241,9 @@ that owns the restart count changes: `job.state_generation` / `dfn_hop_state_gen
 and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class a
 caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
 its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused
-commit (a non-finite head) of a real frame; a model failure on a real frame and a committed frame leave it alone. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
+commit (a non-finite head, and for Align-ULCNet also a finite head whose enhanced spectrum is not finite) of a real frame; a model
+failure on a real frame and a committed frame leave it alone. A failed run or readback (status != 0) leaves the generation unchanged:
+zero the accelerator's state before its next run. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
 compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config
 instead, and the library zeroes and checks them; the DFN2 stage and bridge register none.
 
