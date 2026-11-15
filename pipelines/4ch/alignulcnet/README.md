@@ -183,7 +183,7 @@ changing it means re-querying the pool and re-initializing.
 ./4ch_alignulcnet --delay-mode external        # caller pre-aligns the far
 ```
 
-Numbers are parsed by `common/example_cli.h` (`example_cli_parse_int`): `--delay-num-filters 3x`,
+Numbers are parsed by `example_cli.h` (`example_cli_parse_int`): `--delay-num-filters 3x`,
 `--fixed-delay 12x`, `--sample-rate 16000x`, an empty string, a leading space or a value outside
 `int` exit with 2, as does a `--sample-rate` that is not 16000 or 48000; plain decimals and a
 leading `+` are accepted.

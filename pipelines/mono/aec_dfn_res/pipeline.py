@@ -60,7 +60,7 @@ from lib.aec.python.aec import AecConfig, AecMode, AecPreset, AecResContext  # n
 from pipelines.mono.aec_nr_res.pipeline import (  # noqa: E402
     _project_grid, apply_gain, rendering_base, run_aec_linear, synth_window,
 )
-from pipelines.common.cng_aec3 import Aec3ComfortNoise  # noqa: E402
+from pipelines.mono.cng_aec3 import Aec3ComfortNoise  # noqa: E402
 from pipelines.dfn.dfn2_rate_adapter import Dfn2RateBridge  # noqa: E402
 from pipelines.dfn.dfn2_stage import (  # noqa: E402
     DF_BINS, DF_ORDER, HOP, N_BINS, N_ERB, Dfn2Assets,

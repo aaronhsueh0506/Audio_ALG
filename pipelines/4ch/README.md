@@ -325,7 +325,7 @@ domain.
 
 **Command lines of the examples.** `4ch_raw`, `4ch_static` and `4ch_external_static` read their numeric
 options (`--sample-rate`, `--fft-size`, `--uca-radius-m`, `--fixed-doa-deg`, `--capture-proxy`) with the
-strict parsers of `../common/example_cli.h`: the whole string must be one number, so an empty string, a leading
+strict parsers of `../example_cli.h`: the whole string must be one number, so an empty string, a leading
 space, trailing characters (`16000Hz`), a value outside `int`, `inf` and `nan` are command-line errors, and so
 are an option without its value and an unknown option. A token that starts with `--` where a value belongs is
 the next option, so the value is missing: `--nr-level --no-res` is an error, not the level `--no-res` (this holds

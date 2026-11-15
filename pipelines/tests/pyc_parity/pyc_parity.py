@@ -63,7 +63,7 @@ AEC_SOURCE_PREFIX = 'AEC/c_impl/'
 SOURCES = [   # hashed into the JSON so a result can be tied to the code it judged
     'Audio_ALG/pipelines/4ch/pipeline.py',
     'Audio_ALG/pipelines/mono/aec_nr_res/pipeline.py',
-    'Audio_ALG/pipelines/common/cng_aec3.py',
+    'Audio_ALG/pipelines/mono/cng_aec3.py',
     'Audio_ALG/pipelines/4ch/array_sample_post.h',
     'Audio_ALG/pipelines/tests/pyc_parity/pyc_drv.c',
     'AEC/c_impl/src/aec.c',
@@ -722,7 +722,7 @@ def mono_cng_twin_out(cx, seam, cn_floor, follow_reset=True):
 
     The base is the rendering base of the hop (Y on a guard hop, else E); a new post-reset serial clears the OLA tail and
     restarts the comfort noise before the hop's first draw, as mono/aec_nr_res/main.c does."""
-    from pipelines.common.cng_aec3 import Aec3ComfortNoise
+    from pipelines.mono.cng_aec3 import Aec3ComfortNoise
     P = cx.P
     nf, hop = seam.nf, seam.hop
     bs = 2 * (nf - 1)
@@ -823,7 +823,7 @@ def sec_d_global(cx, want):
 
 def cng_twin(cx):
     """C aec_cng_fill against cng_aec3.Aec3ComfortNoise, three hops with carried state, 18 cases."""
-    from pipelines.common.cng_aec3 import Aec3ComfortNoise, SEED
+    from pipelines.mono.cng_aec3 import Aec3ComfortNoise, SEED
     rs = np.random.RandomState(1)
     exe = cx.drv(1, 'mono')
     bad = []
@@ -880,7 +880,7 @@ def run_cng_c(cx, exe, n, rng, floor, spec, cn, gr, gn, use_gnr):
 
 def cng_pipeline(cx):
     """mono.aec_nr_res.pipeline.comfort_noise_fill against the C fill, 400 hops with carried generator state."""
-    from pipelines.common.cng_aec3 import SEED
+    from pipelines.mono.cng_aec3 import SEED
     P = cx.P
     rs = np.random.RandomState(1)
     n = 513

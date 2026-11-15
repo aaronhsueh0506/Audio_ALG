@@ -31,6 +31,21 @@ A finite mask could still give a non-finite frame: the inverse signed power (exp
 - **Tests.** `AIAEC/tests/test_prepost_chains.c`: the chain's huge-mask hops (mask and state scaled by 1e38) must be refused with the state zeroed, the generation +1 and the error spectrum out, and the one over a zero spectrum accepted; the NEON and scalar digests still agree. `stream/aiaec/ulcnet/tests/verify_vs_sample.c` (`run_refused_spectrum_row`): on the `_freq` entries a 3.0e30 mask bin that overflows only the real plane, one that overflows only the imaginary plane, a NaN error bin, and the mask over a zero spectrum (accepted); on the bare class a retried `frame_finish()` does not advance the generation again and a fresh `frame_open()` recovers the frame. `stream/aiaec/tests/test_aiaec_packet.c`: two overflowing-mask modes in `section_failure` (frame 5 real plane, last frame imaginary plane) and `section_model_io_enhanced_check` (an event frame is neither written nor scanned; one refusal per bad frame with the registered state zeroed, a retry adds none, at both boundaries; a NaN mask bin in an event frame and a NaN in the registered state of a packet are still refused by the mask and state gate). Sixteen mutations of the new check (removed, one plane only, first frame only, no restart, state not zeroed, transaction left armed, event frames scanned or written, scan before the back end) and the removal of the mask and state gate at either call site each fail at least one test.
 - Docs: `AIAEC/Align_ULCNet/reference/deployment.md`, `docs/html/models/align-ulcnet/{index,reference/core}.html`, `docs/html/pipelines/reference/align-ulcnet/configuration.html`, `docs/maintenance/graph-wiring.md`, `docs/c_python_function_map.md`.
 
+## [Unreleased] — 2026-11-15 — `pipelines/common/` dissolved: `example_cli.h` sits in the `pipelines/` root, `cng_aec3.py` and its tests under `pipelines/mono/` (no behaviour change)
+
+Four files moved, none changed in content; the folder is gone.
+
+| Before | Now |
+|---|---|
+| `pipelines/common/example_cli.h` | `pipelines/example_cli.h` |
+| `pipelines/common/cng_aec3.py` (`pipelines.common.cng_aec3`) | `pipelines/mono/cng_aec3.py` (`pipelines.mono.cng_aec3`) |
+| `pipelines/common/tests/test_cng_aec3.py`, `test_cng_floor_constant.py` | `pipelines/mono/tests/` |
+
+- **C.** The seven includes read `#include "example_cli.h"` (`mono/aec_nr_res/main.c`, `mono/alignulcnet/main.c`, `dfn/dfn_example_args.h`, `4ch/4ch_external_static.c`, `4ch/array_sample_driver.c`, `4ch/alignulcnet/main.c`, `4ch/tests/test_array_sample_driver.c`). No `-I` changed: the header resolves through the existing `-I.` (`pipelines/Makefile`) and `-I$(PIPELINES_DIR)` (`pipelines/4ch/Makefile`); only the prerequisite lists of the two Makefiles name the new path. Preprocessed text (`cc -E -P`) and `-g0` objects of the nine translation units are identical before and after at `SIMD=1` and `0`.
+- **Python.** Import sites: `mono/aec_dfn_res/pipeline.py`, `tests/pyc_parity/pyc_parity.py` (three imports and the hashed `SOURCES` path) and `mono/tests/test_cng_aec3.py`. The module path is the only edit.
+- **AEC `cli_level.h` was not reused**: it holds `aec_cli_parse_level()` / `aec_cli_parse_int()` only, not the delay options or the `example_cli_*` parsers.
+- **Outside this repo.** No board sample includes a file of the old folder. `AEC/docs/c_python_function_map.md` names `Audio_ALG/pipelines/common/cng_aec3.py` in one sentence.
+
 ## [Unreleased] — 2026-11-15 — Board samples `alg_ai3_aec_dfn.c` and `uvc_audio_live2a.c` run DFN2 through `ainr_*_freq` and the library `AinrBridge`
 
 No library source changed. The two samples (`audio_sample/`, outside this repo) no longer use `DfnResStage` / `dfn_rate_bridge` (`alg_ai3_aec_dfn.c`) or an embedded copy of the bridge (`uvc_audio_live2a.c`): each 48 kHz or model-grid frame goes `ainr_preprocess_freq()` -> the sample's AI3 run -> `ainr_postprocess_freq()`, and a host that is not on the model rate goes around the `AinrBridge` of `stream/ainr/bridge`. `dfn_res_stage.{h,c}`, `dfn_rate_bridge.{h,c}` and their archive members stay.

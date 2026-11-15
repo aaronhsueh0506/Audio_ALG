@@ -57,7 +57,7 @@ level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）
 非預設 delay mode 得直接寫 C 改 `AecConfig` 後呼叫 `aec_get_mem_size()`／`aec_init()`
 （或改 CLI 原始碼），見 [設定參考](../../html/pipelines/mono/aec-nr-res/reference/configuration.html)。
 
-`aec_nr_pipeline` 的 level 與數字選項一律嚴格解析（`common/example_cli.h`）：level 只收上表的一位數字，`--fft-size`／`--sample-rate` 只收完整的十進位整數，其他一律 exit 2；`--nr-level`／`--aec-level`／`--fft-size`（`--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。未知的選項與不是 level 的位置參數同樣 exit 2（見上）。DFN2／ULCNet 範例與 `4ch_raw`、`4ch_static`、`4ch_external_static` 走同一份嚴格解析（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
+`aec_nr_pipeline` 的 level 與數字選項一律嚴格解析（`example_cli.h`）：level 只收上表的一位數字，`--fft-size`／`--sample-rate` 只收完整的十進位整數，其他一律 exit 2；`--nr-level`／`--aec-level`／`--fft-size`（`--print-mem-size` 路徑另含 `--sample-rate`）後面直接接另一個 `--` 選項或行尾時視為缺值，exit 2。未知的選項與不是 level 的位置參數同樣 exit 2（見上）。DFN2／ULCNet 範例與 `4ch_raw`、`4ch_static`、`4ch_external_static` 走同一份嚴格解析（見 [`pipelines/README.md`](../../../pipelines/README.md)）。
 
 ### 4.2 Debug context dump
 

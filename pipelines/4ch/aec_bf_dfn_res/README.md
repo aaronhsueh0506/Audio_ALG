@@ -100,7 +100,7 @@ refused commit) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
 `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
-the product's measured one; numbers are parsed strictly by `common/example_cli.h`, so values such as
+the product's measured one; numbers are parsed strictly by `example_cli.h`, so values such as
 `16000Hz` exit with 2; it
 publishes the model I/O descriptor of the model grid, which a product replaces with
 the one from its model's exported metadata).

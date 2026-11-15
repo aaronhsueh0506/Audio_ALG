@@ -51,7 +51,7 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 #include "wav_io.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 
 #ifndef AEC_NR_POOL_SPLIT
 #define AEC_NR_POOL_SPLIT 0

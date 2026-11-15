@@ -24,7 +24,7 @@
 #include "4ch/array_sample_beam.h"
 #include "utility/mem_align.h"
 #include "4ch/array_sample_driver.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 #include "audio_stft.h"
 #include "ulcnet_stream.h"
 

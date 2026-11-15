@@ -71,7 +71,7 @@ with its own size query and `init`: lib/aec's `Aec` (`aec_process_linear()` and 
 the denoiser (`anr.h`) and `AcIstft`; the mono RES gain is the `Aec`'s own (`AecResidualView.res_gain`,
 read with `aec_get_residual()`, applied with `aec_apply_gain()` / `aec_apply_cng()`, strength through `aec_set_level()`). Each example `main`
 initialises the libraries it uses and writes the per-hop sequence itself; the example headers
-(`pipelines/common/example_cli.h`, `pipelines/4ch/array_sample_post.h`) carry no ABI and
+(`pipelines/example_cli.h`, `pipelines/4ch/array_sample_post.h`) carry no ABI and
 no layout version. The only multi-channel piece is
 the 4-channel array instance of the same library (`AecConfig.n_mics = AEC_ARRAY_MICS`, `aec.h` "Array instance"): one
 `aec_get_mem_requirements()` / `aec_init_ex()` places the four lanes, the shared delay estimator (MATCHED mode), the

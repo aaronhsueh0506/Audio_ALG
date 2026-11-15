@@ -81,7 +81,7 @@ make test-dfn-grids
 The Python twins sit beside their applications: `mono/aec_nr_res/pipeline.py`, `4ch/pipeline.py`
 (Python names: `McabPipeline`, `McabFrame`, `mcab_apply_lane_contract()`, `mcab_lane_config()`), `dfn/dfn2_stage.py`,
 `dfn/dfn2_rate_adapter.py`, `mono/aec_dfn_res/pipeline.py`, `4ch/aec_bf_dfn_res/pipeline.py` and
-`common/cng_aec3.py` (module paths `pipelines.<folder>.<module>`). Python and C agree for the default settings; the documented
+`mono/cng_aec3.py` (module paths `pipelines.<folder>.<module>`). Python and C agree for the default settings; the documented
 differences S-02 (AEC live observer guard) and S-13 (NR make-up prior) exist only when those default-off features are enabled,
 so do not read the twins as identical for every setting (`docs/c_python_function_map.md`, `make pyc-parity`; the two differences are defined in `AEC/c_impl/test/pyc_parity/pyc_parity.py` (S-02) and `NR/docs/c_python_function_map.md` (S-13)).
 

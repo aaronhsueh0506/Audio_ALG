@@ -1,6 +1,6 @@
 /* Shared sample-driver control flow: CLI boundaries, failures and cleanup. */
 #include "array_sample_driver.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 #include <assert.h>
 #ifdef NDEBUG
 #error "test_array_sample_driver requires assertions"

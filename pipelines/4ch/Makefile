@@ -374,7 +374,7 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 $(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../common/example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
+$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
@@ -390,7 +390,7 @@ $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcn
 $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../tests/ulcnet_test_fixture.h | _cfg_guard
@@ -399,10 +399,10 @@ $(OBJ_DIR)/test_4ch_ulcnet.o: alignulcnet/tests/test_4ch_ulcnet.c array_sample_b
 $(OBJ_DIR)/4ch_raw.o: 4ch_raw.c array_sample_beam.h array_sample_driver.h array_sample_post.h array_sample_unit.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_array_sample_driver.o: tests/test_array_sample_driver.c array_sample_driver.h array_sample_beam.h ../common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/test_array_sample_driver.o: tests/test_array_sample_driver.c array_sample_driver.h array_sample_beam.h ../example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/array_sample_driver.o: array_sample_driver.c array_sample_driver.h array_sample_beam.h ../common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/array_sample_driver.o: array_sample_driver.c array_sample_driver.h array_sample_beam.h ../example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_external_static.o: 4ch_external_static.c array_sample_post.h | _cfg_guard

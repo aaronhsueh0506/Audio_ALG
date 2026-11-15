@@ -24,7 +24,7 @@
  * call resets the AEC, the stream and the three transform objects together. */
 #include "aec.h"
 #include "audio_stft.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 #include "ulcnet_stream.h"
 #include "utility/mem_align.h"
 

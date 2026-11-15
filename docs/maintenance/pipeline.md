@@ -22,7 +22,7 @@ the build at: `AEC_DIR` from the environment (absolute path), else the sibling
 `../AEC/c_impl`. They pin `AEC_LAYOUT_VERSION` against the docs
 (`pipelines/tests/test_doc_layout_versions.py`), the comfort-noise floor and
 seed against the oracle chains, the Python twin and the C witnesses
-(`pipelines/common/tests/test_cng_floor_constant.py`, `test_cng_aec3.py`), and
+(`pipelines/mono/tests/test_cng_floor_constant.py`, `test_cng_aec3.py`), and
 the file list `pyc_parity.py` hashes into its result against the tree
 (`pipelines/tests/test_pyc_parity_sources.py`).
 

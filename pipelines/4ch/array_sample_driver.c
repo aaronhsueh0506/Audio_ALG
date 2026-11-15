@@ -1,5 +1,5 @@
 #include "array_sample_driver.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 
 #include <stdio.h>
 #include <math.h>

@@ -9,7 +9,7 @@ make -C pipelines check-pins
 python3 -m pytest -q pipelines/tests/test_doc_layout_versions.py pipelines/tests/test_c_python_map.py
 ```
 
-讀 AEC 標頭的 Python 守門測試（`test_doc_layout_versions.py`、`pipelines/common/tests/test_cng_*.py`、`pipelines/tests/test_pyc_parity_sources.py`、`AIAEC/tests/test_deployed_frontend_contract.py`）的 AEC 來源與 `lib/deps.mk` 同一套解析：環境變數 `AEC_DIR`（要給絕對路徑），否則是並列的 `../AEC/c_impl`，而不是 `lib/aec` submodule。要對 submodule 跑，就把 `AEC_DIR` 設成它的 `c_impl` 絕對路徑。
+讀 AEC 標頭的 Python 守門測試（`test_doc_layout_versions.py`、`pipelines/mono/tests/test_cng_*.py`、`pipelines/tests/test_pyc_parity_sources.py`、`AIAEC/tests/test_deployed_frontend_contract.py`）的 AEC 來源與 `lib/deps.mk` 同一套解析：環境變數 `AEC_DIR`（要給絕對路徑），否則是並列的 `../AEC/c_impl`，而不是 `lib/aec` submodule。要對 submodule 跑，就把 `AEC_DIR` 設成它的 `c_impl` 絕對路徑。
 
 | 驗收項目 | 入口 |
 |---|---|

@@ -29,7 +29,7 @@
 #include "anr.h"
 #include "audio_stft.h"
 #include "array_sample_post.h"
-#include "common/example_cli.h"
+#include "example_cli.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 

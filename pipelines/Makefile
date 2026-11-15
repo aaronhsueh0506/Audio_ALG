@@ -561,10 +561,10 @@ _cfg_guard:
 # -MD -MP: emits $(OBJ_DIR)/<name>.d per object (header dependency tracking)
 # -- included near the bottom of this file via `-include $(wildcard $(OBJ_DIR)/*.d)`.
 # One source, two binaries: aec_nr_pipeline splits the pool in two (AEC, post stages).
-$(OBJ_DIR)/aec_nr_pipeline.o: mono/aec_nr_res/main.c common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline.o: mono/aec_nr_res/main.c example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -DAEC_NR_POOL_SPLIT=1 -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/aec_nr_pipeline_static.o: mono/aec_nr_res/main.c common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/aec_nr_pipeline_static.o: mono/aec_nr_res/main.c example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # test_mono_chain: the mono chain over lib/aec's Aec -- pool carve vs heap, reset, switches,
@@ -591,7 +591,7 @@ $(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_alignulcnet_main.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h common/example_cli.h | _cfg_guard
+$(OBJ_DIR)/mono_alignulcnet_main.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
@@ -647,7 +647,7 @@ $(OBJ_DIR)/test_dfn_rate_bridge.o: dfn/tests/test_dfn_rate_bridge.c dfn/dfn_rate
 $(OBJ_DIR)/test_mono_dfn.o: mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_hop_pool.h dfn/tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h common/example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
+$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # test_dfn_hop: the DfnHop paths against twins built from the stream layer and from the shipped stage and bridge.
