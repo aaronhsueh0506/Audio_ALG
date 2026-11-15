@@ -168,10 +168,9 @@ unsigned int aiaec_state_generation(const AiaecCtx *ctx);
  * also restarts the stream's framing, so its pcm_out is exactly zero and the previous hop's audio is lost (one hop per event). */
 int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, AiaecWork *work);
 
-/* Closes the block; infer_status is read on SUBMIT only; ERR_SEQUENCE (no open block) writes nothing. pcm_out gets hop_in
- * samples. infer_status != 0 or a non-finite output bypasses the block: DeepVQE-S silence (fails CLOSED), Align-ULCNet the error
- * spectrum (fails OPEN). Only a non-finite output (Align-ULCNet: the mask or the enhanced spectrum) also zeroes the model state and
- * advances the generation, and so does a failed Align-ULCNet packet (N > 1) with an event hop. */
+/* Closes the block (infer_status read on SUBMIT only; ERR_SEQUENCE writes nothing); pcm_out gets hop_in samples. A failed or
+ * non-finite block is bypassed: DeepVQE-S silence, Align-ULCNet the error spectrum. A non-finite output, or a failed Align-ULCNet
+ * packet with an event hop, also zeroes the model state and advances the generation. */
 int aiaec_postprocess(AiaecCtx *ctx, int infer_status, int16_t *pcm_out);
 
 /* ---------------------------------------------------------------------------------------------

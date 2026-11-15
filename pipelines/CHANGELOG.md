@@ -3,6 +3,13 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — Align-ULCNet enhanced-spectrum check: rows for the last bin and for packet frame 0
+
+`stream/aiaec/tests/test_aiaec_packet.c` `section_model_io_enhanced_check` now also puts the overflowing mask bin alone in frame 0 of a packet, in the last bin of every packet frame (the event frame's is accepted: it is neither written nor scanned) and in the last bin of a one-frame call, the bin the NEON scan handles in its scalar tail. Three mutants of `ulcnet_model_io.c` that every test survived are now caught at SIMD=1 and 0: the one-frame scan skipping the last bin, the packet scan skipping frame 0, and the packet scan skipping each frame's last bin. No library change.
+
+- `docs/c_python_function_map.md` AIAEC-UL-02 is `partial` with the new gap D-45 (the check is C only; `export_onnx.host_back_end` has none); the statistics follow (AIAEC mirror 14, partial 21).
+- `aiaec_postprocess()`'s comment is back to three lines.
+
 ## [Unreleased] — 2026-11-15 — The int16 PCM entries round to nearest (`stream_saturate_s16()`), so an identity pass is exact
 
 `stream/common/stream_mem.h` `stream_saturate_s16()` truncated toward zero after scaling by 32768 and clipping, so every value in (-1, 1) LSB became 0 and every other one lost up to 1 LSB of magnitude: an int16 -> STFT -> ISTFT -> int16 identity pass changed 12-52 % of the samples by 1 LSB. It now rounds half away from zero, the rule of audiolib `wav_io.h`'s writer; NaN is still 0 and +-Inf / out-of-range values still clip.

@@ -78,11 +78,11 @@
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 295 | 39 | 19 | 20 | 256 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 145 | 48 | 25 | 23 | 97 | 0 | 2 | 17 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 96 | 35 | 20 | 15 | 61 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 874 | 176 | 98 | 78 | 698 | 0 | 57 | 62 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 96 | 35 | 14 | 21 | 61 | 0 | 0 | 15 |
+| `TOTAL` 合計 | 874 | 176 | 92 | 84 | 698 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：874 個 C 函式中，176 個有 Python 對應（mirror 98、partial 78），其中 62 個的配對是推論；698 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：874 個 C 函式中，176 個有 Python 對應（mirror 92、partial 84），其中 62 個的配對是推論；698 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -350,7 +350,7 @@
 | ID | C 檔:函式 | Python 檔:符號 | 關係 | 已知落差 | 對拍工具／測試 | 備註 |
 |---|---|---|---|---|---|---|
 | AIAEC-UL-01 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_prepare, ulcnet_model_io_prepare_packet, publish_views, frame_planes, front_end, front_end_scalar, front_end_neon, front_end_tail_one` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | mirror | D-34 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量） | 有號冪壓縮、幅度與壓縮域相位方向。16k/257 bin 與 48k/513 bin：error_mag 4.77e-7、far_mag 9.54e-7（一次性量測）。 |
-| AIAEC-UL-02 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_enhance_spectrum, ulcnet_model_io_enhance_packet, finish_is_valid, back_end, back_end_scalar, back_end_neon` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | mirror | D-34 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量）；`AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，<2e-5，出貨版與純量孿生） | 壓縮誤差乘上圖輸出的平面複數 mask，再做逆有號冪。enhance_spectrum 相對誤差 8e-8~5.8e-7。增強後頻譜的有限值檢查只在 C（非有限即拒收、state 歸零、generation +1）；Python 的 `host_back_end` 沒有這一步。 |
+| AIAEC-UL-02 | `lib/aiaec/ulcnet/ulcnet_model_io.c: ulcnet_model_io_enhance_spectrum, ulcnet_model_io_enhance_packet, finish_is_valid, back_end, back_end_scalar, back_end_neon` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | partial | D-34；D-45 | `AIAEC/tests/test_ulcnet_model_io_c.py`（C 契約）；`AIAEC/tests/test_prepost_kernels.py`（NEON 對純量）；`AIAEC/tests/test_ulcnet_process_c.py`（C↔Py，<2e-5，出貨版與純量孿生） | 壓縮誤差乘上圖輸出的平面複數 mask，再做逆有號冪。enhance_spectrum 相對誤差 8e-8~5.8e-7。增強後頻譜的有限值檢查只在 C（非有限即拒收、state 歸零、generation +1）；Python 的 `host_back_end` 沒有這一步。 |
 | AIAEC-UL-03 | `lib/aiaec/ulcnet/ulcnet_model_io.h: ulcnet_model_io_signed_pow` | `AIAEC/Align_ULCNet/model.py:_signed_power` | mirror | — | — | 檔內註解明載是 model.py `_signed_power` 的唯一 C 副本。 |
 | AIAEC-UL-06 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_pre_process_freq, ulcnet_prepost_pre_process_packet, ulcnet_prepost_frame_open` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）暫存一個 hop 的誤差頻譜與遠端頻譜，再送進 model I/O 的 prepare；頻譜由應用端的 AcStft 產生，類別不含框架。 |
 | AIAEC-UL-07 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_frame_finish, ulcnet_prepost_post_process_freq` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）把圖輸出送進 model I/O 的 `enhance_spectrum`，再交出增強後頻譜；合成由應用端的 AcIstft 完成。 |
@@ -394,6 +394,7 @@
 | D-42 | DFN2 fail-open：Python 不步進遞迴狀態；C 在輸出被拒時，把已註冊的遞迴狀態就地歸零並遞增 state generation，未註冊狀態的 stage 與 rate bridge 只遞增 generation，由持有狀態的模型回呼重載零；每個暖機幀（N = 1、M ≥ 1）也各歸零並遞增一次（heads 丟棄，音訊不變），Python 沒有這一步（它的 heads 不經加速器）。 |
 | D-43 | audiolib（SRP-PHAT、BF、VAD）與 ULCNet 範例 main 沒有 Python 版（設計如此）；Python 另有實驗專用開關。 |
 | D-44 | ULCNet 模型串流（`ulcnet_stream`）在對齊事件（`delay.changed`，或第一次轉為 solid）重啟模型 state（state generation 前進）並插入 `ULCNET_STREAM_REPRIME_FRAMES` 個恆等框。Python 串流推論（`AIAEC/Align_ULCNet/_streaming.py`）沒有逐 hop 事件來源：`lib/aec/python` 沒有 `AecLinearView.delay_state` 的對應存取器（只有 `get_post_reset_serial`），Python 無法從音訊推出事件。事件重播存在，但只從記錄檔來：`inference.py` 與 `inference.py calib` 的 `--events PATH`（`.json`／`.csv`／`.npz`，每個真實模型 hop 一筆 `(changed, solid)`），邊緣規則集中在 `AIAEC/Align_ULCNet/alignment_events.py` 的 `EdgeTracker`，N=1 與 N=8 共用。重播沿用 C `_freq` 的流程：事件 hop 重設模型 state 並以 error 頻譜旁路（N>1 為封包 graph 的 `frame_reset`），STFT／ISTFT 繼續跑，不重啟自己的分析與合成；C 的 PCM 入口（`aiaec_*`，以及外接 ISTFT 在 `synthesis_restart_mask` 重設的 `_spec`）會重啟，所以事件 hop 附近的 Python PCM 與 C `aiaec_*`／`_spec` 不同。沒有給 `--events` 時不會有任何事件。 |
+| D-45 | Align-ULCNet 增強後頻譜的有限值檢查只在 C（`ulcnet_model_io_enhance_spectrum`／`_enhance_packet`）：非有限即拒收、已註冊 state 歸零、generation +1；Python 的 `host_back_end` 沒有這一步。 |
 | S-04 | HPF 參數域檢查（0 < cutoff < 0.45 * sr）只在 C；Python 的 HighPassFilter／AecConfig 不檢查。 |
 | S-05 | AecResContext.filter_converged 在上升緣晚 1 hop：Python 在 update_convergence 之前建構 ctx。 |
 | S-14 | RNNoise-ERB 的 Valin post-filter（--pf-beta）只有 Python，C 沒有；出貨 beta=0 兩邊無差。 |
