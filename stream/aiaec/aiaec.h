@@ -118,7 +118,8 @@ typedef struct AiaecWork {
     AiaecTensorOut   outputs[AIAEC_MAX_OUTPUT_TENSORS];
     int              output_count;
     /* Sampled every SUBMIT block (0 on BYPASS): zero the accelerator's state whenever it differs from the last value seen.
-     * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run. */
+     * A failed run or readback (status != 0) leaves the generation unchanged (Align-ULCNet packet with an event hop: +1):
+     * zero the accelerator's state before its next run. */
     unsigned int     state_generation;
     /* Align-ULCNet PCM and _spec: bit k = model hop k (oldest first, N up to 64) restarted the stream's framing with the
      * model state; synthesis_restarted = any bit set. A _spec caller calls ac_istft_reset right before that hop's frame.

@@ -47,6 +47,7 @@ At N > 1 the graph restarts the model at an event hop itself (`frame_reset`), so
 - **Unchanged.** Every committed packet, every failed packet without an event, every one-frame hop and every refused finish (which already restarted the state and clears `prepared`, so it is not restarted twice). No pool, struct or layout change. No Python twin.
 - **Tests.** `stream/aiaec/tests/test_aiaec_packet.c` `section_failure`: a packet with the hop-10 event fails before the run (generation +1), a packet without an event fails (generation unchanged), and the next packet equals a run from a zero state. Mutations killed: the `prepared` gate removed (the refused-mask rows advance twice), no restart, a restart without an event, and a refused finish that keeps `prepared`.
 - **Board.** `alg_ai3_alignulcnet.c` and `uvc_audio_live3.c` only need a rebuild; no production Align-ULCNet graph is registered yet.
+- The general recovery sentence ("a failed run or readback leaves the generation unchanged") in `ulcnet_stream.h`, `aiaec.h` and `docs/reference/board/sequence.md` names this exception.
 
 ## [Unreleased] — 2026-11-15 — The DFN2 ERB file loader refuses bytes after the two tables and a forward table that is not finite (`AINR_ERR_ERB_FILE`)
 
