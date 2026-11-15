@@ -134,9 +134,9 @@ generation on that same hop, regardless of the callback's own return code.
 (pointer+count pairs, all-or-none) and owned in caller memory, or left to a hardware accelerator
 that tracks its own quantized copy. A `*_state_generation()` counter advances on every reset, every
 warm-up frame, every refused commit and every `frame_fail(p, 1)` (the stream does this for a run
-status other than `STREAM_RUN_OK` and `STREAM_RUN_NOT_STARTED`); an Align-ULCNet model restart
-advances it too, and a packet with an event frame whose run was `STREAM_RUN_NOT_STARTED` advances
-it once. Any accelerator-side state must be reloaded with quantized zero whenever the generation
+status other than `STREAM_RUN_OK` and `STREAM_RUN_NOT_STARTED`); an Align-ULCNet alignment restart
+(`frames_per_call` N = 1) advances it too; in a packet the graph restarts the model before the event
+hop and the generation stays, unless the run was `STREAM_RUN_NOT_STARTED`, which advances it once. Any accelerator-side state must be reloaded with quantized zero whenever the generation
 differs from its value at the last zeroing (not just at init/reset) or it will carry stale state
 into the next real frame; a board sample keeps no failure flag of its own. A DFN2 `infer()` that
 fails inside `dfn2_model_run_frame` is a `frame_fail(p, 1)`.
