@@ -31,7 +31,7 @@
 <p>三個模型的 init 都回 0 或負的錯誤碼，並填一份精簡的 info：圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code>。stream 函式庫不描述圖的埠：客戶只設 <code>sr、fft、hop_in</code>，N = <code>hop_in / (fft / 2)</code> 由 sample 從 config 算；每個已交付 graph 的訊號、head 與 state 的 shape 放在各函式庫旁的模型設定（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/aiaec/graph_io_deepvqes.h</code>、<code>stream/aiaec/graph_io_alignulcnet.h</code>，只有標頭，<code>ainr.h</code>／<code>aiaec.h</code> 不引用），共用的接線程式是 <code>stream/common/graph_io.h</code>。圖的埠順序是同一條規則：輸入為訊號再接 state、輸出為 head 再接 state，所以 sample 依位置綁埠並以 SDK 無關的檢查器 <code>stream_check_ports()</code>（<code>stream/common</code>）檢查，細節見<a href="dfn2/reference/board.html#info">板端整合</a>。</p>
 
 <h2 id="customer-headers">客戶標頭與 include 路徑</h2>
-<p>三個模型的板端 sample 只 include 下列本庫標頭，其餘（<code>lib/ainr/</code>、<code>lib/aiaec/</code> 與各模型的 <code>stream/*/*_stream.h</code>）是函式庫內部的。</p>
+<p>三個模型的產品路徑（<code>ainr.h</code>／<code>aiaec.h</code>）用下列本庫標頭。直接用頻域 core 的應用另外 include 各模型首頁所列的 <code>lib/ainr/</code>、<code>lib/aiaec/</code> 標頭。</p>
 <table><thead><tr><th>標頭</th><th>用途</th></tr></thead><tbody>
 <tr><td><code>stream/ainr/ainr.h</code></td><td>DFN2 產品介面</td></tr>
 <tr><td><code>stream/ainr/bridge/ainr_bridge.h</code></td><td>8／16 kHz host 經取樣率 bridge 接 48 kHz 模型</td></tr>

@@ -229,7 +229,7 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
 
 ## 13. Customer header set
 
-A board sample of DFN2, DeepVQE-S or Align-ULCNet includes only these project headers:
+The product path of DFN2, DeepVQE-S and Align-ULCNet (`ainr.h` / `aiaec.h`) uses these project headers:
 
 | Header | For |
 |---|---|
@@ -243,9 +243,9 @@ A board sample of DFN2, DeepVQE-S or Align-ULCNet includes only these project he
 
 Include roots: the directory of each header used, `stream/common`, audiolib `common/`
 (`stream_mem.h` includes `utility/mem_align.h`) and, with `ainr_bridge.h`, audiolib
-`common/include` (`fft_wrapper.h`). Library-internal headers (`lib/ainr/**`, `lib/aiaec/**`)
-and the per-model `stream/*/*_stream.h` are not part of this set; the one exception is a
-`-DDFN2_STREAM_NO_STDIO` build, which calls `stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
+`common/include` (`fft_wrapper.h`). An application on a frequency-domain core also includes the
+`lib/ainr/**` / `lib/aiaec/**` headers its model page names; a `-DDFN2_STREAM_NO_STDIO` build calls
+`stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
 
 - [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`
       and as C++11, given only the include roots above.
