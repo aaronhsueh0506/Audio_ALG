@@ -139,11 +139,12 @@ debug-only and is not part of the production ABI.
 
 `ulcnet_model_io_state_generation()` (also exposed as
 `ulcnet_prepost_state_generation()`) counts the times the C side
-restarted the state: `reset` and each refused frame add one, whether or not
-state is registered; it is 0 after init. A board whose accelerator keeps
-fixed-point state loads the quantized representation of zero into its state
-inputs at start, whenever the value differs from the one it last saw, and
-before the next run after any failed run or readback.
+restarted the state: `reset`, each refused frame and each run reported as
+started and failed (`stream_run.h`: any status except `STREAM_RUN_OK` and
+`STREAM_RUN_NOT_STARTED`) add one, whether or not state is registered; it is 0
+after init. A board whose accelerator keeps fixed-point state loads the
+quantized representation of zero into its state inputs at start and whenever
+the value differs from the one it last saw; it does not track failures itself.
 
 A board that calls the model I/O layer directly uses it in this order (error
 paths fail open and must not call `enhance_spectrum` with incomplete

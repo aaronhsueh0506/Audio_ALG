@@ -2,7 +2,7 @@
 
 DeepVQE-S consumes microphone and raw far-end audio and predicts complex CCM taps. The host applies the taps to the microphone spectrum. The single-model [PCM stream SDK](../../docs/html/models/deepvqe-s/index.html) handles the two analysis STFTs and output synthesis. For an application that already has spectra, use the [frequency core and state layout](../../docs/html/models/deepvqe-s/reference/core.html).
 
-After a failed job the current spectral contribution is zero. Output PCM can still contain the preceding frame’s overlap. Refill device state if a failed accelerator run may have partly updated it.
+After a failed job the current spectral contribution is zero. Output PCM can still contain the preceding frame’s overlap. The library moves the state generation after a run that started and failed, a refused result and a reset (and restarts its CCM ring); the sample zeroes the device state when it changes. Report `STREAM_RUN_NOT_STARTED` for a run that never reached the accelerator.
 
 ## Training
 
