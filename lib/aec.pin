@@ -9,5 +9,5 @@
 # step-5 "is the gitlink caught up with this pin" NOTE, never as the value a build is judged
 # against. Bump AEC_COMMIT in the same commit that bumps the gitlink, until step 5 (migrating the
 # gitlink itself) retires one of the two.
-AEC_COMMIT=13e804aed3e46614e1071c1a93126d31e5f4dc53
+AEC_COMMIT=921937ebb8c4e2f678f66e049743730ef50e37d0
 AEC_URL=https://github.com/aaronhsueh0506/AEC.git

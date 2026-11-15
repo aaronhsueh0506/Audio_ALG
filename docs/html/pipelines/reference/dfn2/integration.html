@@ -394,7 +394,7 @@ int four_dfn_run(void) {
   |                          |                          | model.reset(user)(有設才呼叫)                      |
   |                          |                          |----------------------------------------------------&gt;|
 -- 不要 reset 的情形 -----------------------------------------------------------------------------------------------------
-  | AEC delay 改變(delay_changed／AecArrayView.delay.changed):模型串流與 bridge 不消費 far-end,輸入仍連續,不 reset  |
+  | AEC delay 改變(AecLinearView.delay_state == CHANGED／AecArrayView.delay.changed):模型串流與 bridge 不消費 far-end,輸入仍連續,不 reset  |
   | nn_end(rc != 0):該幀 identity,不是錯誤,也不 reset   |                          |                          |</pre>
 </main>
 </body>

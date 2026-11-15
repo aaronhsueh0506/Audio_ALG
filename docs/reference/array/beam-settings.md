@@ -198,22 +198,22 @@ fallback VAD 的噪聲 EMA 係數（0.999／0.95）同樣依 hop retime。
 | `geometry` 與座標 | 不變 |
 
 ne10、`SIMD=1`、`delay_mode=MATCHED`（`delay_num_filters` = 5）預設的實測（`4ch_static --print-mem-size` 輸出，以及 `aec_get_mem_requirements()`、
-`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 3）。
+`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 4）。
 **Array** = `aec_get_mem_requirements()` 的 `req.bytes`（四條 lane、共用 estimator、對齊環、融合緩衝與增益級，加 `Aec` 結構）；**helper** = `array_sample_beam_get_mem_size()`；
 **Unit** = Array + helper（`4ch_static` 的 `Unit:`）；**後級** = NR + 合成 + 暫存（範例程式自己各自查大小後加總）。array 與 helper 都**不含**後級，後級另計：
 
 | Config | Array | helper | Unit | 後級 | 合計（`Total:`） |
 |---|---:|---:|---:|---:|---:|
-| 16000，全預設（256/128，`num_angles=72`） | 700,480（lane ×4 570,880） | 792,192 | 1,492,672 | 57,168 | 1,549,840 |
-| 16000，`fft_size = 512` | 1,091,072（lane ×4 937,664） | 1,569,920 | 2,660,992 | 79,264 | 2,740,256 |
-| 16000，`num_angles = 360` | 700,480 | 3,794,304 | 4,494,784 | 57,168 | 4,551,952 |
-| 48000，全預設（1024/512，`num_angles=72`） | 2,410,720（lane ×4 2,074,176） | 3,125,376 | 5,536,096 | 189,424 | 5,725,520 |
+| 16000，全預設（256/128，`num_angles=72`） | 700,464（lane ×4 570,880） | 792,192 | 1,492,656 | 57,168 | 1,549,824 |
+| 16000，`fft_size = 512` | 1,091,056（lane ×4 937,664） | 1,569,920 | 2,660,976 | 79,264 | 2,740,240 |
+| 16000，`num_angles = 360` | 700,464 | 3,794,304 | 4,494,768 | 57,168 | 4,551,936 |
+| 48000，全預設（1024/512，`num_angles=72`） | 2,410,704（lane ×4 2,074,176） | 3,125,376 | 5,536,080 | 189,424 | 5,725,504 |
 
 後級在 16 kHz/256 為 NR 44,256 + 合成 11,344 + 暫存 1,568 B，16 kHz/512 為 54,320 + 21,840 + 3,104 B，48 kHz/1024 為 140,416 + 42,832 + 6,176 B
 （`anr_get_mem_size()` 等的實測；增益級在 array 內，不再另列）。`4ch_static` 的 CLI 沒有 `num_angles` 選項，
 `num_angles = 360` 那列是在程式裡設 `bp.num_angles` 後呼叫 `array_sample_beam_get_mem_size()` 的結果，後級與合計欄用同格點的後級。
-`residual = STATE`（ULCNet 範例的設定，`delay_num_filters = 5`）時 array 較小（16 kHz/256 為 594,944、16 kHz/512 為 883,136、48 kHz/1024 為 1,994,912），
-Unit 為 1,387,136（16 kHz/256）、2,453,056（16 kHz/512）、5,120,288（48 kHz/1024）。
+`residual = STATE`（ULCNet 範例的設定，`delay_num_filters = 5`）時 array 較小（16 kHz/256 為 594,928、16 kHz/512 為 883,120、48 kHz/1024 為 1,994,896），
+Unit 為 1,387,120（16 kHz/256）、2,453,040（16 kHz/512）、5,120,272（48 kHz/1024）。
 
 ⚠ 上表是某一次建置的實測輸出，不是契約：這些 byte 數不會隨程式改動自動更新——引用前請自己現查一次。
 

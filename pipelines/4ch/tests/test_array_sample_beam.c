@@ -1783,8 +1783,7 @@ static int same_frame(const AecResidualView* a, const AecResidualView* b) {
            a->guard_lanes == b->guard_lanes && a->post_reset_serial == b->post_reset_serial &&
            bits_equal_f(a->max_dt, b->max_dt) &&
            bits_equal_f(a->max_saturation, b->max_saturation) && a->all_converged == b->all_converged &&
-           a->usable_linear == b->usable_linear && a->clock_drift == b->clock_drift &&
-           a->delay_changed == b->delay_changed && a->delay_locked == b->delay_locked;
+           a->usable_linear == b->usable_linear && a->clock_drift == b->clock_drift;
 }
 
 /* A hop refused for a non-finite sample changes no adaptive state and leaves nothing pending:

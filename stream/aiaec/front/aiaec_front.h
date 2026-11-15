@@ -32,7 +32,7 @@ extern "C" {
 
 enum {
     AIAEC_FRONT_ERR_DELAY = -201,   /* illegal delay policy (reachable only through aiaec_front_test.h) */
-    AIAEC_FRONT_ERR_AEC = -202      /* the AEC library refused the resolved configuration */
+    AIAEC_FRONT_ERR_AEC = -202      /* the AEC library refused the resolved configuration, or a hop of the block */
 };
 
 /* One block's output; pointers are front-owned (raw_far of a float call is the caller's far buffer), valid until the

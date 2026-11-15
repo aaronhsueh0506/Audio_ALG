@@ -1,5 +1,6 @@
-/* A non-finite sample in hop 0 or hop 1 of a block is refused (AIAEC_FRONT_ERR_AEC). The refusal resets the AEC, so the next block
- * equals a fresh front's output even when an earlier hop of the refused block had already advanced it. */
+/* A non-finite sample (the AEC answers AEC_ERR_ARG) or a finite one that overflows the hop (3e38: AEC_ERR_DSP) in hop 0 or hop 1
+ * of a block is refused (AIAEC_FRONT_ERR_AEC). The refusal resets the AEC, so the next block equals a fresh front's output even
+ * when an earlier hop of the refused block had already advanced it. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,12 +30,13 @@ static int fails;
 
 int main(void) {
     static const int bad_at[] = { 3, N / 2 + 3 };   /* hop 0 and hop 1 of a two-hop block */
-    for (int w = 0; w < 2; ++w) {
+    static const float bad_value[] = { NAN, 3.0e38f };
+    for (int w = 0; w < 4; ++w) {
         void *p1, *p2; AiaecFront *a = mk(&p1), *fresh = mk(&p2);
         AiaecFrontOut oa, of; float m[N], f[N], bad[N];
         for (int k = 0; k < 30; ++k) { sig(m, f, k); CHECK(aiaec_front_process_f32(a, m, f, N, &oa) == AIAEC_OK, "warm-up"); }
-        sig(m, f, 30); memcpy(bad, m, sizeof m); bad[bad_at[w]] = NAN;
-        CHECK(aiaec_front_process_f32(a, bad, f, N, &oa) == AIAEC_FRONT_ERR_AEC, "non-finite mic is refused");
+        sig(m, f, 30); memcpy(bad, m, sizeof m); bad[bad_at[w % 2]] = bad_value[w / 2];
+        CHECK(aiaec_front_process_f32(a, bad, f, N, &oa) == AIAEC_FRONT_ERR_AEC, "case %d: the bad mic sample is refused", w);
         CHECK(oa.formed_hop == NULL && oa.event_count == 0, "out cleared");
         sig(m, f, 31);
         CHECK(aiaec_front_process_f32(a, m, f, N, &oa) == AIAEC_OK, "block after the refusal");

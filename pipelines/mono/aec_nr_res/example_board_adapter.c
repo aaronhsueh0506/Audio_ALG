@@ -238,6 +238,7 @@ static float lcg_sample(void) {
  * before any DMA-out. */
 static int run_hops(MonoStages* s, int hop, int n_hops) {
     float mic[MAX_HOP], ref[MAX_HOP], out[MAX_HOP];
+    int refused = 0;
     if (hop <= 0 || hop > MAX_HOP) {
         fprintf(stderr, "run_hops: hop=%d out of expected range (1..%d)\n", hop, MAX_HOP);
         return 0;
@@ -248,13 +249,19 @@ static int run_hops(MonoStages* s, int hop, int n_hops) {
             mic[i] = 0.3f * ref[i] + 0.05f * lcg_sample();   /* echo + a bit of near-end */
         }
         if (mono_hop(s, mic, ref, out) != 0) {
-            fprintf(stderr, "run_hops: the hop failed at hop %d\n", h);
-            return 0;
+            /* A refused hop (e.g. AEC_ERR_DSP, the AEC already reset): silence, every stage restarts, the stream goes on. */
+            mono_reset(s);
+            memset(out, 0, (size_t)hop * sizeof(float));
+            ++refused;
         }
         if (!skn_all_finite_f32(out, (size_t)hop)) {
             fprintf(stderr, "run_hops: non-finite output at hop %d\n", h);
             return 0;
         }
+    }
+    if (refused) {   /* the smoke input is benign: any refusal is a failure */
+        fprintf(stderr, "run_hops: %d of %d hops refused\n", refused, n_hops);
+        return 0;
     }
     return 1;
 }

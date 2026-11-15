@@ -548,6 +548,63 @@ static void test_reset_equals_fresh_instance(int sr, int fft_size, int enable_cn
     free(pool_a); free(pool_b);
 }
 
+/* A refused hop (one microphone sample of 3e38: the AEC answers AEC_ERR_DSP and resets itself) handled as main.c does it:
+ * rig_reset() and a zero hop. Every later hop equals a fresh chain started on the hop after the refusal. */
+static void test_refused_hop_restarts_chain(int sr, int fft_size) {
+    enum { HIST = 8192, BAD = 120, AFTER = 200 };
+    Plan p;
+    ConvMonoConfig o = grid_opts(sr, fft_size);
+    Rig subject, fresh;
+    void *pool_a, *pool_b;
+    float *mic, *ref, *out_a, *out_b, *hist;
+    unsigned int rng = 0x2468aceu;
+    long differing = 0, refused_elsewhere = 0, compared = 0;
+    int refused_bad = 0, hop;
+
+    o.enable_cng = 1;
+    o.enable_nr = 1;
+    if (plan_make(&p, &o) != 0) {
+        fprintf(stderr, "FAIL: setup (plan) for the refused hop @ %d Hz\n", sr);
+        g_failures++;
+        return;
+    }
+    pool_a = aligned_block(p.total, 0);
+    pool_b = aligned_block(p.total, 0);
+    if (!pool_a || !pool_b || rig_init_pool(&subject, pool_a, p.total, &p) != 0) {
+        fprintf(stderr, "FAIL: init for the refused hop @ %d Hz\n", sr);
+        g_failures++;
+        free(pool_a); free(pool_b);
+        return;
+    }
+    hop = p.grid.hop_size;
+    mic = (float*)malloc((size_t)hop * sizeof(float));
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    out_a = (float*)malloc((size_t)hop * sizeof(float));
+    out_b = (float*)malloc((size_t)hop * sizeof(float));
+    hist = (float*)calloc(HIST, sizeof(float));
+    for (int h = 0; h < BAD + 1 + AFTER; h++) {
+        reset_scene_hop(&rng, mic, ref, hop, h, hist, HIST, 293, 0.5f);
+        if (h == BAD) mic[3] = 3.0e38f;
+        if (rig_hop(&subject, mic, ref, out_a) != 0) {
+            rig_reset(&subject);
+            memset(out_a, 0, (size_t)hop * sizeof(float));
+            if (h == BAD) refused_bad = 1; else refused_elsewhere++;
+            if (h == BAD && rig_init_pool(&fresh, pool_b, p.total, &p) != 0) break;
+            continue;
+        }
+        if (h <= BAD || !refused_bad) continue;
+        compared++;
+        if (rig_hop(&fresh, mic, ref, out_b) != 0 || memcmp(out_a, out_b, (size_t)hop * sizeof(float)) != 0) differing++;
+    }
+    CHECK(refused_bad && refused_elsewhere == 0 && compared == AFTER && differing == 0,
+          fmt_msg("refused hop @ %d Hz / %d: refused on the poisoned hop %d, elsewhere %ld; %ld of %ld later hops differ "
+                  "from a fresh chain", sr, fft_size, refused_bad, refused_elsewhere, differing, compared));
+    free(mic); free(ref); free(out_a); free(out_b); free(hist);
+    rig_free(&subject);
+    if (refused_bad) rig_free(&fresh);
+    free(pool_a); free(pool_b);
+}
+
 /* Teardown of a pool-resident instance is repeatable and NULL-safe, and the pool stays the
  * caller's and reusable. */
 static void test_destroy_idempotence(int sr, int fft_size) {
@@ -1931,6 +1988,7 @@ int main(int argc, char** argv) {
         test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/1, /*enable_nr=*/1);
         test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/0, /*enable_nr=*/1);
         test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/0, /*enable_nr=*/0);
+        test_refused_hop_restarts_chain(sr, fft_size);
         test_destroy_idempotence(sr, fft_size);
     }
 

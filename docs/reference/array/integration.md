@@ -205,7 +205,7 @@ int main(void) {
 }
 ```
 
-將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴；執行會印 `ok hop=128 n_freqs=129 pool=700480`
+將範例存成 Audio_ALG 根目錄的 `app.c`。以下使用預設的 sibling 依賴；執行會印 `ok hop=128 n_freqs=129 pool=700464`
 （`pool` 隨函式庫版本與編譯選項而變，見 [config.md §4.4](config.md#44-檢視欄位記憶體用量與實測-pool)）。
 
 ```sh

@@ -176,12 +176,12 @@ requires the final int8/fp runtime and board cycle measurement.
 Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter bank, NE10; the
 array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
 the P buffer, and the DFN tail of `dfn_hop_pool_bytes()`, each part 16-byte
-aligned; shipped pair): 1,716,576 bytes at the 16 kHz default (array plus helper 1,492,672 bytes, the P buffer, and a DFN tail of
+aligned; shipped pair): 1,716,560 bytes at the 16 kHz default (array plus helper 1,492,656 bytes, the P buffer, and a DFN tail of
 222,864 bytes: the model stream 92,688, the six conversion buffers 12,312 and the bridge 117,856) and
-5,692,160 bytes at 48 kHz (array plus helper 5,536,096 bytes; DFN tail 151,952: the stream and the buffers, the synthesis 42,832
+5,692,144 bytes at 48 kHz (array plus helper 5,536,080 bytes; DFN tail 151,952: the stream and the buffers, the synthesis 42,832
 and the output spectrum 4,104). The stream is a `freq_only` one (`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`):
-its pool holds the `DFN2Prepost` and no analysis, synthesis or PCM buffer. The array's own pool is 700,480 bytes at
-16 kHz/256 (the lanes 570,880 of it; `residual = STATE` 594,944 bytes).
+its pool holds the `DFN2Prepost` and no analysis, synthesis or PCM buffer. The array's own pool is 700,464 bytes at
+16 kHz/256 (the lanes 570,880 of it; `residual = STATE` 594,928 bytes).
 Model weights, accelerator activation/workspace memory and the recurrent state are external;
 adding int8 weights alone brings the pool plus weights to about 3.7 MiB at
 16 kHz.

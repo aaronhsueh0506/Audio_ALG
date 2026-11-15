@@ -240,6 +240,7 @@ int main(int argc, char** argv) {
     int grid_index;
     int hop;
     int index;
+    int refused = 0;
     int rc;
     rc = parse_options(argc, argv, &profile, &grid_index);
     if (rc != 0) return rc == 1 ? 0 : rc;
@@ -307,12 +308,15 @@ int main(int argc, char** argv) {
         /* Host smoke path: a product calls the hop once per grid.hop-sample hop. */
         for (hop = 0; hop < 4 && rc == 0; ++hop) {
             if (process_hop(aec, stream, &framing, mic, far, output) != 0) {
-                reset_pipeline(aec, stream, &framing);   /* the AEC, the stream and the transforms restart together */
-                rc = 1;
+                /* A refused hop (e.g. AEC_ERR_DSP): silence, and the AEC, the stream and the transforms restart together. */
+                reset_pipeline(aec, stream, &framing);
+                memset(output, 0, (size_t)grid.hop * sizeof(float));
+                ++refused;
             }
             for (index = 0; index < grid.hop && rc == 0; ++index)
                 if (!isfinite(output[index])) rc = 1;
         }
+        if (refused) rc = 1;   /* the smoke input is benign: any refusal is a failure */
     }
 
     if (aec) aec_destroy(aec);

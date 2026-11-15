@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
     static float mic[HOST_MAX_HOP];
     static float far[HOST_MAX_HOP];
     static float output[HOST_MAX_HOP];
-    int hop, index, rc, hop_size, latency, status = 1;
+    int hop, index, rc, hop_size, latency, refused = 0, status = 1;
 
     rc = dfn_example_parse_args(argc, argv, name, HOST_RATES, &args);
     if (rc != 0) return rc == 1 ? 0 : rc;
@@ -260,9 +260,10 @@ int main(int argc, char **argv) {
      * (the latency) come out silent. */
     for (hop = 0; hop < 8; ++hop) {
         if (rig_process(&rig, mic, far, output) != 0) {
+            /* A refused hop (e.g. AEC_ERR_DSP, the AEC already reset): silence, every stage restarts, the next hop runs. */
             rig_reset(&rig);
-            rig_free(&rig);
-            goto done;
+            memset(output, 0, (size_t)hop_size * sizeof(float));
+            ++refused;
         }
         for (index = 0; index < hop_size; ++index) {
             if (!isfinite(output[index])) {
@@ -272,6 +273,10 @@ int main(int argc, char **argv) {
         }
     }
     rig_free(&rig);
+    if (refused) {   /* the smoke input is benign: any refusal is a failure */
+        fprintf(stderr, "%s: %d of 8 hops refused\n", name, refused);
+        goto done;
+    }
     printf("%s: fail-open board skeleton PASS\n", name);
     status = 0;
 done:
