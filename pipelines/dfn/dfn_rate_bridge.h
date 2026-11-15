@@ -1,5 +1,7 @@
 /* Rate bridge: runs the DFN2 stage on its 48 kHz grid inside a pipeline whose
- * own grid is 8 or 16 kHz. AEC, RES, BF and comfort noise stay on the native grid.
+ * own grid is 8 or 16 kHz. A thin adapter: the resampling, 48 kHz framing, FIFOs and delay are
+ * stream/ainr/bridge's AinrBridge (which embeds no model); this layer puts the configured
+ * dfn_res_stage between its "model-rate spectra out" and "enhanced spectrum back". AEC, RES, BF and comfort noise stay on the native grid.
  * Per native hop:
  *   E, P (native spectra) -> iFFT + sqrt-Hann WOLA -> e[n], p[n] (native)
  *   -> resample up (x3 at 16 kHz, x6 at 8 kHz) -> 48 kHz FIFOs
@@ -28,8 +30,8 @@
  * hop the serial protocol demands (no delay line; the 48 kHz stage path synthesises its output
  * L hops after the spectra went in and delays the clear by L). Everything downstream of those
  * two objects is a continuous time-domain stream and is left alone.
- * Memory: static pool with the 32-byte descriptor; the stage and resampler pools
- * are carved inside it. No heap after init, no stdio. */
+ * Memory: static pool with the 32-byte descriptor; the AinrBridge and stage pools are carved
+ * inside it. No heap after init, no stdio. */
 
 #ifndef DFN_RATE_BRIDGE_H
 #define DFN_RATE_BRIDGE_H
@@ -45,7 +47,7 @@ extern "C" {
 
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 /* Carve layout version; bumped on any change of pool size, carve order or descriptor. */
-#define DFN_RATE_BRIDGE_LAYOUT_VERSION     6u
+#define DFN_RATE_BRIDGE_LAYOUT_VERSION     7u
 /* Denominator of dfn_rate_bridge_added_delay_exact(): sixths of a native sample. */
 #define DFN_RATE_BRIDGE_DELAY_DENOMINATOR  6
 
@@ -65,7 +67,7 @@ typedef struct {
     uint32_t descriptor_version;  /* DFN_RATE_BRIDGE_DESCRIPTOR_VERSION      */
     uint32_t layout_version;      /* DFN_RATE_BRIDGE_LAYOUT_VERSION          */
     uint32_t backend_id;          /* the stage's backend id                  */
-    uint32_t build_flags_hash;    /* FNV-1a-32: the stage's hash, FIFO caps, resampler pool sizes */
+    uint32_t build_flags_hash;    /* FNV-1a-32: this layout, the stage's hash and the AinrBridge's */
     uint32_t alignment;           /* 16                                      */
     uint32_t reserved;            /* 0                                       */
     uint64_t bytes;

@@ -40,7 +40,8 @@ disas() { fp_contract_disas "$1"; }
 # kernels audited elsewhere.
 ENTRIES='
 .:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- boundary scaling by dfn2_stft_scale()/dfn2_stft_unscale()
-.:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
+.:libaudio_pipeline_dfn.a:ainr_bridge.o:sample-rate bridge (stream/ainr/bridge) -- host and 48 kHz WOLA, analysis windows, resamplers
+.:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge adapter -- the stage hand-off around ainr_bridge
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming enhance-spectrum kernels
 .:mono_alignulcnet:ulcnet_nn_stage.o:Align-ULCNet stage (mono build) -- spectrum copies and the model-output finite check
 @AEC@:lib:aec_array.o:4-channel array instance in lib/aec -- lane-spectrum projection and the fused PSD views

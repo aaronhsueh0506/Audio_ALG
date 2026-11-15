@@ -41,7 +41,8 @@ Pass conditions:
 
 `make -C pipelines test` also builds and runs the shared post-RES DFN2
 stage, the rate bridge that takes that stage to its 48 kHz grid from a
-product-rate host, and the mono example that composes lib/aec's `Aec` (its own RES
+product-rate host (`dfn/dfn_rate_bridge.c`, a thin adapter over `stream/ainr/bridge`'s
+model-free `AinrBridge`; `make -C stream/ainr/bridge test` is the bridge's own gate), and the mono example that composes lib/aec's `Aec` (its own RES
 gain, formed into P in the example's `rig_process`; no denoiser; the host synthesis is
 the example's `AcIstft` on the stage path and the bridge's own otherwise) and
 `dfn/dfn_hop.h`:
@@ -120,7 +121,8 @@ Pass conditions:
       `8000` and `48000`, and prints a pool size, hop and algorithmic latency
       for each.
 - [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (carrying
-      `dfn_rate_bridge.o`, built from `dfn/dfn_rate_bridge.c`) and the `mono_aec_dfn_res` board skeleton alongside
+      `dfn_rate_bridge.o`, built from `dfn/dfn_rate_bridge.c`, and `ainr_bridge.o`, built from
+      `stream/ainr/bridge/ainr_bridge.c`) and the `mono_aec_dfn_res` board skeleton alongside
       the other artifacts.
 
 ## 9. Four-channel pipeline gate
@@ -202,7 +204,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`); `AEC_LAYOUT_VERSION` is 3 (the `Aec` pool, array included).
+      `dfn_rate_bridge.o` and `ainr_bridge.o`); `AEC_LAYOUT_VERSION` is 3 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

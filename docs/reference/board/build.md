@@ -208,7 +208,7 @@ against the row; tested by `make -C stream/common test-graph-io`). A sample adds
 `stream/common/stream_mem.h`), and a
 configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is
 `-DDFN2_MASK_ONLY`; every DFN2 unit of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`,
-`dfn_rate_bridge.c`) hold no grid and no pair either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and
+`dfn_rate_bridge.c`, over `stream/ainr/bridge/ainr_bridge.c`, which needs `-I stream/ainr/bridge` when `dfn_rate_bridge.c` is compiled from source and is a member of `libaudio_pipeline_dfn.a`) hold no grid and no pair either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and
 synthesis scales and the overlap-add mode are part of each library's framing contract (see its header or README): the model streams take
 and return audio-scale spectra (the default `AcStft` / `AcIstft` scales of 1) and convert to the model scale internally, and the
 DFN2, Align-ULCNet and DeepVQE-S samples synthesize with `AC_OLA_ACCUMULATE`.

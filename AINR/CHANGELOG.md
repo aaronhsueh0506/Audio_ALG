@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New `stream/ainr/bridge` (`AinrBridge`): the 8 / 16 kHz host to 48 kHz model sample-rate bridge, without a model inside
+
+`ainr_bridge.{h,c}` carries the signal path that `pipelines/dfn/dfn_rate_bridge.c` used to own (host-grid WOLA, resamplers, 48 kHz analysis and synthesis, FIFOs, prefill, added delay); the caller runs any 48 kHz / 1024 model (`dfn2_stream_*_freq`, `ainr_*_freq`, DFN3) between `ainr_bridge_model_begin()` and `ainr_bridge_model_end()`. The configuration carries `lookahead_frames` only. No change to `lib/ainr`, `ainr.h` or any DFN2 pool; `dfn_rate_bridge` in `pipelines/dfn` is an adapter over it with identical output (details in `pipelines/CHANGELOG.md`). Page: `docs/html/models/dfn2/reference/bridge.html`.
+
 ### `dfn2_stream` init refuses an inverse ERB table that is not a partition of unity
 
 `dfn2_stream_init[_ex]` and `dfn2_stream_init_from_erb_file[_ex]` (and so `ainr_init*`, `AINR_ERR_ERB_FILE`) return NULL for an `erb_inv` whose bins' band weights do not sum, band-ascending in float32, to exactly 1.0f, the rule `export_erb_matrix.py` applies before it writes and `dfn_res_stage.c` applies at `get_mem_requirements()`. Pool size, descriptor and `DFN2_STREAM_LAYOUT_VERSION` are unchanged. Every ERB matrix the exporter writes for the shipped and test grids (48k/1024/32, 16k/256/24, 32k/512/28, 16k/512/24 and /32, 8k/256/24; from the checkpoints `dfn2_best.pth` and `dfn2_last.pth` too) passes with deviation 0. The stand-in tables of the stream and ainr tests are partitions now. Details and the equivalence test against `DfnResStage` are in `pipelines/CHANGELOG.md`.

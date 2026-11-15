@@ -64,6 +64,8 @@ include ../../lib/deps.mk
 # Model cores moved to lib/ainr/, lib/aiaec/ by the single-model-release restructuring.
 ULCNET_DIR ?= $(ALG_DIR)/lib/aiaec/ulcnet
 DFN2_DIR ?= $(ALG_DIR)/lib/ainr/dfn2
+# The sample-rate bridge (stream/ainr/bridge) that ../dfn/dfn_rate_bridge.c adapts.
+BRIDGE_DIR ?= $(ALG_DIR)/stream/ainr/bridge
 
 # DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 stage, the
 # bridge and the example main take their grid and pair at run time (the config carries a DFN2Grid),
@@ -267,7 +269,7 @@ PRODUCER_SIGS += SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG)
 endif
 
 SRCS := array_sample_beam.c \
-        ../dfn/dfn_res_stage.c ../dfn/dfn_rate_bridge.c \
+        ../dfn/dfn_res_stage.c ../dfn/dfn_rate_bridge.c $(BRIDGE_DIR)/ainr_bridge.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
         ../ulcnet/ulcnet_nn_stage.c \
@@ -297,6 +299,7 @@ DFN_PIPELINE_LIB := $(BIN_DIR)/libdfn_res_stage.a
 SAMPLE_BEAM_OBJ := $(OBJ_DIR)/array_sample_beam.o
 DFN_PIPELINE_OBJS := $(OBJ_DIR)/dfn_res_stage.o \
                      $(OBJ_DIR)/dfn_rate_bridge.o \
+                     $(OBJ_DIR)/ainr_bridge.o \
                      $(OBJ_DIR)/dfn2_process.o \
                      $(OBJ_DIR)/dfn2_model_io.o \
                      $(OBJ_DIR)/dfn2_prepost.o
@@ -333,8 +336,11 @@ $(OBJ_DIR)/array_sample_beam.o: array_sample_beam.c array_sample_beam.h | _cfg_g
 $(OBJ_DIR)/dfn_res_stage.o: ../dfn/dfn_res_stage.c ../dfn/dfn_res_stage.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn_rate_bridge.o: ../dfn/dfn_rate_bridge.c ../dfn/dfn_rate_bridge.h ../dfn/dfn_res_stage.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/dfn_rate_bridge.o: ../dfn/dfn_rate_bridge.c ../dfn/dfn_rate_bridge.h ../dfn/dfn_res_stage.h $(BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -I$(BRIDGE_DIR) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/ainr_bridge.o: $(BRIDGE_DIR)/ainr_bridge.c $(BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -I$(BRIDGE_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
