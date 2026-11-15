@@ -335,7 +335,7 @@ deepvqe_prepost_post_process_freq
 ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE；每拍回滿一個 hop，含首拍)
   |
   v
-float -> int16 飽和轉換（push 回 0 時填零；N=1 不會發生）
+float -> int16 飽和轉換（×32768，四捨五入、半值遠離零）（push 回 0 時填零；N=1 不會發生）
   |
   v
 PCM out (int16, 永遠完整一個 hop)

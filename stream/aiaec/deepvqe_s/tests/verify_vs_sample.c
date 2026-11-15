@@ -154,7 +154,7 @@ static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *written_
         float v = d->hop_out[k] * 32768.0f;
         if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
-        pcm_out[k] = (int16_t)v;
+        pcm_out[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);   /* round half away from zero */
     }
     return 1;
 }
@@ -466,7 +466,8 @@ static int run_fail_closed_oracle(int kind) {   /* 0 status only, 1 non-finite t
         if (ac_istft_push_planar(O.istft, O.mic_re, O.mic_im, O.hop_out) != hop) { bad++; continue; }
         for (k = 0; k < hop; ++k) {
             float v = O.hop_out[k] * 32768.0f;
-            pcm_o[k] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+            v = v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v;
+            pcm_o[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
         }
 
         if (deepvqe_stream_pre_process(B, mic_in, far_in, &io) != 1) { bad++; continue; }

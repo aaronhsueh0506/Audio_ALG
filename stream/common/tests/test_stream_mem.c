@@ -29,6 +29,25 @@ int main(void) {
     CHECK(stream_saturate_s16(0.5f) == 16384 && stream_saturate_s16(2.0f) == 32767 &&
           stream_saturate_s16(-2.0f) == -32768 && stream_saturate_s16(NAN) == 0 &&
           stream_saturate_s16(INFINITY) == 32767 && stream_saturate_s16(-INFINITY) == -32768, "saturate");
+    {   /* round half away from zero, in LSB: not truncation (0.6), not ties to even (2.5), not floor(v + 0.5) (-0.5) */
+        static const float lsb[][2] = {
+            { 0.4f, 0 }, { 0.5f, 1 }, { 0.6f, 1 }, { 1.5f, 2 }, { 2.5f, 3 }, { -0.4f, 0 }, { -0.5f, -1 }, { -0.6f, -1 },
+            { -1.5f, -2 }, { -2.5f, -3 }, { 32766.4f, 32766 }, { 32766.5f, 32767 }, { 32767.4f, 32767 }, { 32767.6f, 32767 },
+            { -32767.4f, -32767 }, { -32767.5f, -32768 }, { -32768.6f, -32768 },
+        };
+        size_t i;
+        int x, bad = 0;
+        for (i = 0; i < sizeof lsb / sizeof lsb[0]; ++i)
+            CHECK(stream_saturate_s16(lsb[i][0] / 32768.0f) == (int16_t)lsb[i][1], "saturate(%g LSB) = %d, want %d",
+                  (double)lsb[i][0], stream_saturate_s16(lsb[i][0] / 32768.0f), (int)lsb[i][1]);
+        /* int16 -> float -> int16 is exact, also one float step either side of the exact value */
+        for (x = -32768; x <= 32767; ++x) {
+            const float f = (float)x / 32768.0f;
+            bad += stream_saturate_s16(f) != x || stream_saturate_s16(nextafterf(f, 0.0f)) != x ||
+                   stream_saturate_s16(nextafterf(f, x < 0 ? -1.0f : 1.0f)) != x;
+        }
+        CHECK(bad == 0, "int16 round trip: %d of 65536 values not restored", bad);
+    }
 
     if (g_fail) { printf("test_stream_mem: %d of %d check(s) FAILED\n", g_fail, g_checks); return 1; }
     printf("test_stream_mem: PASS (%d checks)\n", g_checks);

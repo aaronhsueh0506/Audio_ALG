@@ -335,7 +335,7 @@ dfn2_prepost_post_process_freq
 ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE)
   |
   v
-float -> int16 飽和轉換
+float -> int16 飽和轉換（×32768，四捨五入、半值遠離零）
   |
   v
 PCM out (int16, 永遠完整一個 hop)

@@ -600,7 +600,7 @@ static int section_trim_align(void) {
         v = residual[k] * 32768.0f;
         if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
-        expect_pcm[k] = (int16_t)v;
+        expect_pcm[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
     }
     for (bidx = 0; bidx < blocks; ++bidx) {
         AiaecInput input;

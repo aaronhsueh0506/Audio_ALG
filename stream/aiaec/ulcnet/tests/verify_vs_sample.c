@@ -212,7 +212,7 @@ static int board_post(BoardDriver *d, int pre_rc, int ai_rc, int16_t *pcm_out, i
         float v = d->hop_out[k] * 32768.0f;
         if (v > 32767.0f) v = 32767.0f;
         if (v < -32768.0f) v = -32768.0f;
-        pcm_out[k] = (int16_t)v;
+        pcm_out[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);   /* round half away from zero */
     }
     return 1;
 }
