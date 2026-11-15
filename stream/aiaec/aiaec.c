@@ -739,7 +739,8 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
 
         if (c->frames_per_call > 1) {
             /* A packet: one event per model hop, one job for all of them. The graph resets and bypasses an
-             * event hop itself (no generation change); a PCM entry restarts its own framing at those hops. */
+             * event hop itself (no generation change; a failed job advances it instead); a PCM entry restarts its own
+             * framing at those hops. */
             UlcnetStreamDelay delays[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
             int k;
 

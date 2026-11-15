@@ -16,7 +16,8 @@
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries
  * refuse such a stream and the packet entries a one-hop stream. delay[k] is hop k's event, oldest first, edge rule as above
  * with the previous solid carried across packets; the graph resets the model before an event hop and bypasses it (generation
- * unchanged). A failed or non-finite job passes all N error spectra through.
+ * unchanged). A failed or non-finite job passes all N error spectra through; a failed job with an event hop advances the
+ * generation.
  *
  * A caller with its own analysis and synthesis uses the _freq entries; cfg.freq_only then keeps the FFT, STFT / ISTFT and
  * PCM scratch out of the pool. */

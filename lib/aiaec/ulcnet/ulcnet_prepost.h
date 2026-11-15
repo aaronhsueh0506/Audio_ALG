@@ -123,9 +123,9 @@ int ulcnet_prepost_frame_open(UlcnetPrepost *p,
  * generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
 int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
 
-/* Identity for the current frame (after a failed run or a reprime): the error spectrum passes through without the AEC
- * output guard, so on a guard hop it can exceed the capture. State is left as is. Returns 0, or -1. A packet is
- * bypassed whole: all N frames. */
+/* Identity for the current frame (after a failed run or a reprime): the error spectrum, without the AEC output guard (on a
+ * guard hop it can exceed the capture). Returns 0, or -1. A packet is bypassed whole; one opened by frame_open() with an event
+ * frame also zeroes the state and advances the generation (its run's restart). Otherwise state is left as is. */
 int ulcnet_prepost_frame_bypass(UlcnetPrepost *p);
 
 /* The enhanced spectrum (n_bins bins; a packet: N * n_bins) of the frame just finished or bypassed. Returns 0, or -1. */

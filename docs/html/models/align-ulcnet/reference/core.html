@@ -285,7 +285,7 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 <tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
 <tr><td><code>frame_finish</code></td><td>-1</td><td>mask、登錄的 state 或增強後的頻譜有非有限值（mask 有限但逆冪溢位也算；或沒先 <code>frame_open</code>）：登錄的 state 全部歸零、generation +1、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
-<tr><td><code>frame_bypass</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子；這個 error 是未經 guard 的 analysis residual，guard 作用的 hop 上可能大於 capture）</td></tr>
+<tr><td><code>frame_bypass</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子；封包經 frame_open 後若有事件幀，改為 state 歸零、generation +1；這個 error 是未經 guard 的 analysis residual，guard 作用的 hop 上可能大於 capture）</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
 </table></div>
 

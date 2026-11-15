@@ -852,27 +852,49 @@ static int section_failure(void) {
               "refused mask %d: generation changes seen by the accelerator %u (%u -> %u)", m, r.gen_changes, r.first_gen, r.last_gen);
     }
 
-    /* inference failure: infer_status != 0 passes the packet through and leaves the generation alone */
-    if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
-    accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
-    gen_before = aiaec_state_generation_freq(c.freq);
-    for (p = 0; p < 3; ++p) {
+    /* infer_status != 0 before the device run: the packet passes through. Packet 1 carries the hop-10 event the graph
+     * never applied, so the generation advances once and the accelerator restarts its state for packet 3; packet 2 has
+     * no event and leaves the generation alone. Packet 3 must then equal a run that starts from a zero state. */
+    {
+        static float re[NF * BINS], im[NF * BINS], fresh_re[NF * BINS], fresh_im[NF * BINS];
+        unsigned gen_seen[4];
         AiaecFreqInput fin;
         AiaecWork w;
-        static float re[NF * BINS], im[NF * BINS];
-        freq_input(&fin, p * NF, NF, s.ev);
-        CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK, "failure preprocess %d", p);
+
+        if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
+        accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
+        freq_input(&fin, 3 * NF, NF, s.ev);
+        CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK, "failure: fresh preprocess");
         accel_run(&acc, &w, NF);
-        CHECK(aiaec_postprocess_freq(c.freq, p == 1 ? 7 : 0, re, im) == AIAEC_OK, "failure postprocess %d", p);
-        if (p == 1)
-            CHECK(memcmp(re, g_ere + (size_t)p * NF * BINS, sizeof(re)) == 0 && memcmp(im, g_eim + (size_t)p * NF * BINS, sizeof(im)) == 0,
-                  "infer_status != 0: packet %d is not the error spectrum", p);
-        else
-            CHECK(memcmp(re, g_ere + (size_t)p * NF * BINS, sizeof(re)) != 0, "packet %d should be enhanced", p);
+        CHECK(aiaec_postprocess_freq(c.freq, 0, fresh_re, fresh_im) == AIAEC_OK, "failure: fresh postprocess");
+        ctxs_free(&c);
+
+        if (ctxs_make(&c, NF, 0, 0, 1) != 0) return 1;
+        accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
+        gen_before = aiaec_state_generation_freq(c.freq);
+        for (p = 0; p < 4; ++p) {
+            const int failed = p == 1 || p == 2;
+            freq_input(&fin, p * NF, NF, s.ev);
+            CHECK(aiaec_preprocess_freq(c.freq, &fin, &w) == AIAEC_OK, "failure preprocess %d", p);
+            if (!failed) accel_run(&acc, &w, NF);
+            CHECK(aiaec_postprocess_freq(c.freq, failed ? 7 : 0, re, im) == AIAEC_OK, "failure postprocess %d", p);
+            gen_seen[p] = aiaec_state_generation_freq(c.freq);
+            if (failed)
+                CHECK(memcmp(re, g_ere + (size_t)p * NF * BINS, sizeof(re)) == 0 && memcmp(im, g_eim + (size_t)p * NF * BINS, sizeof(im)) == 0,
+                      "infer_status != 0: packet %d is not the error spectrum", p);
+            else
+                CHECK(memcmp(re, g_ere + (size_t)p * NF * BINS, sizeof(re)) != 0, "packet %d should be enhanced", p);
+        }
+        gen_after = aiaec_state_generation_freq(c.freq);
+        CHECK(gen_seen[0] == gen_before && gen_seen[1] == gen_before + 1u && gen_seen[2] == gen_seen[1] && gen_after == gen_seen[1],
+              "failed packets: generation %u -> %u (event) -> %u (no event) -> %u, want +1 then unchanged",
+              gen_before, gen_seen[1], gen_seen[2], gen_after);
+        CHECK(acc.calls == 2 && acc.gen_changes == 1u, "failed packets: accelerator ran %d packets and saw %u generation changes",
+              acc.calls, acc.gen_changes);
+        CHECK(memcmp(re, fresh_re, sizeof(re)) == 0 && memcmp(im, fresh_im, sizeof(im)) == 0,
+              "packet 3 after the failed event packet did not start from a zero state");
+        ctxs_free(&c);
     }
-    gen_after = aiaec_state_generation_freq(c.freq);
-    CHECK(gen_after == gen_before, "infer_status != 0 changed the generation %u -> %u", gen_before, gen_after);
-    ctxs_free(&c);
     printf("section_failure: failed, non-finite and overflowing packets pass all %d error spectra through\n", NF);
     return 0;
 }

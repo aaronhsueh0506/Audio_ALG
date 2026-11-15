@@ -3,6 +3,14 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — Align-ULCNet packet (N > 1): a failed job that carries an alignment event advances the generation
+
+At N > 1 the graph restarts the model at an event hop itself (`frame_reset`), so the generation stays. A job that fails before the device run never applied that restart: the library bypassed the packet with the generation unchanged, and the next packet ran from the pre-event recurrent state. `ulcnet_prepost_frame_bypass()` now zeroes the registered state and advances the generation for a packet opened by `frame_open()` that has an event frame, the same step an N = 1 event takes; the board sample's generation check then zeroes the device state.
+
+- **Unchanged.** Every committed packet, every failed packet without an event, every one-frame hop and every refused finish (which already restarted the state and clears `prepared`, so it is not restarted twice). No pool, struct or layout change. No Python twin.
+- **Tests.** `stream/aiaec/tests/test_aiaec_packet.c` `section_failure`: a packet with the hop-10 event fails before the run (generation +1), a packet without an event fails (generation unchanged), and the next packet equals a run from a zero state. Mutations killed: the `prepared` gate removed (the refused-mask rows advance twice), no restart, a restart without an event, and a refused finish that keeps `prepared`.
+- **Board.** `alg_ai3_alignulcnet.c` and `uvc_audio_live3.c` only need a rebuild; no production Align-ULCNet graph is registered yet.
+
 ## [Unreleased] — 2026-11-15 — The DFN2 ERB file loader refuses bytes after the two tables and a forward table that is not finite (`AINR_ERR_ERB_FILE`)
 
 `dfn2_stream_init_from_erb_file[_ex]` (both kinds of context; so `ainr_init*` with `AINR_ERR_ERB_FILE`) now also returns NULL when the file goes on after the forward and inverse tables (one more byte is enough) or when a forward value is NaN or infinite. Before, such a file loaded: a NaN forward value passed init and put non-finite values into the accelerator's input tensors on every hop. Checked at init only; no hop code, numbers, pool size, descriptor or layout version changed. Memory mode (caller tables) is unchanged.

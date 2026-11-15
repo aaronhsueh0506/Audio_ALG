@@ -132,7 +132,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <li>recurrent state 留在 AI3 的 buffer。每對 state 輸入與輸出依位置（輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>）綁同一塊 buffer；Align-ULCNet 有 4 對。</li>
 <li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point，清零仍是填位元組 0，不受 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 影響（見<a href="../dfn2/reference/board.html#float-io">Float I/O 模式</a>）。</li>
 <li>init 時每塊 state buffer 清零一次（memset 加 cache flush）。正常連續推論不碰 state，每包只交換特徵與 head。</li>
-<li>函式庫只在 reset 與輸出被拒（非有限）時讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，generation 不動，所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。N&gt;1 封包的事件 hop 由 graph 內的 <code>frame_reset</code> 重設模型 state，generation 不變，host 不需要清 buffer。</li>
+<li>函式庫只在 reset 與輸出被拒（非有限）時讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，generation 不動（N&gt;1 封包內有事件 hop 時例外：graph 沒跑到那次重設，函式庫改成 generation +1），所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。N&gt;1 封包的事件 hop 由 graph 內的 <code>frame_reset</code> 重設模型 state，generation 不變，host 不需要清 buffer。</li>
 </ul>
 
 <h2>對齊事件</h2>
