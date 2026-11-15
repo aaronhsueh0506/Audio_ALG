@@ -183,8 +183,8 @@ kernel 路徑。</li>
 <li><b>16 個 state 歸應用端</b>（<code>DeepVqeStateId</code> 順序，形狀見 <a href="core.html">DeepVQE-S 頻域與模型契約</a> 的 State 表，函式庫只收元素數）：浮點 host 配 16 塊 float buffer，把 16 組（指標，元素數）登錄進 <code>cfg.state[]</code>／<code>cfg.state_elements[]</code>——全登錄或全不登錄，init 與 reset 時清零，每次 <code>frame_finish</code> 整塊檢查有限，不計入 pool 大小與 hash；目標平台不登錄，由加速器持有，把每個 state 輸入與其 <code>*_out</code> 綁在同一塊加速器 buffer。</li>
 <li><code>deepvqe_prepost_config_defaults(&amp;cfg, &amp;grid)</code>（grid 被複製）→ 登錄 state → <code>deepvqe_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>deepvqe_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>。D = 32 的 pool：16 kHz／512 為 35,520 B、48 kHz／1024 為 70,336 B（本機量測，不含應用端的 state 與 <code>AcStft</code>／<code>AcIstft</code>）。</li>
 <li>按名稱綁定 graph 的 state 的 host 用 <code>deepvqe_prepost_state_name(id)</code>／<code>_state_name_out(id)</code>；能讀 ONNX／JSON 的 host 可在啟動時把 <code>c_descriptor</code> 讀成 <code>DeepVqePrepostDescriptor</code>，以 <code>deepvqe_prepost_descriptor_validate(&amp;grid, &amp;meta)</code> 檢查。板端 sample 兩者都不做：它依位置綁定，以接線表核對埠（見<a href="../index.html#graph-wiring">Graph 接線</a>）。</li>
-<li>每個 hop（從 hop 0 起一次推論）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(mic, far)</code> 恆回 1 → <code>frame_open</code>（host 端做 power-law 壓縮 0.3，<code>mic</code>／<code>far</code> 是壓縮後的 planar <code>[1,2,1,n_bins]</code>；只有 <code>taps</code> 預填 NaN）→ 加速器 → <code>frame_finish</code>（失敗改 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
-<li>目標平台：每次 <code>deepvqe_prepost_state_generation()</code> 改變（<code>reset</code> 或被拒的 <code>frame_finish</code>），把加速器自己的 16 個 state 清成零（定點 state 埠兩端的 <code>zero_point</code> 須為 0，見<a href="../index.html">整合入口</a>的 State 一節；float 的 state 清零同樣是填位元組 0，與 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 無關）；新建實例的 generation 為 0，做法同 <a href="../../align-ulcnet/reference/core.html#frequency-api">Align-ULCNet 頻域與模型契約</a> 的目標平台片段。</li>
+<li>每個 hop（從 hop 0 起一次推論）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(mic, far)</code> 恆回 1 → <code>frame_open</code>（host 端做 power-law 壓縮 0.3，<code>mic</code>／<code>far</code> 是壓縮後的 planar <code>[1,2,1,n_bins]</code>；只有 <code>taps</code> 預填 NaN）→ 加速器 → <code>frame_finish</code>（執行失敗改 <code>frame_fail</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
+<li>目標平台：每次 <code>deepvqe_prepost_state_generation()</code> 改變（<code>reset</code>、被拒的 <code>frame_finish</code> 或 <code>frame_fail(p, 1)</code>），把加速器自己的 16 個 state 清成零（定點 state 埠兩端的 <code>zero_point</code> 須為 0，見<a href="../index.html">整合入口</a>的 State 一節；float 的 state 清零同樣是填位元組 0，與 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 無關）；新建實例的 generation 為 0，做法同 <a href="../../align-ulcnet/reference/core.html#frequency-api">Align-ULCNet 頻域與模型契約</a> 的目標平台片段。</li>
 <li>重新開始：<code>deepvqe_prepost_reset(p)</code>（登錄的 state、CCM ring 歸零，generation +1），並自行 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op，登錄的 buffer 與 pool 歸應用端）。</li>
 </ol>
 <pre>#include &lt;stdlib.h&gt;
@@ -242,8 +242,9 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
             ac_stft_push_planar(far_stft, far + h * grid.hop, f_re, f_im);
             if (deepvqe_prepost_pre_process_freq(p, m_re, m_im, f_re, f_im) != 1 ||
                 deepvqe_prepost_frame_open(p, &amp;xin, &amp;xout) != 0) { rc = -1; break; }
-            if (npu_run(&amp;xin, &amp;xout) != 0 || deepvqe_prepost_frame_finish(p) != 0)
-                deepvqe_prepost_frame_bypass(p);                  /* fail-closed：當前增強頻譜歸零 */
+            int ran = npu_run(&amp;xin, &amp;xout);               /* 0：全部寫完 */
+            if (ran == 0) { if (deepvqe_prepost_frame_finish(p) != 0) deepvqe_prepost_frame_bypass(p); }
+            else deepvqe_prepost_frame_fail(p, 1);                /* fail-closed：增強頻譜歸零；已啟動而失敗則 state 清零、generation +1（未啟動傳 0） */
             if (deepvqe_prepost_post_process_freq(p, o_re, o_im) != 0) { rc = -1; break; }
             ac_istft_push_planar(istft, o_re, o_im, dst);         /* AC_OLA_ACCUMULATE：每 hop 恰 grid.hop 個樣本 */
         }
@@ -262,9 +263,10 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <tr><td><code>config_defaults</code></td><td>-1</td><td>NULL 或無效 grid</td></tr>
 <tr><td><code>get_mem_size</code></td><td>-1，<code>*req</code> 不動</td><td>同上，或 state 登錄不一致（有指標無元素數、元素數無指標、16 組沒有全設或全空）</td></tr>
 <tr><td><code>init</code>／<code>init_ex</code></td><td>NULL</td><td>pool 未對齊／太小、config 錯、<code>expected</code> 不符（陳舊 pool；hash 認 grid、D、layout 與 carve 版本）；被拒的呼叫不動 pool</td></tr>
-<tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
+<tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code>／<code>frame_fail</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
 <tr><td><code>frame_finish</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限：登錄的 state 全部歸零（沒登錄時只檢查 taps）、generation +1、CCM ring 不前進、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
+<tr><td><code>frame_fail</code></td><td>-1（無 frame；什麼都不動）</td><td>執行沒成功時關閉該批，輸出同 <code>frame_bypass</code>；<code>run_started</code> 非 0（加速器 state 可能已髒）另把登錄的 state 全部歸零、generation +1；0（未啟動）什麼都不動</td></tr>
 <tr><td><code>frame_bypass</code></td><td>-1（無 frame）</td><td>成功時當前增強頻譜歸零，PCM 合成保留前拍 overlap（mute、fail closed）：CCM ring 與 state 維持原樣。想要優雅降級的呼叫端須自己在 pipeline 層放 canceller 並 cross-fade</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
 </table></div>
@@ -272,7 +274,7 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <h2 id="section-7">函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>
 <tr><th>分類</th><th>函式（<code>deepvqe_prepost.h</code>）</th></tr>
-<tr><td><b>公開（整合者）</b></td><td><code>deepvqe_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（整合者）</b></td><td><code>deepvqe_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_frame_fail</code>、<code>_post_process_freq</code></td></tr>
 <tr><td><b>公開（grid 與邊界查詢）</b></td><td><code>deepvqe_grid_make</code>、<code>deepvqe_grid_validate</code>、<code>deepvqe_prepost_state_name</code>、<code>_state_name_out</code>、<code>_descriptor_default</code>、<code>_descriptor_validate</code>；inline <code>deepvqe_prepost_taps_elements</code></td></tr>
 <tr><td><b>低階（類別內部使用）</b></td><td><code>deepvqe_process.h</code>：<code>deepvqe_ccm_init</code>、<code>deepvqe_ccm_reset</code>、<code>deepvqe_ccm_process</code></td></tr>
 
@@ -326,7 +328,7 @@ deepvqe_prepost_frame_open ---> DeepVqeHopIO{inputs, outputs, state_generation}
   |                                        |
   v                                        v
 deepvqe_stream_post_process(ai_rc) <-------
-  |  ai_rc==0: frame_finish          ai_rc!=0: frame_bypass(當拍頻譜歸零)
+  |  ai_rc==0: frame_finish          ai_rc!=0: frame_fail(當拍頻譜歸零; 非 NOT_STARTED 則 state 清零, generation +1)
   v
 deepvqe_prepost_post_process_freq
   |
@@ -355,7 +357,7 @@ hop   caller                       deepvqe_stream                       NPU
       &lt;-- 1 (真實輸出) --------------------- ISTFT push=hop ----
   ... (fail-closed 範例) ...
 k     pre_process -> open --------------------------------------> 替身回 -1, 不寫 taps
-      post_process(ai_rc=-1) -----> frame_bypass (本拍頻譜貢獻歸零, 非直通 mic_in) ->
+      post_process(ai_rc=-1) -----> frame_fail (本拍頻譜貢獻歸零, state 清零, 非直通 mic_in) ->
       &lt;-- 1 (PCM 仍疊加上一拍 OLA 尾段, 單拍不保證全零; 連續兩拍才靜音) --
 </pre>
 
@@ -373,9 +375,9 @@ k     pre_process -> open --------------------------------------> 替身回 -1, 
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
 <tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td><code>deepvqe_stream_reset()</code></td></tr>
-<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>reset 時清空；<code>ai_rc != 0</code> 的 bypass 不動；<code>frame_finish</code> 的非有限拒收「ring 不推進」但不清空</td></tr>
-<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零「已登錄的 state」</td></tr>
-<tr><td><code>state_generation</code></td><td>轉呼叫 <code>deepvqe_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=0；reset 或非有限拒收各 +1；<code>ai_rc != 0</code> 的單純 bypass 不推進</td></tr>
+<tr><td>CCM ring（原始 mic 歷史）</td><td><code>DeepVqePrepost</code> 內部</td><td>最近 <code>TIME_ORDER</code> 個原始 mic 頻譜，供 tap 套用</td><td>reset 時清空；<code>ai_rc != 0</code> 的失敗關閉（bypass 輸出）不動；<code>frame_finish</code> 的非有限拒收「ring 不推進」但不清空</td></tr>
+<tr><td>16 組遞迴 state</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>align key/value ring、score history、GRU hidden、far/mic/up/res history 等</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收與已啟動的失敗（<code>frame_fail(p, 1)</code>）只歸零「已登錄的 state」</td></tr>
+<tr><td><code>state_generation</code></td><td>轉呼叫 <code>deepvqe_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=0；reset、非有限拒收、<code>ai_rc</code> 為 <code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 各 +1；<code>STREAM_RUN_NOT_STARTED</code>（加速器 state 沒動）與單純 <code>frame_bypass</code> 不推進</td></tr>
 </table></div>
 
 <h2 id="section-12">延遲與啟動行為</h2>

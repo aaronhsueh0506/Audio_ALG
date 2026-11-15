@@ -33,8 +33,12 @@ for the module):
              after a refused one
   whole      commit checks the whole of every registered buffer; a non-finite
              value in the newest, an older or the dropped frame is refused
-  generation state_generation starts at 0 and advances on reset and on a
-             refused commit, and on nothing else
+  generation state_generation starts at 0 and advances on reset, on a
+             refused commit and on frame_fail with a started run, and on
+             nothing else
+  fail       frame_fail closes the open batch with the frame_bypass output;
+             a started run zeroes the registered state and advances the
+             generation, a run that never started changes neither
   boundary   state names and the descriptor validator: the eight external
              fields are refused when perturbed, the four model-interior fields
              are not read
@@ -1563,7 +1567,84 @@ static int case_generation(void) {
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.125f) == 0);
     CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
+
+    /* frame_fail: a run that never started leaves it, a started one advances it once. */
+    CHECK(open_and_run(inst.p, &inputs, &outputs, 0.375f) == 0);
+    CHECK(deepvqe_prepost_frame_fail(inst.p, 0) == 0);
+    CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
+    CHECK(deepvqe_prepost_frame_fail(inst.p, 1) == -1);   /* nothing open: refused, unchanged */
+    CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
+    CHECK(open_and_run(inst.p, &inputs, &outputs, 0.625f) == 0);
+    CHECK(deepvqe_prepost_frame_fail(inst.p, 1) == 0);
+    CHECK(deepvqe_prepost_state_generation(inst.p) == 5u);
     inst_free(&inst);
+    return 0;
+}
+
+/* ---- fail: frame_fail closes the batch with the bypass output ------------ */
+
+static int case_fail(void) {
+    Inst a, b, c;
+    DeepVqePrepostInputs in_a, in_b, in_c;
+    DeepVqePrepostOutputs out_a, out_b, out_c;
+    static float f1_re[BINS_MAX], f1_im[BINS_MAX], f3_re[BINS_MAX], f3_im[BINS_MAX];
+    static float far_re[BINS_MAX], far_im[BINS_MAX];
+    static float a_re[BINS_MAX], a_im[BINS_MAX], b_re[BINS_MAX], b_im[BINS_MAX];
+    static float c_re[BINS_MAX], c_im[BINS_MAX];
+    Snap snap;
+    int id;
+
+    make_frame(f1_re, f1_im, 0.0f);
+    make_frame(f3_re, f3_im, -0.375f);
+    make_frame(far_re, far_im, 0.0625f);
+    CHECK(deepvqe_prepost_frame_fail(NULL, 0) == -1 && deepvqe_prepost_frame_fail(NULL, 1) == -1);
+
+    CHECK(inst_make(&a) == 0 && inst_make(&b) == 0 && inst_make(&c) == 0);
+    CHECK(commit_freq(a.p, f1_re, f1_im, far_re, far_im, a_re, a_im) == 0);
+    CHECK(commit_freq(b.p, f1_re, f1_im, far_re, far_im, b_re, b_im) == 0);
+    CHECK(commit_freq(c.p, f1_re, f1_im, far_re, far_im, c_re, c_im) == 0);
+    CHECK(!all_zero(a_re, BINS));
+
+    /* No batch open: refused, and nothing moves (state, generation). */
+    CHECK(snap_take(&snap, &c) == 0);
+    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == -1 && deepvqe_prepost_frame_fail(c.p, 0) == -1);
+    CHECK(deepvqe_prepost_state_generation(c.p) == 0u && snap_same(&snap, &c));
+    snap_free(&snap);
+
+    /* A: the bypass. B: frame_fail, run not started. Same silence, same state, same generation, and the
+     * next frame comes out the same, so frame_fail(p, 0) IS frame_bypass. */
+    CHECK(open_and_run(a.p, &in_a, &out_a, 0.125f) == 0);
+    CHECK(open_and_run(b.p, &in_b, &out_b, 0.125f) == 0);
+    CHECK(deepvqe_prepost_frame_bypass(a.p) == 0);
+    CHECK(deepvqe_prepost_frame_fail(b.p, 0) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(a.p, a_re, a_im) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(b.p, b_re, b_im) == 0);
+    CHECK(all_zero(a_re, BINS) && all_zero(a_im, BINS));
+    CHECK(identical(a_re, b_re, BINS) && identical(a_im, b_im, BINS));
+    CHECK(deepvqe_prepost_state_generation(b.p) == 0u);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        CHECK(identical(a.buf[id], b.buf[id], state_count(id, D)) && !all_zero(b.buf[id], state_count(id, D)));
+    CHECK(deepvqe_prepost_frame_fail(b.p, 0) == -1);   /* closed: a second call has nothing to close */
+    CHECK(commit_freq(a.p, f3_re, f3_im, far_re, far_im, a_re, a_im) == 0);
+    CHECK(commit_freq(b.p, f3_re, f3_im, far_re, far_im, b_re, b_im) == 0);
+    CHECK(identical(a_re, b_re, BINS) && identical(a_im, b_im, BINS) && !all_zero(b_re, BINS));
+
+    /* C: the run started and failed. Silence, every registered buffer zero, generation +1 once, and the
+     * next frame commits from the cold state. */
+    CHECK(open_and_run(c.p, &in_c, &out_c, 0.125f) == 0);
+    CHECK(!inst_state_zero(&c));
+    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == 0);
+    CHECK(deepvqe_prepost_state_generation(c.p) == 1u);
+    CHECK(inst_state_zero(&c));
+    CHECK(deepvqe_prepost_post_process_freq(c.p, c_re, c_im) == 0);
+    CHECK(all_zero(c_re, BINS) && all_zero(c_im, BINS));
+    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == -1 && deepvqe_prepost_state_generation(c.p) == 1u);
+    CHECK(commit_freq(c.p, f3_re, f3_im, far_re, far_im, c_re, c_im) == 0);
+    CHECK(!all_zero(c_re, BINS) && deepvqe_prepost_state_generation(c.p) == 1u);
+
+    inst_free(&a);
+    inst_free(&b);
+    inst_free(&c);
     return 0;
 }
 
@@ -1810,6 +1891,40 @@ static int case_board(void) {
     return 0;
 }
 
+/* frame_fail on a board (nothing registered): the generation is all there is to move. */
+static int case_fail_board(void) {
+    DeepVqePrepostConfig cfg;
+    DeepVqePrepostMemReq req;
+    DeepVqePrepost *board;
+    static float re[BINS_MAX], im[BINS_MAX], got_re[BINS_MAX], got_im[BINS_MAX];
+    unsigned char *raw;
+    size_t bytes;
+
+    CHECK(deepvqe_prepost_config_defaults(&cfg, &g_grid) == 0);
+    CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
+    bytes = (size_t)req.bytes;
+    raw = (unsigned char *)alloc_aligned(req.alignment, bytes + 2u * FENCE);
+    CHECK(raw != NULL);
+    memset(raw, 0xa5, bytes + 2u * FENCE);
+    board = deepvqe_prepost_init_ex(raw + FENCE, bytes, &cfg, &req);
+    CHECK(board != NULL);
+    make_frame(re, im, 0.25f);
+
+    CHECK(head_hop(board, 0, 1, 0) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(board, got_re, got_im) == 0);
+    CHECK(deepvqe_prepost_state_generation(board) == 0u);
+    CHECK(deepvqe_prepost_pre_process_freq(board, re, im, re, im) == 1);
+    CHECK(deepvqe_prepost_frame_fail(board, 0) == 0 && deepvqe_prepost_state_generation(board) == 0u);
+    CHECK(deepvqe_prepost_pre_process_freq(board, re, im, re, im) == 1);
+    CHECK(deepvqe_prepost_frame_fail(board, 1) == 0 && deepvqe_prepost_state_generation(board) == 1u);
+    CHECK(deepvqe_prepost_post_process_freq(board, got_re, got_im) == 0);
+    CHECK(all_zero(got_re, BINS) && all_zero(got_im, BINS));
+    CHECK(head_hop(board, 2, 1, 0) == 0 && deepvqe_prepost_state_generation(board) == 1u);
+    CHECK(fences_intact(raw, bytes));
+    free(raw);
+    return 0;
+}
+
 /* ---- registration: all sixteen pairs or none -------------------------- */
 
 /* shape 0: only pair `id`; 1: its pointer without a count; 2: its count without a pointer; 3: all but it. */
@@ -2035,6 +2150,8 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "inplace") == 0)   status = case_inplace();
     else if (strcmp(argv[1], "whole") == 0)     status = case_whole();
     else if (strcmp(argv[1], "generation") == 0) status = case_generation();
+    else if (strcmp(argv[1], "fail") == 0)      status = case_fail();
+    else if (strcmp(argv[1], "failboard") == 0) status = case_fail_board();
     else if (strcmp(argv[1], "boundary") == 0)  status = case_boundary();
     else if (strcmp(argv[1], "board") == 0)     status = case_board();
     else if (strcmp(argv[1], "registration") == 0) status = case_registration();
@@ -2212,11 +2329,30 @@ def test_commit_reads_the_whole_of_every_registered_buffer(driver):
 
 
 def test_state_generation_counts_restarts(driver):
-    """0 at init; reset and a refused commit advance it, once each; healthy
-    commits, skips and a refused retry do not. NULL reads 0. A board with a
+    """0 at init; reset, a refused commit and frame_fail with a started run
+    advance it, once each; healthy commits, skips, a frame_fail whose run never
+    started and a refused retry do not. NULL reads 0. A board with a
     fixed-point accelerator state refills it with quantized zeros when the
     value changes."""
     _run(driver, 'generation')
+
+
+def test_frame_fail_closes_the_batch_and_restarts_only_a_started_run(driver):
+    """frame_fail(p, 0) IS frame_bypass: silence, the state as the accelerator
+    left it, the generation unchanged, and the next frame equal to an
+    instance that bypassed. frame_fail(p, 1) is the same silence plus a cold
+    state: all sixteen registered buffers zero, the generation advanced once.
+    With no batch open (or NULL) it is refused and moves nothing."""
+    _run(driver, 'fail')
+
+
+@pytest.mark.parametrize('build', ['driver', 'driver_scalar'])
+@pytest.mark.parametrize('grid', [_GRID_16K, _GRID_48K])
+def test_frame_fail_on_a_board_moves_the_generation_only(request, build, grid):
+    """Nothing registered: frame_fail(p, 1) advances the generation by one
+    and emits silence, frame_fail(p, 0) changes nothing, the next hop commits,
+    and the bytes around the pool are never written."""
+    _run(request.getfixturevalue(build), 'failboard', grid)
 
 
 def test_inherit_path_is_gone():

@@ -11,6 +11,7 @@
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+#include "stream_run.h"
 
 struct DeepVqeStream {
     DeepVqeGrid grid;
@@ -351,8 +352,6 @@ int deepvqe_stream_pre_process_freq(DeepVqeStream *s, const float *mic_re, const
 }
 
 int deepvqe_stream_post_process_freq(DeepVqeStream *s, int ai_rc, float *re, float *im) {
-    int rc;
-
     /* `pending` rejects a post_process with no matching pre_process this hop -- without it, a
      * second call in a row (or a call with no pre_process ever) would fall through to the
      * `!s->result_ready` test below exactly as if this were a legitimate no-job pre-roll hop,
@@ -360,14 +359,15 @@ int deepvqe_stream_post_process_freq(DeepVqeStream *s, int ai_rc, float *re, flo
     if (!s || !re || !im || !s->pending) return -1;
     s->pending = 0;
 
-    /* A finish that itself fails (non-finite tap or state, despite ai_rc == 0) still needs a
-     * bypass to actually close the batch -- deepvqe_prepost_frame_finish() leaves it open on
-     * failure, and a batch left open here would desync this stream's `open` bookkeeping from
-     * DeepVqePrepost's. Skipped on a no-job hop (frames_per_call > 1, still gathering): there is
-     * nothing open to close, drain straight from whatever the last finished/bypassed batch left. */
+    /* A refused finish (non-finite tap or state) already advanced the generation but leaves the batch open: the bypass
+     * closes it. Skipped on a no-job hop (frames_per_call > 1, still gathering): nothing is open, drain what the last
+     * closed batch left. */
     if (s->open) {
-        rc = (ai_rc == 0) ? deepvqe_prepost_frame_finish(s->prepost) : -1;
-        if (rc != 0) deepvqe_prepost_frame_bypass(s->prepost);
+        if (ai_rc == STREAM_RUN_OK) {
+            if (deepvqe_prepost_frame_finish(s->prepost) != 0) deepvqe_prepost_frame_bypass(s->prepost);
+        } else {
+            deepvqe_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+        }
         s->open = 0;
         s->result_ready = 1;
     }

@@ -7,7 +7,7 @@
  *     if (ready) {
  *         deepvqe_prepost_frame_open(p, &in, &out);   // N-frame views into the pool
  *         my_npu_run(&in, &out);                        // NPU fills `out` (N taps)
- *         deepvqe_prepost_frame_finish(p);              // after every run; or _frame_bypass()
+ *         deepvqe_prepost_frame_finish(p);              // after a run; _frame_fail() if it failed
  *     }
  *     deepvqe_prepost_post_process_freq(p, re, im);   // drains one of the N frames
  *
@@ -242,9 +242,9 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p);
  * pool stay. Advances the state generation. NULL is ignored. */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
-/* Counter of state restarts (reset, or frame_finish refusing a frame); 0 after init and for NULL;
- * kept whether or not a state is registered. A fixed-point accelerator loads quantized zeros
- * into its own copy of the state at start and on every change. */
+/* Counter of state restarts (reset, frame_finish refusing a frame, frame_fail with run_started); 0 after
+ * init and for NULL; kept whether or not a state is registered. A fixed-point accelerator loads
+ * quantized zeros into its own copy of the state at start and on every change. */
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
@@ -278,6 +278,11 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
  * silence (not pass-through) for all N frames of the open batch; the CCM ring and state stay as
  * they are. Returns 0, or -1. */
 int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
+
+/* Closes the open batch after a run that did not succeed: the frame_bypass output. run_started != 0
+ * (the device state may be dirty): the registered state is zeroed and the generation advances.
+ * Returns 0, or -1 (nothing changed) if no batch is open. */
+int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started);
 
 /* The enhanced spectrum (n_bins bins) of the next frame still owed from the last finished or
  * bypassed batch -- one drained per call, in order, over the N calls following that batch (N ==

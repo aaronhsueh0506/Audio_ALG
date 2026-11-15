@@ -73,7 +73,7 @@ CORE_HEADERS := ../../../lib/aiaec/deepvqe_s/deepvqe_process.h \
 	../../../lib/aiaec/deepvqe_s/deepvqe_prepost.h
 
 STREAM_SOURCES := deepvqe_stream.c
-STREAM_HEADERS := deepvqe_stream.h ../../common/stream_mem.h
+STREAM_HEADERS := deepvqe_stream.h ../../common/stream_mem.h ../../common/stream_run.h
 
 LIB := $(OBJ_DIR)/libdeepvqe_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/deepvqe_process.o $(OBJ_DIR)/deepvqe_prepost.o $(OBJ_DIR)/deepvqe_stream.o

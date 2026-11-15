@@ -78,11 +78,11 @@
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 146 | 49 | 25 | 24 | 97 | 0 | 2 | 17 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 96 | 35 | 14 | 21 | 61 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 872 | 177 | 92 | 85 | 695 | 0 | 57 | 62 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 97 | 35 | 14 | 21 | 62 | 0 | 0 | 15 |
+| `TOTAL` 合計 | 873 | 177 | 92 | 85 | 696 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：872 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；695 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：873 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；696 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -170,7 +170,7 @@
 | `lib/aiaec/ulcnet/ulcnet_model_io.c` | all | 34 |
 | `lib/aiaec/ulcnet/ulcnet_model_io.h` | all | 1 |
 | `lib/aiaec/ulcnet/ulcnet_prepost.c` | all | 23 |
-| `lib/aiaec/deepvqe_s/deepvqe_prepost.c` | all | 33 |
+| `lib/aiaec/deepvqe_s/deepvqe_prepost.c` | all | 34 |
 | `lib/aiaec/deepvqe_s/deepvqe_prepost.h` | all | 1 |
 | `lib/aiaec/deepvqe_s/deepvqe_process.c` | all | 4 |
 <!-- map:coverage:end -->
@@ -361,7 +361,7 @@
 | AIAEC-DV-04 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: deepvqe_prepost_post_process_freq, deepvqe_prepost_frame_finish` | `AIAEC/DeepVQE_S/model.py:DeepVQES._apply_ccm_frame` | partial | T-14 | `AIAEC/tests/test_deepvqe_prepost_c.py`（C 對 C） | （推論）圖輸出的 CCM taps 套到原始麥克風頻譜的環上，再交出增強後頻譜；合成由應用端的 AcIstft 完成。 |
 | AIAEC-DV-05 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: deepvqe_prepost_state_name, deepvqe_prepost_state_name_out, dv_valid_depth` | `AIAEC/_streaming_export.py:StatelessOneFrameAIAEC.state_names` | partial | T-14 | — | （推論）C 側的狀態張量名稱逐字對應匯出器的 input_names；形狀由應用端持有，契約變動要同時 bump layout 版本。 |
 | AIAEC-DV-06 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: deepvqe_prepost_descriptor_default, deepvqe_prepost_descriptor_validate, deepvqe_prepost_descriptor` | `AIAEC/_streaming_export.py:c_descriptor` | partial | T-14 | — | （推論）描述子對匯出器寫入的 metadata。 |
-| AIAEC-DV-07 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_layout, dv_valid_frames_per_call, deepvqe_grid_make, deepvqe_grid_validate, deepvqe_prepost_config_defaults, pp_registration_ok, pp_check_config, deepvqe_prepost_get_mem_size, deepvqe_prepost_init_ex, deepvqe_prepost_init, deepvqe_prepost_create, deepvqe_prepost_destroy, zero_registered, zero_state, deepvqe_prepost_reset, deepvqe_prepost_state_generation, fill_nan, all_finite, deepvqe_prepost_frame_bypass` | — | C-only | T-14 | — | 記憶體池佈局、`DeepVqeGrid` 與設定檢查（`dv_valid_frames_per_call`：[1, DEEPVQE_MODEL_MAX_FRAMES_PER_CALL] 範圍）、已註冊狀態檢查（十六個張量全有或全無）、build hash（已折入 frames_per_call）、生命週期、有限性掃描、NaN 填充；`deepvqe_prepost_frame_bypass` 對整批 N 個幀輸出靜音（fail closed）；沒有 Python 孿生。 |
+| AIAEC-DV-07 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_layout, dv_valid_frames_per_call, deepvqe_grid_make, deepvqe_grid_validate, deepvqe_prepost_config_defaults, pp_registration_ok, pp_check_config, deepvqe_prepost_get_mem_size, deepvqe_prepost_init_ex, deepvqe_prepost_init, deepvqe_prepost_create, deepvqe_prepost_destroy, zero_registered, zero_state, deepvqe_prepost_reset, deepvqe_prepost_state_generation, fill_nan, all_finite, deepvqe_prepost_frame_bypass, deepvqe_prepost_frame_fail` | — | C-only | T-14 | — | 記憶體池佈局、`DeepVqeGrid` 與設定檢查（`dv_valid_frames_per_call`：[1, DEEPVQE_MODEL_MAX_FRAMES_PER_CALL] 範圍）、已註冊狀態檢查（十六個張量全有或全無）、build hash（已折入 frames_per_call）、生命週期、有限性掃描、NaN 填充；`deepvqe_prepost_frame_bypass` 對整批 N 個幀輸出靜音（fail closed）；`deepvqe_prepost_frame_fail` 在執行失敗後關閉該批，輸出同 bypass，執行已開始時另清零已註冊狀態並使世代 +1；沒有 Python 孿生。 |
 | AIAEC-DV-08 | `lib/aiaec/deepvqe_s/deepvqe_prepost.h: deepvqe_prepost_taps_elements` | — | C-only | — | — | CCM taps 張量的 float 個數，由 grid 算出：`frames_per_call` × `n_bins` × `DEEPVQE_TIME_ORDER` × `DEEPVQE_FREQ_TAPS` × 2；應用端據此配置 taps 緩衝。標頭內的 inline 函式；Python 端的形狀在匯出的 `output_schema`。 |
 
 <!-- map:rows:end -->

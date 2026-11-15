@@ -559,6 +559,12 @@ int deepvqe_prepost_frame_bypass(DeepVqePrepost *p) {
     return 0;
 }
 
+int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started) {
+    if (!p || !p->frame_open) return -1;
+    if (run_started) zero_state(p);
+    return deepvqe_prepost_frame_bypass(p);
+}
+
 int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im) {
     size_t frame_bytes;
     size_t at;

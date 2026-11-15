@@ -84,7 +84,6 @@ while (read_blocks(mic, far, hop_in)) {
             if (work.state_generation != seen) { clear_state_buffers(); seen = work.state_generation; }
             ai_rc = run_ai3(&amp;work);                /* 填 work.inputs，執行，讀回 work.outputs */
         }
-        if (ai_rc != 0) clear_state_buffers_before_next_run();
     }
     if (aiaec_postprocess(ctx, ai_rc, pcm_out) != AIAEC_OK) return -1;   /* 失敗也呼叫 */
     write_block(pcm_out, hop_in);
@@ -105,7 +104,7 @@ while (read_blocks(mic, far, hop_in)) {
 <li>recurrent state 留在 AI3 的 buffer。每對 state 輸入與輸出依位置（輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>）綁同一塊 buffer；DeepVQE-S 有 16 對。</li>
 <li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）。5/5、0/5、5/0 都在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕；float 的 state 埠不看 zero_point，清零仍是填位元組 0，不受 <code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 影響（見<a href="../dfn2/reference/board.html#float-io">Float I/O 模式</a>）。</li>
 <li>init 時每塊 state buffer 清零一次（memset 加 cache flush）。正常連續推論不碰 state，每包只交換特徵與 head。</li>
-<li>函式庫只在 reset 與加速器輸出非有限時動 state 並讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就清。回報失敗（<code>infer_status</code> 非 0）的一包只旁路該包，state 與 generation 都不動，所以 sample 在任何失敗的一包之後，也要在下一次實際送件前自行再清一次。</li>
+<li>函式庫在 reset、加速器輸出非有限、以及回報失敗而 state 可能已髒時動 state 並讓 <code>work.state_generation</code> 改變；sample 看到 generation 改變就在下一次送件前清（上面的範例）。狀態值 0 是全部寫完；<code>STREAM_RUN_NOT_STARTED</code>（0x4E53）是加速器沒動 state，只旁路該包，generation 不動；其他值都算 state 可能已髒，generation +1。</li>
 </ul>
 
 <h2>失敗語義與延遲</h2>

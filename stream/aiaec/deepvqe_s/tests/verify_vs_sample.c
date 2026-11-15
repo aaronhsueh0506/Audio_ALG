@@ -1,12 +1,12 @@
 /* Verifies deepvqe_stream.c (deepvqe_stream_pre_process/post_process) against an independent
  * re-implementation of the same per-hop lifecycle (driver A below): int16->float mic+far (no
  * HPF) -> ac_stft_push_planar x2 -> deepvqe_prepost_pre_process_freq -> deepvqe_prepost_frame_open
- * -> NPU -> deepvqe_prepost_frame_finish/frame_bypass -> deepvqe_prepost_post_process_freq ->
+ * -> NPU -> deepvqe_prepost_frame_finish/frame_fail -> deepvqe_prepost_post_process_freq ->
  * ac_istft_push_planar -> int16 saturate, built directly against
  * lib/aiaec/deepvqe_s/deepvqe_prepost.h and audiolib, never
  * against deepvqe_stream.c itself -- the same lib-level core deepvqe_stream.c wraps, called by
  * hand instead of through the wrapper. Both drivers run the SAME deterministic fake accelerator
- * (pure function of a global hop counter + a force_fail flag) and must produce byte-identical
+ * (pure function of a global hop counter + a run status) and must produce byte-identical
  * PCM and an identical (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop, at
  * frames_per_call == 1 -- an independent-implementation cross-check of the wrapper, not a
  * comparison against any specific caller's source file (the board sample calls
@@ -34,19 +34,37 @@
 #include "deepvqe_stream.h"
 #include "fft_wrapper.h"
 #include "audio_stft.h"
+#include "stream_run.h"
 
 /* DEEPVQE_TIME_ORDER itself comes from deepvqe_process.h via deepvqe_stream.h ->
  * deepvqe_prepost.h -> deepvqe_process.h; used directly below instead of a local, driftable
  * copy. */
 
-/* ---- shared deterministic fake accelerator: pure function of (global hop, force_fail) ---- */
-static int shared_fake(long long ghop, int force_fail, DeepVqePrepostOutputs *out) {
+/* ---- shared deterministic fake accelerator: pure function of (global hop, status, poison) ---- */
+static int shared_fake(long long ghop, int status, int poison, DeepVqePrepostOutputs *out) {
     size_t i;
     for (i = 0; i < out->taps_elements; ++i)
         out->taps[i] = 0.05f * (float)(((ghop + (long long)i) % 37) - 18);
-    if (force_fail) return -1;   /* valid finite taps AND a failure status: only the status can fail the hop closed */
-    /* No state registered in this test (state[id] all NULL), so state_out[*] are all NULL too --
-     * nothing else to write. */
+    if (poison) out->taps[out->taps_elements / 3] = NAN;
+    return status;   /* valid finite taps AND a run status: only a status other than STREAM_RUN_OK can fail the hop closed */
+}
+
+/* Faulted hops of phase 0 (hop index within the phase): the run status, and whether a tap is left non-finite. The
+ * generation must move by exactly 1 on a hop whose status is not OK or NOT_STARTED, and on a refused commit (OK with a
+ * non-finite tap, or FAILED with one: counted once); never on NOT_STARTED. Statuses 7 and 1 are "any other value". */
+static const struct { long long hip; int status; int poison; } FAULTS[] = {
+    {4, STREAM_RUN_FAILED, 0}, {7, STREAM_RUN_NOT_STARTED, 0}, {10, 7, 0}, {12, 1, 0},
+    {14, STREAM_RUN_OK, 1}, {16, STREAM_RUN_FAILED, 1}
+};
+#define N_FAULTS ((int)(sizeof(FAULTS) / sizeof(FAULTS[0])))
+
+static int fault_at(long long phase, long long hip, int *status, int *poison) {
+    int i;
+    *status = STREAM_RUN_OK;
+    *poison = 0;
+    if (phase != 0) return 0;
+    for (i = 0; i < N_FAULTS; ++i)
+        if (FAULTS[i].hip == hip) { *status = FAULTS[i].status; *poison = FAULTS[i].poison; return 1; }
     return 0;
 }
 
@@ -134,9 +152,12 @@ static int board_pre(BoardDriver *d, const int16_t *mic_in, const int16_t *far_i
  * where the push legitimately returns < hop), -1 (post_process_freq contract error). *written_out
  * carries ac_istft_push_planar's own return value for the trace. */
 static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *written_out) {
-    int rc, prc, hop = d->grid.hop, k, written = 0;
-    rc = (ai_rc == 0) ? deepvqe_prepost_frame_finish(d->prepost) : -1;
-    if (rc != 0) deepvqe_prepost_frame_bypass(d->prepost);
+    int prc, hop = d->grid.hop, k, written = 0;
+    if (ai_rc == STREAM_RUN_OK) {
+        if (deepvqe_prepost_frame_finish(d->prepost) != 0) deepvqe_prepost_frame_bypass(d->prepost);
+    } else {
+        deepvqe_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+    }
 
     prc = deepvqe_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im);
     if (prc != 0) {
@@ -174,7 +195,7 @@ static uint32_t board_generation(const BoardDriver *d) {
 
 typedef struct Stats {
     long long hops, mismatches, feat_mismatches;
-    long long passthrough_violations, generation_advanced_on_bypass;
+    long long passthrough_violations, generation_trace_wrong;
 } Stats;
 
 static int cmp_floats_exact(const float *a, const float *b, size_t n) {
@@ -193,8 +214,7 @@ static int run_matrix(int inject_shift) {
     long long ghop = 0;
     Stats st;
     int16_t *mic_in, *far_in, *pcm_out_a, *pcm_out_b, *prev_pcm_out_b;
-    long long fault_hop = DEEPVQE_TIME_ORDER + 1;   /* well past the ring's own startup window */
-    long long phase0_hops = DEEPVQE_TIME_ORDER + 3;
+    long long phase0_hops = DEEPVQE_TIME_ORDER + 16;   /* the faults of FAULTS[] sit well past the ring's own startup window */
     long long phase1_hops = 3;
     long long phase, phase_hops, hip;
 
@@ -235,7 +255,8 @@ static int run_matrix(int inject_shift) {
             int pre_rc_a, pre_rc_b, post_rc_a, post_rc_b, ai_rc;
             int written_a = -2, written_b = -2;
             uint32_t gen_before_a, gen_before_b, gen_after_a, gen_after_b;
-            int force_fail = (phase == 0 && hip == fault_hop) ? 1 : 0;
+            int status, poison;
+            const int fault = fault_at(phase, hip, &status, &poison);
             int k;
 
             for (k = 0; k < hop; ++k) {
@@ -261,9 +282,9 @@ static int run_matrix(int inject_shift) {
                 }
             }
 
-            ai_rc = shared_fake(ghop, force_fail, &out_a);
+            ai_rc = shared_fake(ghop, status, poison, &out_a);
             {
-                int ai_rc_b = shared_fake(ghop, force_fail, &io_b.outputs);
+                int ai_rc_b = shared_fake(ghop, status, poison, &io_b.outputs);
                 if (ai_rc_b != ai_rc) { fprintf(stderr, "hop %lld: fake rc mismatch\n", ghop); st.mismatches++; }
             }
 
@@ -286,7 +307,7 @@ static int run_matrix(int inject_shift) {
             /* Explicit assertion of the documented return-code pattern, not just "PCM happens to
              * be zero": AC_OLA_ACCUMULATE has no first-push special case, so every non-faulted
              * hop from hop 0 onward must be post_rc == 1 on both sides. */
-            if (!force_fail) {
+            if (!fault) {
                 if (post_rc_a != 1 || post_rc_b != 1) {
                     fprintf(stderr, "hop %lld: expected post_rc==1 on BOTH sides, got A=%d B=%d\n",
                            ghop, post_rc_a, post_rc_b);
@@ -310,21 +331,20 @@ static int run_matrix(int inject_shift) {
                 st.mismatches++;
             }
 
-            if (force_fail) {
-                /* Bypass-is-silence-not-passthrough, and bypass must not advance the generation
-                 * (only a non-finite frame_finish rejection would -- not exercised by this fake,
-                 * which fails via ai_rc != 0, i.e. a pure bypass). */
-                int identical_to_mic = (memcmp(pcm_out_b, mic_in, (size_t)hop * sizeof(int16_t)) == 0);
-                if (identical_to_mic) {
+            {
+                /* One restart per hop at most: a status other than OK / NOT_STARTED, or a refused commit under OK. */
+                const uint32_t want = status == STREAM_RUN_NOT_STARTED ? 0u : status == STREAM_RUN_OK ? (uint32_t)(poison != 0) : 1u;
+                if (gen_after_a - gen_before_a != want || gen_after_b - gen_before_b != want) {
+                    fprintf(stderr, "hop %lld: status %d%s: generation moved A %u->%u B %u->%u, expected +%u\n",
+                            ghop, status, poison ? " with a non-finite tap" : "", gen_before_a, gen_after_a, gen_before_b, gen_after_b, want);
+                    st.generation_trace_wrong++;
+                }
+            }
+            if (fault) {   /* bypass is silence, not a passthrough of the microphone */
+                if (memcmp(pcm_out_b, mic_in, (size_t)hop * sizeof(int16_t)) == 0) {
                     fprintf(stderr, "hop %lld: FAULT-INJECTED hop's PCM equals mic_in verbatim -- "
                                     "bypass looks like a passthrough, not fail-closed silence\n", ghop);
                     st.passthrough_violations++;
-                }
-                if (gen_after_b != gen_before_b || gen_after_a != gen_before_a) {
-                    fprintf(stderr, "hop %lld: generation advanced on a plain bypass hop "
-                                    "(before A=%u B=%u, after A=%u B=%u) -- bypass must not touch "
-                                    "the generation\n", ghop, gen_before_a, gen_before_b, gen_after_a, gen_after_b);
-                    st.generation_advanced_on_bypass++;
                 }
             }
             st.hops++;
@@ -332,15 +352,15 @@ static int run_matrix(int inject_shift) {
     }
 
     printf("hops=%lld mismatches=%lld feat_mismatches=%lld passthrough_violations=%lld "
-          "generation_advanced_on_bypass=%lld %s\n",
+          "generation_trace_wrong=%lld %s\n",
           st.hops, st.mismatches, st.feat_mismatches, st.passthrough_violations,
-          st.generation_advanced_on_bypass,
+          st.generation_trace_wrong,
           (st.mismatches == 0 && st.feat_mismatches == 0 && st.passthrough_violations == 0 &&
-           st.generation_advanced_on_bypass == 0) ? "PASS" : "FAIL");
+           st.generation_trace_wrong == 0) ? "PASS" : "FAIL");
 
     free(mic_in); free(far_in); free(pcm_out_a); free(pcm_out_b); free(prev_pcm_out_b);
     return (st.mismatches == 0 && st.feat_mismatches == 0 && st.passthrough_violations == 0 &&
-            st.generation_advanced_on_bypass == 0) ? 0 : 1;
+            st.generation_trace_wrong == 0) ? 0 : 1;
 }
 
 /* ---- OLA-matters proof: driver A (AC_OLA_ENV_NORM) vs. driver C (AC_OLA_ACCUMULATE) on
@@ -381,8 +401,8 @@ static int run_ola_matters_proof(void) {
         }
         pre_a = board_pre(&A, mic_in, far_in, &in_a, &out_a);
         pre_c = board_pre(&C, mic_in, far_in, &in_c, &out_c);
-        ai_rc = shared_fake(ghop, 0, &out_a);
-        (void)shared_fake(ghop, 0, &out_c);
+        ai_rc = shared_fake(ghop, 0, 0, &out_a);
+        (void)shared_fake(ghop, 0, 0, &out_c);
         post_a = board_post(&A, ai_rc, pcm_a, &written_a);
         post_c = board_post(&C, ai_rc, pcm_c, &written_c);
         (void)pre_c;
@@ -415,9 +435,9 @@ static int run_ola_matters_proof(void) {
  * An identity accelerator (CCM taps = 1 + 0j at delay 0, centre frequency) makes the stream's output the mic one hop
  * late. The oracle is that chain built by hand from ac_stft/ac_istft: mic spectrum in, the same spectrum out, except a
  * ZERO spectrum at the failed hop. The stream must equal it sample for sample (+-1 LSB, int16 conversion), so a failed
- * hop that kept the mic spectrum (a passthrough), or one that ignored a reported infer_status, differs from the oracle
- * by thousands of LSB. Three failures: a reported infer_status != 0 with valid finite taps, non-finite taps with
- * infer_status 0 (refused), and both. The oracle is independent of deepvqe_prepost_frame_bypass(). */
+ * hop that kept the mic spectrum (a passthrough), or one that ignored a reported run status, differs from the oracle
+ * by thousands of LSB. Three failures: a reported run status != 0 with valid finite taps, non-finite taps with
+ * run status 0 (refused), and both. The oracle is independent of deepvqe_prepost_frame_bypass(). */
 static void identity_taps(DeepVqePrepostOutputs *out) {
     const size_t tapn = 9, bins = out->taps_elements / (tapn * 2u);
     size_t b;
@@ -491,7 +511,7 @@ static int run_fail_closed_oracle(int kind) {   /* 0 status only, 1 non-finite t
     if (discriminating < hop / 4) { fprintf(stderr, "fail-closed oracle (kind %d): the failed hop is not distinguishable from a normal one (%lld samples)\n", kind, discriminating); bad++; }
     free(mic_in); free(prev_mic); free(far_in); free(pcm_b); free(pcm_o); free(pool_b);
     printf("fail-closed oracle (kind %d: %s): %lld deviations %s\n", kind,
-           kind == 0 ? "infer_status only" : kind == 1 ? "non-finite taps" : "both", bad, bad == 0 ? "PASS" : "FAIL");
+           kind == 0 ? "run status only" : kind == 1 ? "non-finite taps" : "both", bad, bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : 1;
 }
 

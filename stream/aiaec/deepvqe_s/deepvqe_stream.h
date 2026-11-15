@@ -3,13 +3,14 @@
  * once every N hops and pre_process's return value says which (1 job, 0 none); pre/post_process run every hop.
  *
  *     per hop: rc = deepvqe_stream_pre_process(ctx, mic_in, far_in, &io);             // -1: contract error
- *              if (rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs);
- *                             if (ai_rc != 0) device_state_refill_zero(); }
+ *              if (rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs); }
  *              deepvqe_stream_post_process(ctx, ai_rc, pcm_out);
  *
- * io.state_generation is written every hop; the state sync is the caller's (also with the optional registered state).
- * A failed run or readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
- * Bypass (ai_rc != 0) fails CLOSED: the batch's spectrum is zero, but the overlap-add still carries the previous hop, so
+ * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any other
+ * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
+ * continue from (reset, refused commit, a dirty status). Before a run, zero the accelerator's state when io.state_generation
+ * differs from the value at the last zeroing; it is written every hop, also with the optional registered state.
+ * A status other than 0 fails CLOSED: the batch's spectrum is zero, but the overlap-add still carries the previous hop, so
  * pcm_out is not fully zero except on the first bypass. No warm-up: a frame is ready from hop 0 (N == 1) or hop N - 1, over a
  * zero-filled CCM ring. The zero hops are the N - 1 pre-roll hops of the first batch. PCM delay is N * grid.hop samples. */
 
@@ -87,7 +88,7 @@ typedef struct DeepVqeHopIO {
 int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
                                DeepVqeHopIO *io);
 
-/* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits, else frame_bypass, fail CLOSED). pcm_out is a
+/* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits; otherwise the batch fails CLOSED, see above). pcm_out is a
  * full hop: return 1; 0 with zeros during the N - 1 pre-roll hops (N > 1); -1 with zeros on a post_process_freq() error, or
  * -1 untouched if no pre_process is pending or the stream is freq_only (the hop stays due: post_process_freq() closes it).
  * Once per pre_process, every hop. */
