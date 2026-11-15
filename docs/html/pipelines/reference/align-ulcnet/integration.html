@@ -74,6 +74,7 @@ int mono_ulcnet_run(void) {
     UlcnetStreamMemReq sreq;
     memset(&amp;scfg, 0, sizeof(scfg));
     scfg.grid = grid;                                    /* frames_per_call 0:一 hop 一次推論 */
+    scfg.freq_only = 1;                                  /* 只用頻譜進出口:pool 不含 STFT／ISTFT */
     if (ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq) != 0) return -1;
     AcStftConfig fcfg;
     ac_stft_config_default(&amp;fcfg, grid.n_fft);
@@ -165,6 +166,7 @@ int four_ulcnet_run(void) {
     size_t aec_b, beam_b;
     memset(&amp;scfg, 0, sizeof(scfg));
     scfg.grid = grid;
+    scfg.freq_only = 1;                                  /* 只用頻譜進出口 */
     if (ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc) != 0 ||          /* 板端由匯出 metadata 填 */
         ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc) != 0 ||
         ulcnet_model_io_descriptor_frames(&amp;desc) != 1 ||
@@ -253,7 +255,7 @@ int four_ulcnet_run(void) {
   | ulcnet_model_io_descriptor_validate(&amp;grid, &amp;desc) == 0 且 ulcnet_model_io_descriptor_frames(&amp;desc) == 1,否則不啟動 |
   | aec_get_mem_size(&amp;aec_cfg)                          |                                                 |
   |-------------------------&gt;|                          |                                                 |
-  | scfg.grid = grid;  ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq)      (framing 物件由應用端另外查大小)       |
+  | scfg.grid = grid; scfg.freq_only = 1; ulcnet_stream_get_mem_size(&amp;scfg, &amp;sreq) (framing 由應用端另查)|
   |----------------------------------------------------&gt;|                                                 |
   | aec_init(pool, aec_b, &amp;aec_cfg)                     |                                                 |
   |-------------------------&gt;|                          |                                                 |

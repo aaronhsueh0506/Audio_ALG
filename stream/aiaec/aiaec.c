@@ -291,6 +291,27 @@ struct AiaecCtx { AiaecCore core; };
 struct AiaecSpecCtx  { AiaecCore core; };
 struct AiaecFreqCtx  { AiaecCore core; };
 
+#if AIAEC_ENABLE_DEEPVQE_S
+/* The inner stream's config, the one sizing and init both use; the _freq family's stream carries no framing. */
+static void aiaec_deepvqe_stream_cfg(AiaecFamily family, const DeepVqeGrid *grid, DeepVqeStreamConfig *scfg)
+{
+    memset(scfg, 0, sizeof(*scfg));
+    scfg->grid = *grid;
+    scfg->freq_only = family == AIAEC_FAMILY_FREQ;
+}
+#endif
+
+#if AIAEC_ENABLE_ALIGN_ULCNET
+/* As aiaec_deepvqe_stream_cfg(); no state registration: the accelerator owns its own state copy. */
+static void aiaec_ulcnet_stream_cfg(AiaecFamily family, const UlcnetGrid *grid, int n, UlcnetStreamConfig *ucfg)
+{
+    memset(ucfg, 0, sizeof(*ucfg));
+    ucfg->grid = *grid;
+    ucfg->frames_per_call = n;
+    ucfg->freq_only = family == AIAEC_FAMILY_FREQ;
+}
+#endif
+
 /* Carves (base != NULL) or just sizes (base == NULL) the core header, the DeepVQE-S stash (if
  * applicable) and the bound inner stream's own pool region, in that order. dgrid/ugrid are
  * `const void *` (cast back inside each #if branch) so the signature compiles in every build
@@ -323,8 +344,7 @@ static int aiaec_pool_layout(AiaecFamily family, int n, const void *dgrid, const
         }
         if (stash_out) *stash_out = p;
 
-        memset(&scfg, 0, sizeof(scfg));
-        scfg.grid = *grid;
+        aiaec_deepvqe_stream_cfg(family, grid, &scfg);
         if (deepvqe_stream_get_mem_size(&scfg, &sreq) != 0) return -1;
         if (stream_carve(base, &cursor, (size_t)sreq.bytes, &p) != 0) return -1;
         if (inner_pool_out) *inner_pool_out = p;
@@ -339,12 +359,10 @@ static int aiaec_pool_layout(AiaecFamily family, int n, const void *dgrid, const
         UlcnetStreamConfig ucfg;
         UlcnetStreamMemReq ureq;
 
-        (void)family; (void)dgrid;
+        (void)dgrid;
         if (stash_out) *stash_out = (void *)0;
 
-        memset(&ucfg, 0, sizeof(ucfg));
-        ucfg.grid = *grid;   /* no state registration: the accelerator owns its own state copy */
-        ucfg.frames_per_call = n;
+        aiaec_ulcnet_stream_cfg(family, grid, n, &ucfg);
         if (ulcnet_stream_get_mem_size(&ucfg, &ureq) != 0) return -1;
         if (stream_carve(base, &cursor, (size_t)ureq.bytes, &p) != 0) return -1;
         if (inner_pool_out) *inner_pool_out = p;
@@ -462,8 +480,7 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
             return AIAEC_ERR_POOL;
         if (total != (size_t)req.bytes) return AIAEC_ERR_POOL;
 
-        memset(&scfg, 0, sizeof(scfg));
-        scfg.grid = dgrid;
+        aiaec_deepvqe_stream_cfg(family, &dgrid, &scfg);
         core->u.deepvqe.inner = deepvqe_stream_init(&scfg, inner_pool, inner_bytes);
         if (!core->u.deepvqe.inner) return AIAEC_ERR_POOL;
         core->u.deepvqe.grid = dgrid;
@@ -486,9 +503,7 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
             return AIAEC_ERR_POOL;
         if (total != (size_t)req.bytes) return AIAEC_ERR_POOL;
 
-        memset(&ucfg, 0, sizeof(ucfg));
-        ucfg.grid = ugrid;
-        ucfg.frames_per_call = n;
+        aiaec_ulcnet_stream_cfg(family, &ugrid, n, &ucfg);
         core->u.align.inner = ulcnet_stream_init(&ucfg, inner_pool, inner_bytes);
         if (!core->u.align.inner) return AIAEC_ERR_POOL;
         core->u.align.grid = ugrid;

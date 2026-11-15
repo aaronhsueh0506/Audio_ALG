@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
     DfnResStageConfig stage = dfn_res_stage_default_config(dfn_test_grid());
     DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000, dfn_test_grid());
     DFN2StreamConfig stream;
-    UlcnetStreamConfig ulc_stream;
+    UlcnetStreamConfig ulc_stream, ulc_stream_freq;
     AinrBridgeConfig ainr_bridge_cfg = ainr_bridge_default_config(16000, DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD);
 
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
@@ -180,6 +180,8 @@ int main(int argc, char **argv) {
     stream.erb_inv = erb_inv;
     memset(&ulc_stream, 0, sizeof ulc_stream);
     ulc_stream.grid = ulc_grid;
+    ulc_stream_freq = ulc_stream;
+    ulc_stream_freq.freq_only = 1;
 
     EXERCISE(dfn2_prepost, DFN2PrepostMemReq, dfn2);
     EXERCISE(dfn3_prepost, DFN3PrepostMemReq, dfn3);
@@ -193,7 +195,8 @@ int main(int argc, char **argv) {
     EXERCISE(dfn2_stream_abi, DFN2StreamMemReq, stream);
     EXERCISE(ainr_bridge, AinrBridgeMemReq, ainr_bridge_cfg);
     EXERCISE(ulcnet_stream_abi, UlcnetStreamMemReq, ulc_stream);
-    assert(cases == 11u);
+    EXERCISE(ulcnet_stream_abi, UlcnetStreamMemReq, ulc_stream_freq);
+    assert(cases == 12u);
     if (write_file) assert(fclose(write_file) == 0);
     if (foreign_file) {
         assert(fgetc(foreign_file) == EOF);

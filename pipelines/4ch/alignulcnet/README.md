@@ -12,8 +12,8 @@ with `fft_size` = `grid.n_fft`; the grid is built with `ulcnet_grid_make()` from
 there is no RES (this application has no gain stage) and `aec_process_residual()` /
 `array_sample_beam_fuse()` are unavailable (`AEC_ERR_MODE`). The array plus helper and the
 stream are two pools: `main.c` queries `aec_get_mem_requirements()`,
-`array_sample_beam_get_mem_size()` and `ulcnet_stream_get_mem_size()`, cuts both blocks (the stream's
-block at its descriptor's alignment, 16 bytes) and prints the sizes. The spectrum entries do no STFT or ISTFT: `main.c` owns an `AcStft` for the raw
+`array_sample_beam_get_mem_size()` and `ulcnet_stream_get_mem_size()` (a spectrum-only stream, `freq_only = 1`), cuts both
+blocks (the stream's block at its descriptor's alignment, 16 bytes) and prints the sizes. The spectrum entries do no STFT or ISTFT: `main.c` owns an `AcStft` for the raw
 far hop and an `AcIstft` for the output spectrum, in a third block with the six spectrum planes (the beam spectrum is already a
 spectrum, so there is no error analysis; it is copied into two planes).
 
@@ -167,10 +167,10 @@ The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
 profile, that banner reads a 2,453,056 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
-103,312 B stream pool at 16 kHz and a 5,120,288 B unit pool plus a 202,640 B stream pool at 48 kHz
+14,992 B stream pool at 16 kHz and a 5,120,288 B unit pool plus a 29,328 B stream pool at 48 kHz
 (`--sample-rate 48000`); the application's framing line follows (49,920 B at 16 kHz, 98,048 B at 48 kHz: the far `AcStft`, the output
-`AcIstft` and six spectrum planes). The stream pool follows the grid, not `D`, and also holds the analysis and
-synthesis objects of the stream's PCM entries, which this example does not call. Read the numbers from your
+`AcIstft` and six spectrum planes). The stream pool follows the grid, not `D`, and holds no analysis or synthesis
+object (`freq_only`). Read the numbers from your
 own build rather than copying them.
 `n` is an init parameter, not a runtime setter —
 changing it means re-querying the pool and re-initializing.

@@ -92,7 +92,12 @@ VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) ulcnet_stre
 STREAM_FREQ_BIN := $(OBJ_DIR)/test_ulcnet_stream_freq
 STREAM_FREQ_SOURCES := tests/test_ulcnet_stream_freq.c $(CORE_SOURCES) ulcnet_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq audit-no-stdio clean _cfg_guard
+# The spectrum-only stream (cfg.freq_only) against a full one, in an exact pool between canaries.
+FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
+FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) ulcnet_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq test-freq-only \
+	audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -150,10 +155,17 @@ $(STREAM_FREQ_BIN): $(STREAM_FREQ_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(C
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(STREAM_FREQ_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
+$(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(FREQ_ONLY_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
 test-stream-freq: $(STREAM_FREQ_BIN)
 	"$(STREAM_FREQ_BIN)"
 
-test: smoke verify-vs-sample test-stream-freq
+test-freq-only: $(FREQ_ONLY_BIN)
+	"$(FREQ_ONLY_BIN)"
+
+test: smoke verify-vs-sample test-stream-freq test-freq-only
 
 # audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
 # stdio symbol (nothing in this model needs stdio at all).

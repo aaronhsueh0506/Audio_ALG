@@ -82,7 +82,11 @@ VPATH := ../../../lib/aiaec/deepvqe_s
 SMOKE_BIN := $(OBJ_DIR)/smoke_deepvqe_stream
 SMOKE_SOURCES := tests/smoke_deepvqe_stream.c $(CORE_SOURCES) deepvqe_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample \
+# The spectrum-only stream (cfg.freq_only) against a full one, in an exact pool between canaries.
+FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
+FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) deepvqe_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-freq-only \
 	audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -129,7 +133,14 @@ $(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $
 smoke: $(SMOKE_BIN)
 	"$(SMOKE_BIN)"
 
-test: smoke verify-vs-sample
+$(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(FREQ_ONLY_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+test-freq-only: $(FREQ_ONLY_BIN)
+	"$(FREQ_ONLY_BIN)"
+
+test: smoke verify-vs-sample test-freq-only
 
 # audit-no-stdio: builds the archive (the one every real caller in this tree links) and asserts,
 # via `nm -u`, that deepvqe_stream.o references no stdio symbol (nothing in this model needs

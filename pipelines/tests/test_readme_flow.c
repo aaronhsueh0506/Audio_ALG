@@ -392,6 +392,7 @@ static int ulc_host_build(UlcHost* u) {
     istft_b = ac_istft_get_mem_size(&sc);
     memset(&stream_cfg, 0, sizeof(stream_cfg));
     stream_cfg.grid = g_ulc_grid;                 /* one hop per accelerator job */
+    stream_cfg.freq_only = 1;                     /* the host runs the analysis and the ISTFT */
     if (ulcnet_stream_get_mem_size(&stream_cfg, &stream_req) != 0) return -1;
     stream_b = (size_t)stream_req.bytes;
     /* the stream's grid; the lane keeps the state of the linear residual only */

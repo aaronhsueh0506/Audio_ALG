@@ -20,7 +20,9 @@
  *                (real length - 1 + trim_samples) after the documented tail_zero_blocks, through every
  *                family; the queue-only drain with one zero spectrum loses it.
  *   bind/pool    per-family trim / queue / tail, ports; pools: short / misaligned refused, larger constructs,
- *                also when the pool is undersized.
+ *                also when the pool is undersized; the _freq pool is the pinned size and the _spec pool less
+ *                the framing (FFT, two STFT, one ISTFT, PCM scratch). Every section runs each family in a pool of
+ *                exactly its size with a canary zone behind it.
  *   gates        kind / size / null / sequence rejections for the new entries. */
 
 #include <math.h>
@@ -33,6 +35,7 @@
 #include "aiaec_test_fixture.h"
 #include "aiaec_product.h"
 #include "audio_stft.h"
+#include "fft_wrapper.h"
 #include "stream_mem.h"
 
 #define PRODUCT_DV (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S)
@@ -50,14 +53,29 @@ static AiaecConfig make_cfg(int fft, int n) {
     return cfg;
 }
 
-/* One context per family on its own pool. */
+/* One context per family on its own pool of exactly its size, followed by TRIO_CANARY bytes of 0xC3. */
+enum { TRIO_CANARY = 64 };
 typedef struct Trio {
     AiaecCtx *blk;
     AiaecSpecCtx *spec;
     AiaecFreqCtx *freq;
     void *p_blk, *p_spec, *p_freq;
+    size_t b_blk, b_spec, b_freq;
     AiaecInfo info_blk, info_spec, info_freq;
 } Trio;
+
+static void *trio_pool(size_t bytes) {
+    unsigned char *p = (unsigned char *)alloc_aligned(bytes + TRIO_CANARY);
+    memset(p + bytes, 0xC3, TRIO_CANARY);
+    return p;
+}
+
+static int canary_intact(const void *pool, size_t bytes) {
+    const unsigned char *p = (const unsigned char *)pool + bytes;
+    size_t k;
+    for (k = 0; k < TRIO_CANARY; ++k) if (p[k] != 0xC3) return 0;
+    return 1;
+}
 
 static int trio_make(Trio *t, const AiaecConfig *cfg) {
     StreamMemReq rb, rs, rf;
@@ -68,8 +86,8 @@ static int trio_make(Trio *t, const AiaecConfig *cfg) {
         FAIL("trio: get_mem_size failed for fft=%d hop_in=%d", cfg->fft, cfg->hop_in);
         return -1;
     }
-    t->p_blk = alloc_aligned((size_t)rb.bytes); t->p_spec = alloc_aligned((size_t)rs.bytes);
-    t->p_freq = alloc_aligned((size_t)rf.bytes);
+    t->b_blk = (size_t)rb.bytes; t->b_spec = (size_t)rs.bytes; t->b_freq = (size_t)rf.bytes;
+    t->p_blk = trio_pool(t->b_blk); t->p_spec = trio_pool(t->b_spec); t->p_freq = trio_pool(t->b_freq);
     e = aiaec_init(cfg, t->p_blk, (size_t)rb.bytes, &t->blk, &t->info_blk);
     CHECK(e == AIAEC_OK && t->blk != NULL, "trio: init err=%d", e);
     e = aiaec_init_spec(cfg, t->p_spec, (size_t)rs.bytes, &t->spec, &t->info_spec);
@@ -79,7 +97,12 @@ static int trio_make(Trio *t, const AiaecConfig *cfg) {
     return t->blk && t->spec && t->freq ? 0 : -1;
 }
 
-static void trio_free(Trio *t) { free(t->p_blk); free(t->p_spec); free(t->p_freq); }
+static void trio_free(Trio *t) {
+    CHECK(canary_intact(t->p_blk, t->b_blk) && canary_intact(t->p_spec, t->b_spec) && canary_intact(t->p_freq, t->b_freq),
+          "trio: a context wrote past its pool (block/spec/freq canary %d/%d/%d)", canary_intact(t->p_blk, t->b_blk),
+          canary_intact(t->p_spec, t->b_spec), canary_intact(t->p_freq, t->b_freq));
+    free(t->p_blk); free(t->p_spec); free(t->p_freq);
+}
 
 /* An external framing object of the customer's: default config, accumulate OLA, scale 1. */
 typedef struct Frame { AcStft *stft; AcIstft *istft; void *mem_s, *mem_i; } Frame;
@@ -698,8 +721,24 @@ static int section_bind_and_pool(int fft, int n) {
         CHECK(aiaec_init_spec(&cfg, pool, (size_t)rs.bytes, &cs, &info) == AIAEC_OK && cs != NULL, "pool: the exact spec size must construct");
         CHECK(aiaec_init_freq(&cfg, pool, (size_t)rf.bytes + 64u, &cf, &info) == AIAEC_OK && cf != NULL, "pool: a larger freq pool must construct");
     }
-    printf("section_bind_and_pool(fft=%d N=%d): info shared, trim %d and queue %d frames in every family, pool sizes enforced\n",
-           fft, n, want_trim, want_queue);
+    {   /* the _freq pool carries no framing: pinned (host, both models compiled) and _spec less the framing */
+        AcStftConfig sc;
+        const size_t plane = (size_t)(PRODUCT_AL ? n : 1) * (size_t)(fft / 2 + 1);
+        size_t framing, pinned;
+        ac_stft_config_default(&sc, fft);
+        sc.ola = AC_OLA_ACCUMULATE;
+        framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
+                  ck_align16_size(ac_istft_get_mem_size(&sc)) +
+                  ck_align16_size((3u * (size_t)hop + 6u * plane) * sizeof(float));
+        pinned = PRODUCT_DV ? (fft == 512 ? 35776u : n == 8 ? 126640u : 18368u) : (fft == 512 ? 15088u : 7920u);
+        CHECK(rs.bytes - rf.bytes == framing, "pool(fft=%d N=%d): _spec %llu - _freq %llu is not the framing %zu", fft, n,
+              (unsigned long long)rs.bytes, (unsigned long long)rf.bytes, framing);
+        CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
+              (unsigned long long)rf.bytes, pinned);
+    }
+    printf("section_bind_and_pool(fft=%d N=%d): info shared, trim %d and queue %d frames in every family, pool sizes enforced"
+           " (block/spec/freq %llu/%llu/%llu)\n", fft, n, want_trim, want_queue, (unsigned long long)rb.bytes,
+           (unsigned long long)rs.bytes, (unsigned long long)rf.bytes);
     free(pool);
     return bad;
 }

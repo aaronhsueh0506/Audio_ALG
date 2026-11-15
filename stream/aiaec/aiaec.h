@@ -224,7 +224,8 @@ typedef struct AiaecFreqInput {
 
 typedef struct AiaecFreqCtx AiaecFreqCtx;
 
-/* As aiaec_get_mem_size(), for the _freq family. */
+/* As aiaec_get_mem_size(), for the _freq family; the pool holds no FFT, STFT / ISTFT or PCM scratch (smaller than
+ * _spec). */
 int aiaec_get_mem_size_freq(const AiaecConfig *cfg, StreamMemReq *req);
 
 /* As aiaec_init(), for the _freq family. */

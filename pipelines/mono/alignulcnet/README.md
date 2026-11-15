@@ -10,8 +10,8 @@ for the output spectrum. The
 executable links the stream object, the Align-ULCNet C pre/post-processing objects, and the existing
 AEC/audiolib/common libraries. The AEC, the stream and the framing objects are initialised separately
 (`aec_get_mem_size()`, `ulcnet_stream_get_mem_size()`, `ac_stft_get_mem_size()` / `ac_istft_get_mem_size()`); the example prints the
-total pool size. The stream's pool is 103,312 B at 16 kHz and 202,640 B at 48 kHz: it also holds the
-analysis and synthesis objects of the stream's PCM entries, which this example does not call.
+total pool size. The stream is built spectrum-only (`UlcnetStreamConfig.freq_only = 1`): its pool holds no FFT,
+STFT / ISTFT or PCM scratch, 14,992 B at 16 kHz and 29,328 B at 48 kHz, and its PCM entries return -1.
 
 `main.c` shows the board boundary. The K/V windows, logit window and GRU hidden state belong
 to the application; on a board they live in the accelerator's own buffers (the stream registers

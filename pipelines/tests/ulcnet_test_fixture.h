@@ -162,13 +162,15 @@ typedef struct UlcTestRig {
     long broken;     /* contract violations seen by the rig; every test expects 0 (see ulc_rig_begin) */
 } UlcTestRig;
 
-/* Pool bytes of the stream for `grid`, 0 for a grid it refuses. */
+/* Pool bytes of the stream for `grid` (spectrum-only, cfg.freq_only: the rig drives the _freq entries), 0 for a grid it
+ * refuses. */
 static inline size_t ulc_rig_stream_bytes(const UlcnetGrid* grid) {
     UlcnetStreamConfig cfg;
     UlcnetStreamMemReq req;
     if (!grid) return 0;
     memset(&cfg, 0, sizeof(cfg));
     cfg.grid = *grid;
+    cfg.freq_only = 1;
     return ulcnet_stream_get_mem_size(&cfg, &req) == 0 ? (size_t)req.bytes : 0;
 }
 
@@ -180,6 +182,7 @@ static inline int ulc_rig_init(UlcTestRig* r, void* mem, size_t bytes, const Ulc
     if (!grid) return -1;
     memset(&cfg, 0, sizeof(cfg));
     cfg.grid = *grid;
+    cfg.freq_only = 1;
     if (ulcnet_stream_get_mem_size(&cfg, &req) != 0) return -1;
     r->stream = ulcnet_stream_init_ex(&cfg, mem, bytes, &req);
     return r->stream ? 0 : -1;

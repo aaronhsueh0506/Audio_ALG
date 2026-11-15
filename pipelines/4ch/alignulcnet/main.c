@@ -177,6 +177,7 @@ static int ulc_setup(void *user, ArraySampleHopView *view) {
      * must agree on one (sample_rate, hop, n). */
     memset(&s->stream_cfg, 0, sizeof(s->stream_cfg));
     s->stream_cfg.grid = s->grid;   /* one hop per accelerator job */
+    s->stream_cfg.freq_only = 1;    /* the application runs the analysis and the ISTFT */
     s->stream_bytes = ulcnet_stream_get_mem_size(&s->stream_cfg, &s->stream_req) == 0
         ? (size_t)s->stream_req.bytes : 0;
     ac_stft_config_default(&sc, s->grid.n_fft);

@@ -16,7 +16,10 @@
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries
  * refuse such a stream and the packet entries a one-hop stream. delay[k] is hop k's event, oldest first, edge rule as above
  * with the previous solid carried across packets; the graph resets the model before an event hop and bypasses it (generation
- * unchanged). A failed or non-finite job passes all N error spectra through. */
+ * unchanged). A failed or non-finite job passes all N error spectra through.
+ *
+ * A caller with its own analysis and synthesis uses the _freq entries; cfg.freq_only then keeps the FFT, STFT / ISTFT and
+ * PCM scratch out of the pool. */
 
 #ifndef ULCNET_STREAM_H
 #define ULCNET_STREAM_H
@@ -31,7 +34,7 @@ extern "C" {
 #endif
 
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
-#define ULCNET_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define ULCNET_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u
 /* Identity hops after an alignment boundary: each frame spans two hops, so only the boundary hop's frame straddles it. */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
@@ -47,14 +50,17 @@ typedef struct UlcnetStreamConfig {
     UlcnetGrid grid;   /* ulcnet_grid_make() */
     /* 0 or 1: one model hop per call. 2..ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL: a packet stream, N hops per accelerator job. */
     int frames_per_call;
+    /* Non-zero: a spectrum-only stream. Only the _freq entries run (the PCM entries return -1 and change nothing) and the
+     * pool holds no FFT, STFT / ISTFT or PCM scratch. 0: both entry families. */
+    int freq_only;
 } UlcnetStreamConfig;
 
-/* Fixed 32-byte descriptor; init refuses a pool sized for another grid or build. */
+/* Fixed 32-byte descriptor; init refuses a pool sized for another grid, freq_only or build. */
 typedef struct UlcnetStreamMemReq {
     uint32_t descriptor_version;  /* ULCNET_STREAM_DESCRIPTOR_VERSION        */
     uint32_t layout_version;      /* ULCNET_STREAM_LAYOUT_VERSION            */
     uint32_t reserved0;           /* must be 0                                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, frames_per_call and the UlcnetPrepost hash */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, frames_per_call, freq_only and the UlcnetPrepost hash */
     uint32_t alignment;           /* ULCNET_STREAM_ALIGNMENT                  */
     uint32_t reserved;            /* 0                                        */
     uint64_t bytes;
@@ -69,11 +75,12 @@ int ulcnet_stream_get_mem_size(const UlcnetStreamConfig *cfg, UlcnetStreamMemReq
  * config or a misaligned / undersized pool. */
 UlcnetStream *ulcnet_stream_init(const UlcnetStreamConfig *cfg, void *pool, size_t pool_bytes);
 
-/* As ulcnet_stream_init, refusing a pool carved for another grid, frames_per_call or layout; `expected` NULL skips it. */
+/* As ulcnet_stream_init, refusing a pool carved for another grid, frames_per_call, freq_only or layout; `expected` NULL
+ * skips it. */
 UlcnetStream *ulcnet_stream_init_ex(const UlcnetStreamConfig *cfg, void *pool, size_t pool_bytes,
                                     const UlcnetStreamMemReq *expected);
 
-/* Back to the start: framing and UlcnetPrepost reset (generation advanced), reprime countdown
+/* Back to the start: framing (when the stream has it) and UlcnetPrepost reset (generation advanced), reprime countdown
  * cleared. The alignment-edge detector runs the same operation. */
 void ulcnet_stream_reset(UlcnetStream *s);
 
@@ -96,8 +103,8 @@ typedef struct UlcnetHopIO {
 } UlcnetHopIO;
 
 /* One hop in as full-scale float err_in and far_in (hop_size samples each): alignment-edge check (may reset), analysis,
- * pre_process_freq, then frame_bypass (reprime hop: io zeroed, returns 0) or frame_open (returns 1). -1: contract error. The
- * int16 entry below round-trips float lanes through int16 (up to 4 LSB of PCM). */
+ * pre_process_freq, then frame_bypass (reprime hop: io zeroed, returns 0) or frame_open (returns 1). -1: contract error
+ * (a freq_only stream included). The int16 entry below round-trips float lanes through int16 (up to 4 LSB of PCM). */
 int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                   UlcnetStreamDelay delay, UlcnetHopIO *io);
 
@@ -107,24 +114,26 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
 
 /* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits, else bypass, fail OPEN); a reprime hop is already
  * bypassed. pcm_out is a full hop (return 1). An alignment-event hop restarts the stream: its pcm_out is exactly zero and
- * the previous hop's audio is not output. -1 with zeros on a post_process_freq() error. Once per pre_process. */
+ * the previous hop's audio is not output. -1 with zeros on a post_process_freq() error. Once per pre_process. A freq_only
+ * stream: -1, pcm_out untouched and the hop still open (post_process_freq() closes it). */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
 /* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then the job; an event hop also
  * restarts the stream's framing (exactly zero output, the previous hop's audio lost; ulcnet_stream_restart_mask()), so the PCM
- * equals N one-hop calls. Returns 1, or -1 on a contract error (NULL args, a one-hop stream, a call before the matching post). */
+ * equals N one-hop calls. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a call before the
+ * matching post). */
 int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                          const UlcnetStreamDelay *delay, UlcnetHopIO *io);
 
-/* As the f32 packet entry with the N hops' spectra supplied (frame-major, N * n_bins per plane, the stream's scale); restarts
- * no framing. ulcnet_stream_reset() restarts everything, generation included. */
+/* As the f32 packet entry with the N hops' spectra supplied (frame-major, N * n_bins per plane, the stream's scale), for
+ * either kind of stream; restarts no framing. ulcnet_stream_reset() restarts everything, generation included. */
 int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, const float *err_im,
                                           const float *far_re, const float *far_im,
                                           const UlcnetStreamDelay *delay, UlcnetHopIO *io);
 
-/* As ulcnet_stream_pre_process_f32(), with this hop's linear-error and raw-far spectra supplied (the stream's scale:
- * unnormalised rfft of a sqrt-Hann n_fft block of full-scale float audio, n_bins floats per plane). An edge restarts only the
- * model (state, one identity hop); the caller's analysers and ISTFT are not restarted. */
+/* As ulcnet_stream_pre_process_f32(), on either kind of stream, with this hop's linear-error and raw-far spectra supplied
+ * (the stream's scale: unnormalised rfft of a sqrt-Hann n_fft block of full-scale float audio, n_bins floats per plane).
+ * An edge restarts only the model (state, one identity hop); the caller's analysers and ISTFT are not restarted. */
 int ulcnet_stream_pre_process_freq(UlcnetStream *s, const float *err_re, const float *err_im,
                                    const float *far_re, const float *far_im,
                                    UlcnetStreamDelay delay, UlcnetHopIO *io);

@@ -15,6 +15,7 @@
 struct DeepVqeStream {
     DeepVqeGrid grid;
 
+    /* fft, stft_mic, stft_far, istft and the scratch: the PCM half, NULL in a freq_only stream. */
     FftHandle *fft;     /* shared by stft_mic / stft_far / istft */
     AcStft    *stft_mic;
     AcStft    *stft_far;
@@ -77,7 +78,7 @@ static int cfg_valid(const DeepVqeStreamConfig *cfg) {
 
 /* One carve walk: sizing (base == NULL, *out pointers stay NULL) or carving; *total must match across both with one cfg.
  * -1 on a bad config or an overflowing carve. Order (bump LAYOUT_VERSION and build_flags_hash on a change): self, fft,
- * stft_mic, stft_far, istft, prepost, scratch. */
+ * stft_mic, stft_far, istft, prepost, scratch; cfg.freq_only: self, prepost. */
 static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
                                  DeepVqeStreamLayout *out, size_t *total) {
     size_t cursor = 0;
@@ -97,26 +98,28 @@ static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *
     if (stream_carve(base, &cursor, sizeof(DeepVqeStream), &ptr) != 0) return -1;
     out->self = (DeepVqeStream *)ptr;
 
-    fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
-    if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
-    out->fft_mem = ptr;
+    if (!cfg->freq_only) {
+        fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
+        if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
+        out->fft_mem = ptr;
 
-    /* One AcStftConfig, reused for sizing stft_mic/stft_far/istft (analysis ignores ola).
-     * scfg.fft stays NULL here (own-carve sizing; the shared handle doesn't exist yet). ola =
-     * AC_OLA_ACCUMULATE, this stream's real-time contract for every grid it serves. */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ACCUMULATE;
+        /* One AcStftConfig, reused for sizing stft_mic/stft_far/istft (analysis ignores ola).
+         * scfg.fft stays NULL here (own-carve sizing; the shared handle doesn't exist yet). ola =
+         * AC_OLA_ACCUMULATE, this stream's real-time contract for every grid it serves. */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.ola = AC_OLA_ACCUMULATE;
 
-    stft_bytes = ac_stft_get_mem_size(&scfg);
-    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-    out->stft_mic_mem = ptr;
+        stft_bytes = ac_stft_get_mem_size(&scfg);
+        if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        out->stft_mic_mem = ptr;
 
-    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-    out->stft_far_mem = ptr;
+        if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        out->stft_far_mem = ptr;
 
-    istft_bytes = ac_istft_get_mem_size(&scfg);
-    if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-    out->istft_mem = ptr;
+        istft_bytes = ac_istft_get_mem_size(&scfg);
+        if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        out->istft_mem = ptr;
+    }
 
     if (deepvqe_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
     for (i = 0; i < DEEPVQE_STATE_COUNT; ++i) {
@@ -131,12 +134,14 @@ static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *
 
     /* mic_f, far_f, hop_out [hop] + mic_re, mic_im, far_re, far_im, enh_re, enh_im [n_bins], one
      * slab; only the slab base is part of the pool ABI. */
-    scratch_bytes = ck_add_size(
-        ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
-        ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
-    if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
-        return -1;
-    out->scratch_mem = ptr;
+    if (!cfg->freq_only) {
+        scratch_bytes = ck_add_size(
+            ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
+            ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
+        if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
+            return -1;
+        out->scratch_mem = ptr;
+    }
 
     *total = ck_align16_size(cursor);
     return MEM_SIZE_INVALID(*total) ? -1 : 0;
@@ -152,6 +157,7 @@ static uint32_t build_hash(const DeepVqeStreamConfig *cfg, uint32_t prepost_hash
     h = stream_fnv1a_u32(h, (uint32_t)g->delay_depth);
     h = stream_fnv1a_u32(h, (uint32_t)DEEPVQE_STREAM_LAYOUT_VERSION);
     h = stream_fnv1a_u32(h, (uint32_t)(state_mode(cfg) > 0 ? 1u : 0u));
+    h = stream_fnv1a_u32(h, cfg->freq_only ? 1u : 0u);
     h = stream_fnv1a_u32(h, prepost_hash);
     return ac_memreq_abi_hash(h);
 }
@@ -201,23 +207,29 @@ static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg,
     s->open = 0;
     s->pending = 0;
 
-    s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
-    if (!s->fft) return NULL;
+    s->fft = NULL;
+    s->stft_mic = s->stft_far = NULL;
+    s->istft = NULL;
 
-    /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
-     * than the sizing one above, which the larger carved region always fits. */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ACCUMULATE;
-    scfg.fft = s->fft;
+    if (!cfg->freq_only) {
+        s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
+        if (!s->fft) return NULL;
 
-    s->stft_mic = ac_stft_init(layout->stft_mic_mem, ac_stft_get_mem_size(&scfg), &scfg);
-    if (!s->stft_mic) return NULL;
+        /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
+         * than the sizing one above, which the larger carved region always fits. */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.ola = AC_OLA_ACCUMULATE;
+        scfg.fft = s->fft;
 
-    s->stft_far = ac_stft_init(layout->stft_far_mem, ac_stft_get_mem_size(&scfg), &scfg);
-    if (!s->stft_far) return NULL;
+        s->stft_mic = ac_stft_init(layout->stft_mic_mem, ac_stft_get_mem_size(&scfg), &scfg);
+        if (!s->stft_mic) return NULL;
 
-    s->istft = ac_istft_init(layout->istft_mem, ac_istft_get_mem_size(&scfg), &scfg);
-    if (!s->istft) return NULL;
+        s->stft_far = ac_stft_init(layout->stft_far_mem, ac_stft_get_mem_size(&scfg), &scfg);
+        if (!s->stft_far) return NULL;
+
+        s->istft = ac_istft_init(layout->istft_mem, ac_istft_get_mem_size(&scfg), &scfg);
+        if (!s->istft) return NULL;
+    }
 
     if (deepvqe_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return NULL;
     for (i = 0; i < DEEPVQE_STATE_COUNT; ++i) {
@@ -227,17 +239,19 @@ static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg,
     s->prepost = deepvqe_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;
 
-    hop = (size_t)cfg->grid.hop;
-    n_bins = (size_t)cfg->grid.n_bins;
-    s->mic_f = (float *)layout->scratch_mem;
-    s->far_f = s->mic_f + hop;
-    s->hop_out = s->far_f + hop;
-    s->mic_re = s->hop_out + hop;
-    s->mic_im = s->mic_re + n_bins;
-    s->far_re = s->mic_im + n_bins;
-    s->far_im = s->far_re + n_bins;
-    s->enh_re = s->far_im + n_bins;
-    s->enh_im = s->enh_re + n_bins;
+    if (!cfg->freq_only) {
+        hop = (size_t)cfg->grid.hop;
+        n_bins = (size_t)cfg->grid.n_bins;
+        s->mic_f = (float *)layout->scratch_mem;
+        s->far_f = s->mic_f + hop;
+        s->hop_out = s->far_f + hop;
+        s->mic_re = s->hop_out + hop;
+        s->mic_im = s->mic_re + n_bins;
+        s->far_re = s->mic_im + n_bins;
+        s->far_im = s->far_re + n_bins;
+        s->enh_re = s->far_im + n_bins;
+        s->enh_im = s->enh_re + n_bins;
+    }
 
     return s;
 }
@@ -267,9 +281,11 @@ DeepVqeStream *deepvqe_stream_init(const DeepVqeStreamConfig *cfg, void *pool, s
 
 void deepvqe_stream_reset(DeepVqeStream *s) {
     if (!s) return;
-    ac_stft_reset(s->stft_mic);
-    ac_stft_reset(s->stft_far);
-    ac_istft_reset(s->istft);
+    if (s->stft_mic) {   /* a freq_only stream has no framing */
+        ac_stft_reset(s->stft_mic);
+        ac_stft_reset(s->stft_far);
+        ac_istft_reset(s->istft);
+    }
     deepvqe_prepost_reset(s->prepost);
     s->open = 0;
     s->pending = 0;
@@ -314,7 +330,7 @@ int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const in
     /* Gated on `pending`, not `open`: a no-job hop (frames_per_call > 1) leaves `open` at 0, but
      * pre_process has still run and post_process is still due -- a second pre_process before
      * that post_process must be rejected either way. */
-    if (!s || !mic_in || !far_in || !io || s->pending) return -1;
+    if (!s || !mic_in || !far_in || !io || !s->stft_mic || s->pending) return -1;
     hop = s->grid.hop;
 
     for (i = 0; i < hop; ++i) {
@@ -379,7 +395,7 @@ int deepvqe_stream_post_process_freq(DeepVqeStream *s, int ai_rc, float *re, flo
 int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
     int hop, i, rc, written;
 
-    if (!s || !pcm_out || !s->pending) return -1;
+    if (!s || !pcm_out || !s->istft || !s->pending) return -1;
     hop = s->grid.hop;
 
     rc = deepvqe_stream_post_process_freq(s, ai_rc, s->enh_re, s->enh_im);

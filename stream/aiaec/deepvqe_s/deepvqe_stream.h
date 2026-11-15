@@ -25,23 +25,26 @@ extern "C" {
 #endif
 
 #define DEEPVQE_STREAM_DESCRIPTOR_VERSION 1u
-#define DEEPVQE_STREAM_LAYOUT_VERSION     3u   /* bump with build_flags_hash on any pool / carve / descriptor change */
+#define DEEPVQE_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool / carve / descriptor change */
 #define DEEPVQE_STREAM_ALIGNMENT          16u
 
 typedef struct DeepVqeStreamConfig {
     DeepVqeGrid grid;   /* deepvqe_grid_make(); frames_per_call in [1, 64] */
+    /* Non-zero: a spectrum-only stream. Only the _freq entries run (the PCM entries return -1 and change nothing) and the
+     * pool holds no FFT, STFT / ISTFT or PCM scratch. 0: both entry families. */
+    int freq_only;
     /* Optional borrowed state registration by DeepVqeStateId (see deepvqe_prepost.h): every pointer non-NULL with a
      * nonzero count, or all NULL / 0 (the accelerator owns its state). Not in the pool size or hash. */
     float  *state[DEEPVQE_STATE_COUNT];
     size_t  state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqeStreamConfig;
 
-/* Fixed 32-byte descriptor; init refuses a pool sized for another grid, registration mode or build. */
+/* Fixed 32-byte descriptor; init refuses a pool sized for another grid, registration mode, freq_only or build. */
 typedef struct DeepVqeStreamMemReq {
     uint32_t descriptor_version;  /* DEEPVQE_STREAM_DESCRIPTOR_VERSION       */
     uint32_t layout_version;      /* DEEPVQE_STREAM_LAYOUT_VERSION           */
     uint32_t reserved0;           /* must be 0                                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, state-registration mode and the DeepVqePrepost hash */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, state-registration mode, freq_only and the DeepVqePrepost hash */
     uint32_t alignment;           /* DEEPVQE_STREAM_ALIGNMENT                 */
     uint32_t reserved;            /* 0                                        */
     uint64_t bytes;
@@ -56,11 +59,13 @@ int deepvqe_stream_get_mem_size(const DeepVqeStreamConfig *cfg, DeepVqeStreamMem
  * config or a misaligned / undersized pool. */
 DeepVqeStream *deepvqe_stream_init(const DeepVqeStreamConfig *cfg, void *pool, size_t pool_bytes);
 
-/* As deepvqe_stream_init, refusing a pool carved for another grid, registration mode or layout; `expected` NULL skips it. */
+/* As deepvqe_stream_init, refusing a pool carved for another grid, registration mode, freq_only or layout; `expected` NULL
+ * skips it. */
 DeepVqeStream *deepvqe_stream_init_ex(const DeepVqeStreamConfig *cfg, void *pool, size_t pool_bytes,
                                      const DeepVqeStreamMemReq *expected);
 
-/* Back to the start: framing and DeepVqePrepost reset (registered state zeroed, generation advanced, CCM ring cleared). */
+/* Back to the start: framing (when the stream has it) and DeepVqePrepost reset (registered state zeroed, generation
+ * advanced, CCM ring cleared). */
 void deepvqe_stream_reset(DeepVqeStream *s);
 
 /* Generation of the recurrent state; 0 for NULL. */
@@ -77,18 +82,20 @@ typedef struct DeepVqeHopIO {
 
 /* One PCM hop in (mic_in, far_in: hop_size samples each, no HPF): analysis, pre_process_freq, frame_open if a job is due.
  * Returns 1 with io filled, 0 with io zeroed (N > 1, no job this hop; state_generation still written), -1 on a contract
- * error (NULL args, or a call before the matching post_process). */
+ * error (NULL args, a freq_only stream, or a call before the matching post_process). */
 int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
                                DeepVqeHopIO *io);
 
 /* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits, else frame_bypass, fail CLOSED). pcm_out is a
  * full hop: return 1; 0 with zeros during the N - 1 pre-roll hops (N > 1); -1 with zeros on a post_process_freq() error, or
- * -1 untouched if no pre_process is pending. Once per pre_process, every hop. */
+ * -1 untouched if no pre_process is pending or the stream is freq_only (the hop stays due: post_process_freq() closes it).
+ * Once per pre_process, every hop. */
 int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out);
 
 /* Spectrum-domain entries, for a caller that keeps analysis and / or synthesis outside: the stream's own scale
  * (unnormalised rfft of a sqrt-Hann n_fft block of full-scale float audio, n_bins floats per plane); same pending / job /
- * return conventions as the PCM pair, which may be paired with the _freq entries across. */
+ * return conventions as the PCM pair, which may be paired with the _freq entries across. They run on either kind of
+ * stream; cfg.freq_only keeps the FFT, STFT / ISTFT and PCM scratch out of the pool. */
 
 /* As deepvqe_stream_pre_process(), with this hop's mic and far spectra supplied (the analysis STFTs are not touched). */
 int deepvqe_stream_pre_process_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,

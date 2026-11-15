@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
      * must agree on one (sample_rate, hop, n). */
     memset(&stream_cfg, 0, sizeof(stream_cfg));
     stream_cfg.grid = grid;   /* one hop per accelerator job */
+    stream_cfg.freq_only = 1; /* the application runs the analysis and the ISTFT */
     stream_bytes = ulcnet_stream_get_mem_size(&stream_cfg, &stream_req) == 0 ? (size_t)stream_req.bytes : 0;
     framing_pool_bytes = framing_bytes(&grid);
     derive_lane(&profile, &grid, &aec_cfg);

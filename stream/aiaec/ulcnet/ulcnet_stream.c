@@ -24,6 +24,7 @@ struct UlcnetStream {
     UlcnetGrid grid;
     int frames;         /* hops per accelerator job: 1, or the packet size */
 
+    /* fft, stft_err, stft_far, istft and the scratch: the PCM half, NULL in a freq_only stream. */
     FftHandle *fft;     /* shared by stft_err / stft_far / istft */
     AcStft    *stft_err;
     AcStft    *stft_far;
@@ -75,7 +76,7 @@ static int cfg_valid(const UlcnetStreamConfig *cfg) {
 
 /* One carve walk: sizing (base == NULL, *out pointers stay NULL) or carving; *total must match across both with one cfg.
  * -1 on a bad config or an overflowing carve. Order (bump LAYOUT_VERSION and build_flags_hash on a change): self, fft,
- * stft_err, stft_far, istft, prepost, scratch. */
+ * stft_err, stft_far, istft, prepost, scratch; cfg.freq_only: self, prepost. */
 static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *base,
                                 UlcnetStreamLayout *out, size_t *total) {
     size_t cursor = 0;
@@ -94,26 +95,28 @@ static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *ba
     if (stream_carve(base, &cursor, sizeof(UlcnetStream), &ptr) != 0) return -1;
     out->self = (UlcnetStream *)ptr;
 
-    fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
-    if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
-    out->fft_mem = ptr;
+    if (!cfg->freq_only) {
+        fft_bytes = fft_get_mem_size(cfg->grid.n_fft);
+        if (fft_bytes == 0 || stream_carve(base, &cursor, fft_bytes, &ptr) != 0) return -1;
+        out->fft_mem = ptr;
 
-    /* One AcStftConfig, reused for sizing stft_err/stft_far/istft; scfg.fft stays NULL here --
-     * audio_stft.c's config_valid() dereferences a non-NULL cfg->fft, which doesn't exist yet
-     * during sizing. */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ACCUMULATE;
+        /* One AcStftConfig, reused for sizing stft_err/stft_far/istft; scfg.fft stays NULL here --
+         * audio_stft.c's config_valid() dereferences a non-NULL cfg->fft, which doesn't exist yet
+         * during sizing. */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.ola = AC_OLA_ACCUMULATE;
 
-    stft_bytes = ac_stft_get_mem_size(&scfg);
-    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-    out->stft_err_mem = ptr;
+        stft_bytes = ac_stft_get_mem_size(&scfg);
+        if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        out->stft_err_mem = ptr;
 
-    if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
-    out->stft_far_mem = ptr;
+        if (stft_bytes == 0 || stream_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        out->stft_far_mem = ptr;
 
-    istft_bytes = ac_istft_get_mem_size(&scfg);
-    if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
-    out->istft_mem = ptr;
+        istft_bytes = ac_istft_get_mem_size(&scfg);
+        if (istft_bytes == 0 || stream_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        out->istft_mem = ptr;
+    }
 
     if (ulcnet_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
     pcfg.frames_per_call = cfg->frames_per_call;
@@ -126,12 +129,14 @@ static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *ba
     /* err_f, far_f, hop_out [hop] + err_re, err_im, far_re, far_im, enh_re, enh_im [frames * n_bins], one
      * slab (the other stream modules' "one aligned slab" pattern); only the slab base is part of
      * the pool ABI. */
-    scratch_bytes = ck_add_size(
-        ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
-        ck_mul_size(6u, ck_mul_size(plane_bins, sizeof(float))));
-    if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
-        return -1;
-    out->scratch_mem = ptr;
+    if (!cfg->freq_only) {
+        scratch_bytes = ck_add_size(
+            ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
+            ck_mul_size(6u, ck_mul_size(plane_bins, sizeof(float))));
+        if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
+            return -1;
+        out->scratch_mem = ptr;
+    }
 
     *total = ck_align16_size(cursor);
     return MEM_SIZE_INVALID(*total) ? -1 : 0;
@@ -147,6 +152,7 @@ static uint32_t build_hash(const UlcnetStreamConfig *cfg, uint32_t prepost_hash)
     h = stream_fnv1a_u32(h, (uint32_t)g->delay_depth);
     h = stream_fnv1a_u32(h, (uint32_t)ULCNET_STREAM_LAYOUT_VERSION);
     h = stream_fnv1a_u32(h, prepost_hash);
+    h = stream_fnv1a_u32(h, cfg->freq_only ? 1u : 0u);
     if (cfg_frames(cfg) > 1) h = stream_fnv1a_u32(h, (uint32_t)cfg_frames(cfg));
     return ac_memreq_abi_hash(h);
 }
@@ -198,41 +204,49 @@ static UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, un
     s->prev_solid = 0;
     s->reprime_remaining = 0;
 
-    s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
-    if (!s->fft) return NULL;
+    s->fft = NULL;
+    s->stft_err = s->stft_far = NULL;
+    s->istft = NULL;
 
-    /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
-     * than the sizing one above, which the larger carved region always fits. */
-    ac_stft_config_default(&scfg, cfg->grid.n_fft);
-    scfg.ola = AC_OLA_ACCUMULATE;
-    scfg.fft = s->fft;
+    if (!cfg->freq_only) {
+        s->fft = fft_init(layout->fft_mem, fft_get_mem_size(cfg->grid.n_fft), cfg->grid.n_fft);
+        if (!s->fft) return NULL;
 
-    s->stft_err = ac_stft_init(layout->stft_err_mem, ac_stft_get_mem_size(&scfg), &scfg);
-    if (!s->stft_err) return NULL;
+        /* Real, now-constructed handle, borrowed by all three framing objects -- a smaller scfg
+         * than the sizing one above, which the larger carved region always fits. */
+        ac_stft_config_default(&scfg, cfg->grid.n_fft);
+        scfg.ola = AC_OLA_ACCUMULATE;
+        scfg.fft = s->fft;
 
-    s->stft_far = ac_stft_init(layout->stft_far_mem, ac_stft_get_mem_size(&scfg), &scfg);
-    if (!s->stft_far) return NULL;
+        s->stft_err = ac_stft_init(layout->stft_err_mem, ac_stft_get_mem_size(&scfg), &scfg);
+        if (!s->stft_err) return NULL;
 
-    s->istft = ac_istft_init(layout->istft_mem, ac_istft_get_mem_size(&scfg), &scfg);
-    if (!s->istft) return NULL;
+        s->stft_far = ac_stft_init(layout->stft_far_mem, ac_stft_get_mem_size(&scfg), &scfg);
+        if (!s->stft_far) return NULL;
+
+        s->istft = ac_istft_init(layout->istft_mem, ac_istft_get_mem_size(&scfg), &scfg);
+        if (!s->istft) return NULL;
+    }
 
     if (ulcnet_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return NULL;
     pcfg.frames_per_call = cfg->frames_per_call;
     s->prepost = ulcnet_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;
 
-    hop = (size_t)cfg->grid.hop;
-    n_bins = (size_t)cfg->grid.n_bins;
-    plane_bins = (size_t)s->frames * n_bins;
-    s->err_f = (float *)layout->scratch_mem;
-    s->far_f = s->err_f + hop;
-    s->hop_out = s->far_f + hop;
-    s->err_re = s->hop_out + hop;
-    s->err_im = s->err_re + plane_bins;
-    s->far_re = s->err_im + plane_bins;
-    s->far_im = s->far_re + plane_bins;
-    s->enh_re = s->far_im + plane_bins;
-    s->enh_im = s->enh_re + plane_bins;
+    if (!cfg->freq_only) {
+        hop = (size_t)cfg->grid.hop;
+        n_bins = (size_t)cfg->grid.n_bins;
+        plane_bins = (size_t)s->frames * n_bins;
+        s->err_f = (float *)layout->scratch_mem;
+        s->far_f = s->err_f + hop;
+        s->hop_out = s->far_f + hop;
+        s->err_re = s->hop_out + hop;
+        s->err_im = s->err_re + plane_bins;
+        s->far_re = s->err_im + plane_bins;
+        s->far_im = s->far_re + plane_bins;
+        s->enh_re = s->far_im + plane_bins;
+        s->enh_im = s->enh_re + plane_bins;
+    }
 
     return s;
 }
@@ -262,9 +276,11 @@ UlcnetStream *ulcnet_stream_init(const UlcnetStreamConfig *cfg, void *pool, size
 
 void ulcnet_stream_reset(UlcnetStream *s) {
     if (!s) return;
-    ac_stft_reset(s->stft_err);
-    ac_stft_reset(s->stft_far);
-    ac_istft_reset(s->istft);
+    if (s->stft_err) {   /* a freq_only stream has no framing */
+        ac_stft_reset(s->stft_err);
+        ac_stft_reset(s->stft_far);
+        ac_istft_reset(s->istft);
+    }
     ulcnet_prepost_reset(s->prepost);
     s->hop_state = ULCNET_STREAM_IDLE;
     s->reprime_remaining = 0;
@@ -335,7 +351,7 @@ static int open_hop(UlcnetStream *s, const float *err_re, const float *err_im,
 
 int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                   UlcnetStreamDelay delay, UlcnetHopIO *io) {
-    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
+    if (!s || !err_in || !far_in || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
 
     s->restart_mask = apply_alignment_edge(s, delay) ? 1u : 0u;
 
@@ -369,8 +385,9 @@ static void packet_events(UlcnetStream *s, const UlcnetStreamDelay *delay, int *
     }
 }
 
-static int open_packet(UlcnetStream *s, const int *events, UlcnetHopIO *io) {
-    if (ulcnet_prepost_pre_process_packet(s->prepost, s->err_re, s->err_im, s->far_re, s->far_im, events) != 1)
+static int open_packet(UlcnetStream *s, const float *err_re, const float *err_im,
+                       const float *far_re, const float *far_im, const int *events, UlcnetHopIO *io) {
+    if (ulcnet_prepost_pre_process_packet(s->prepost, err_re, err_im, far_re, far_im, events) != 1)
         return -1;
     if (ulcnet_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
     io->state_generation = ulcnet_prepost_state_generation(s->prepost);
@@ -384,7 +401,8 @@ int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, c
     size_t k;
     const size_t hop = s ? (size_t)s->grid.hop : 0u, bins = s ? (size_t)s->grid.n_bins : 0u;
 
-    if (!s || !err_in || !far_in || !delay || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames < 2) return -1;
+    if (!s || !err_in || !far_in || !delay || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames < 2)
+        return -1;
     packet_events(s, delay, events);
     s->restart_mask = 0;
     for (k = 0; k < (size_t)s->frames; ++k) {
@@ -398,25 +416,20 @@ int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, c
         ac_stft_push_planar(s->stft_err, err_in + k * hop, s->err_re + k * bins, s->err_im + k * bins);
         ac_stft_push_planar(s->stft_far, far_in + k * hop, s->far_re + k * bins, s->far_im + k * bins);
     }
-    return open_packet(s, events, io);
+    return open_packet(s, s->err_re, s->err_im, s->far_re, s->far_im, events, io);
 }
 
 int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, const float *err_im,
                                           const float *far_re, const float *far_im,
                                           const UlcnetStreamDelay *delay, UlcnetHopIO *io) {
     int events[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
-    const size_t plane = s ? (size_t)s->frames * (size_t)s->grid.n_bins * sizeof(float) : 0u;
 
     if (!s || !err_re || !err_im || !far_re || !far_im || !delay || !io || s->hop_state != ULCNET_STREAM_IDLE ||
         s->frames < 2)
         return -1;
     packet_events(s, delay, events);
     s->restart_mask = 0;   /* the caller owns the analysers and the ISTFT */
-    memcpy(s->err_re, err_re, plane);
-    memcpy(s->err_im, err_im, plane);
-    memcpy(s->far_re, far_re, plane);
-    memcpy(s->far_im, far_im, plane);
-    return open_packet(s, events, io);
+    return open_packet(s, err_re, err_im, far_re, far_im, events, io);
 }
 
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
@@ -427,7 +440,7 @@ int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int1
      * ulcnet_stream_pre_process_f32()'s path (see ulcnet_stream.h). The contract check is
      * repeated here, not deferred to the f32 call, so a refused call never touches
      * s->err_f/far_f -- the "no state touched before any write" shape used elsewhere in this file. */
-    if (!s || !err_in || !far_in || !io || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
+    if (!s || !err_in || !far_in || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
     hop = s->grid.hop;
     for (i = 0; i < hop; ++i) {
         s->err_f[i] = (float)err_in[i] / 32768.0f;
@@ -465,7 +478,7 @@ int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out) {
     int hop, i, k;
     const size_t bins = s ? (size_t)s->grid.n_bins : 0u;
 
-    if (!s || !pcm_out || s->hop_state == ULCNET_STREAM_IDLE) return -1;
+    if (!s || !pcm_out || !s->istft || s->hop_state == ULCNET_STREAM_IDLE) return -1;
     hop = s->grid.hop;
 
     if (ulcnet_stream_post_process_freq(s, ai_rc, s->enh_re, s->enh_im) != 1) {
