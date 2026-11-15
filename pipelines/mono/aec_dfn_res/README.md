@@ -207,7 +207,7 @@ of `aec_get_mem_size()`, the post spectrum buffer of the RES path and the DFN ta
 DFN tail of 222,864 bytes: the model stream 92,688, the six conversion buffers 12,312 and the bridge 117,856),
 932,128 bytes at 48 kHz (a DFN tail of 151,952 bytes: the stream and the buffers as above, the synthesis 42,832 and the
 output spectrum 4,104; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 963,456 bytes) and 436,928 bytes at 8 kHz (tail 224,496). The 16 kHz / 256 model on a 16 kHz host: 304,112 bytes
+grid needs 959,312 bytes) and 436,928 bytes at 8 kHz (tail 224,496). The 16 kHz / 256 model on a 16 kHz host: 304,112 bytes
 (tail 63,312: stream 47,824, buffers 3,096, synthesis 11,344, spectrum 1,032). The stream is a `freq_only` one
 (`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`): its pool is the `DFN2Prepost` (92,528 of the 92,688 bytes), with no
 analysis, synthesis or PCM buffer, since the hop uses the spectrum entries only. Model weights, accelerator activation/

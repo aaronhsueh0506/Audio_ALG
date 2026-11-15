@@ -39,10 +39,10 @@ stays explicitly selectable.
 
 | Rate | AEC | Synthesis (`AcIstft`) | NR | Gain/spectrum buffers | **Total** |
 |------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 211,392 B | 10,320 B | 27,696 B | 2,096 B | **251,504 B (245.6 KB)** |
-| **16 kHz (default, 256/128)** | 239,760 B | 10,320 B | 44,256 B | 2,096 B | **296,432 B (289.5 KB)** |
-| **16 kHz (alt, 512/256)** | 352,128 B | 19,792 B | 54,320 B | 4,144 B | **430,384 B (420.3 KB)** |
-| **48 kHz** | 776,064 B | 38,736 B | 140,416 B | 8,240 B | **963,456 B (940.9 KB)** |
+| **8 kHz** | 211,392 B | 10,320 B | 26,624 B | 2,096 B | **250,432 B (244.6 KB)** |
+| **16 kHz (default, 256/128)** | 239,760 B | 10,320 B | 43,184 B | 2,096 B | **295,360 B (288.4 KB)** |
+| **16 kHz (alt, 512/256)** | 352,128 B | 19,792 B | 52,224 B | 4,144 B | **428,288 B (418.2 KB)** |
+| **48 kHz** | 776,064 B | 38,736 B | 136,272 B | 8,240 B | **959,312 B (936.8 KB)** |
 
 The AEC column is owned by `AEC/docs/reference/lifecycle.md` (§4, the pool-size section) — re-measure from
 there rather than editing it here, and always prefer the values `aec_get_mem_size()`,
