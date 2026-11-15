@@ -5,8 +5,10 @@ kernel (``DeepVQE_S/deepvqe_process.c``) behind one frequency-domain object, so
 the gate is that the class reproduces the hand-composed path SAMPLE FOR SAMPLE:
 every numeric comparison is ``memcmp`` on fp32, and every "identical" claim is
 paired with a "not trivially identical" one so no gate passes on silence. The
-framing is the application's, built from audiolib directly (sqrt-Hann, center
-0, hop = n_fft / 2, envelope-normalised synthesis). The recurrent state is the
+framing is built from audiolib directly (sqrt-Hann, center 0, hop = n_fft / 2)
+with envelope-normalised synthesis; the application's contract is
+AC_OLA_ACCUMULATE. Both paths use the same synthesis, so the mode cannot
+change the verdict. The recurrent state is the
 application's too: the driver is a float host that owns the sixteen NaN-filled
 buffers of every instance and registers them; the state shapes are a table of
 the driver (the library knows none), pinned to the exported graph below.
@@ -336,8 +338,8 @@ typedef struct HopOut {
 static HopSpectra specs[HOPS];
 static HopOut outs_a[HOPS], outs_b[HOPS];
 
-/* The application's framing, built from audiolib directly (deepvqe_prepost.h): sqrt-Hann,
- * center 0, hop = n_fft / 2, unnormalised spectra, AC_OLA_ENV_NORM synthesis. */
+/* Test framing from audiolib: sqrt-Hann, center 0, hop = n_fft / 2, unnormalised spectra. Synthesis is AC_OLA_ENV_NORM
+ * on purpose (hop 0 emits nothing; the checks below expect it); the contract (deepvqe_prepost.h) is AC_OLA_ACCUMULATE. */
 static void framing_config(AcStftConfig *sc) {
     ac_stft_config_default(sc, N_FFT);
     sc->ola = AC_OLA_ENV_NORM;
@@ -2422,8 +2424,10 @@ def test_grid_make_and_validate_report_each_documented_status(driver):
 def test_layout_version_matches_c_header():
     """The C header is the source of truth for DEEPVQE_PREPOST_LAYOUT_VERSION
     and _streaming_export.py writes it into every artifact. If the two drift,
-    a board refuses a graph it can bind or -- far worse -- binds one it
-    cannot. A source-text check, kept as the cheap no-torch gate;
+    the host validator refuses every graph the exporter writes; the board
+    never sees the layout version (it checks port counts,
+    shapes and formats and binds by position), so only these host tests
+    catch the drift. A source-text check, kept as the cheap no-torch gate;
     test_c_descriptor_matches_the_built_graph proves the same thing against
     the COMPILED constant through the C validator."""
     from AIAEC._streaming_export import DEEPVQE_C_LAYOUT_VERSION

@@ -226,9 +226,11 @@ def _deepvqe_c_descriptor(built, outputs, frames_per_call=1) -> Dict[str, int]:
     the graph just built rather than restated by hand: the head's tap axes,
     the conv and score window depths, the GRU shape, the alignment depth and
     the state count all come from the boundary tensors, and the grid from the
-    model's own. A topology change therefore surfaces as a
-    deepvqe_prepost_descriptor_validate() refusal on the board, never as a
-    silently wrong binding."""
+    model's own. The descriptor is written into the export metadata, and the
+    host tests run deepvqe_prepost_descriptor_validate() on it, so a topology
+    change fails there. The board does not read it: the sample checks the
+    opened graph's port counts, shapes and formats and binds the ports by
+    position."""
     wrapper, inputs, input_names, _output_names, split = built
     grid = wrapper.model.grid
     shapes = {
