@@ -57,7 +57,7 @@ AiaecFront *aiaec_front_init(void *pool, size_t pool_bytes, const AiaecConfig *g
  * aiaec_preprocess() (same returns and work). ctx: same AiaecConfig, no block open. A refusal zeroes work, leaves AEC and ctx
  * untouched and owes no postprocess; success owes one. AIAEC_FRONT_ERR_AEC owes none; the AEC has been reset. */
 int aiaec_front_preprocess(AiaecFront *f, AiaecCtx *ctx, const int16_t *mic, const int16_t *far,
-                           AiaecWork *work);
+                           StreamWork *work);
 
 /* Lower-level steps of aiaec_front_preprocess; exactly grid.hop_in samples per call, else AIAEC_ERR_INPUT_SIZE. */
 int aiaec_front_process_i16(AiaecFront *f, const int16_t *mic, const int16_t *far, int samples,

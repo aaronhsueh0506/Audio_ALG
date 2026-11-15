@@ -111,7 +111,7 @@ static void accel_init(Accel *a, unsigned gen, AccMode mode) {
 }
 
 /* The graph of layout 18 (N == 1, no frame_reset input) and 19 (frame_reset = inputs[4]). */
-static void accel_run(Accel *a, const AiaecWork *w, int n) {
+static void accel_run(Accel *a, const StreamWork *w, int n) {
     const float *reset = n > 1 ? w->inputs[4].data : NULL;
     float *out = w->outputs[0].data;
     int k, b;
@@ -238,12 +238,12 @@ static void run_freq_n1(const Sched *s, Run *r) {
     accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (h = 0; h < s->packets * NF; ++h) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         int rc;
         freq_input(&fin, h, 1, s->ev);
         rc = aiaec_preprocess_freq(c.freq, &fin, &w);
         CHECK(rc == AIAEC_OK, "n1 %s: preprocess hop %d rc=%d", s->name, h, rc);
-        if (w.action == AIAEC_SUBMIT) accel_run(&acc, &w, 1); else ++r->bypass_hops;
+        if (w.action == STREAM_WORK_SUBMIT) accel_run(&acc, &w, 1); else ++r->bypass_hops;
         rc = aiaec_postprocess_freq(c.freq, 0, r->re + (size_t)h * BINS, r->im + (size_t)h * BINS);
         CHECK(rc == AIAEC_OK, "n1 %s: postprocess hop %d rc=%d", s->name, h, rc);
     }
@@ -264,12 +264,12 @@ static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
     r->first_gen = acc.gen;
     for (p = 0; p < s->packets; ++p) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         int rc;
         freq_input(&fin, p * NF, NF, s->ev);
         rc = aiaec_preprocess_freq(c.freq, &fin, &w);
         CHECK(rc == AIAEC_OK, "n8 %s: preprocess packet %d rc=%d", s->name, p, rc);
-        CHECK(w.action == AIAEC_SUBMIT && w.input_count == 5 && w.output_count == 1,
+        CHECK(w.action == STREAM_WORK_SUBMIT && w.input_count == 5 && w.output_count == 1,
               "n8 %s: packet %d work action=%d inputs=%d", s->name, p, (int)w.action, w.input_count);
         for (k = 0; k < NF && w.input_count == 5; ++k) {
             const float want = edge[p * NF + k] ? 1.0f : 0.0f;
@@ -373,7 +373,7 @@ static void run_freq_continuous_analyser(const Sched *s, Run *r) {
     accel_init(&acc, aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s->packets; ++p) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         memset(&fin, 0, sizeof(fin));
         fin.kind = AIAEC_INPUT_ALIGN_ULCNET; fin.frames = NF;
         fin.u.align_ulcnet.err_re = ere + (size_t)p * NF * BINS; fin.u.align_ulcnet.err_im = eim + (size_t)p * NF * BINS;
@@ -407,12 +407,12 @@ static int section_families(void) {
 
     for (p = 0; p < s.packets; ++p) {
         AiaecInput in;
-        AiaecWork w;
+        StreamWork w;
         int rc;
 
         block_input(&in, p, s.ev);
         rc = aiaec_preprocess(c.blk, &in, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT, "block packet %d rc=%d", p, rc);
+        CHECK(rc == AIAEC_OK && w.action == STREAM_WORK_SUBMIT, "block packet %d rc=%d", p, rc);
         accel_run(&a_blk, &w, NF);
         rc = aiaec_postprocess(c.blk, 0, pcm + (size_t)p * HOP_IN);
         CHECK(rc == AIAEC_OK, "postprocess packet %d rc=%d", p, rc);
@@ -466,7 +466,7 @@ static void run_pcm(const Sched *s, int n, int freq, PcmRun *r) {
     ext_make(&ae, freq, 0); ext_make(&af, freq, 0);
     for (b = 0; b < hops / n; ++b) {
         AiaecInput in;
-        AiaecWork w;
+        StreamWork w;
         const int h0 = b * n;
         int rc;
 
@@ -496,7 +496,7 @@ static void run_pcm(const Sched *s, int n, int freq, PcmRun *r) {
         CHECK(rc == AIAEC_OK, "%s n=%d: preprocess block %d rc=%d", s->name, n, b, rc);
         if (rc != AIAEC_OK) break;
         ++r->pre_ok;
-        if (w.action == AIAEC_SUBMIT) accel_run(&acc, &w, n);
+        if (w.action == STREAM_WORK_SUBMIT) accel_run(&acc, &w, n);
         if (freq) {
             float *re = r->spec_re + (size_t)h0 * BINS, *im = r->spec_im + (size_t)h0 * BINS;
             rc = aiaec_postprocess_freq(c.freq, 0, re, im);
@@ -662,12 +662,12 @@ static int section_event_hop_pin(void) {
 
 /* ---- the generic binding ------------------------------------------------------------------------------------ */
 
-/* AiaecWork's views against the exporter's literal shapes (16k/256: 129 bins): four feature signals [1,1,n,129], at
+/* StreamWork's views against the exporter's literal shapes (16k/256: 129 bins): four feature signals [1,1,n,129], at
  * N = 8 frame_reset [1,1,1,8] as the fifth and last, one head [1,2,n,129]; at N = 1 nothing past the four. */
-static void check_work_views(const AiaecWork *w, int n, const char *what) {
+static void check_work_views(const StreamWork *w, int n, const char *what) {
     const int want_in = n > 1 ? 5 : 4;
     int i;
-    CHECK(w->action == AIAEC_SUBMIT && w->input_count == want_in && w->output_count == 1,
+    CHECK(w->action == STREAM_WORK_SUBMIT && w->input_count == want_in && w->output_count == 1,
           "%s: work counts %d/%d", what, w->input_count, w->output_count);
     for (i = 0; i < 4; ++i)
         CHECK(w->inputs[i].data != NULL && w->inputs[i].b == 1u && w->inputs[i].c == 1u && w->inputs[i].h == (unsigned)n &&
@@ -701,7 +701,7 @@ static int section_frame_reset_inputs(void) {
     for (p = 0; p < s.packets; ++p) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork w[2];
+        StreamWork w[2];
         block_input(&in, p, s.ev);
         freq_input(&fin, p * NF, NF, s.ev);
         CHECK(aiaec_preprocess(c.blk, &in, &w[0]) == AIAEC_OK && aiaec_preprocess_freq(c.freq, &fin, &w[1]) == AIAEC_OK,
@@ -729,7 +729,7 @@ static int section_frame_reset_inputs(void) {
         AiaecAlignEvent none[1] = { { 0, 0 } };
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork w[2];
+        StreamWork w[2];
         block_input(&in, 0, none);
         in.samples = HOP; in.u.align_ulcnet.event_count = 1;
         freq_input(&fin, 0, 1, none);
@@ -770,7 +770,7 @@ static int section_tail(void) {
     accel_init(&acc, aiaec_state_generation(c.blk), ACC_IDENTITY);
     for (b = 0; b < blocks; ++b) {
         AiaecInput in;
-        AiaecWork w;
+        StreamWork w;
         memset(&in, 0, sizeof(in));
         in.kind = AIAEC_INPUT_ALIGN_ULCNET; in.samples = HOP_IN;
         in.u.align_ulcnet.residual_in = resid + (size_t)b * HOP_IN; in.u.align_ulcnet.far_in = farz + (size_t)b * HOP_IN;
@@ -830,7 +830,7 @@ static int section_failure(void) {
         static float re[NF * BINS], im[NF * BINS], fresh_re[2][NF * BINS], fresh_im[2][NF * BINS];
         unsigned gen_seen[P], want;
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         int f;
 
         sched_clear(&s, "failure", P);
@@ -888,7 +888,7 @@ static int section_gates(void) {
     static int16_t pcm[HOP_IN];
     Ctxs c;
     AiaecInput in;
-    AiaecWork w;
+    StreamWork w;
     AiaecAlignEvent one[1] = { { 0, 0 } };
     AiaecConfig n1 = cfg_n(1), n2 = cfg_n(2), n16 = cfg_n(16), bad = cfg_n(NF);
     StreamMemReq rq;

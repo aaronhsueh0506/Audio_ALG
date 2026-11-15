@@ -33,7 +33,7 @@ typedef struct Pass {
 } Pass;
 
 /* The accelerator of the graph with an identity mask: mask real = 1, imaginary = 0, for every frame. */
-static void identity_mask(const AiaecWork *w, int n) {
+static void identity_mask(const StreamWork *w, int n) {
     float *out = w->outputs[0].data;
     int k, b;
     CHECK(w->outputs[0].elements == (size_t)2 * n * BINS, "mask elements %zu", w->outputs[0].elements);
@@ -71,7 +71,7 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
     for (b = 0; b < packets && !g_fail; ++b) {
         AiaecFrontOut fo;
         AiaecInput in;
-        AiaecWork work;
+        StreamWork work;
         int rc = aiaec_front_process_i16(front, sc->mic + (size_t)b * hop_in, sc->far + (size_t)b * hop_in, hop_in, &fo);
         CHECK(rc == AIAEC_OK, "N=%d front rc=%d", n, rc);
         if (rc != AIAEC_OK) break;
@@ -90,11 +90,11 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
         CHECK(rc == AIAEC_OK, "N=%d preprocess rc=%d (%s)", n, rc, aiaec_front_status_text(rc));
         if (rc != AIAEC_OK) break;
         if (n == 1) {
-            CHECK((work.action == AIAEC_BYPASS) == (p->edge[b] != 0), "block %d: action %s but the events say edge=%d", b,
-                  work.action == AIAEC_BYPASS ? "BYPASS" : "SUBMIT", p->edge[b]);
+            CHECK((work.action == STREAM_WORK_BYPASS) == (p->edge[b] != 0), "block %d: action %s but the events say edge=%d", b,
+                  work.action == STREAM_WORK_BYPASS ? "BYPASS" : "SUBMIT", p->edge[b]);
         } else {
             const float *reset = work.inputs[4].data;
-            CHECK(work.action == AIAEC_SUBMIT && work.input_count == 5 && work.inputs[4].elements == (size_t)n,
+            CHECK(work.action == STREAM_WORK_SUBMIT && work.input_count == 5 && work.inputs[4].elements == (size_t)n,
                   "packet %d: action %d inputs %d", b, (int)work.action, work.input_count);
             for (k = 0; k < n; ++k) {
                 CHECK(reset[k] == (p->edge[b * n + k] ? 1.0f : 0.0f), "packet %d frame %d: frame_reset %g, edge %d", b, k,
@@ -102,7 +102,7 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
                 p->reset_ones += reset[k] == 1.0f;
             }
         }
-        if (work.action == AIAEC_SUBMIT) {
+        if (work.action == STREAM_WORK_SUBMIT) {
             identity_mask(&work, n);
             ++p->submit_blocks;
         } else {

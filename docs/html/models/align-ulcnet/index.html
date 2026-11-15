@@ -63,7 +63,7 @@ cc app.c -Istream/aiaec -Istream/aiaec/front -Istream/common -I$AUDIOLIB/common 
 <tr><th>16k／256／N=8</th><td>129</td><td>63</td><td>13</td><td>5</td></tr>
 <tr><th>16k／512／N=1</th><td>257</td><td>32</td><td>26</td><td>4</td></tr>
 </tbody></table>
-<p><code>frame_reset</code> 是 stream 依逐 hop 事件產生的控制值（N 個 0.0／1.0，事件 hop 為 1.0），放在 <code>AiaecWork.inputs[4]</code>；sample 不判斷事件，把它當第五個普通訊號輸入依位置搬進加速器，沒有特例。<code>AiaecWork.inputs[0..3]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>AiaecWork</code> 裡。括號內的名稱是匯出器的 ONNX 名稱，C 端與 sample 不讀名稱。</p>
+<p><code>frame_reset</code> 是 stream 依逐 hop 事件產生的控制值（N 個 0.0／1.0，事件 hop 為 1.0），放在 <code>StreamWork.inputs[4]</code>；sample 不判斷事件，把它當第五個普通訊號輸入依位置搬進加速器，沒有特例。<code>StreamWork.inputs[0..3]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>StreamWork</code> 裡。括號內的名稱是匯出器的 ONNX 名稱，C 端與 sample 不讀名稱。</p>
 
 <h2>初始化與每包呼叫</h2>
 <p>sample 的演算法流程只有一次啟動，之後每包 pre → sample 自己的 AI3 → post。啟動時 <code>aiaec_get_mem_size()</code> → <code>aiaec_init()</code> 備好 pool 並填 <code>AiaecInfo</code>（圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄；N 由 sample 從 config 算：N = <code>hop_in / (fft / 2)</code>）；起始 generation 由 <code>aiaec_state_generation()</code> 取得。AI3 的開圖、送張量、執行、讀回與 state 緩衝是 sample 自己的。獨立 sample 的線性 AEC 前端與 pre 合成一次呼叫 <code>aiaec_front_preprocess()</code>（前端內的 AEC 以 <code>AEC_RESIDUAL_STATE</code> 逐階段執行：<code>aec_process_linear()</code> 加 <code>aec_process_residual()</code>，沒有增益與輸出級，分析 seam 取 <code>AecResidualView.formed_hop</code>）；前端的延遲策略是內部預設（BALANCED、線上 matched filter、5 組），不是客戶選項。</p>
@@ -92,11 +92,11 @@ if (graph_io_check_ports(&amp;model, din, n_in, dout, n_out, msg, sizeof msg) !=
 unsigned seen = aiaec_state_generation(ctx);
 
 while (read_blocks(mic, far, hop_in)) {
-    AiaecWork work;
+    StreamWork work;
     /* 線性 AEC，再接 pre；mic、far 各 hop_in 個 int16 */
     if (aiaec_front_preprocess(front, ctx, mic, far, &amp;work) != AIAEC_OK) return -1;
     int ai_rc = 0;
-    if (work.action == AIAEC_SUBMIT) {
+    if (work.action == STREAM_WORK_SUBMIT) {
         int chk;
         GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
         if (chk != GRAPH_IO_OK) ai_rc = STREAM_RUN_NOT_STARTED;    /* 不符：不送件，仍呼叫 post */
@@ -184,7 +184,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <ul>
 <li><b>主機替身</b>：<code>make -C stream/aiaec test</code> 涵蓋 catalog 拒絕順序、PCM／<code>_freq</code> 兩個家族、N=8 封包（含事件與 N=1 逐樣本對照）、work 的形狀與 <code>frame_reset</code> 值，以及兩個單模型建置。替身加速器自己實作 <code>frame_reset</code> 語意，不是 AI3 的圖。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_aiaec_packet_ort.py</code> 只涵蓋 16k／256，逐 frame 與 Python 逐 hop 串流及 C 的 N=1 串流比對，事件組合包含無事件、單一與多個事件、相鄰事件、每包一個、每 frame 都是、solid 邊緣與跨包邊緣，並驗證 N=8 每包只呼叫一次加速器、事件不改變 generation。<code>test_aiaec_packet_ort_events.py</code> 以同一份事件記錄檔，比對 <code>inference.py --events</code>（N=1、N=8）與 C 的 <code>frame_reset</code>、加速器呼叫數與 PCM。</li>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 </ul>
 
 <h2>參考</h2>

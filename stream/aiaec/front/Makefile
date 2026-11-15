@@ -63,7 +63,7 @@ CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
 LIB := $(OBJ_DIR)/libaiaec_front.a
-FRONT_HEADERS := aiaec_front.h aiaec_front_internal.h aiaec_front_test.h ../aiaec.h ../aiaec_internal.h ../../common/stream_mem.h
+FRONT_HEADERS := aiaec_front.h aiaec_front_internal.h aiaec_front_test.h ../aiaec.h ../aiaec_internal.h ../../common/stream_mem.h ../../common/stream_run.h
 
 # The Align-ULCNet build for the front integration tests: aiaec.c built for that one model with
 # placeholder graph paths (AIAEC_TEST_CATALOG), same source list as ../Makefile's single-model variant.

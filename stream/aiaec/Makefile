@@ -83,7 +83,7 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 STREAM_SOURCES := aiaec.c
 STREAM_HEADERS := aiaec.h aiaec_internal.h aiaec_product.h deepvqe_s/deepvqe_stream.h ../../lib/aiaec/deepvqe_s/deepvqe_prepost.h \
 	ulcnet/ulcnet_stream.h ../../lib/aiaec/ulcnet/ulcnet_prepost.h \
-	../../lib/aiaec/ulcnet/ulcnet_model_io.h ../common/stream_mem.h
+	../../lib/aiaec/ulcnet/ulcnet_model_io.h ../common/stream_mem.h ../common/stream_run.h
 
 LIB := $(OBJ_DIR)/libaiaec.a
 LIB_OBJECTS := $(OBJ_DIR)/aiaec.o
@@ -217,7 +217,7 @@ test-aiaec-product: $(TEST_DEPS) | _cfg_guard
 	echo "test-aiaec-product: PASS (pool sizes differ: $$h1 vs $$h2)"
 
 # test-aiaec-graph-io: the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the
-# AiaecWork of real pre calls, per product, with the test catalog and the production one. The port check of the
+# StreamWork of real pre calls, per product, with the test catalog and the production one. The port check of the
 # model-config header links ../common/stream_bind.c (samples only, not the archive).
 test-aiaec-graph-io: $(TEST_DEPS) tests/test_aiaec_graph_io.c graph_io_deepvqes.h graph_io_alignulcnet.h ../common/graph_io.h | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
@@ -241,7 +241,7 @@ graph-io-dumper: $(OBJ_DIR)/dump_graph_io
 
 # bind-dumpers: builds tests/dump_bind_info.c once per product with the test catalog and prints the
 # two binary paths (deepvqe_s first). AIAEC/tests/test_aiaec_bind_info_pin.py runs them and compares
-# the AiaecWork signal and head views of a real pre call with the ONNX export.
+# the StreamWork signal and head views of a real pre call with the ONNX export.
 bind-dumpers: $(TEST_DEPS) | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \

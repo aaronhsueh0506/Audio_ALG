@@ -51,7 +51,7 @@ static void pair_init(Pair *p, int n) {
 
 static void pair_free(Pair *p) { free(p->bpool); free(p->fpool); }
 
-static int pre_three(Pair *p, const int16_t *mic, const int16_t *far, AiaecWork *w) {
+static int pre_three(Pair *p, const int16_t *mic, const int16_t *far, StreamWork *w) {
     AiaecFrontOut fo;
     AiaecInput in;
     int rc = aiaec_front_process_i16(p->front, mic, far, p->cfg.hop_in, &fo);
@@ -61,33 +61,33 @@ static int pre_three(Pair *p, const int16_t *mic, const int16_t *far, AiaecWork 
 }
 
 /* Same everything except pointers into the two contexts. */
-static int same_work(const AiaecWork *a, const AiaecWork *b) {
+static int same_work(const StreamWork *a, const StreamWork *b) {
     int i;
     if (a->action != b->action || a->input_count != b->input_count || a->output_count != b->output_count ||
         a->state_generation != b->state_generation)
         return 0;
     for (i = 0; i < a->input_count; ++i) {
-        const AiaecTensorIn *x = &a->inputs[i], *y = &b->inputs[i];
+        const StreamTensorIn *x = &a->inputs[i], *y = &b->inputs[i];
         if (x->elements != y->elements || x->w != y->w || x->h != y->h || x->c != y->c || x->b != y->b) return 0;
         if (x->elements && memcmp(x->data, y->data, x->elements * sizeof(float)) != 0) return 0;
     }
     for (i = 0; i < a->output_count; ++i) {
-        const AiaecTensorOut *x = &a->outputs[i], *y = &b->outputs[i];
+        const StreamTensorOut *x = &a->outputs[i], *y = &b->outputs[i];
         if (x->elements != y->elements || x->w != y->w || x->h != y->h || x->c != y->c || x->b != y->b) return 0;
     }
     return 1;
 }
 
 /* Alignment events of a block: the BYPASS block at N = 1, the frame_reset ones at N > 1. */
-static int block_events(const AiaecWork *w, int n) {
+static int block_events(const StreamWork *w, int n) {
     int k, count = 0;
-    if (n == 1) return w->action == AIAEC_BYPASS;
+    if (n == 1) return w->action == STREAM_WORK_BYPASS;
     for (k = 0; k < n; ++k) count += w->inputs[4].data[k] == 1.0f;
     return count;
 }
 
 /* Deterministic non-identity mask, identical for both pairs. */
-static void fill_mask(const AiaecWork *w, int n, int blk) {
+static void fill_mask(const StreamWork *w, int n, int blk) {
     float *out = w->outputs[0].data;
     int k, b;
     for (k = 0; k < n; ++k)
@@ -109,7 +109,7 @@ static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) 
     *events = 0;
     for (b = 0; b < packets && !g_fail; ++b) {
         const int16_t *mic = sc->mic + (size_t)b * hop_in, *far = sc->far + (size_t)b * hop_in;
-        AiaecWork wa, wb;
+        StreamWork wa, wb;
         int ra = aiaec_front_preprocess(A.front, A.ctx, mic, far, &wa);
         int rb = pre_three(&B, mic, far, &wb);
         CHECK(ra == AIAEC_OK && rb == AIAEC_OK, "N=%d block %d: rc one-shot %d, three-call %d", n, b, ra, rb);
@@ -120,7 +120,7 @@ static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) 
             break;
         }
         *events += block_events(&wa, n);
-        if (wa.action == AIAEC_SUBMIT) {
+        if (wa.action == STREAM_WORK_SUBMIT) {
             fill_mask(&wa, n, b);
             fill_mask(&wb, n, b);
         }
@@ -140,7 +140,7 @@ static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) 
 static void run_gates(const Scene *sc) {
     static int16_t pa[HOP], pb[HOP];
     Pair A, B, C;
-    AiaecWork wa, wb, wz;
+    StreamWork wa, wb, wz;
     AiaecConfig cfg512 = { 16000, 512, 256 };   /* same N = 1, another grid: only the sample count differs */
     StreamMemReq req512;
     AiaecCtx *ctx512 = NULL;
@@ -189,7 +189,7 @@ static void run_gates(const Scene *sc) {
         CHECK(pre_three(&B, mic, far, &wb) == AIAEC_OK, "block %d: three-call rc", b);
         if (rc != AIAEC_OK) break;
         if (!same_work(&wa, &wb)) { CHECK(0, "block %d after the gates: work differs", b); break; }
-        if (wa.action == AIAEC_SUBMIT) { fill_mask(&wa, 1, b); fill_mask(&wb, 1, b); }
+        if (wa.action == STREAM_WORK_SUBMIT) { fill_mask(&wa, 1, b); fill_mask(&wb, 1, b); }
         CHECK(aiaec_postprocess(A.ctx, 0, pa) == AIAEC_OK && aiaec_postprocess(B.ctx, 0, pb) == AIAEC_OK, "post %d", b);
         CHECK(memcmp(pa, pb, sizeof(pa)) == 0, "block %d after the gates: PCM differs", b);
     }
@@ -213,7 +213,7 @@ static void run_duplicate(const Scene *sc, int n) {
     if (!A.ctx || !A.front || !B.ctx || !B.front) return;
     for (b = 0; b < packets && !g_fail; ++b) {
         const int16_t *mic = sc->mic + (size_t)b * hop_in, *far = sc->far + (size_t)b * hop_in;
-        AiaecWork wa, wb, wd, wz;
+        StreamWork wa, wb, wd, wz;
         int ra = aiaec_front_preprocess(A.front, A.ctx, mic, far, &wa);
         int rb = aiaec_front_preprocess(B.front, B.ctx, mic, far, &wb);
         CHECK(ra == AIAEC_OK && rb == AIAEC_OK, "dup N=%d block %d: rc %d/%d", n, b, ra, rb);
@@ -226,7 +226,7 @@ static void run_duplicate(const Scene *sc, int n) {
             CHECK(rb == AIAEC_ERR_SEQUENCE && memcmp(&wd, &wz, sizeof(wd)) == 0, "dup N=%d: rc %d or work not zeroed", n, rb);
         }
         if (!same_work(&wa, &wb)) { CHECK(0, "dup N=%d block %d: work differs", n, b); break; }
-        if (wa.action == AIAEC_SUBMIT) { fill_mask(&wa, n, b); fill_mask(&wb, n, b); }
+        if (wa.action == STREAM_WORK_SUBMIT) { fill_mask(&wa, n, b); fill_mask(&wb, n, b); }
         CHECK(aiaec_postprocess(A.ctx, 0, pa + (size_t)b * hop_in) == AIAEC_OK &&
               aiaec_postprocess(B.ctx, 0, pb + (size_t)b * hop_in) == AIAEC_OK, "dup N=%d block %d: post", n, b);
     }

@@ -1,6 +1,6 @@
 """The AIAEC stream's work views equal what the exporters write.
 
-The signal and head tensors of every block are the AiaecWork views a real aiaec_preprocess*() call returns;
+The signal and head tensors of every block are the StreamWork views a real aiaec_preprocess*() call returns;
 the recurrent state belongs to the accelerator, so the library holds no port table. This test compares those
 views with a fresh export of the same configuration. Every converted graph follows one order: inputs are the
 signal inputs, then the state inputs; outputs are the head outputs, then the state outputs; state k is input
@@ -9,7 +9,7 @@ input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinn
 
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
 ``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
-resolve) prints the AiaecInfo of a real init and the AiaecWork of the first real pre call for each family
+resolve) prints the AiaecInfo of a real init and the StreamWork of the first real pre call for each family
 (PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1
 and N=8, DeepVQE-S 16k/512 N=1, Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19) and 16k/512 N=1.
 The dumped signal inputs and head output are compared with the exported graph's leading inputs and outputs
@@ -99,7 +99,7 @@ FAMILIES = (0, 1)   # AiaecFamily: PCM, spectrum -> spectrum
 
 
 def run_dumper(path, sr, fft, hop_in, family=0, event_hop=None):
-    """The dumper's init result and the first block's AiaecWork as a dict; views as (b, c, h, w) shapes with
+    """The dumper's init result and the first block's StreamWork as a dict; views as (b, c, h, w) shapes with
     their element counts. N is not printed: it is hop_in / (fft / 2)."""
     argv = [path, str(sr), str(fft), str(hop_in), str(family)]
     if event_hop is not None:

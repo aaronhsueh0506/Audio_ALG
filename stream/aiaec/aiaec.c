@@ -2,7 +2,7 @@
  * ulcnet_stream's hop-level (one model_hop samples per call) PCM APIs. The catalog below is the only
  * place that knows which (model, sample_rate, n_fft) combinations exist and which of their
  * frames_per_call variants have an actual shipped graph. The graph's port wiring is the sample's;
- * this file keeps only the per-hop signal and head views AiaecWork carries.
+ * this file keeps only the per-hop signal and head views StreamWork carries.
  *
  * The product binds one model (aiaec_product.h). AIAEC_ENABLE_DEEPVQE_S / AIAEC_ENABLE_ALIGN_ULCNET
  * (the Makefile's AIAEC_MODEL knob) let a product link only the model it ships, so its .o never
@@ -184,10 +184,10 @@ static int aiaec_build_grid_ulcnet(const AiaecModelEntry *entry, int delay_depth
 #endif
 
 /* ---------------------------------------------------------------------------------------------
- * AiaecWork views: the per-hop signal and head tensors, in graph order.
+ * StreamWork views: the per-hop signal and head tensors, in graph order.
  * ------------------------------------------------------------------------------------------- */
 
-static void aiaec_set_in(AiaecTensorIn *t, const float *data, unsigned int b, unsigned int c, unsigned int h,
+static void aiaec_set_in(StreamTensorIn *t, const float *data, unsigned int b, unsigned int c, unsigned int h,
                          unsigned int w)
 {
     t->data = data;
@@ -195,7 +195,7 @@ static void aiaec_set_in(AiaecTensorIn *t, const float *data, unsigned int b, un
     t->b = b; t->c = c; t->h = h; t->w = w;
 }
 
-static void aiaec_set_out(AiaecTensorOut *t, float *data, unsigned int b, unsigned int c, unsigned int h,
+static void aiaec_set_out(StreamTensorOut *t, float *data, unsigned int b, unsigned int c, unsigned int h,
                           unsigned int w)
 {
     t->data = data;
@@ -208,12 +208,12 @@ static void aiaec_set_out(AiaecTensorOut *t, float *data, unsigned int b, unsign
  * [1, N, n_bins, TIME_ORDER * FREQ_TAPS * 2], oldest frame first along the second axis. */
 static void aiaec_block_fill_deepvqe(const DeepVqeGrid *grid, const DeepVqePrepostInputs *in,
                                      const DeepVqePrepostOutputs *out, unsigned int generation,
-                                     AiaecWork *work)
+                                     StreamWork *work)
 {
     const unsigned int nn = (unsigned int)grid->frames_per_call, bins = (unsigned int)grid->n_bins;
 
     memset(work, 0, sizeof(*work));
-    work->action = AIAEC_SUBMIT;
+    work->action = STREAM_WORK_SUBMIT;
     aiaec_set_in(&work->inputs[0], in->mic, 1u, 2u, nn, bins);
     aiaec_set_in(&work->inputs[1], in->far, 1u, 2u, nn, bins);
     work->input_count = 2;
@@ -229,12 +229,12 @@ static void aiaec_block_fill_deepvqe(const DeepVqeGrid *grid, const DeepVqePrepo
  * plane of all N frames, then the imaginary). */
 static void aiaec_block_fill_align(const UlcnetGrid *grid, int n, const UlcnetModelIoInputs *in,
                                    const UlcnetModelIoOutputs *out, uint32_t generation,
-                                   AiaecWork *work)
+                                   StreamWork *work)
 {
     const unsigned int nn = (unsigned int)n, bins = (unsigned int)grid->n_bins;
 
     memset(work, 0, sizeof(*work));
-    work->action = AIAEC_SUBMIT;
+    work->action = STREAM_WORK_SUBMIT;
     aiaec_set_in(&work->inputs[0], in->error_mag, 1u, 1u, nn, bins);
     aiaec_set_in(&work->inputs[1], in->far_mag, 1u, 1u, nn, bins);
     aiaec_set_in(&work->inputs[2], in->error_cos, 1u, 1u, nn, bins);
@@ -662,7 +662,7 @@ static int aiaec_deepvqe_post_freq(AiaecCore *c, int infer_status, float *out_re
 /* Shared by both families. `pin` (PCM in) or `fin` (spectra in) is non-NULL, the other NULL;
  * kind, size and NULL gates run in that order before the first call that advances any state. */
 static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const AiaecFreqInput *fin,
-                                 AiaecWork *work)
+                                 StreamWork *work)
 {
     const AiaecInputKind kind = pin ? pin->kind : fin->kind;
     const int count = pin ? pin->samples : fin->frames;
@@ -778,13 +778,13 @@ int aiaec_precheck(const AiaecCtx *ctx, AiaecInputKind kind, int samples, int ev
     return AIAEC_OK;
 }
 
-int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, AiaecWork *work)
+int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, StreamWork *work)
 {
     if (!ctx || !input || !work) return AIAEC_ERR_NULL;
     return aiaec_core_preprocess(&ctx->core, input, (const AiaecFreqInput *)0, work);
 }
 
-int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, AiaecWork *work)
+int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, StreamWork *work)
 {
     if (!ctx || !input || !work) return AIAEC_ERR_NULL;
     return aiaec_core_preprocess(&ctx->core, (const AiaecInput *)0, input, work);

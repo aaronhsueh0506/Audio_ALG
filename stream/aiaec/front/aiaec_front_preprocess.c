@@ -7,7 +7,7 @@
 #include "aiaec_internal.h"
 
 int aiaec_front_preprocess(AiaecFront *f, AiaecCtx *ctx, const int16_t *mic, const int16_t *far,
-                           AiaecWork *work) {
+                           StreamWork *work) {
     AiaecFrontOut out;
     AiaecInput in;
     int rc;

@@ -7,7 +7,7 @@
 | 項目 | 位置 |
 |---|---|
 | 產品、grid、`N = hop_in / (fft / 2)`、graph 與 ERB 的選擇，尾端長度 | `stream/ainr/ainr.c`、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` / `AiaecInfo` 只回 `graph_path`、`trim_samples`、`queue_frames`、`tail_zero_blocks` |
-| 這一包的訊號與 head（資料指標、元素數、`[b,c,h,w]`、generation、action、`frame_reset` 控制值） | `AinrWork` / `AiaecWork`，由真實的 pre 呼叫填 |
+| 這一包的訊號與 head（資料指標、元素數、`[b,c,h,w]`、generation、action、`frame_reset` 控制值） | `StreamWork`（`stream/common/stream_run.h`），由真實的 pre 呼叫填 |
 | 每個登錄的組態（含尚未交付 graph 的）的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_deepvqes.h`、`stream/aiaec/graph_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列，註明所對應的匯出器 |
 | 共用接線程式：列的展開、state 配對、`stream_check_ports()` 呼叫、buffer 大小、pre 到 AI3 的邊界核對 | `stream/common/graph_io.h`（SDK 無關、只有標頭；`make -C stream/common test-graph-io`）。sample 加 `-I stream/common -I stream/ainr`（或 `stream/aiaec`）並編譯 `stream/common/stream_bind.c` |
 | SDK 無關的 graph／裝置描述檢查器（`StreamWiring`、`StreamDeviceDesc`、`stream_check_ports()`、`STREAM_PORT_ERR_*`） | `stream/common/stream_bind.{h,c}`，只由 sample 連結；`libainr.a`、`libaiaec.a` 不含它 |
@@ -32,11 +32,11 @@
 | Align-ULCNet N=1（layout 18） | 4（`error_mag`、`far_mag`、`error_cos`、`error_sin`） | 1（`output`） | 8 ／ 5 | 4 |
 | Align-ULCNet N>1（layout 19） | 5（上列加最後一個 `frame_reset`，`[1, 1, 1, N]`） | 1 | 9 ／ 5 | 4 |
 
-Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個 `frame_reset`，由 stream 依逐 hop 事件填進 `AiaecWork.inputs`，sample 把它當一般的第五個訊號輸入搬運，沒有特例。N=1 維持 layout 18，圖裡沒有 `frame_reset`，事件 hop 是 BYPASS 區塊。包內第 3 個 hop 有事件時 `frame_reset` 為 `00100000`。
+Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個 `frame_reset`，由 stream 依逐 hop 事件填進 `StreamWork.inputs`，sample 把它當一般的第五個訊號輸入搬運，沒有特例。N=1 維持 layout 18，圖裡沒有 `frame_reset`，事件 hop 是 BYPASS 區塊。包內第 3 個 hop 有事件時 `frame_reset` 為 `00100000`。
 
 ## Float I/O 模式（FLOAT_IN／FLOAT_OUT）
 
-函式庫與 stream 層的所有 tensor 本來就是 float32（`AinrWork`／`AiaecWork` 的資料指標都是 `float *`），沒有任何量化程式。定點與 float 之間的軟體轉換只在板端 sample：輸入端把 float 轉成定點再送進 NPU，head 讀回時再轉回 float。Float I/O 的目的只有一個：讓 NPU 在開圖時做這兩步（量化與反量化），CPU 不再做。
+函式庫與 stream 層的所有 tensor 本來就是 float32（`StreamWork` 的資料指標都是 `float *`），沒有任何量化程式。定點與 float 之間的軟體轉換只在板端 sample：輸入端把 float 轉成定點再送進 NPU，head 讀回時再轉回 float。Float I/O 的目的只有一個：讓 NPU 在開圖時做這兩步（量化與反量化），CPU 不再做。
 
 - 開關是每支 AI3 sample 開頭的編譯期 `#define FLOAT_IN 0`、`#define FLOAT_OUT 0`，預設關閉；沒有執行期旗標，也沒有全域模式結構。`FLOAT_IN` 管訊號輸入，`FLOAT_OUT` 管 head 輸出。
 - 這些 model 的 state 就地繼承 input／output 的型別（recurrent state 的輸入與輸出共用同一塊 buffer），所以**要求 `FLOAT_IN == FLOAT_OUT`**；混合設定只適用於不繼承 state 的模型，這裡的 AI3 sample 都不是。混合設定不會被編譯擋下，只有一個編譯警告（`#warning`，內容為 `FLOAT_IN != FLOAT_OUT: these models inherit the state port types, so FLOAT_IN must equal FLOAT_OUT; ...`）和啟動時 `[AI3] float_in=%d float_out=%d` 那行 log 後面的 `WARNING: mixed setting`。用 `-Werror` 建置時這個 `#warning` 會變成錯誤。
@@ -81,10 +81,10 @@ make -C stream/ainr MASK_ONLY=1 test-ainr-graph-io
 make -C stream/aiaec test-aiaec-graph-io
 ```
 
-- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `AiaecWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 16k/256 N=1、N=8、16k/512 N=1；Align-ULCNet 同三組）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
+- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `StreamWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 16k/256 N=1、N=8、16k/512 N=1；Align-ULCNet 同三組）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
   （二）另用 `make -C stream/aiaec graph-io-dumper`（環境變數 `AIAEC_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_deepvqes.h`／`graph_io_alignulcnet.h` 的每一列，逐列比對全新匯出的圖：layout 版本、訊號／head／輸入／輸出的數量、每個輸入輸出的 shape、state 名稱與順序、輸出名稱 `<輸入>_out`、state 兩端同 shape，以及 Align-ULCNet N>1 的 `frame_reset` 為最後一個訊號；列集合必須恰為匯出的六個案例。
 - `test_dfn2_port_order.py` 對 DFN2 full 與 lite、N=1 與 8 的匯出圖做名稱順序與 state 形狀檢查，並用 `make -C stream/ainr [MASK_ONLY=1] work-dumper` 建的傾印程式，把四個登錄列（full 16 kHz/256 的 N=1 與 8、full 與 lite 48 kHz/1024 的 N=1）的 `AinrWork` 對匯出圖的訊號輸入與 head 輸出，另驗拒絕的組態回傳碼。它也用 `make -C stream/ainr graph-io-dumper`（`AINR_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_dfn2.h` 的每一列，逐列比對全新匯出的圖（`test_sample_row_equals_a_fresh_export`，項目同上），列集合必須恰為登錄的四列。
 - `test-ainr-graph-io` 另驗每個家族的第二個 block 與第一個同形狀，以及 `ainr_get_mem_size()` 的每個拒絕碼由三個 init 家族原樣回傳（`*ctx` 為 NULL、`*info` 不動）。
 - `stream/common` 的 `test_stream_bind` 涵蓋 `stream_check_ports()` 的每條拒絕規則（含定點 state 埠兩端 `zero_point` 必須為 0）；`test_stream_mem` 涵蓋 `StreamMemReq` 與 pool 工具。
 - 函式庫端的 float head 非有限值回歸：`make -C stream/ainr test-ainr-state-generation`（DFN2 三個 head 任一端的 NaN／+Inf／-Inf 都是被拒的 commit，generation 前進）、`make -C stream/aiaec test-aiaec-block test-aiaec-packet`（DeepVQE-S taps、Align-ULCNet mask 首尾元素的 Inf，以及有限但使增強後頻譜溢位的 mask）。
-- state 的 shape 只在 `graph_io_<model>.h` 的表裡（`stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`），函式庫沒有。表各列與匯出器的對照有兩層：上面兩個 pytest 對全新匯出逐列比對（埠序、每個登錄 grid 與 N 的形狀、state 順序）；C 端的 `test-ainr-graph-io`、`test-aiaec-graph-io` 把每一列展開後對真實 pre 呼叫給出的 `AinrWork`／`AiaecWork` 核對。共用的展開、配對與檢查程式 `stream/common/graph_io.h` 由 `make -C stream/common test-graph-io` 測試。
+- state 的 shape 只在 `graph_io_<model>.h` 的表裡（`stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`），函式庫沒有。表各列與匯出器的對照有兩層：上面兩個 pytest 對全新匯出逐列比對（埠序、每個登錄 grid 與 N 的形狀、state 順序）；C 端的 `test-ainr-graph-io`、`test-aiaec-graph-io` 把每一列展開後對真實 pre 呼叫給出的 `StreamWork` 核對。共用的展開、配對與檢查程式 `stream/common/graph_io.h` 由 `make -C stream/common test-graph-io` 測試。

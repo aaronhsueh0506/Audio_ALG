@@ -48,7 +48,7 @@ static int run_roundtrip(void) {
     AiaecInfo info;
     AiaecCtx *ctx = NULL;
     AiaecInput input;
-    AiaecWork work;
+    StreamWork work;
     void *pool = NULL;
     static int16_t mic[128], far16[128], pcm_out[128];
     static float resid[128], farf[128];
@@ -83,14 +83,14 @@ static int run_roundtrip(void) {
 
     rc = aiaec_preprocess(ctx, &input, &work);
     CHECK(rc == AIAEC_OK, "preprocess (normal) rc=%d", rc);
-    CHECK(work.action == AIAEC_SUBMIT && work.input_count == (deepvqe ? 2 : 4) && work.output_count == 1 &&
+    CHECK(work.action == STREAM_WORK_SUBMIT && work.input_count == (deepvqe ? 2 : 4) && work.output_count == 1 &&
           work.inputs[0].w == 129u && work.inputs[0].h == 1u && work.inputs[0].c == (deepvqe ? 2u : 1u) &&
           work.outputs[0].elements == (deepvqe ? 129u * 18u : 2u * 129u),
           "work views %d/%d, first signal [%u,%u,%u,%u]", work.input_count, work.output_count, work.inputs[0].b,
           work.inputs[0].c, work.inputs[0].h, work.inputs[0].w);
-    if (work.action == AIAEC_SUBMIT)
+    if (work.action == STREAM_WORK_SUBMIT)
         for (k = 0; k < (int)work.outputs[0].elements; ++k) ((float *)work.outputs[0].data)[k] = 0.01f * (float)k;
-    CHECK(deepvqe ? work.action == AIAEC_SUBMIT : 1, "DeepVQE-S expects SUBMIT");
+    CHECK(deepvqe ? work.action == STREAM_WORK_SUBMIT : 1, "DeepVQE-S expects SUBMIT");
     rc = aiaec_postprocess(ctx, 0, pcm_out);
     CHECK(rc == AIAEC_OK, "postprocess (normal) rc=%d", rc);
 
@@ -130,7 +130,7 @@ static int run_roundtrip(void) {
         }
         rc = aiaec_preprocess_freq(cf, &fin, &work);
         CHECK(rc == AIAEC_OK, "freq preprocess rc=%d", rc);
-        if (work.action == AIAEC_SUBMIT)
+        if (work.action == STREAM_WORK_SUBMIT)
             for (k = 0; k < (int)work.outputs[0].elements; ++k) ((float *)work.outputs[0].data)[k] = 0.01f * (float)k;
         CHECK(aiaec_postprocess_freq(cf, 0, o_re, o_im) == AIAEC_OK, "freq postprocess");
         free(pf);

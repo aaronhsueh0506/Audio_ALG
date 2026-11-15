@@ -29,10 +29,10 @@ Inputs are the signal inputs followed by the four state inputs; outputs are the 
 the four state outputs named `<input>_out`; state `k` is input `signal_in + k` and output `1 + k` with equal shapes. The signal
 inputs are `error_mag`, `far_mag`, `error_cos`, `error_sin` (layout 18, `--frames-per-call 1`: 8 inputs, 5 outputs); at
 `--frames-per-call N > 1` (layout 19) `frame_reset` `[1, N]` is appended as the last signal input (9 inputs, 5 outputs). One
-description generator produces both. `stream/aiaec` keeps no port list: `AiaecWork` carries the block's signals and the head, and the
+description generator produces both. `stream/aiaec` keeps no port list: `StreamWork` carries the block's signals and the head, and the
 graph's wiring (including the four state shapes) is the board sample's model configuration (`stream/aiaec/graph_io_alignulcnet.h`, shared helper `stream/common/graph_io.h`), which binds by
 position, never by name. The stream computes `frame_reset` from the per-hop events (hop 3 of a packet alone: `0 0 1 0 0 0 0 0`) and the
-sample moves it like any other signal input. `AIAEC/tests/test_aiaec_bind_info_pin.py` compares the `AiaecWork` views of real pre calls
+sample moves it like any other signal input. `AIAEC/tests/test_aiaec_bind_info_pin.py` compares the `StreamWork` views of real pre calls
 with a fresh export for N = 1 and N = 8 and asserts this name order. Fixed-point state ports need `zero_point` 0 at both ends
 (the sample's `stream_check_ports()` refuses a graph that does not).
 

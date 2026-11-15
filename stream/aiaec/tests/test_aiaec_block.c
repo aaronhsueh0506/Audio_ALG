@@ -94,7 +94,7 @@ static void fake_mask(long long ghop, float *dst, size_t n) {
 /* A pure function of the input mic/far spectra, frame by frame: required wherever two drivers run
  * different frames_per_call (frame f of an N=8 batch and the N=1 hop with the same content must
  * produce the same taps). mic/far are [2][N][bins]: real plane, then imaginary plane. */
-static void content_taps(const AiaecWork *w, int n, float *taps) {
+static void content_taps(const StreamWork *w, int n, float *taps) {
     const size_t bins = w->inputs[0].w;
     const int tapw = 18;
     const float *mic_re = w->inputs[0].data, *mic_im = mic_re + (size_t)n * bins;
@@ -161,7 +161,7 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
 
     for (b = 0; b < blocks; ++b) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         DeepVqeHopIO hio;
         int rc;
 
@@ -172,7 +172,7 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
 
         dv_input(&input, mic_in, far_in, hop * n);
         rc = aiaec_preprocess(ctx, &input, &work);
-        CHECK(rc == AIAEC_OK && work.action == AIAEC_SUBMIT, "N=%d fft=%d block %d: preprocess rc=%d action=%d", n, fft, b, rc, (int)work.action);
+        CHECK(rc == AIAEC_OK && work.action == STREAM_WORK_SUBMIT, "N=%d fft=%d block %d: preprocess rc=%d action=%d", n, fft, b, rc, (int)work.action);
         CHECK(work.input_count == 2 && work.output_count == 1, "N=%d block %d: counts %d/%d", n, b, work.input_count, work.output_count);
 
         for (i = 0; i < n - 1; ++i) {
@@ -231,7 +231,7 @@ static int section_batching_vs_n1(int n) {
 
     for (b = 0; b < blocks; ++b) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         for (k = 0; k < hop * n; ++k) {
             mic_in[k] = (int16_t)((((long long)k * 5 + ghop * 3) % 97 - 48) * 8);
             far_in[k] = (int16_t)((((long long)k * 11 + ghop * 7) % 89 - 44) * 8);
@@ -243,7 +243,7 @@ static int section_batching_vs_n1(int n) {
 
         for (k = 0; k < n; ++k) {
             DeepVqeHopIO io;
-            AiaecWork one;
+            StreamWork one;
             CHECK(deepvqe_stream_pre_process(ref, mic_in + (size_t)k * hop, far_in + (size_t)k * hop, &io) == 1, "ref pre");
             memset(&one, 0, sizeof(one));
             one.inputs[0].data = io.inputs.mic; one.inputs[0].w = (unsigned)rgrid.n_bins;
@@ -321,10 +321,10 @@ static int section_fail_closed_one(FailKind kind) {
     for (k = 0; k < BS * BLOCKS; ++k) mic_in[k] = (int16_t)(((k * 977) % 20001) - 10000);
     for (b = 0; b < BLOCKS; ++b) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         const int fail = b == FAILED;
         dv_input(&input, mic_in + (size_t)b * BS, far_zero, BS);
-        CHECK(aiaec_preprocess(ctx, &input, &work) == AIAEC_OK && work.action == AIAEC_SUBMIT, "fail_closed block %d: preprocess", b);
+        CHECK(aiaec_preprocess(ctx, &input, &work) == AIAEC_OK && work.action == STREAM_WORK_SUBMIT, "fail_closed block %d: preprocess", b);
         gen_seen[b] = work.state_generation;
         CHECK(work.state_generation == aiaec_state_generation(ctx), "fail_closed block %d: work generation %u, live %u", b,
               work.state_generation, aiaec_state_generation(ctx));
@@ -360,7 +360,7 @@ static int section_fail_closed_one(FailKind kind) {
     }
     {   /* a reset advances the generation and the next SUBMIT block carries it */
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         const unsigned int before = aiaec_state_generation(ctx);
         aiaec_reset(ctx);
         dv_input(&input, mic_in, far_zero, BS);
@@ -408,7 +408,7 @@ static int section_trim(int n, int fft) {
     for (k = 0; k < bs * blocks; ++k) mic_in[k] = (int16_t)(((k * 977) % 20001) - 10000);
     for (bidx = 0; bidx < blocks; ++bidx) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         dv_input(&input, mic_in + (size_t)bidx * bs, far_zero, bs);
         CHECK(aiaec_preprocess(ctx, &input, &work) == AIAEC_OK, "delay N=%d block %d: preprocess", n, bidx);
         fill_identity_taps((float *)work.outputs[0].data, work.outputs[0].elements, n);
@@ -477,7 +477,7 @@ static int section_align_block(void) {
 
     for (i = 0; i < n_hops; ++i) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         AiaecAlignEvent ev;
         UlcnetStreamDelay rdelay;
         UlcnetHopIO rio;
@@ -497,7 +497,7 @@ static int section_align_block(void) {
         CHECK(rrc >= 0, "align hop %d: ref pre rc=%d", i, rrc);
 
         if (rrc == 1) {
-            CHECK(work.action == AIAEC_SUBMIT, "align hop %d: expected SUBMIT, got %d", i, (int)work.action);
+            CHECK(work.action == STREAM_WORK_SUBMIT, "align hop %d: expected SUBMIT, got %d", i, (int)work.action);
             CHECK(work.input_count == 4 && work.output_count == 1, "align hop %d: counts %d/%d", i, work.input_count, work.output_count);
             CHECK(work.inputs[0].elements == rio.inputs.spectrum_bins_elements && work.inputs[3].elements == rio.inputs.spectrum_bins_elements &&
                   work.outputs[0].elements == rio.outputs.spectrum_ri_elements, "align hop %d: element counts", i);
@@ -506,7 +506,7 @@ static int section_align_block(void) {
             submit_calls++;
             ai_rc = hops[i].force_fail ? 1 : 0;
         } else {
-            CHECK(work.action == AIAEC_BYPASS, "align hop %d: expected BYPASS, got %d", i, (int)work.action);
+            CHECK(work.action == STREAM_WORK_BYPASS, "align hop %d: expected BYPASS, got %d", i, (int)work.action);
             CHECK(work.input_count == 0 && work.output_count == 0 && work.state_generation == 0u, "align hop %d: bypass work not zeroed", i);
             ai_rc = 0;
         }
@@ -550,7 +550,7 @@ static int section_bypass_ignores_infer_status(void) {
     }
     for (i = 0; i < 2; ++i) {
         AiaecInput input;
-        AiaecWork wa, wb;
+        StreamWork wa, wb;
         AiaecAlignEvent ev;
         int rc_a, rc_b, ai_a = 0, ai_b = 0;
 
@@ -560,7 +560,7 @@ static int section_bypass_ignores_infer_status(void) {
         rc_b = aiaec_preprocess(ctx_b, &input, &wb);
         CHECK(rc_a == AIAEC_OK && rc_b == AIAEC_OK && wa.action == wb.action, "bypass hop %d: preprocess", i);
         if (i == 1) {
-            CHECK(wa.action == AIAEC_BYPASS, "bypass: hop 1 was not flagged BYPASS (test setup is wrong)");
+            CHECK(wa.action == STREAM_WORK_BYPASS, "bypass: hop 1 was not flagged BYPASS (test setup is wrong)");
             ai_b = 0xBAD1;
         } else {
             fake_mask(i, wa.outputs[0].data, wa.outputs[0].elements);
@@ -604,7 +604,7 @@ static int section_trim_align(void) {
     }
     for (bidx = 0; bidx < blocks; ++bidx) {
         AiaecInput input;
-        AiaecWork work;
+        StreamWork work;
         AiaecAlignEvent ev;
         ev.changed = 0; ev.solid = 0;
         al_input(&input, residual + (size_t)bidx * hop, far_zero, &ev, hop, 1);
@@ -644,8 +644,8 @@ static void feed_input(const Feed *f, int samples, int n, AiaecInput *in) {
 #endif
 }
 
-static void fake_head(AiaecWork *w) {
-    if (w->action != AIAEC_SUBMIT) return;
+static void fake_head(StreamWork *w) {
+    if (w->action != STREAM_WORK_SUBMIT) return;
 #if PRODUCT_DV
     fake_taps(0, w->outputs[0].data, w->outputs[0].elements);
 #else
@@ -656,7 +656,7 @@ static void fake_head(AiaecWork *w) {
 /* A live first block's views at 16k/256 N=1, against the exporter's literal numbers (129 bins). */
 static int section_work_views(void) {
     AiaecConfig cfg = make_cfg(256, 1);
-    AiaecWork live;
+    StreamWork live;
     AiaecInput input;
     static Feed feed;
     void *pool = NULL;
@@ -666,7 +666,7 @@ static int section_work_views(void) {
 
     if (!ctx) return 1;
     feed_input(&feed, 128, 1, &input);
-    CHECK(aiaec_preprocess(ctx, &input, &live) == AIAEC_OK && live.action == AIAEC_SUBMIT, "views: live preprocess");
+    CHECK(aiaec_preprocess(ctx, &input, &live) == AIAEC_OK && live.action == STREAM_WORK_SUBMIT, "views: live preprocess");
     CHECK(live.input_count == (PRODUCT_DV ? 2 : 4) && live.output_count == 1, "views: counts %d/%d", live.input_count, live.output_count);
     for (k = 0; k < live.input_count; ++k) {
         const unsigned c = PRODUCT_DV ? 2u : 1u;
@@ -690,7 +690,7 @@ static int section_work_views(void) {
 static int section_mismatch(void) {
     AiaecConfig cfg = make_cfg(256, 1);
     AiaecInput input;
-    AiaecWork work;
+    StreamWork work;
     static Feed feed;
     void *pool = NULL;
     AiaecCtx *ctx = make_ctx(&cfg, &pool, "mismatch");
@@ -737,7 +737,7 @@ static int section_mismatch(void) {
     /* a correct call after every rejection; then a double preprocess is a sequence error */
     feed_input(&feed, 128, 1, &input);
     rc = aiaec_preprocess(ctx, &input, &work);
-    CHECK(rc == AIAEC_OK && work.action == AIAEC_SUBMIT, "mismatch: correct call after rejections rc=%d", rc);
+    CHECK(rc == AIAEC_OK && work.action == STREAM_WORK_SUBMIT, "mismatch: correct call after rejections rc=%d", rc);
     CHECK(aiaec_preprocess(ctx, &input, &work) == AIAEC_ERR_SEQUENCE, "mismatch: second preprocess before postprocess");
     fake_head(&work);
     CHECK(aiaec_postprocess(ctx, 0, pcm) == AIAEC_OK, "mismatch: postprocess after recovery");

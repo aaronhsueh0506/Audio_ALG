@@ -49,7 +49,7 @@ int main(void) {
                 fprintf(stderr, "link_only_aiaec: FAIL shipped row init rc=%d (%s)\n", rc, aiaec_status_text(rc));
                 status = 1;
             } else {
-                AiaecWork work;
+                StreamWork work;
                 AiaecInput in;
                 int16_t mic[256] = {0}, far[256] = {0}, out[256];
                 printf("link_only_aiaec: shipped 16kHz/512/N=1 row constructs via %s\n", info.graph_path);

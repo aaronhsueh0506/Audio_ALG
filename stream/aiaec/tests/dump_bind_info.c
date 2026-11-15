@@ -1,4 +1,4 @@
-/* Prints, for one {sr, fft, hop_in} of the product this binary is built for, the init result and the AiaecWork
+/* Prints, for one {sr, fft, hop_in} of the product this binary is built for, the init result and the StreamWork
  * views of the first real pre call, one line per fact, for AIAEC/tests/test_aiaec_bind_info_pin.py to compare
  * with the ONNX export. Built by `make bind-dumpers` with -DAIAEC_TEST_CATALOG (placeholder graph paths, so the
  * rows without a delivered graph still resolve) and -DAIAEC_PRODUCT_MODEL_ID=<id>.
@@ -10,13 +10,13 @@
  *                                       0 when all succeed (a refused config prints this line only)
  *     graph <path>                      AiaecInfo.graph_path
  *     info trim <int> queue <int> tail <int>      AiaecInfo trim_samples / queue_frames / tail_zero_blocks
- *     work action <int> inputs <int> outputs <int>   AiaecWork.action (0 BYPASS, 1 SUBMIT), input_count, output_count
- *     in <i> <b> <c> <h> <w> <elements>   AiaecWork.inputs[i], the signals in graph order (none on a BYPASS block)
- *     out <i> <b> <c> <h> <w> <elements>  AiaecWork.outputs[i], the heads (none on a BYPASS block)
+ *     work action <int> inputs <int> outputs <int>   StreamWork.action (0 BYPASS, 1 SUBMIT), input_count, output_count
+ *     in <i> <b> <c> <h> <w> <elements>   StreamWork.inputs[i], the signals in graph order (none on a BYPASS block)
+ *     out <i> <b> <c> <h> <w> <elements>  StreamWork.outputs[i], the heads (none on a BYPASS block)
  *     frame_reset <v0> ... <vN-1>         Align-ULCNet at N > 1 only: the last signal's N control values
  *
  * Only the signal and head views a sample binds are printed: the graph's recurrent-state ports are not part of
- * AiaecWork, and the library has no record of them. N and hop_in are not printed: they are the arguments. */
+ * StreamWork, and the library has no record of them. N and hop_in are not printed: they are the arguments. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +28,7 @@
 int main(int argc, char **argv) {
     AiaecConfig cfg;
     AiaecInfo info;
-    AiaecWork work;
+    StreamWork work;
     StreamMemReq req;
     AiaecCtx *pcm = NULL;
     AiaecFreqCtx *freq = NULL;

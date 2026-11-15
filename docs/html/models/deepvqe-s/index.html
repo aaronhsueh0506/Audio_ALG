@@ -45,7 +45,7 @@ cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common \
 <tr><th>16k／256／N=8</th><td>[1,2,8,129]</td><td>[1,8,129,18]</td><td>16 組，D = 63</td></tr>
 <tr><th>16k／512／N=1</th><td>[1,2,1,257]</td><td>[1,1,257,18]</td><td>16 組，D = 32</td></tr>
 </tbody></table>
-<p><code>AiaecWork.inputs[0..1]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>AiaecWork</code> 裡。state 的順序是匯出器的順序（<code>align_key_ring</code>、<code>align_value_ring</code>、<code>align_score_history</code>、<code>ccm_up_history</code>、<code>far1_history</code>、<code>far2_history</code>、<code>h_gru</code>、<code>mic1_history</code> … <code>mic4_history</code>、<code>res2_history</code>、<code>res3_history</code>、<code>up1_history</code> … <code>up3_history</code>；ONNX 名稱除 <code>h_gru</code> 外都帶 <code>state_</code> 前綴），各自的 shape 見模型設定的列。</p>
+<p><code>StreamWork.inputs[0..1]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>StreamWork</code> 裡。state 的順序是匯出器的順序（<code>align_key_ring</code>、<code>align_value_ring</code>、<code>align_score_history</code>、<code>ccm_up_history</code>、<code>far1_history</code>、<code>far2_history</code>、<code>h_gru</code>、<code>mic1_history</code> … <code>mic4_history</code>、<code>res2_history</code>、<code>res3_history</code>、<code>up1_history</code> … <code>up3_history</code>；ONNX 名稱除 <code>h_gru</code> 外都帶 <code>state_</code> 前綴），各自的 shape 見模型設定的列。</p>
 
 <h2>初始化與每包呼叫</h2>
 <p>一次 init（<code>aiaec_get_mem_size()</code> → <code>aiaec_init()</code>）備好 pool，並填 <code>AiaecInfo</code>：圖路徑、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄。N 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。起始 generation 由 <code>aiaec_state_generation()</code> 取得。sample 的演算法入口只有 init／pre／post；AI3 的開圖、送張量、執行、讀回與 state 緩衝是 sample 自己的。每包 pre／post 只交換這一包的特徵（<code>work.inputs[0..1]</code> 為 mic、far 的特徵）與模型 head（<code>work.outputs[0]</code>，CCM taps）。</p>
@@ -73,10 +73,10 @@ while (read_blocks(mic, far, hop_in)) {
     AiaecInput in = { .kind = AIAEC_INPUT_DEEPVQE_S, .samples = hop_in };
     in.u.deepvqe_s.mic_in = mic;
     in.u.deepvqe_s.far_in = far;
-    AiaecWork work;
+    StreamWork work;
     if (aiaec_preprocess(ctx, &amp;in, &amp;work) != AIAEC_OK) return -1;
     int ai_rc = 0;
-    if (work.action == AIAEC_SUBMIT) {             /* DeepVQE-S 每包都是 SUBMIT */
+    if (work.action == STREAM_WORK_SUBMIT) {             /* DeepVQE-S 每包都是 SUBMIT */
         int chk;
         GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);   /* work 的數量與 shape 必須等於這一列 */
         if (chk != GRAPH_IO_OK) ai_rc = -1;    /* 不符：不送件，仍呼叫 post */
@@ -127,7 +127,7 @@ while (read_blocks(mic, far, hop_in)) {
 <tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>AiaecWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>AiaecWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_deepvqe_frames_per_call.py</code> 匯出 16k／512 的 N=1、2、4，驗 state 就地契約並以 ONNX Runtime 對 PyTorch 驗證；<code>test_deepvqe_inference_frames_per_call.py</code> 在 16k／256 匯出 N=1 與 N=8 兩張圖，在 ONNX Runtime 串流同一段輸入，CCM taps 最大差小於 5e-5，加速器呼叫數分別為 hop 數與 hop 數除以 8 進位。兩者都不經 C 的 <code>aiaec_*</code> 家族。</li>
 </ul>
 

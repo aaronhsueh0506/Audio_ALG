@@ -31,7 +31,7 @@ static int init_cfg(const AiaecConfig *cfg, AiaecInfo *info, void **pool_out, Ai
 }
 
 /* One zero N=8 (hop_in 1024) block through a real pre; the views of the first signal. */
-static int pre_zero_n8(AiaecCtx *ctx, AiaecWork *work) {
+static int pre_zero_n8(AiaecCtx *ctx, StreamWork *work) {
     static const int16_t pcm[1024];
     static const float f[1024];
     static const AiaecAlignEvent ev[8];
@@ -58,7 +58,7 @@ int main(void) {
     AiaecConfig n1, n8, odd;
     StreamMemReq req;
     AiaecInfo info;
-    AiaecWork work;
+    StreamWork work;
     AiaecCtx *ctx = NULL;
     void *pool = NULL;
     int rc;

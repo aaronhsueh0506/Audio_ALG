@@ -130,10 +130,10 @@ static void synth_frames(Frame *f, int n, int hop, int n_bins, const float *re, 
 }
 
 /* Deterministic accelerator heads keyed by a block counter. */
-static void fake_head(AiaecWork *w, long long ghop) {
+static void fake_head(StreamWork *w, long long ghop) {
     size_t i;
     float *d;
-    if (w->action != AIAEC_SUBMIT) return;
+    if (w->action != STREAM_WORK_SUBMIT) return;
     d = w->outputs[0].data;
     for (i = 0; i < w->outputs[0].elements; ++i)
         d[i] = PRODUCT_DV ? 0.05f * (float)(((ghop + (long long)i) % 37) - 18)
@@ -141,7 +141,7 @@ static void fake_head(AiaecWork *w, long long ghop) {
 }
 
 /* CCM taps forced to (time 0, centre frequency) = 1 + 0j: the head is then the identity on the mic. */
-static void identity_head(AiaecWork *w, int n) {
+static void identity_head(StreamWork *w, int n) {
     const size_t tapn = 9, bins = w->outputs[0].elements / (tapn * 2u * (size_t)n);
     float *taps = w->outputs[0].data;
     size_t f, b;
@@ -180,7 +180,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
     for (b = 0; b < blocks; ++b) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork wb, wf;
+        StreamWork wb, wf;
         const Ev *e = &sched[b % (PRODUCT_AL ? blocks : 1)];
         int fail = PRODUCT_DV ? (b == 3) : e->fail;
         int edge = 0;
@@ -232,7 +232,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         CHECK(wb.action == wf.action, "fft=%d N=%d block %d: action differs across families (%d/%d, edge %d)",
               fft, n, b, (int)wb.action, (int)wf.action, edge);
         edges += edge;
-        if (wb.action == AIAEC_SUBMIT) {
+        if (wb.action == STREAM_WORK_SUBMIT) {
             for (k = 0; k < NINPUTS; ++k)
                 CHECK(wb.inputs[k].elements == wf.inputs[k].elements &&
                       memcmp(wb.inputs[k].data, wf.inputs[k].data, wb.inputs[k].elements * sizeof(float)) == 0,
@@ -240,7 +240,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
             CHECK(wb.state_generation == wf.state_generation, "block %d: state_generation differs across families", b);
             if (!fail) { fake_head(&wb, ghop); fake_head(&wf, ghop); }
         }
-        fails += fail && wb.action == AIAEC_SUBMIT;
+        fails += fail && wb.action == STREAM_WORK_SUBMIT;
         CHECK(aiaec_postprocess(t.blk, fail, p_blk) == AIAEC_OK, "block %d: block postprocess", b);
         CHECK(aiaec_postprocess_freq(t.freq, fail, f_re, f_im) == AIAEC_OK, "block %d: freq postprocess", b);
 
@@ -295,7 +295,7 @@ static int section_events(void) {
     for (i = 0; i < hops; ++i) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork wb, wf;
+        StreamWork wb, wf;
         AiaecAlignEvent ev;
         for (k = 0; k < 128; ++k) { resid[k] = 0.002f * (float)((k * 5 + i * 3) % 97 - 48); farf[k] = 0.002f * (float)((k * 11 + i) % 89 - 44); }
         ev.changed = h[i].changed; ev.solid = h[i].solid;
@@ -312,18 +312,18 @@ static int section_events(void) {
         fin.u.align_ulcnet.events = &ev; fin.u.align_ulcnet.event_count = 1;
         CHECK(aiaec_preprocess(t.blk, &in, &wb) == AIAEC_OK && aiaec_preprocess_freq(t.freq, &fin, &wf) == AIAEC_OK,
               "events hop %d: preprocess", i);
-        sub_blk += wb.action == AIAEC_SUBMIT; sub_freq += wf.action == AIAEC_SUBMIT;
-        if ((wb.action == AIAEC_SUBMIT) != (h[i].submit != 0) || (wf.action == AIAEC_SUBMIT) != (h[i].submit != 0)) {
-            FAIL("events hop %d: submit block/freq = %d/%d, want %d", i, wb.action == AIAEC_SUBMIT,
-                 wf.action == AIAEC_SUBMIT, h[i].submit);
+        sub_blk += wb.action == STREAM_WORK_SUBMIT; sub_freq += wf.action == STREAM_WORK_SUBMIT;
+        if ((wb.action == STREAM_WORK_SUBMIT) != (h[i].submit != 0) || (wf.action == STREAM_WORK_SUBMIT) != (h[i].submit != 0)) {
+            FAIL("events hop %d: submit block/freq = %d/%d, want %d", i, wb.action == STREAM_WORK_SUBMIT,
+                 wf.action == STREAM_WORK_SUBMIT, h[i].submit);
             bad = 1;
         }
-        if (wb.action == AIAEC_BYPASS)
+        if (wb.action == STREAM_WORK_BYPASS)
             CHECK(wb.input_count == 0 && wb.output_count == 0 && wb.state_generation == 0u && wf.input_count == 0,
                   "events hop %d: bypass work not zeroed", i);
         /* infer_status is not read on a bypass hop */
-        CHECK(aiaec_postprocess(t.blk, wb.action == AIAEC_SUBMIT ? 1 : 0xBAD1, pcm) == AIAEC_OK &&
-              aiaec_postprocess_freq(t.freq, wf.action == AIAEC_SUBMIT ? 1 : 0xBAD1, re, im) == AIAEC_OK,
+        CHECK(aiaec_postprocess(t.blk, wb.action == STREAM_WORK_SUBMIT ? 1 : 0xBAD1, pcm) == AIAEC_OK &&
+              aiaec_postprocess_freq(t.freq, wf.action == STREAM_WORK_SUBMIT ? 1 : 0xBAD1, re, im) == AIAEC_OK,
               "events hop %d: postprocess", i);
     }
     CHECK(sub_blk == 4 && sub_freq == 4, "events: submissions block/freq = %d/%d, want 4 of %d hops", sub_blk, sub_freq, hops);
@@ -353,7 +353,7 @@ static int section_freq_continuity(int fft) {
     for (k = 0; k < hop; ++k) farf[k] = 0.003f * (float)((k * 11) % 53 - 26);
     for (b = 0; b < blocks; ++b) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         AiaecAlignEvent ev;
         ev.changed = sched[b].changed; ev.solid = sched[b].solid;
         events += sched[b].changed;
@@ -365,7 +365,7 @@ static int section_freq_continuity(int fft) {
         fin.u.align_ulcnet.far_re = b_re; fin.u.align_ulcnet.far_im = b_im;
         fin.u.align_ulcnet.events = &ev; fin.u.align_ulcnet.event_count = 1;
         CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_OK, "continuity block %d: preprocess", b);
-        CHECK(aiaec_postprocess_freq(t.freq, w.action == AIAEC_SUBMIT ? 1 : 0, o_re, o_im) == AIAEC_OK, "continuity block %d: postprocess", b);
+        CHECK(aiaec_postprocess_freq(t.freq, w.action == STREAM_WORK_SUBMIT ? 1 : 0, o_re, o_im) == AIAEC_OK, "continuity block %d: postprocess", b);
         ac_istft_push_planar(ist.istft, o_re, o_im, out);
         if (b == 0) continue;
         for (k = 0; k < hop; ++k) {
@@ -395,7 +395,7 @@ static int section_scale(void) {
     frame_make(&an_a, fft, 1, 0); frame_make(&an_b, fft, 1, 0);
     for (b = 0; b < 6; ++b) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         AiaecAlignEvent ev;
         for (k = 0; k < hop; ++k) {
             hopf[k] = (float)(((k * 7 + b * 13) % 201) - 100) / 400.0f;
@@ -416,7 +416,7 @@ static int section_scale(void) {
         fin.u.align_ulcnet.far_re = b_re; fin.u.align_ulcnet.far_im = b_im;
         fin.u.align_ulcnet.events = &ev; fin.u.align_ulcnet.event_count = 1;
 #endif
-        CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_OK && w.action == AIAEC_SUBMIT, "scale block %d: preprocess", b);
+        CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_OK && w.action == STREAM_WORK_SUBMIT, "scale block %d: preprocess", b);
 #if PRODUCT_DV
         identity_head(&w, 1);
         CHECK(aiaec_postprocess_freq(t.freq, 0, o_re, o_im) == AIAEC_OK, "scale block %d: postprocess", b);
@@ -462,7 +462,7 @@ static int check_pulse(const float *out, size_t n, size_t idx, const char *label
 
 /* The accelerator stand-in of the tail test: identity head for DeepVQE-S, a bypass for Align-ULCNet
  * (fail open: the error spectrum passes through). Returns the infer_status to close the block with. */
-static int tail_accel(AiaecWork *w, int n) {
+static int tail_accel(StreamWork *w, int n) {
     if (PRODUCT_DV) { identity_head(w, n); return 0; }
     return 1;
 }
@@ -554,7 +554,7 @@ static int section_tail(int fft, int n) {
     for (b = 0; b < total_blocks; ++b) {
         AiaecInput in;
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         int st;
         const int16_t *blk = pcm + (size_t)b * (size_t)hop_in;
 
@@ -566,11 +566,11 @@ static int section_tail(int fft, int n) {
         tail_input(&in, &fin, blk, resid, hop_in, ev, a_re, a_im, b_re, b_im, n);
 
         if (aiaec_preprocess(t.blk, &in, &w) != AIAEC_OK) { FAIL("%s: block pre %d", label, b); return 1; }
-        st = w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0;
+        st = w.action == STREAM_WORK_SUBMIT ? tail_accel(&w, n) : 0;
         if (aiaec_postprocess(t.blk, st, out16 + (size_t)b * hop_in) != AIAEC_OK) { FAIL("%s: block post %d", label, b); return 1; }
 
         if (aiaec_preprocess_freq(t.freq, &fin, &w) != AIAEC_OK) { FAIL("%s: freq pre %d", label, b); return 1; }
-        st = w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0;
+        st = w.action == STREAM_WORK_SUBMIT ? tail_accel(&w, n) : 0;
         if (aiaec_postprocess_freq(t.freq, st, fre, fim) != AIAEC_OK) { FAIL("%s: freq post %d", label, b); return 1; }
         for (f = 0; f < n; ++f)
             ac_istft_push_planar(ist_f.istft, fre + (size_t)f * nb, fim + (size_t)f * nb, outq + (size_t)b * hop_in + (size_t)f * hop);
@@ -600,14 +600,14 @@ static int section_tail(int fft, int n) {
         for (b = 0; b < BLOCKS_REAL + zero_hops; ++b) {
             AiaecInput in;
             AiaecFreqInput fin;
-            AiaecWork w;
+            StreamWork w;
             const int16_t *blk = pcm + (size_t)b * hop_in;
             for (k = 0; k < hop; ++k) hopf[k] = (float)blk[k] / 32768.0f;
             ac_stft_push_planar(ax_a.stft, hopf, a_re, a_im);
             ac_stft_push_planar(ax_b.stft, hopf, b_re, b_im);
             tail_input(&in, &fin, blk, resid, hop_in, ev, a_re, a_im, b_re, b_im, n);
             if (aiaec_preprocess_freq(cs, &fin, &w) != AIAEC_OK) return 1;
-            if (aiaec_postprocess_freq(cs, w.action == AIAEC_SUBMIT ? tail_accel(&w, n) : 0, fre, fim) != AIAEC_OK) return 1;
+            if (aiaec_postprocess_freq(cs, w.action == STREAM_WORK_SUBMIT ? tail_accel(&w, n) : 0, fre, fim) != AIAEC_OK) return 1;
             ac_istft_push_planar(ist_x.istft, fre, fim, outf + (size_t)b * hop);
         }
         ac_istft_push_planar(ist_x.istft, zre, zim, outf + (size_t)b * hop);
@@ -703,7 +703,7 @@ static int section_gates(void) {
     Pair t;
     float re[129], im[129], zeros[129];
     AiaecFreqInput fin;
-    AiaecWork w;
+    StreamWork w;
     AiaecAlignEvent ev[2];
     unsigned int gen;
 
@@ -750,7 +750,7 @@ static int section_gates(void) {
 
     CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_OK, "gates: valid freq preprocess");
     CHECK(aiaec_preprocess_freq(t.freq, &fin, &w) == AIAEC_ERR_SEQUENCE, "gates: second freq preprocess before postprocess");
-    if (w.action == AIAEC_SUBMIT) fake_head(&w, 0);
+    if (w.action == STREAM_WORK_SUBMIT) fake_head(&w, 0);
     CHECK(aiaec_postprocess_freq(t.freq, 0, NULL, NULL) == AIAEC_ERR_NULL, "gates: NULL outputs keep the block open");
     CHECK(aiaec_postprocess_freq(t.freq, 0, re, im) == AIAEC_OK, "gates: freq postprocess after recovery");
 
@@ -807,7 +807,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
     }
     for (b = 0; b < BLOCKS; ++b) {
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         const int fail = b == FAILED;
         int rc;
 
@@ -816,7 +816,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
         fin.u.deepvqe_s.mic_re = e_re + (size_t)b * n * nb; fin.u.deepvqe_s.mic_im = e_im + (size_t)b * n * nb;
         fin.u.deepvqe_s.far_re = z; fin.u.deepvqe_s.far_im = z;   /* n * nb floats are read: the far stays silent */
         rc = aiaec_preprocess_freq(t.freq, &fin, &w);
-        CHECK(rc == AIAEC_OK && w.action == AIAEC_SUBMIT, "fail_closed block %d: preprocess rc=%d", b, rc);
+        CHECK(rc == AIAEC_OK && w.action == STREAM_WORK_SUBMIT, "fail_closed block %d: preprocess rc=%d", b, rc);
         gen_seen[b] = w.state_generation;
         CHECK(w.state_generation == aiaec_state_generation_freq(t.freq), "fail_closed block %d: work generation %u, live %u", b,
               w.state_generation, aiaec_state_generation_freq(t.freq));
@@ -847,7 +847,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
               gen_seen[FAILED], gen_seen[FAILED + 1], gen_seen[FAILED + 2]);
     {   /* a reset advances the generation and the next SUBMIT block carries it */
         AiaecFreqInput fin;
-        AiaecWork w;
+        StreamWork w;
         const unsigned int before = aiaec_state_generation_freq(t.freq);
         unsigned int live;
         int rc;

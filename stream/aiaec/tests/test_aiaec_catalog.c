@@ -100,11 +100,11 @@ static void section_shipped_row(void) {
         {   /* the delivered graph's views: mic, far [1,2,1,257]; CCM taps [1,1,257,18] */
             static const int16_t zeros[256];
             AiaecInput in;
-            AiaecWork work;
+            StreamWork work;
             memset(&in, 0, sizeof(in));
             in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = 256;
             in.u.deepvqe_s.mic_in = zeros; in.u.deepvqe_s.far_in = zeros;
-            CHECK(aiaec_preprocess(ctx, &in, &work) == AIAEC_OK && work.action == AIAEC_SUBMIT &&
+            CHECK(aiaec_preprocess(ctx, &in, &work) == AIAEC_OK && work.action == STREAM_WORK_SUBMIT &&
                   work.input_count == 2 && work.output_count == 1 &&
                   work.inputs[0].b == 1u && work.inputs[0].c == 2u && work.inputs[0].h == 1u && work.inputs[0].w == 257u &&
                   work.inputs[0].elements == 514u && work.inputs[1].w == 257u && work.inputs[1].elements == 514u &&

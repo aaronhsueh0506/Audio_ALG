@@ -1,4 +1,4 @@
-/* The board samples' AIAEC graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the AiaecWork of
+/* The board samples' AIAEC graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the StreamWork of
  * real pre calls (PCM, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
  * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration, and with
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
@@ -49,7 +49,7 @@ static int same_info(const AiaecInfo *a, const AiaecInfo *b)
            a->queue_frames == b->queue_frames && a->tail_zero_blocks == b->tail_zero_blocks;
 }
 
-static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWork *work)
+static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamWork *work)
 {
     int i, rc;
     const StreamWiring *w = &mc->wiring;
@@ -57,7 +57,7 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWo
     CHECK(graph_io_state_count(mc) == DEEPVQE_STATE_COUNT, "%s state count %d, the library has %d", tag,
           graph_io_state_count(mc), (int)DEEPVQE_STATE_COUNT);
 #endif
-    CHECK(work->action == AIAEC_SUBMIT, "%s action %d", tag, (int)work->action);
+    CHECK(work->action == STREAM_WORK_SUBMIT, "%s action %d", tag, (int)work->action);
     CHECK(work->input_count == w->signal_in_count, "%s input_count %d vs %d", tag, work->input_count, w->signal_in_count);
     CHECK(work->output_count == w->head_out_count, "%s output_count %d vs %d", tag, work->output_count, w->head_out_count);
     for (i = 0; i < work->input_count && i < w->signal_in_count; ++i)
@@ -68,7 +68,7 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWo
         CHECK(work->outputs[i].b == w->outputs[i].b && work->outputs[i].c == w->outputs[i].c &&
               work->outputs[i].h == w->outputs[i].h && work->outputs[i].w == w->outputs[i].w &&
               work->outputs[i].elements == w->outputs[i].elements, "%s head %d shape", tag, i);
-    for (i = work->input_count; i < AIAEC_MAX_INPUT_TENSORS; ++i)
+    for (i = work->input_count; i < STREAM_WORK_MAX_INPUTS; ++i)
         CHECK(work->inputs[i].data == NULL && work->inputs[i].elements == 0u && work->inputs[i].w == 0u,
               "%s inputs[%d] beyond the %d signals is not empty", tag, i, work->input_count);
     for (i = 0; i < work->input_count; ++i) {
@@ -88,11 +88,11 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const AiaecWo
     }
     GRAPH_IO_CHECK_WORK(rc, mc, work);
     CHECK(rc == GRAPH_IO_OK, "%s GRAPH_IO_CHECK_WORK rc %d", tag, rc);
-    CHECK(graph_io_fits(mc, AIAEC_MAX_INPUT_TENSORS, AIAEC_MAX_OUTPUT_TENSORS) == GRAPH_IO_OK, "%s fits", tag);
+    CHECK(graph_io_fits(mc, STREAM_WORK_MAX_INPUTS, STREAM_WORK_MAX_OUTPUTS) == GRAPH_IO_OK, "%s fits", tag);
 }
 
 /* One pre call of `family` on a fresh init; event_hop < 0: no event. Returns the pre status. */
-static int run_pre(const AiaecConfig *cfg, int family, int event_hop, AiaecWork *work, AiaecInfo *info)
+static int run_pre(const AiaecConfig *cfg, int family, int event_hop, StreamWork *work, AiaecInfo *info)
 {
     StreamMemReq req;
     AiaecCtx *pcm = NULL; AiaecFreqCtx *freq = NULL;
@@ -185,7 +185,7 @@ int main(void)
         if (!lib_ok || !row_ok) continue;
         memset(infos, 0, sizeof infos);
         for (family = 0; family < 2; ++family) {
-            AiaecWork work; AiaecInfo info;
+            StreamWork work; AiaecInfo info;
             char tag[96];
             int rc, e, ev, n_events = IS_ALIGN ? 2 : 1;   /* no event, then (Align-ULCNet) an event at hop 2 or the last */
             for (e = 0; e < n_events; ++e) {
@@ -197,7 +197,7 @@ int main(void)
                 if (e == 0) infos[family] = info;
                 if (IS_ALIGN && n == 1 && ev == 0) {
                     /* an N = 1 event hop is BYPASS: no tensors, so no boundary check (and none would pass) */
-                    CHECK(work.action == AIAEC_BYPASS && work.input_count == 0 && work.output_count == 0,
+                    CHECK(work.action == STREAM_WORK_BYPASS && work.input_count == 0 && work.output_count == 0,
                           "%s expected BYPASS with an empty work", tag);
                     CHECK(graph_io_check_counts(&mc, work.input_count, work.output_count) == GRAPH_IO_ERR_COUNT,
                           "%s the boundary check must reject an empty BYPASS work", tag);

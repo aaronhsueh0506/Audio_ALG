@@ -31,7 +31,7 @@ typedef struct Slot {
     AiaecFreqCtx *ctx;
     void *pool;
     int n;
-    AiaecWork work;
+    StreamWork work;
 } Slot;
 
 static Slot g_slot[MAX_SLOTS];
