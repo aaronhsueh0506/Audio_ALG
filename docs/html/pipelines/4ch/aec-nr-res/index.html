@@ -160,8 +160,8 @@ fuse+RES+後級 (C)  out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的
 <p>三塊 caller 記憶體:(1) array pool(<code>aec_get_mem_requirements()</code>,16-byte 對齊):<code>Aec</code> 結構、控制區、mic lane、aligned far、融合緩衝、增益級、對齊環、estimator pool(MATCHED)與 4 條 lane;<code>build_flags_hash</code> 涵蓋整個 carve;(2) helper pool(control block、SRP 含 steering table、BF、<code>bf_spectrum</code>／<code>bf_weights</code>);(3) 應用的 post pool(<code>AnrDenoiser</code>、<code>AcIstft</code> 與暫存)。array 與 helper 的 <code>req.bytes</code> <b>都不含</b> NR 與合成;它們各有自己的 <code>mem_size</code>。數字為 ne10 實測(<code>--print-mem-size</code>),換 backend／編譯選項／函式庫版本就失效,務必現查。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>Unit(array + SRP/BF helper)合計</td><td>1,492,656 B @16k/256(預設)/ 2,660,976 B @16k/512 / 5,536,080 B @48k/1024</td><td>—</td><td>實測 <code>4ch_static --print-mem-size</code> 的 <code>Unit:</code> 行(<code>AEC_LAYOUT_VERSION</code> = 4);不含 NR／合成</td></tr>
-<tr><td>Unit＋NR／合成／暫存</td><td>1,548,752 B @16k/256(預設)/ 2,738,144 B @16k/512 / 5,721,360 B @48k/1024</td><td>—</td><td><code>4ch_static --print-mem-size</code> 的 <code>Unit</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後三項 56,096 B @16k/256／77,168 B @16k/512／185,280 B @48k)</td></tr>
+<tr><td>Unit(array + SRP/BF helper)合計</td><td>1,459,184 B @16k/256(預設)/ 2,626,992 B @16k/512 / 5,435,184 B @48k/1024</td><td>—</td><td>實測 <code>4ch_static --print-mem-size</code> 的 <code>Unit:</code> 行(<code>AEC_LAYOUT_VERSION</code> = 4);不含 NR／合成</td></tr>
+<tr><td>Unit＋NR／合成／暫存</td><td>1,515,280 B @16k/256(預設)/ 2,704,160 B @16k/512 / 5,620,464 B @48k/1024</td><td>—</td><td><code>4ch_static --print-mem-size</code> 的 <code>Unit</code> + <code>NR</code> + <code>Synthesis</code> + <code>Buffers</code> = <code>Total:</code> 行(後三項 56,096 B @16k/256／77,168 B @16k/512／185,280 B @48k)</td></tr>
 </table>
 <p>各 state 的細項(array 的 lane／estimator／ring／融合、helper pool、<code>AnrDenoiser</code>、<code>AcIstft</code>、暫存)的大小與存放者見 <a href="reference/configuration.html#diagnostics">四聲道 參數與診斷</a> 的 State 表(細項)。</p>
 

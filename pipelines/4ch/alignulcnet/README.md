@@ -166,8 +166,8 @@ sets the measured one through `ArraySampleBeamParams`). Internal: the helper's B
 The matched-filter bank size `n` is a product deployment decision, so it is a
 command-line argument rather than a literal in `main.c`; the resolved profile
 and the pool it costs are printed at start-up — at the default matched/n=5
-profile, that banner reads a 2,453,040 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
-14,992 B stream pool at 16 kHz and a 5,120,272 B unit pool plus a 29,328 B stream pool at 48 kHz
+profile, that banner reads a 2,419,056 B unit pool (the array plus the helper; the 16 kHz row of the example's table is fft 512) plus a
+14,992 B stream pool at 16 kHz and a 5,019,376 B unit pool plus a 29,328 B stream pool at 48 kHz
 (`--sample-rate 48000`); the application's framing line follows (49,920 B at 16 kHz, 98,048 B at 48 kHz: the far `AcStft`, the output
 `AcIstft` and six spectrum planes). The stream pool follows the grid, not `D`, and holds no analysis or synthesis
 object (`freq_only`). Read the numbers from your

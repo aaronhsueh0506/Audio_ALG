@@ -35,7 +35,7 @@ sample 層另有 `array_sample_default_config(&cfg, sr)`（`array_sample_beam.h`
 | `delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 隔離窗長（秒），init 時換算成 hop 數（最小 1）；enable 為 0 時無作用但仍被驗證 |
 
 **level（強度）是 `AecConfig.level`**（`aec_config_from_level()` 寫入；`aec_set_level()` 在執行期更換並存回實例；不在 0..3 會被拒絕，全零的 `AecConfig` 是 `MILD`）：只作用在融合後的增益級（`FULL`），lane 自己的地板什麼都不塑形（[integration.md §3.2](integration.md#32-執行期強度控制)）。
-RES 與 NR 的其他設定：增益級的調校值（地板、近端偵測、double-talk）是函式庫內部的，隨 `level` 成組決定；NR 是你的 `AnrConfig`（`anr_config_for_level_grid()`）。共用 delay ring 的容量由函式庫決定（延遲範圍 1024 ms 加 2 hop 與 1 個 sample，隨 `delay_mode` 與 `delay_num_filters`），不是欄位。
+RES 與 NR 的其他設定：增益級的調校值（地板、近端偵測、double-talk）是函式庫內部的，隨 `level` 成組決定；NR 是你的 `AnrConfig`（`anr_config_for_level_grid()`）。共用 delay ring 的容量由函式庫決定（`MATCHED` 為 estimator 可回報的最大延遲加 hop，與單聲道同式；`FIXED` 為 `fixed_delay_samples` 加 hop；隨 `delay_mode` 與 `delay_num_filters`），不是欄位。
 `AecConfig.residual` 決定陣列做到哪裡：`AEC_RESIDUAL_STATE`（只有 lane）、`ESTIMATE`（融合、無增益）或 `FULL`。
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）

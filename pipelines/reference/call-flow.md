@@ -223,10 +223,10 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   the `Aec`). Gain vectors the chain needs (the extra gain, the NR prior scratch, the
   spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
 - The 4-channel array is one `Aec` pool (`aec_get_mem_requirements()`): the `Aec` structure, the four lanes, the shared `DelayAec` (MATCHED only),
-  the alignment ring, the fusion buffers and the gain stage: 700,464 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 594,928 B with
+  the alignment ring, the fusion buffers and the gain stage: 666,992 B at 16 kHz/256 (MATCHED, `AEC_RESIDUAL_FULL`; 561,456 B with
   `AEC_RESIDUAL_STATE`, `test_target_abi`), of which the four lanes are 570,880 B (4 x 142,720 B).
-  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 570,880 B and front end (the rest of the array pool) 129,584 B
-  at 16 kHz/256 (48 kHz/1024: 2,074,176 B and 336,528 B). The sample beam helper
+  `4ch_external_static --print-mem-size` prints lanes (`AEC x4`) 570,880 B and front end (the rest of the array pool) 96,112 B
+  at 16 kHz/256 (48 kHz/1024: 2,074,176 B and 235,632 B). The sample beam helper
   (SRP-PHAT, BF, scratch) is one more block. The post-beam stages are separate blocks sized by their own queries
   (`anr_get_mem_size()`, `ac_istft_get_mem_size()`),
   and a neural stage (`ulcnet_stream_get_mem_size()` of a `freq_only` stream, 14,992 B at 16 kHz/512 and 29,328 B at 48 kHz/1024, plus the application's `AcStft` / `AcIstft`; for DFN2 the tail `dfn_hop_pool_bytes()`

@@ -30,8 +30,8 @@
 |---|---|---|---|
 | 1 | `a` 為 NULL、`mics` 或 `ref` 為 NULL；陣列已 destroy | `AEC_ERR_ARG`(−1) | 無 |
 | 2 | `mics`（`hop*4` 個）或 `ref`（`hop` 個）含非有限值 | `AEC_ERR_ARG`(−1) | 什麼都不改：耗時記錄、linear 有效旗標、上一個 hop 的視圖與自適應狀態（lane、estimator、ring）都保持原樣 |
-| 3 | 內部 render 對齊失敗（例如目前採用的延遲超過 ring 能供應的範圍；ring 的容量是函式庫內部的 1024 ms 延遲範圍加 2 hop 與 1 個 sample） | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
-| 4 | 某條 lane 的 linear 或殘餘階段拒絕，或其視圖綁定失敗 | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
+| 3 | 內部 render 對齊失敗（防禦性檢查：ring 的容量是 estimator 可回報的最大延遲加 hop，採用的延遲不會超出） | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
+| 4 | 某條 lane 的 linear 或殘餘階段拒絕（與單聲道相同的檢查：結果不是有限值，例如有限但極大的 mic／ref sample；`STATE` 也檢查），或其視圖綁定失敗 | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
 
 `aec_process_linear()` **不會**檢查 buffer 長度 —— `hop*4` 與 `hop` 是你的責任。`aec_get_array()` 在沒有待處理的 linear 幀時回 `AEC_ERR_SEQUENCE`，`struct_size` 短於 `sizeof(AecArrayView)` 時回 `AEC_ERR_ARG`（`out` 保持原樣）。
 
