@@ -2176,6 +2176,33 @@ static int test_raw_descriptor_gate(void) {
     bad_model.io_descriptor = &packet_desc;
     CHECK(ul4_set_model(p, &bad_model) != 0,
           "a packet descriptor (N = 8) is rejected by the one-hop composition");
+    {   /* one field off the grid's own descriptor at a time */
+        static const int packet_counts[] = { 2, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL };
+        UlcnetModelIoDescriptor one;
+        size_t c;
+        one = raw_desc; one.delay_depth = ULCNET_MODEL_IO_MIN_D - 1;
+        bad_model.io_descriptor = &one;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with D below the range is rejected");
+        one = raw_desc; one.delay_depth = ULCNET_MODEL_IO_MAX_D + 1;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with D above the range is rejected");
+        one = raw_desc; one.sample_rate = og.sample_rate;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with another sample rate is rejected");
+        one = raw_desc; one.fft_size = og.n_fft;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with another fft size is rejected");
+        one = raw_desc; one.hop_size += 1;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with another hop is rejected");
+        one = raw_desc; one.spectrum_bins += 1;
+        CHECK(ul4_set_model(p, &bad_model) != 0, "a descriptor with another bin count is rejected");
+        for (c = 0; c < sizeof packet_counts / sizeof packet_counts[0]; ++c) {
+            CHECK(ulcnet_model_io_descriptor_default_packet(&g_grid, packet_counts[c], &one) == 0 &&
+                  one.layout_version == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION &&
+                  ulcnet_model_io_descriptor_validate(&g_grid, &one) == 0 &&
+                  ulcnet_model_io_descriptor_frames(&one) == packet_counts[c],
+                  "a packet descriptor of the grid builds and validates with its frame count");
+            CHECK(ul4_set_model(p, &bad_model) != 0,
+                  "a packet descriptor (N = 2, the maximum) is rejected by the one-hop composition");
+        }
+    }
     /* The refused models left the accepted one installed. */
     CHECK(ul4_process_with_activity(p, mics, far, 0, out) == AEC_OK && m.infer_calls == 1,
           "a refused model leaves the installed one running");

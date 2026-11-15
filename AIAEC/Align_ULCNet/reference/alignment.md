@@ -24,14 +24,14 @@ does not change the front-end contract or the model I/O layout.
 
 The C PCM entries drop one hop of audio at each event: the event hop's output is
 exactly silent (zero analysis history, discarded overlap) and the input hop before it
-is not output. Use `_freq` or the pipeline stage if a continuous signal is needed;
+is not output. Use `_freq` (as the desktop pipelines do) if a continuous signal is needed;
 the Python reference follows the `_freq` flow.
 
 Consequently the C/Python inference comparison of a checkpoint is defined only
 over spans without alignment events:
 
 1. **Event-free by construction (primary).** Python
-   `inference.py --input-is-linear-error` against the C stage fed the same
+   `inference.py --input-is-linear-error` against the C stream (`_freq`) fed the same
    `linear_error` and `far` with `delay = {changed 0, solid 1}` on every hop.
    Neither side has an AEC, so neither has an event; both start from zeroed
    state. Compare the whole stream after hop #0.
@@ -41,11 +41,11 @@ over spans without alignment events:
    frames plus a settling margin. The margin has to be measured on the
    delivered checkpoint (the recurrent state is not guaranteed to forget at a
    known rate); frames in between are expected to differ and are not a defect.
-   Take the event hops from the C side (the stage's `delay` argument, logged per
+   Take the event hops from the C side (the stream's `delay` argument, logged per
    hop). A change of `applied_delay_samples` in the sweep alignment trace is
    only a proxy for them.
 
-No committed test drives the stage against Python (function map T-15); until
+No committed test drives the stream against Python (function map T-15); until
 the owner's checkpoint exists, either comparison can run only on a synthetic
 checkpoint. The model-level pieces (`ulcnet_model_io`, `ulcnet_prepost`) are
 independent of alignment events and keep their own C tests.

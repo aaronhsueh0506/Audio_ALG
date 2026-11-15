@@ -414,7 +414,7 @@
 | T-10 | 沒有 Python 對照的 C 元件（mem_align、部分 simd 核心等）。 |
 | T-13 | 應用端寫死的 spec 列（`DFN_EXAMPLE_MODEL_ROWS`）沒有依名稱對 `AINR/DeepFilterNet2/config.ini` 的漂移守衛；測試用的 spec 已有（DFN 的 `pipelines/dfn/tests/test_dfn_test_grid_pin.py`，RNNoise-ERB 的 `AINR/RNNoise-ERB/tests/test_feature_contract.py`）。 |
 | T-14 | 沒有 Python 孿生的 C 狀態機（prepost、model_io、adapter）。 |
-| T-15 | pipelines 內執行 C 並與 Python 對拍的常設測試有 delay、DFN2 stage、rate bridge（與 resampler twin），以及 `pipelines/tests/pyc_parity_pipelines.sh`（4ch NR 增益、4ch 後波束 RES、4ch 共用 delay 的混合 realign、mono NR／min／apply／CNG／OLA 膠水）；lane 組合（derive_lane）、4ch fuse 本身（只靠以 C 融合框餵入的 a.nr4／b.res4 間接覆蓋）、DFN 組合範例（Py 對 Py）、ULCNet NN stage 沒有常設 C↔Py 對拍。 |
+| T-15 | pipelines 內執行 C 並與 Python 對拍的常設測試有 delay、DFN2 stage、rate bridge（與 resampler twin），以及 `pipelines/tests/pyc_parity_pipelines.sh`（4ch NR 增益、4ch 後波束 RES、4ch 共用 delay 的混合 realign、mono NR／min／apply／CNG／OLA 膠水）；lane 組合（derive_lane）、4ch fuse 本身（只靠以 C 融合框餵入的 a.nr4／b.res4 間接覆蓋）、DFN 組合範例（Py 對 Py）、ULCNet 模型串流（`ulcnet_stream`）沒有常設 C↔Py 對拍。 |
 | T-16 | 4ch 後波束 RES 的 clock_drift 輸入：C 傳共用 estimator 旗標，Python 寫死 False；無測試。 |
 | T-17 | mono 端到端與上游 AEC 分岔（歸屬 lib/aec 接縫，非 pipeline 膠水）。 |
 <!-- map:gaps:end -->
