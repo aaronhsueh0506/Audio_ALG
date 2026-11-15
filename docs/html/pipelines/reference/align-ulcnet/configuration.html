@@ -92,7 +92,7 @@
  │      outputs.*_history_out / h_gru_out = 對應 inputs 的位址(不預填)
  ├─ ai_rc = run_accelerator(user, &amp;io.inputs, &amp;io.outputs)   ← 呼叫端(板端)一次無狀態 tensor invocation
  │      runtime 先讀完所有 state 輸入、再寫輸出(輸出位址 = 輸入位址)
- │      回非 0 → post_process_freq 以 ulcnet_prepost_frame_bypass(prepost) 收掉交易,state 不動(回報失敗的 runtime 視同沒寫)
+ │      回非 STREAM_RUN_OK → post_process_freq 以 ulcnet_prepost_frame_fail(prepost, ai_rc != STREAM_RUN_NOT_STARTED) 收掉交易(STREAM_RUN_NOT_STARTED:state 不動;其他:state 歸零、generation +1)
  ├─ ulcnet_prepost_frame_finish(prepost)
  │      output 有限,已登錄的 state 整塊有限,解包出的 enhanced_re/im 也有限?
  │        是 → 交出 enhanced_re/im(state 已由 runtime 就地寫好,finish 不位移、不複製)

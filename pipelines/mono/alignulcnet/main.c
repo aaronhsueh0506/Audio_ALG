@@ -9,7 +9,7 @@
  *     ac_stft_push_planar(err_stft, rctx.formed_hop, err_re, err_im);
  *     ac_stft_push_planar(far_stft, ref, far_re, far_im);
  *     pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);
- *     if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   // 0 = every tensor written
+ *     if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   // STREAM_RUN_* (stream_run.h)
  *     ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);         // accepted frame, else the error
  *     ac_istft_push_planar(istft, out_re, out_im, out);                       // one hop
  *
@@ -118,8 +118,8 @@ static int parse_options(int argc, char** argv, ExampleCliDelayOptions* out, int
 /* Replace with the board runtime call. `inputs` holds the feature tensors; the four state
  * tensors (key_history, value_history, logit_history, h_gru) live in the accelerator's own
  * buffers, so the state views are NULL here. Bind each *_out of the graph to the buffer of
- * the state input of the same name, write `outputs->output`, and return 0, or -1 when the
- * run failed. The graph shifts every window itself; read every state input before writing any
+ * the state input of the same name, write `outputs->output`, and return STREAM_RUN_OK, or
+ * STREAM_RUN_NOT_STARTED when nothing ran, or STREAM_RUN_FAILED once the run started and failed. The graph shifts every window itself; read every state input before writing any
  * state output. When the accelerator keeps fixed-point state, load quantized zeros at start
  * and whenever UlcnetHopIO.state_generation changes. */
 static int run_accelerator(void *user,
@@ -128,7 +128,7 @@ static int run_accelerator(void *user,
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* BOARD: invoke the stateless ONNX accelerator. */
+    return STREAM_RUN_NOT_STARTED; /* BOARD: invoke the stateless ONNX accelerator. */
 }
 
 /* The mono lane on the stream's grid: the state of the linear residual only (AEC_RESIDUAL_STATE); the
@@ -205,7 +205,7 @@ static int process_hop(Aec* aec, UlcnetStream* stream, Framing* f, const float* 
     AecLinearView lctx;
     UlcnetStreamDelay delay;
     UlcnetHopIO io;
-    int pre, ai_rc = -1;
+    int pre, ai_rc = STREAM_RUN_NOT_STARTED;
     if (aec_process_linear(aec, mic, ref) != AEC_OK) return -1;
     if (aec_process_residual(aec, NULL) != AEC_OK) return -1;
     memset(&rctx, 0, sizeof(rctx));

@@ -28,7 +28,7 @@
 <h2>API 用法</h2>
 <p>呼叫順序:<code>ulcnet_grid_make()</code> → <code>derive_lane()</code>(<code>residual = STATE</code> 的 <code>AecConfig</code>)→ <code>aec_get_mem_size()</code>、<code>ulcnet_stream_get_mem_size()</code>、<code>framing_bytes()</code> → <code>ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)</code> 與 <code>ulcnet_model_io_descriptor_validate()</code>(板端換成模型匯出的 descriptor) → 切塊 <code>aec_init()</code>、<code>ulcnet_stream_init_ex()</code>、<code>framing_init()</code>(兩個 <code>ac_stft_init()</code> 與一個 <code>ac_istft_init()</code>) → 每 hop 一次(<code>aec_process_linear</code>、<code>aec_process_residual</code>、取視圖、兩次 <code>ac_stft_push_planar</code>、<code>ulcnet_stream_pre_process_freq</code>、<code>run_accelerator</code>、<code>ulcnet_stream_post_process_freq</code>、<code>ac_istft_push_planar</code>)→ destroy。完整可編譯範例、流程時序圖與參數表收在 <a href="../../reference/align-ulcnet/integration.html">Align-ULCNet pipeline 呼叫與時序</a>、<a href="../../reference/align-ulcnet/integration.html#sequence">Align-ULCNet pipeline 呼叫與時序</a> 與 <a href="../../reference/align-ulcnet/configuration.html">Align-ULCNet pipeline 參數與狀態</a>。每 hop 的核心如下:</p>
 <pre>AecResidualView rctx = { .struct_size = sizeof(rctx) };  AecLinearView lctx = { .struct_size = sizeof(lctx) };
-UlcnetStreamDelay delay;  UlcnetHopIO io;  int pre, ai_rc = -1;
+UlcnetStreamDelay delay;  UlcnetHopIO io;  int pre, ai_rc = STREAM_RUN_NOT_STARTED;
 aec_process_linear(aec, mic, ref);                                   /* mic/ref/out 各 grid.hop 個 float */
 aec_process_residual(aec, NULL);                                     /* residual = STATE: 只留 formed_hop 與狀態旗標 */
 aec_get_residual(aec, &amp;rctx);  aec_get_linear(aec, &amp;lctx);
@@ -41,7 +41,7 @@ if (pre == 1) ai_rc = run_accelerator(NULL, &amp;io.inputs, &amp;io.outputs);   
 ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);      /* 接受的增強頻譜,否則誤差頻譜 */
 ac_istft_push_planar(istft, out_re, out_im, out);                    /* 應用端 WOLA */
 /* 任一步回負值: aec_reset(aec); ulcnet_stream_reset(stream); ac_stft_reset ×2; ac_istft_reset */</pre>
-<p>推論夾在 <code>pre_process_freq</code> 與 <code>post_process_freq</code> 之間,沒有要安裝的回呼;<code>pre_process_freq</code> 回 1、0 或 −1(契約錯誤)。<code>ai_rc</code> 非 0、mask 沒寫滿或含非有限值時該幀走 identity(fail-open)。mono 範例每 hop 以 <code>aec_get_residual()</code> 的 <code>formed_hop</code> 由 <code>main.c</code> 自己的 <code>AcStft</code> 做 error 分析(不重用 AEC 的頻譜),與 far 的分析一起在 <code>pre_process_freq</code> 之前完成;4ch 範例則把 BF 頻譜拆成 re／im 平面交給它。任何一步回負值,整合者把 <code>Aec</code>、串流與三個轉換物件一起 reset。</p>
+<p>推論夾在 <code>pre_process_freq</code> 與 <code>post_process_freq</code> 之間,沒有要安裝的回呼;<code>pre_process_freq</code> 回 1、0 或 −1(契約錯誤)。<code>ai_rc</code> 不是 STREAM_RUN_OK、mask 沒寫滿或含非有限值時該幀走 identity(fail-open)。mono 範例每 hop 以 <code>aec_get_residual()</code> 的 <code>formed_hop</code> 由 <code>main.c</code> 自己的 <code>AcStft</code> 做 error 分析(不重用 AEC 的頻譜),與 far 的分析一起在 <code>pre_process_freq</code> 之前完成;4ch 範例則把 BF 頻譜拆成 re／im 平面交給它。任何一步回負值,整合者把 <code>Aec</code>、串流與三個轉換物件一起 reset。</p>
 <p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b><code>pipeline_mono</code> 與 <code>pipeline_4ch</code> 的後級有 <code>aec_set_level()</code> / <code>anr_set_level()</code>,本範例 <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。這條範例完全沒有 NR 實例(<code>anr_*</code> 在 <code>main.c</code> 一次都沒出現);AEC 側以 <code>residual = AEC_RESIDUAL_STATE</code> 建立:殘餘階段只留選中的線性殘差與狀態旗標,<code>G_res</code>、R²、comfort noise 都不計算(<code>res_gain</code>/<code>r2</code>/<code>comfort_noise</code> 為 NULL),範例只讀 <code>formed_hop</code> 與 <code>AecLinearView</code> 的 <code>delay_state</code>(模型的 far 取 caller 的 raw <code>ref</code>)——塑形輸出的是 ULCNet 的 mask。所以「回音壓多深」在這裡是模型的性質,不是一個 runtime 旋鈕。<code>aec_config_from_level()</code> 仍需要一個 level(範例用 BALANCED),但它只決定那個不執行的抑制器的地板。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_mono</code>。</p>
 <p class="note"><b>模型 error 分支讀的是分析 seam。</b><code>rctx.formed_hop</code> 與 <code>rctx.error_spec</code> 一律是被選中的線性殘差(refined 或 coarse,既有的 30-sample crossfade),輸出守衛不會改動它們,也沒有 capture 候選;模型因此每個 hop 看到的都是真實的線性殘差(濾波器在加訊號的 hop 上它可能比 mic 還大)。<code>AIAEC/dataset_gen/linear_aec.py</code> 產生訓練用 linear error 時走的是同一組設定與同一個 seam。輸出守衛只決定渲染基底(<code>base_spec</code>,給 <code>base * gain</code> 的鏈用),這條鏈不讀它;identity／fail-open 的 hop 輸出的是未經守衛的殘差。</p>
 
@@ -49,7 +49,7 @@ ac_istft_push_planar(istft, out_re, out_im, out);                    /* 應用�
 <p>production 沒有 raw/aligned runtime switch。模型固定讀 caller 傳入的 raw <code>ref</code>；PBFDKF 的 aligned 副本只用來形成 linear error，對齊由模型的 TA block 負責。取得對齊(或 delay 變動)的 hop 會讓 state generation 前進,外部 K/V、logit 與 GRU state 據此歸零。raw/aligned 比較只保留在 <code>sweep_delay_depth.py</code>。export 的 <code>training_far_input_mode</code> 是 checkpoint provenance，<code>far_input_mode=raw_far</code> 是部署 ABI，兩者必須相同。C descriptor 只接受 <code>ULCNET_FAR_RAW</code>，其他值的 descriptor 在啟動時被 <code>ulcnet_model_io_descriptor_validate()</code> 拒絕(<code>main.c</code> 在建串流前檢查,並要求一幀一包)。</p>
 <h3>模型呼叫契約(step-always,唯一例外 = reprime)</h3>
 <ul>
-<li><b>Fail-open identity</b>:<code>ai_rc</code> 非 0(含範例預設的 <code>run_accelerator()</code> 回 −1)、mask 沒寫滿(預填的 NaN 還在)、mask 或增強後頻譜含任何非有限值 → 該幀改走誤差頻譜原樣;NaN/Inf 永不進 WOLA。後三種同時讓 state generation 加一。STFT/WOLA 時序不因模型存在與否改變。</li>
+<li><b>Fail-open identity</b>:<code>ai_rc</code> 不是 STREAM_RUN_OK(含範例預設的 <code>run_accelerator()</code> 回 STREAM_RUN_NOT_STARTED)、mask 沒寫滿(預填的 NaN 還在)、mask 或增強後頻譜含任何非有限值 → 該幀改走誤差頻譜原樣;NaN/Inf 永不進 WOLA。除了 STREAM_RUN_NOT_STARTED(沒有啟動執行),其餘同時讓 state generation 加一。STFT/WOLA 時序不因模型存在與否改變。</li>
 <li><b>Step-always</b>:每個發射幀 <code>pre_process_freq</code> 都回 1；delay lock 不閘控模型。唯一例外是下面的 identity reprime(每個 alignment generation 少 1 幀推論——compute 只會少,不會加倍)。</li>
 <li><b>Delay 事件</b>:MATCHED 的 <code>AEC_LINEAR_DELAY_CHANGED</code>，以及 FIXED 首次 <code>UNLOCKED→LOCKED</code>，都先讓 state generation 前進(加速器清除 recurrent state)，並武裝 identity reprime。</li>
 </ul>
@@ -75,7 +75,7 @@ ac_stft_push_planar(err_stft, formed_hop) + ac_stft_push_planar(far_stft, ref)
    ai_rc = run_accelerator(io.inputs, io.outputs)   ← 呼叫端:板端 NPU;每 hop 至多一次
 
 ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im)   不合成
- ├─ ai_rc==0 且 mask、增強頻譜皆有限 → out ← enh(mask × 壓縮域誤差,再逆冪)
+ ├─ ai_rc==STREAM_RUN_OK 且 mask、增強頻譜皆有限 → out ← enh(mask × 壓縮域誤差,再逆冪)
  ├─ 否則 out ← err(identity);mask／頻譜非有限時 state generation +1
  └─ 應用端 ac_istft_push_planar(istft, out_re, out_im, out):每 hop 回整個 hop(hop#0 也是真輸出)
 任一步回負值 → 整合者 aec_reset(aec) + ulcnet_stream_reset(stream) + 三個轉換物件 reset</pre>

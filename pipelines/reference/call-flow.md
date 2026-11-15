@@ -250,7 +250,7 @@ applications; the examples are compiled by `tests/test_readme_flow.c`.
 ac_stft_push_planar(far_stft, far, far_re, far_im);            /* the application's far analysis (mono: and err_stft on formed_hop) */
 pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);   /* reprime / model restart */
 if (pre == 1)                                                  /* io: the graph's tensors, NaN-prefilled mask */
-    ai_rc = run_ulcnet_npu(&io);                               /* 0 = every tensor written; else the identity */
+    ai_rc = run_ulcnet_npu(&io);                               /* STREAM_RUN_OK = every tensor written; else the identity */
 ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im); /* accepted enhanced spectrum, else the error spectrum */
 ac_istft_push_planar(istft, out_re, out_im, out);              /* the application's WOLA: one hop, real output at hop 0 */
 

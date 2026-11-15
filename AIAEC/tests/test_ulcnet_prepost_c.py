@@ -21,7 +21,11 @@ for the module):
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init reject-first validation
   reset     _reset really clears state (re-run reproduces the first run)
-  skip      _frame_bypass is the identity and leaves the state as written
+  skip      _frame_bypass is the identity and leaves the state and the generation as written
+  fail      _frame_fail closes a frame whose run did not succeed: a started run
+            zeroes the registered state and advances the generation once, one
+            that never started leaves both except for a packet's event
+            restart; the hop is the error spectrum either way
   guard     the frame state machine: a spectrum on top of an unfinished frame,
             a commit with no frame_open and a retry after a refused commit are
             refused; skip needs no frame_open
@@ -932,6 +936,146 @@ static int case_skip(void) {
     return 0;
 }
 
+/* ---- fail: _frame_fail closes a frame whose run did not succeed ---- */
+
+#define PACKET_N 4
+/* The registered part of the host's buffers (the rest keeps its NaN fill). */
+#define STATE_ZERO(host) (all_zero((host).key, (size_t)STATE_CHANNELS * D * FEATURE) && \
+                          all_zero((host).value, (size_t)STATE_CHANNELS * D * FEATURE) && \
+                          all_zero((host).logit, (size_t)STATE_CHANNELS * STATE_SCORE_FRAMES * D) && \
+                          all_zero((host).gru, (size_t)STATE_GRU_ROWS * STATE_GRU_HIDDEN))
+
+static int all_zero(const float *v, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) if (v[i] != 0.0f) return 0;
+    return 1;
+}
+
+/* One packet instance, nothing registered; its N analysed hops, frame-major, in the planes. */
+typedef struct Packet {
+    UlcnetPrepost *p;
+    void *pool;
+    float er[PACKET_N * BINS_MAX], ei[PACKET_N * BINS_MAX], fr[PACKET_N * BINS_MAX], fi[PACKET_N * BINS_MAX];
+} Packet;
+
+static int packet_make(Packet *pk) {
+    UlcnetPrepostConfig cfg;
+    UlcnetPrepostMemReq req;
+    int k;
+    if (ulcnet_prepost_config_defaults(&cfg, &grid) != 0) return -1;
+    cfg.frames_per_call = PACKET_N;
+    if (ulcnet_prepost_get_mem_size(&cfg, &req) != 0) return -1;
+    pk->pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    if (!pk->pool) return -1;
+    pk->p = ulcnet_prepost_init_ex(pk->pool, (size_t)req.bytes, &cfg, &req);
+    for (k = 0; k < PACKET_N; ++k) {
+        memcpy(pk->er + (size_t)k * BINS, specs[k].er, BINS * sizeof(float));
+        memcpy(pk->ei + (size_t)k * BINS, specs[k].ei, BINS * sizeof(float));
+        memcpy(pk->fr + (size_t)k * BINS, specs[k].fr, BINS * sizeof(float));
+        memcpy(pk->fi + (size_t)k * BINS, specs[k].fi, BINS * sizeof(float));
+    }
+    return pk->p ? 0 : -1;
+}
+
+/* A packet frame with `events`, opened for the accelerator when `open`. */
+static int packet_begin(Packet *pk, const int *events, int open) {
+    UlcnetModelIoInputs in;
+    UlcnetModelIoOutputs out;
+    if (ulcnet_prepost_pre_process_packet(pk->p, pk->er, pk->ei, pk->fr, pk->fi, events) != 1) return -1;
+    return open ? ulcnet_prepost_frame_open(pk->p, &in, &out) : 0;
+}
+
+/* The N frames come back as the error spectra. */
+static int packet_is_identity(Packet *pk) {
+    static float re[PACKET_N * BINS_MAX], im[PACKET_N * BINS_MAX];
+    return ulcnet_prepost_post_process_freq(pk->p, re, im) == 0 &&
+           identical(re, pk->er, PACKET_N * BINS) && identical(im, pk->ei, PACKET_N * BINS);
+}
+
+static int case_fail(void) {
+    static Host host;
+    static HopOut out, fresh_out;
+    UlcnetPrepost *p, *fresh;
+    static Host fresh_host;
+    void *pool, *fresh_pool;
+    UlcnetModelIoInputs inputs;
+    UlcnetModelIoOutputs outputs;
+    uint32_t gen;
+    Packet pk;
+    static const int none[PACKET_N] = { 0, 0, 0, 0 };
+    static const int event[PACKET_N] = { 0, 0, 1, 0 };
+
+    /* A run that started: the registered state is zeroed, the generation advances once, the hop is the error spectrum. */
+    p = class_make(&host, &pool, NULL);
+    fresh = class_make(&fresh_host, &fresh_pool, NULL);
+    CHECK(p != NULL && fresh != NULL);
+    CHECK(drive_spec(p, 0, 3, outs_a) == 0);
+    CHECK(!STATE_ZERO(host));
+    CHECK(ulcnet_prepost_pre_process_freq(p, specs[3].er, specs[3].ei, specs[3].fr, specs[3].fi) == 1);
+    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
+    gen = ulcnet_prepost_state_generation(p);
+    CHECK(ulcnet_prepost_frame_fail(p, 1) == 0);
+    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u);
+    CHECK(STATE_ZERO(host));
+    CHECK(ulcnet_prepost_post_process_freq(p, out.re, out.im) == 0);
+    CHECK(identical(out.re, specs[3].er, BINS) && identical(out.im, specs[3].ei, BINS));
+    CHECK(ulcnet_prepost_frame_fail(p, 1) == -1);              /* nothing open any more */
+    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u);
+    /* The next hop starts from zero state: it equals a fresh instance's hop. */
+    CHECK(drive_spec(p, 4, 1, &out) == 0 && drive_spec(fresh, 4, 1, &fresh_out) == 0);
+    CHECK(outs_identical(&out, &fresh_out, 1));
+    CHECK(!identical(out.re, specs[4].er, BINS));
+
+    /* A run that never started: state and generation stay, the hop is still the error spectrum. */
+    CHECK(ulcnet_prepost_pre_process_freq(p, specs[5].er, specs[5].ei, specs[5].fr, specs[5].fi) == 1);
+    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
+    CHECK(!STATE_ZERO(host));
+    gen = ulcnet_prepost_state_generation(p);
+    CHECK(ulcnet_prepost_frame_fail(p, 0) == 0);
+    CHECK(ulcnet_prepost_state_generation(p) == gen && !STATE_ZERO(host));
+    CHECK(ulcnet_prepost_post_process_freq(p, out.re, out.im) == 0);
+    CHECK(identical(out.re, specs[5].er, BINS) && identical(out.im, specs[5].ei, BINS));
+    /* Without a frame_open the run cannot have started; the flag still decides. */
+    CHECK(ulcnet_prepost_pre_process_freq(p, specs[6].er, specs[6].ei, specs[6].fr, specs[6].fi) == 1);
+    CHECK(ulcnet_prepost_frame_fail(p, 0) == 0 && ulcnet_prepost_state_generation(p) == gen);
+    CHECK(ulcnet_prepost_pre_process_freq(p, specs[6].er, specs[6].ei, specs[6].fr, specs[6].fi) == 1);
+    CHECK(ulcnet_prepost_frame_fail(p, 1) == 0 && ulcnet_prepost_state_generation(p) == gen + 1u && STATE_ZERO(host));
+    CHECK(ulcnet_prepost_frame_fail(NULL, 1) == -1 && ulcnet_prepost_frame_fail(NULL, 0) == -1);
+    /* A refused commit has restarted the state already: bypass closes it, no second step. */
+    CHECK(ulcnet_prepost_pre_process_freq(p, specs[7].er, specs[7].ei, specs[7].fr, specs[7].fi) == 1);
+    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+    gen = ulcnet_prepost_state_generation(p);
+    CHECK(ulcnet_prepost_frame_finish(p) == -1 && ulcnet_prepost_state_generation(p) == gen + 1u);
+    CHECK(ulcnet_prepost_frame_bypass(p) == 0 && ulcnet_prepost_state_generation(p) == gen + 1u);
+    ulcnet_prepost_destroy(p);
+    ulcnet_prepost_destroy(fresh);
+    free(pool);
+    free(fresh_pool);
+
+    /* A packet: the model restart of an event frame is part of the run that did not happen. */
+    CHECK(packet_make(&pk) == 0);
+    gen = ulcnet_prepost_state_generation(pk.p);
+    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);
+    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
+    CHECK(packet_begin(&pk, none, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);
+    CHECK(ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
+    CHECK(packet_begin(&pk, event, 0) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);   /* never armed */
+    CHECK(ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
+    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 1) == 0);   /* once, not twice */
+    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
+    CHECK(packet_begin(&pk, none, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 1) == 0);
+    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
+    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_finish(pk.p) == -1);   /* NaN staging: refused */
+    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen);
+    CHECK(ulcnet_prepost_frame_fail(pk.p, 0) == 0 && ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
+    CHECK(ulcnet_prepost_frame_fail(pk.p, 1) == -1);
+    ulcnet_prepost_destroy(pk.p);
+    free(pk.pool);
+    return 0;
+}
+
 /* ---- guard: the frame state machine refuses what it must -------------- */
 
 static int case_guard(void) {
@@ -1416,6 +1560,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "reject") == 0)    status = case_reject();
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset();
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
+    else if (strcmp(argv[1], "fail") == 0)      status = case_fail();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
     else if (strcmp(argv[1], "layout") == 0)    status = case_layout();
     else if (strcmp(argv[1], "hash") == 0)      status = case_hash();
@@ -1540,6 +1685,16 @@ def test_frame_bypass_is_identity_and_does_not_step_the_rings(driver):
     checked against non-zero state, and against a commit that does move
     them."""
     _run(driver, 'skip')
+
+
+def test_frame_fail_closes_a_failed_run_with_the_right_restart(driver):
+    """A run that started zeroes the registered state and advances the
+    generation once, whatever the frame held; one that never started leaves
+    both alone, except that a frame_open()ed packet with an event frame
+    restarts the model (+1, once, and not for a packet that was never armed or
+    whose commit was already refused). The hop is the error spectrum bit for
+    bit and the next hop equals a fresh instance's."""
+    _run(driver, 'fail')
 
 
 def test_frame_state_machine_guards(driver):

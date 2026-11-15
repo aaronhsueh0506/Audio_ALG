@@ -3,23 +3,24 @@
  * AEC: the inputs are its linear-error hop and the raw far, never raw mic.
  *
  *     per hop: pre_rc = ulcnet_stream_pre_process(ctx, err_in, far_in, delay, &io);   // -1: contract error
- *              if (pre_rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs);
- *                                 if (ai_rc != 0) device_state_refill_zero(); }
+ *              if (pre_rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs); }
  *              ulcnet_stream_post_process(ctx, ai_rc, pcm_out);
  *
- * A failed run or readback (status != 0) leaves the generation unchanged (a packet with an event hop: +1): zero the
- * accelerator's state before its next run.
+ * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any other
+ * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
+ * continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the accelerator's state when
+ * the generation differs from the value at the last zeroing.
  * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, resets the stream and arms
  * ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). Fail-OPEN: a bypassed frame is the
  * linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not finite is bypassed and advances the
- * generation.
+ * generation, as does a dirty status.
  *
  * Packet streams (cfg.frames_per_call N >= 2, graph layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): each packet pre_process is
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries
  * refuse such a stream and the packet entries a one-hop stream. delay[k] is hop k's event, oldest first, edge rule as above
  * with the previous solid carried across packets; the graph resets the model before an event hop and bypasses it (generation
- * unchanged). A failed or non-finite job passes all N error spectra through; a failed job with an event hop advances the
- * generation.
+ * unchanged). A failed or non-finite job passes all N error spectra through; a NOT_STARTED job with an event hop advances the
+ * generation too (the restart the graph would have applied).
  *
  * A caller with its own analysis and synthesis uses the _freq entries; cfg.freq_only then keeps the FFT, STFT / ISTFT and
  * PCM scratch out of the pool. */
@@ -31,6 +32,7 @@
 #include <stdint.h>
 
 #include "ulcnet_prepost.h"   /* UlcnetGrid, UlcnetModelIoInputs/Outputs */
+#include "stream_run.h"       /* STREAM_RUN_* statuses */
 
 #ifdef __cplusplus
 extern "C" {
@@ -115,8 +117,8 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
                               UlcnetStreamDelay delay, UlcnetHopIO *io);
 
-/* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits, else bypass, fail OPEN); a reprime hop is already
- * bypassed. pcm_out is a full hop (return 1). An alignment-event hop restarts the stream: its pcm_out is exactly zero and
+/* Closes the hop: ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail OPEN); a
+ * reprime hop is already bypassed. pcm_out is a full hop (return 1). An alignment-event hop restarts the stream: its pcm_out is exactly zero and
  * the previous hop's audio is not output. -1 with zeros on a post_process_freq() error. Once per pre_process. A freq_only
  * stream: -1, pcm_out untouched and the hop still open (post_process_freq() closes it). */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);

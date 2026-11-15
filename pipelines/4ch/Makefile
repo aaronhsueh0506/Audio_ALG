@@ -72,7 +72,7 @@ STREAM_COMMON_DIR ?= $(ALG_DIR)/stream/common
 # The model stream (stream/aiaec/ulcnet) that alignulcnet/main.c drives on its spectrum entries.
 STREAM_ULCNET_DIR ?= $(ALG_DIR)/stream/aiaec/ulcnet
 # Include paths of every TU that includes ulcnet_stream.h.
-ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR)
+ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR) -I$(STREAM_COMMON_DIR)
 # Include paths of every TU that includes ../dfn/dfn_hop.h or ../dfn/dfn_hop_pool.h.
 DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
 # dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
@@ -379,7 +379,7 @@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
 # Align-ULCNet model stream.
-$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) $(ULCNET_STREAM_INC) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard

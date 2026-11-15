@@ -18,7 +18,7 @@
 <h2>API 用法</h2>
 <p>呼叫順序:<code>ulcnet_grid_make()</code>、<code>array_sample_default_config(&amp;cfg, grid.sample_rate)</code> 改 <code>fft_size</code> 與 <code>residual = AEC_RESIDUAL_STATE</code> → <code>aec_get_mem_requirements()</code>、<code>array_sample_beam_get_mem_size()</code>、<code>ulcnet_stream_get_mem_size()</code>、<code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code> → <code>ulcnet_model_io_descriptor_default()</code> 與 <code>ulcnet_model_io_descriptor_validate()</code>(板端換成模型匯出的 descriptor) → <code>aec_init_ex()</code>、<code>array_sample_beam_init(…, aec)</code>、<code>ulcnet_stream_init_ex()</code>、<code>ac_stft_init()</code>、<code>ac_istft_init()</code> → 每 hop 一次 → destroy(<code>array_sample_beam_destroy()</code> 再 <code>aec_destroy()</code>)。完整可編譯範例、流程時序圖與參數表收在 <a href="../../reference/align-ulcnet/integration.html">Align-ULCNet pipeline 呼叫與時序</a>、<a href="../../reference/align-ulcnet/integration.html#sequence">Align-ULCNet pipeline 呼叫與時序</a> 與 <a href="../../reference/align-ulcnet/configuration.html">Align-ULCNet pipeline 參數與狀態</a>。每 hop 的核心如下:</p>
 <pre>ArraySampleBeamResult beam;  ArraySampleBeamInfo info;    /* unit = ArraySampleBeam*;mics=[grid.hop][4], far/out=[grid.hop] */
-UlcnetHopIO io;  int pre, ai_rc = -1, ok;
+UlcnetHopIO io;  int pre, ai_rc = STREAM_RUN_NOT_STARTED, ok;
 ok = array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info) == AEC_OK;
 if (ok) {
     ac_stft_push_planar(far_stft, far, far_re, far_im);
@@ -33,7 +33,7 @@ if (!ok) {
     array_sample_beam_reset(unit);  ulcnet_stream_reset(stream);      /* 被拒: 一起 reset，連同應用端的 AcStft／AcIstft */
     ac_stft_reset(far_stft);  ac_istft_reset(istft);
 }</pre>
-<p>推論夾在 <code>pre_process_freq</code>(回 1 並交出 <code>UlcnetHopIO</code>;0 = 本 hop 無模型幀;−1 = 契約錯誤,例如同一 hop 第二次呼叫)與 <code>post_process_freq(ai_rc)</code> 之間;<code>ai_rc != 0</code>、mask 沒寫滿或 mask／輸出有非有限值時該幀走 identity(fail-open)。reprime 計數在 <code>pre_process_freq</code> 遞減。</p>
+<p>推論夾在 <code>pre_process_freq</code>(回 1 並交出 <code>UlcnetHopIO</code>;0 = 本 hop 無模型幀;−1 = 契約錯誤,例如同一 hop 第二次呼叫)與 <code>post_process_freq(ai_rc)</code> 之間;<code>ai_rc</code> 不是 STREAM_RUN_OK、mask 沒寫滿或 mask／輸出有非有限值時該幀走 identity(fail-open);除了 STREAM_RUN_NOT_STARTED(沒有啟動執行),其餘情況 state generation +1。reprime 計數在 <code>pre_process_freq</code> 遞減。</p>
 <p>板端若有<b>由同一 hop 的 lane 頻譜算出</b>的 per-bin mask 與 VAD(例如 masker 讀 lane 0),helper 的 <code>array_sample_beam_process_with_activity()</code> 要在 lane 與 beamformer 之間讓出控制權:它就是 <code>array_sample_beam_process_front()</code> 加 <code>array_sample_beam_process_beam(front, v, v, NULL)</code>。</p>
 <pre>AecArrayView front;
 array_sample_beam_process_front(unit, mics, far, &amp;front);    /* = aec_process_linear() + aec_get_array():共用 aligner 與四條 lane;front.lane_error_spec[4] 唯讀 */
@@ -84,7 +84,7 @@ ulcnet_stream_pre_process_freq(stream, err, far, delay, &amp;io)    [far = 應�
    ai_rc = run_accelerator(io.inputs, io.outputs)   ← 呼叫端:板端 NPU;full-write contract
 
 ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im)   不合成
- ├─ ai_rc==0 且 mask、增強頻譜皆有限 → out ← enh;否則 out ← err(mask／頻譜非有限時 state generation +1)   每 hop 恰一次
+ ├─ ai_rc==STREAM_RUN_OK 且 mask、增強頻譜皆有限 → out ← enh;否則 out ← err(mask／頻譜非有限或 ai_rc 為髒狀態時 state generation +1)   每 hop 恰一次
  └─ 應用端 ac_istft_push_planar(istft, out_re, out_im, out):每 hop 回整個 hop(hop#0 也是真輸出)
 任一步回負值 → 整合者 array_sample_beam_reset(unit) + ulcnet_stream_reset(stream) + ac_stft_reset／ac_istft_reset</pre>
 

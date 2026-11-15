@@ -86,7 +86,7 @@ The network runs between the stream's two calls; there is no callback to install
 ```c
 UlcnetHopIO io;
 ArraySampleBeamResult beam;  ArraySampleBeamInfo info;
-int ai_rc = -1;
+int ai_rc = STREAM_RUN_NOT_STARTED;
 array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &beam, &info);  /* lanes, DOA, BF */
 UlcnetStreamDelay delay = { info.delay.changed, info.delay.solid };
 ac_stft_push_planar(far_stft, far, far_re, far_im);      /* the application's far analysis */
@@ -94,12 +94,12 @@ for (k = 0; k < grid.n_bins; ++k) { err_re[k] = beam.spectrum[k].r; err_im[k] = 
 pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);  /* reprime / model restart */
 if (pre == 1)                                            /* 1 = a frame to run, 0 = the reprime hop */
     ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   /* write every value of io.outputs.output */
-ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* accepted only if ai_rc == 0 and finite, else beam.spectrum */
+ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* accepted only if ai_rc == STREAM_RUN_OK and finite, else beam.spectrum */
 ac_istft_push_planar(istft, out_re, out_im, out);        /* the application's WOLA, one hop */
 ```
 
-A hop closed with a non-zero `ai_rc`, a mask left unwritten or a non-finite mask or output is the identity
-(fail-open; the last three also restart the state generation); the reprime
+A hop closed with an `ai_rc` other than `STREAM_RUN_OK`, a mask left unwritten or a non-finite mask or output is the identity
+(fail-open; all but `STREAM_RUN_NOT_STARTED` also restart the state generation); the reprime
 hop after an alignment boundary has no model frame (`pre_process_freq` returns 0).
 
 The network input is the analysis beam (`beam.spectrum`, the beam of the lanes' error spectra), as a network on

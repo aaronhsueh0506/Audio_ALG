@@ -1,6 +1,6 @@
 /* Verifies ulcnet_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): alignment-edge
  * check -> stream reset + armed reprime -> int16->float + two STFT pushes + pre_process_freq -> reprime bypass or
- * frame_open / accelerator / frame_finish-or-bypass -> post_process_freq -> ac_istft_push_planar -> int16
+ * frame_open / accelerator / frame_finish-or-fail -> post_process_freq -> ac_istft_push_planar -> int16
  * saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
  * ulcnet_stream.c, on the grid of the shipped model (16 kHz, FFT 512, delay_depth 32). Both drivers run the SAME
  * deterministic fake accelerator and must produce byte-identical PCM and an identical
@@ -22,16 +22,20 @@
 #include "ulcnet_stream.h"
 #include "fft_wrapper.h"
 #include "audio_stft.h"
+#include "stream_run.h"
 
 #define ULCNET_SR   16000
 #define ULCNET_FFT  512
 #define ULCNET_D    32
 
 /* ---- shared deterministic fake accelerator: pure function of (global hop, force_fail) ---- */
+enum { FAKE_OK = 0, FAKE_FAILED = 1, FAKE_NOT_STARTED = 2 };
+
 static int shared_fake(long long ghop, int force_fail, UlcnetModelIoOutputs *out) {
     size_t i;
-    if (force_fail) return -1;   /* writes nothing: mirrors the real accelerator leaving the
-                                  * NaN-prefilled output untouched on failure */
+    if (force_fail == FAKE_NOT_STARTED) return STREAM_RUN_NOT_STARTED;
+    if (force_fail) return STREAM_RUN_FAILED;   /* writes nothing: mirrors the real accelerator leaving the
+                                                 * NaN-prefilled output untouched on failure */
     for (i = 0; i < out->spectrum_ri_elements; ++i)
         out->output[i] = 0.03f * (float)(((ghop + (long long)i) % 59) - 29);
     /* No state registered in this test, so the four *_out pointers are all NULL -- nothing else
@@ -188,13 +192,16 @@ static int board_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_i
 }
 
 /* Stage 5's close + post_process_freq + synthesis. `pre_rc` selects whether to dispatch
- * frame_finish/frame_bypass (1: a real frame was opened) or skip it entirely (0: already bypassed
+ * frame_finish/frame_fail (1: a real frame was opened) or skip it entirely (0: already bypassed
  * inside board_pre -- ai_rc is ignored). */
 static int board_post(BoardDriver *d, int pre_rc, int ai_rc, int16_t *pcm_out, int *written_out) {
     int hop = d->grid.hop, k, prc, written = 0;
     if (pre_rc == 1) {
-        int rc = (ai_rc == 0) ? ulcnet_prepost_frame_finish(d->prepost) : -1;
-        if (rc != 0) ulcnet_prepost_frame_bypass(d->prepost);
+        if (ai_rc == STREAM_RUN_OK) {
+            if (ulcnet_prepost_frame_finish(d->prepost) != 0) (void)ulcnet_prepost_frame_bypass(d->prepost);
+        } else {
+            (void)ulcnet_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+        }
     }
     prc = ulcnet_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im);
     if (prc != 0) {
@@ -288,8 +295,9 @@ static int run_matrix(int inject_shift) {
      *   9..12   solid=0 (changed=0)                                -- quiet period
      *   13      solid flips to 1 (changed=0)                       -- Row 3 (edge via solid, not changed)
      *   14..16  steady (post-reprime)
-     *   17,18   fail-open row: ai_rc forced -1 for TWO consecutive hops -- Row 4
-     *   19      steady again (sanity: generation did not move on 17/18)
+     *   17,18   fail-open row: two consecutive failed hops, 17 STREAM_RUN_FAILED (a run started: generation +1),
+     *           18 STREAM_RUN_NOT_STARTED (generation unchanged) -- Row 4
+     *   19      steady again
      */
     const long long total_hops = 20;
     for (; ghop < total_hops; ++ghop) {
@@ -310,7 +318,7 @@ static int run_matrix(int inject_shift) {
         else if (ghop == 13) { delay.changed = 0; delay.solid = 1; }   /* the 0->1 transition */
         else { delay.changed = 0; delay.solid = 1; }
 
-        force_fail = in_fail_window;
+        force_fail = ghop == 17 ? FAKE_FAILED : (ghop == 18 ? FAKE_NOT_STARTED : FAKE_OK);
 
         for (k = 0; k < hop; ++k) {
             err_in[k] = (int16_t)(((long long)k * 7 + ghop * 5) % 101 - 50);
@@ -453,9 +461,9 @@ static int run_matrix(int inject_shift) {
                       "spectrum through\n", ghop);
             }
         }
-        if (in_fail_window && (gen_after_a != gen_before_a)) {
-            fprintf(stderr, "hop %lld: generation advanced on a plain (ai_rc != 0) bypass hop "
-                            "(before=%u after=%u) -- a pure bypass must not touch the generation\n",
+        if (in_fail_window && gen_after_a != gen_before_a + (ghop == 17 ? 1u : 0u)) {
+            fprintf(stderr, "hop %lld: generation %u -> %u on a failed hop -- a run that started (hop 17) must advance "
+                            "it by one, one that did not start (hop 18) must leave it\n",
                            ghop, gen_before_a, gen_after_a);
             st.mismatches++;
         }

@@ -11,7 +11,7 @@
  *     err_re[k] = beam.spectrum[k].r;  err_im[k] = beam.spectrum[k].i;        // the beamformed spectrum, planar
  *     pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im,
  *                                          {info.delay.changed, .solid}, &io);
- *     if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   // 0 = every tensor written
+ *     if (pre == 1) ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   // STREAM_RUN_* (stream_run.h)
  *     ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);         // accepted frame, else the error
  *     ac_istft_push_planar(istft, out_re, out_im, out);                       // one hop
  *
@@ -75,16 +75,16 @@ static void usage(const char* prog) {
 /* Replace with the product's stateless accelerator invocation. The four state tensors live in
  * the accelerator's own buffers, so the state views in `inputs` are NULL: bind each *_out of
  * the graph to the buffer of the state input of the same name, write `outputs->output`, read
- * every state input before writing any state output, and return 0 (or -1 on a failed run). Load
- * quantized zeros into fixed-point state at start and whenever UlcnetHopIO.state_generation
- * changes. See ulcnet_model_io.h. */
+ * every state input before writing any state output, and return STREAM_RUN_OK (STREAM_RUN_NOT_STARTED when
+ * nothing ran, STREAM_RUN_FAILED once the run started and failed). Load quantized zeros into fixed-point state
+ * at start and whenever UlcnetHopIO.state_generation changes. See ulcnet_model_io.h. */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* BOARD: write every output tensor, then return 0. */
+    return STREAM_RUN_NOT_STARTED; /* BOARD: write every output tensor, then return STREAM_RUN_OK. */
 }
 
 /* The unit on the stream's grid, lanes only (the stream takes the beamformed spectrum); the
@@ -277,7 +277,7 @@ static int ulc_hop(UlcSample *s) {
     ArraySampleBeamInfo info;
     UlcnetStreamDelay delay;
     UlcnetHopIO io;
-    int k, pre, ai_rc = -1;
+    int k, pre, ai_rc = STREAM_RUN_NOT_STARTED;
     if (array_sample_beam_process_with_activity(s->unit, s->microphones, s->far, 0, 0, NULL,
                                                &beam, &info) != AEC_OK)
         return -1;

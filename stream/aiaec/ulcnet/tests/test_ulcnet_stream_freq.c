@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "ulcnet_stream.h"
+#include "stream_run.h"
 
 static int g_fail;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); ++g_fail; } } while (0)
@@ -63,9 +64,9 @@ static void enhanced_of(const float *er, const float *ei, const float *mask, flo
 
 /* ---- the stand-in accelerator ---- */
 
-/* What a run does: write the whole mask, report failure after writing it, report success with nothing or half of it
- * written, or write it with one bad value. */
-enum { K_PLAIN, K_FAIL, K_UNWRITTEN, K_HALF, K_NAN, K_INF, K_HUGE_RE, K_HUGE_IM };
+/* What a run does: write the whole mask, report failure (a started run, or one that never started) after writing it,
+ * report success with nothing or half of it written, or write it with one bad value. */
+enum { K_PLAIN, K_FAIL, K_NOT_STARTED, K_UNWRITTEN, K_HALF, K_NAN, K_INF, K_HUGE_RE, K_HUGE_IM };
 
 typedef struct Fake {
     long calls;
@@ -98,7 +99,7 @@ static int fake_run(Fake *f, int kind, const UlcnetModelIoInputs *in, UlcnetMode
     if (kind == K_HUGE_RE) f->mask[5] = 3.0e30f;
     if (kind == K_HUGE_IM) f->mask[bins] = 3.0e30f;
     memcpy(out->output, f->mask, 2u * bins * sizeof(float));
-    return kind == K_FAIL ? -1 : 0;
+    return kind == K_FAIL ? STREAM_RUN_FAILED : (kind == K_NOT_STARTED ? STREAM_RUN_NOT_STARTED : STREAM_RUN_OK);
 }
 
 /* ---- a stream in an exact pool with a guard behind it ---- */
@@ -232,7 +233,8 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
         if (ulcnet_stream_post_process_freq(r->s, rc, re, im) != 1) return -1;
 
         if (pre != 1) identity = 1;
-        else if (run_kind == K_FAIL) { identity = 1; t->failed++; }
+        else if (run_kind == K_FAIL) { identity = 1; t->failed++; t->generation++; }
+        else if (run_kind == K_NOT_STARTED) { identity = 1; t->failed++; }
         else if (run_kind != K_PLAIN || h == nan_err_at) { identity = 1; refused = 1; }
         else identity = 0;
         if (refused) { t->refused++; t->generation++; }
@@ -299,14 +301,16 @@ static void row_alignment_events(void) {
 /* What a hop hands back when the run failed or wrote a mask the stream refuses, and that the next run is applied. */
 static void row_fail_open(void) {
     enum { N = 50 };
-    static const struct { int kind; int refused; const char *name; } rows[] = {
-        { K_FAIL, 0, "fail-open: a run that reports failure after writing a finite mask" },
-        { K_UNWRITTEN, 1, "fail-open: a mask left unwritten (the NaN staging)" },
-        { K_HALF, 1, "fail-open: a mask half written" },
-        { K_NAN, 1, "fail-open: a NaN mask bin" },
-        { K_INF, 1, "fail-open: an Inf mask bin" },
-        { K_HUGE_RE, 1, "fail-open: a 3.0e30 mask bin, real plane" },
-        { K_HUGE_IM, 1, "fail-open: a 3.0e30 mask bin, imaginary plane" },
+    /* refused: counted as a refused mask (else as a failed run); steps: generation steps per bad hop (0 or 1) */
+    static const struct { int kind; int refused; int steps; const char *name; } rows[] = {
+        { K_FAIL, 0, 1, "fail-open: a run that reports failure after writing a finite mask" },
+        { K_NOT_STARTED, 0, 0, "fail-open: a run that never started" },
+        { K_UNWRITTEN, 1, 1, "fail-open: a mask left unwritten (the NaN staging)" },
+        { K_HALF, 1, 1, "fail-open: a mask half written" },
+        { K_NAN, 1, 1, "fail-open: a NaN mask bin" },
+        { K_INF, 1, 1, "fail-open: an Inf mask bin" },
+        { K_HUGE_RE, 1, 1, "fail-open: a 3.0e30 mask bin, real plane" },
+        { K_HUGE_IM, 1, 1, "fail-open: a 3.0e30 mask bin, imaginary plane" },
     };
     size_t i;
     Sched sc;
@@ -322,8 +326,8 @@ static void row_fail_open(void) {
         bad = rows[i].refused ? t.refused : t.failed;
         CHECK(tally_clean(&t), rows[i].name);
         CHECK(bad == 7 && (rows[i].refused ? t.failed : t.refused) == 0 && t.enhanced == N - 1 - 7 &&
-              ulcnet_stream_state_generation(r.s) == (uint32_t)(1 + (rows[i].refused ? 7 : 0)),
-              "fail-open: seven such hops are the error spectrum, a refused one restarts the state once, the rest are applied");
+              ulcnet_stream_state_generation(r.s) == (uint32_t)(1 + 7 * rows[i].steps),
+              "fail-open: seven such hops are the error spectrum, each restarts the state once unless the run never started, the rest are applied");
         CHECK(rig_guard_intact(&r), "fail-open: nothing is written past the pool");
         rig_free(&r);
     }
@@ -386,9 +390,13 @@ static void row_sequence(void) {
 
     /* a hop closed without a run is the error spectrum and leaves the stream usable */
     CHECK(ulcnet_stream_pre_process_freq(r.s, er, ei, fr, fi, ev(0, 0), &io) == 1 &&
-          ulcnet_stream_post_process_freq(r.s, -1, re, im) == 1 && same_bits(re, er, (size_t)BINS) && same_bits(im, ei, (size_t)BINS) &&
-          ulcnet_stream_state_generation(r.s) == 0u,
-          "sequence: a hop closed as a failed run is the error spectrum; the generation stays");
+          ulcnet_stream_post_process_freq(r.s, STREAM_RUN_NOT_STARTED, re, im) == 1 && same_bits(re, er, (size_t)BINS) &&
+          same_bits(im, ei, (size_t)BINS) && ulcnet_stream_state_generation(r.s) == 0u,
+          "sequence: a hop closed as a run that never started is the error spectrum; the generation stays");
+    CHECK(ulcnet_stream_pre_process_freq(r.s, er, ei, fr, fi, ev(0, 0), &io) == 1 &&
+          ulcnet_stream_post_process_freq(r.s, 7, re, im) == 1 && same_bits(re, er, (size_t)BINS) &&
+          same_bits(im, ei, (size_t)BINS) && ulcnet_stream_state_generation(r.s) == 1u,
+          "sequence: a hop closed as a failed run (any other status) is the error spectrum; the generation advances");
     CHECK(rig_guard_intact(&r), "sequence: nothing is written past the pool");
     free(before);
     rig_free(&r);

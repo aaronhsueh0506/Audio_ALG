@@ -180,7 +180,7 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <li><b>framing 由應用端做</b>：用 audiolib 建兩個 <code>AcStft</code>（error、raw far）與一個 <code>AcIstft</code>，組態 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>（sqrt-Hann、center 0、<code>spec_scale</code> = <code>ispec_scale</code> = 1），合成端另設 <code>sc.ola = AC_OLA_ACCUMULATE</code>（契約寫在 <code>ulcnet_prepost.h</code> 檔頭）。<code>FftHandle</code> 與窗表可循序共用；函式庫不持有 window、FFT 或 STFT 物件。</li>
 <li><b>recurrent state 歸應用端</b>（<code>key_history</code>、<code>value_history</code>、<code>logit_history</code>、<code>h_gru</code>；形狀見 <a href="core.html">Align-ULCNet 頻域與模型契約</a> 的 State 表，函式庫不知道這些形狀）：浮點 host 配四塊 float buffer，把四組（指標，元素數）登錄進 <code>cfg</code>——全登錄或全不登錄，init 與 reset 時清零，每次 <code>frame_finish</code> 整塊檢查有限，不計入 pool 大小與 hash；目標平台不登錄，由加速器持有。</li>
 <li><code>ulcnet_prepost_config_defaults(&amp;cfg, &amp;grid)</code>（grid 被複製）→ 登錄 state → <code>ulcnet_prepost_get_mem_size(&amp;cfg, &amp;req)</code>（<code>req.alignment</code> = 16）→ <code>ulcnet_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>；host 工具可用 <code>_create</code>／<code>_destroy</code>。</li>
-<li>每個 hop（<b>從 hop 0 起一次推論</b>，沒有只暖機不推論的拍）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(err, far)</code> 恆回 1 → <code>frame_open</code> → 加速器 → <code>frame_finish</code>（失敗改 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
+<li>每個 hop（<b>從 hop 0 起一次推論</b>，沒有只暖機不推論的拍）：<code>ac_stft_push_planar</code>×2 → <code>pre_process_freq(err, far)</code> 恆回 1 → <code>frame_open</code> → 加速器 → <code>frame_finish</code>（執行沒成功改 <code>frame_fail</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>。</li>
 <li>目標平台：啟動時先把 state 緩衝清成零（定點 state 埠兩端的 <code>zero_point</code> 須為 0；float 的 state 同樣填位元組 0）並記下 <code>ulcnet_prepost_state_generation()</code>（新建實例為 0）；之後每次它改變（<code>reset</code>、被拒的 <code>frame_finish</code>）就重填加速器自己的 state。</li>
 <li>重新開始：<code>ulcnet_prepost_reset(p)</code>（清登錄的 state、丟掉未結束的 frame、generation +1；config、登錄與 pool 不動），並自行 <code>ac_stft_reset</code>／<code>ac_istft_reset</code>；結束：<code>_destroy</code>（對 <code>_init</code> 實例是 no-op，登錄的 buffer 與 pool 歸應用端）。</li>
 </ol>
@@ -188,6 +188,7 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 #include &lt;string.h&gt;
 #include "audio_stft.h"
 #include "ulcnet_prepost.h"
+#include "stream_run.h"
 
 extern int npu_run(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 
@@ -233,14 +234,18 @@ int run_ulcnet(int sample_rate, int n_fft, int D, const size_t el[4],
         for (long h = 0; h &lt; hops &amp;&amp; rc == 0; ++h) {
             UlcnetModelIoInputs xin;
             UlcnetModelIoOutputs xout;
+            int run_rc;
             float *dst = out + h * grid.hop;
             /* err：linear AEC 的 error hop；far：同一輸入 hop 的原始 far（未對齊） */
             ac_stft_push_planar(err_stft, err + h * grid.hop, e_re, e_im);   /* center 0：恆 1 幀 */
             ac_stft_push_planar(far_stft, far + h * grid.hop, f_re, f_im);
             if (ulcnet_prepost_pre_process_freq(p, e_re, e_im, f_re, f_im) != 1 ||
                 ulcnet_prepost_frame_open(p, &amp;xin, &amp;xout) != 0) { rc = -1; break; }
-            if (npu_run(&amp;xin, &amp;xout) != 0 || ulcnet_prepost_frame_finish(p) != 0)
-                ulcnet_prepost_frame_bypass(p);                    /* error 頻譜原樣通過 */
+            run_rc = npu_run(&amp;xin, &amp;xout);                  /* STREAM_RUN_* */
+            if (run_rc != STREAM_RUN_OK)
+                ulcnet_prepost_frame_fail(p, run_rc != STREAM_RUN_NOT_STARTED);   /* error 頻譜原樣通過 */
+            else if (ulcnet_prepost_frame_finish(p) != 0)
+                ulcnet_prepost_frame_bypass(p);                    /* 被拒的 finish 已重啟 state；error 頻譜原樣通過 */
             if (ulcnet_prepost_post_process_freq(p, o_re, o_im) != 0) { rc = -1; break; }
             if (ac_istft_push_planar(istft, o_re, o_im, dst) == 0)   /* 第一個 hop 無輸出 */
                 memset(dst, 0, (size_t)grid.hop * sizeof(float));
@@ -255,6 +260,7 @@ int run_ulcnet(int sample_rate, int n_fft, int D, const size_t el[4],
 <pre>#include &lt;stdint.h&gt;
 #include "audio_stft.h"
 #include "ulcnet_prepost.h"
+#include "stream_run.h"
 
 extern int  npu_run(const UlcnetModelIoInputs *in, UlcnetModelIoOutputs *out);
 extern void npu_fill_state_with_quantized_zero(void);
@@ -264,12 +270,16 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 {
     UlcnetModelIoInputs xin;
     UlcnetModelIoOutputs xout;
+    int run_rc;
     if (ulcnet_prepost_frame_open(p, &amp;xin, &amp;xout) != 0) return -1;
-    if (ulcnet_prepost_state_generation(p) != *seen) {      /* reset 或被拒的 frame_finish */
+    if (ulcnet_prepost_state_generation(p) != *seen) {      /* reset、被拒的 frame_finish 或髒的執行狀態 */
         npu_fill_state_with_quantized_zero();
         *seen = ulcnet_prepost_state_generation(p);
     }
-    if (npu_run(&amp;xin, &amp;xout) != 0 || ulcnet_prepost_frame_finish(p) != 0)
+    run_rc = npu_run(&amp;xin, &amp;xout);
+    if (run_rc != STREAM_RUN_OK)
+        ulcnet_prepost_frame_fail(p, run_rc != STREAM_RUN_NOT_STARTED);
+    else if (ulcnet_prepost_frame_finish(p) != 0)
         ulcnet_prepost_frame_bypass(p);
     return 0;
 }</pre>
@@ -285,14 +295,15 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen)
 <tr><td><code>pre_process_freq</code></td><td>-1</td><td>NULL、上一個 frame 尚未 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame</td></tr>
 <tr><td><code>frame_finish</code></td><td>-1</td><td>mask、登錄的 state 或增強後的頻譜有非有限值（mask 有限但逆冪溢位也算；或沒先 <code>frame_open</code>）：登錄的 state 全部歸零、generation +1、frame 仍開；呼叫 <code>frame_bypass</code> 或重新 <code>frame_open</code></td></tr>
-<tr><td><code>frame_bypass</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 維持加速器寫完的樣子；封包經 frame_open 後若有事件幀，改為 state 歸零、generation +1；這個 error 是未經 guard 的 analysis residual，guard 作用的 hop 上可能大於 capture）</td></tr>
+<tr><td><code>frame_fail</code>（<code>run_started</code>）</td><td>-1</td><td>沒有開啟中的 frame；成功＝error 頻譜原樣通過。<code>run_started != 0</code>：登錄的 state 全部歸零、generation +1。<code>run_started == 0</code>：state 與 generation 不動，唯一例外是 <code>frame_open</code> 後有事件幀的封包（graph 沒跑到那次重啟）：generation +1。被拒的 <code>frame_finish</code> 之後不要用它（用 <code>frame_bypass</code>）</td></tr>
+<tr><td><code>frame_bypass</code></td><td>-1</td><td>沒有開啟中的 frame；成功＝<b>identity</b>（error 頻譜原樣通過，state 與 generation 不動；這個 error 是未經 guard 的 analysis residual，guard 作用的 hop 上可能大於 capture）</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著；成功時 re／im 寫滿 n_bins 個值</td></tr>
 </table></div>
 
 <h2 id="section-8">函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>
 <tr><th>分類</th><th>函式</th></tr>
-<tr><td><b>公開（整合者）</b><br><code>ulcnet_prepost.h</code></td><td><code>ulcnet_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_post_process_freq</code></td></tr>
+<tr><td><b>公開（整合者）</b><br><code>ulcnet_prepost.h</code></td><td><code>ulcnet_prepost_config_defaults</code>、<code>_get_mem_size</code>、<code>_init</code>、<code>_init_ex</code>、<code>_create</code>、<code>_destroy</code>、<code>_reset</code>、<code>_state_generation</code>、<code>_descriptor</code>、<code>_pre_process_freq</code>、<code>_frame_open</code>、<code>_frame_finish</code>、<code>_frame_bypass</code>、<code>_frame_fail</code>、<code>_post_process_freq</code></td></tr>
 <tr><td><b>公開（grid 與 descriptor）</b><br><code>ulcnet_model_io.h</code></td><td><code>ulcnet_grid_make</code>、<code>ulcnet_grid_validate</code>、<code>ulcnet_model_io_descriptor_default</code>／<code>_validate</code>／<code>_grid</code>、<code>ulcnet_model_io_state_buffers_validate</code></td></tr>
 <tr><td><b>低階（類別內部使用）</b></td><td><code>ulcnet_model_io_get_mem_requirements</code>、<code>_init</code>、<code>_reset</code>、<code>_prepare</code>、<code>_enhance_spectrum</code>、<code>_descriptor</code>、<code>_state_generation</code>、<code>ulcnet_model_io_signed_pow</code>（inline）</td></tr>
 <tr><td><b>內部（<code>static</code>）</b></td><td><code>ulcnet_prepost.c</code>：<code>pp_carve</code>、<code>pp_fnv1a</code>、<code>pp_layout</code>、<code>pp_build_hash</code>、<code>pp_check_config</code>、<code>pp_descriptor_for</code>、<code>pp_buffers</code>、<code>pp_close_frame</code>；<code>ulcnet_model_io.c</code>：<code>front_end</code>／<code>back_end</code>（含 NEON 版）、<code>mio_carve</code>、<code>mio_layout</code>、<code>clear_recurrent_state</code>、<code>zero_registered</code> 等</td></tr>
@@ -349,7 +360,7 @@ ulcnet_prepost_frame_open ---> UlcnetHopIO{inputs, outputs, state_generation}
   |                                        v
   v
 ulcnet_stream_post_process(ai_rc)
-  |  pre_rc==1 分支: ai_rc==0 frame_finish / 其餘 frame_bypass（直通, 非靜音）
+  |  pre_rc==1 分支: ai_rc==STREAM_RUN_OK frame_finish（被拒再 frame_bypass） / 其餘 frame_fail（直通, 非靜音）
   |  pre_rc==0 分支: 已在 pre_process 內 bypass, ai_rc 不讀
   v
 ulcnet_prepost_post_process_freq
@@ -382,8 +393,8 @@ n+1   err,far,delay={0,1} -> pre_process -> 邊界不再觸發 (已消耗 reprim
                                       -> STFT x2, ..., open -------> 跑一次
       &lt;-- 1 (job開啟) ----------------------------------------------
       ...
-k     pre_process -> open --------------------------------------->  替身回 -1
-      post_process(ai_rc=-1) -----------> frame_bypass (直通, 非靜音) ->
+k     pre_process -> open --------------------------------------->  替身回 STREAM_RUN_FAILED
+      post_process(ai_rc=STREAM_RUN_FAILED) -> frame_fail(run_started=1): state 歸零, generation +1 (直通, 非靜音) ->
       &lt;-- 回傳的 PCM == err_in 經 STFT/ISTFT 恆等鏈, 不是零 --------
 </pre>
 
@@ -402,7 +413,7 @@ k     pre_process -> open --------------------------------------->  替身回 -1
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
 <tr><td>STFT／ISTFT 歷史</td><td>本層（兩路 <code>AcStft</code>＋一路 <code>AcIstft</code>，pool 內）</td><td><code>AC_OLA_ACCUMULATE</code> 的前一幀後半窗（重疊相加，無包絡正規化）</td><td>明確 <code>ulcnet_stream_reset()</code> 或對齊邊界觸發的重置</td></tr>
 <tr><td>四組遞迴 state（key／value／logit history、h_gru）</td><td>登錄則呼叫端持有，未登錄則加速器自行持有</td><td>attention K/V window、attention-logit window、GRU hidden</td><td>reset 全歸零；<code>frame_finish</code> 的非有限拒收只歸零已登錄的部分</td></tr>
-<tr><td><code>state_generation</code></td><td>轉呼叫 <code>ulcnet_prepost_state_generation()</code></td><td>目前 generation 值</td><td>reset（含對齊觸發的）或非有限拒收各 +1；純粹 <code>ai_rc != 0</code> 的 bypass 不推進；封包 stream 的事件 hop 不推進</td></tr>
+<tr><td><code>state_generation</code></td><td>轉呼叫 <code>ulcnet_prepost_state_generation()</code></td><td>目前 generation 值</td><td>reset（含對齊觸發的）、非有限拒收、<code>ai_rc</code> 為 STREAM_RUN_NOT_STARTED 以外的非 0 值各 +1；STREAM_RUN_NOT_STARTED 不推進（封包 stream 有事件 hop 時例外，+1）；成功送件的封包事件 hop 不推進</td></tr>
 <tr><td>對齊記帳（<code>had_hop</code>／<code>prev_solid</code>／<code>reprime_remaining</code>）</td><td>本層內部，<b>這個模型特有</b></td><td>上一拍的 <code>solid</code> 值、是否已處理過第一拍、剩餘的 reprime 倒數</td><td><code>ulcnet_stream_reset()</code>（含內部自動呼叫）歸零 <code>had_hop</code>／<code>prev_solid</code>，確保重置後下一拍不會誤觸發第二次邊界</td></tr>
 </table></div>
 

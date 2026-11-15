@@ -156,9 +156,9 @@ typedef struct UlcTestRig {
     UlcnetHopIO io;
     int begun;       /* a hop is between begin and end */
     int frame;       /* 0 no model frame (reprime, or closed), 1 open and not fetched, 2 fetched */
-    int ai_rc;       /* what the hop is closed with; -1 until a job reports otherwise */
+    int ai_rc;       /* what the hop is closed with: NOT_STARTED until the frame is fetched, FAILED until a job reports */
     long edges;      /* hops on which the stream restarted the model before opening the frame */
-    long refused;    /* hops closed with a result the stream refused (the generation moved while closing) */
+    long refused;    /* hops closed with a result the stream refused or a dirty status (the generation moved while closing) */
     long broken;     /* contract violations seen by the rig; every test expects 0 (see ulc_rig_begin) */
 } UlcTestRig;
 
@@ -229,7 +229,7 @@ static inline int ulc_rig_begin(UlcTestRig* r, const float* err_re, const float*
     r->err_re = err_re; r->err_im = err_im; r->far_re = far_re; r->far_im = far_im;
     r->begun = 1;
     r->frame = pre == 1;
-    r->ai_rc = -1;
+    r->ai_rc = STREAM_RUN_NOT_STARTED;
     if (pre == 1) {
         int nan_filled = r->io.outputs.output != NULL && r->io.outputs.spectrum_ri_elements == 2u * (size_t)BINS;
         for (int k = 0; nan_filled && k < 2 * BINS; ++k) nan_filled = isnan(r->io.outputs.output[k]);
@@ -251,6 +251,7 @@ static inline int ulc_rig_job(UlcTestRig* r, UlcTestJob* job) {
     job->far_re = r->far_re; job->far_im = r->far_im;
     job->mask_re = r->io.outputs.output;
     job->mask_im = r->io.outputs.output + BINS;
+    r->ai_rc = STREAM_RUN_FAILED;
     r->frame = 2;
     return 1;
 }
@@ -263,20 +264,22 @@ static inline int ulc_rig_job_done(UlcTestRig* r, int model_rc) {
     return 0;
 }
 
-/* Closes the hop: the enhanced spectrum of an accepted frame, else the error spectrum; a frame never fetched or never
- * reported closes as a failed run. 0, or -1 when the stream refuses (the hop then stays as it was). */
+/* Closes the hop: the enhanced spectrum of an accepted frame, else the error spectrum; a frame never fetched closes as
+ * a run that never started, one fetched and never reported as a failed run. 0, or -1 when the stream refuses (the hop
+ * then stays as it was). Counted as broken: a step that is not one for a dirty status or none for NOT_STARTED. */
 static inline int ulc_rig_end(UlcTestRig* r, float* out_re, float* out_im) {
-    uint32_t before;
+    uint32_t before, step;
     if (!r) return -1;
     before = ulcnet_stream_state_generation(r->stream);
     if (ulcnet_stream_post_process_freq(r->stream, r->ai_rc, out_re, out_im) != 1) return -1;
-    if (ulcnet_stream_state_generation(r->stream) != before) {
-        if (r->ai_rc != 0 || ulcnet_stream_state_generation(r->stream) != before + 1u) r->broken++;
-        r->refused++;
-    }
+    step = ulcnet_stream_state_generation(r->stream) - before;
+    if (step > 1u || (r->ai_rc == STREAM_RUN_NOT_STARTED && step != 0u) ||
+        (r->ai_rc != STREAM_RUN_OK && r->ai_rc != STREAM_RUN_NOT_STARTED && step != 1u))
+        r->broken++;
+    if (step != 0u) r->refused++;
     r->begun = 0;
     r->frame = 0;
-    r->ai_rc = -1;
+    r->ai_rc = STREAM_RUN_NOT_STARTED;
     return 0;
 }
 

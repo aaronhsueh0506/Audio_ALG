@@ -118,7 +118,7 @@ if (pre == 1) {                                  /* 0 = reprime hop: identity,�
     /* io.outputs.output(mask)已全填 NaN */
     ai_rc = run_accelerator(NULL, &amp;io.inputs, &amp;io.outputs);
 }
-ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* ai_rc == 0 且 mask、增強頻譜皆有限才採用,否則 identity */
+ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* ai_rc == STREAM_RUN_OK 且 mask、增強頻譜皆有限才採用,否則 identity */
 ac_istft_push_planar(istft, out_re, out_im, out);</pre>
 <div class="tblwrap"><table>
 <tr><th>Fallback 條件</th><th>行為</th></tr>
@@ -129,12 +129,12 @@ ac_istft_push_planar(istft, out_re, out_im, out);</pre>
 <p><b>三種情況的時序路徑完全相同 → latency 不隨 model 健康度變動</b>。先全填 <code>NAN</code> 是為了把「沒寫」變成可偵測——finite guard 抓得到<b>未寫入</b>,但抓不到<b>寫錯形狀</b>。</p>
 <h3>把推論留給 NPU:加速器夾在兩個呼叫之間</h3>
 <p>兩條 ULCNet 與兩個 DFN 範例都把一個 hop 拆開;ULCNet 的加速器坐在 <code>ulcnet_stream_pre_process_freq()</code> 與 <code>ulcnet_stream_post_process_freq()</code> 之間(沒有回呼),DFN 的坐在 <code>dfn_hop_nn_begin()</code> 與 <code>dfn_hop_nn_end()</code> 之間(模型的 <code>infer</code> 回呼因此可以不設;一次呼叫的 <code>dfn_hop_process()</code> 就是這個序列加上已安裝的回呼)。</p>
-<pre>UlcnetHopIO io;  int ai_rc = -1;
+<pre>UlcnetHopIO io;  int ai_rc = STREAM_RUN_NOT_STARTED;
 ac_stft_push_planar(err_stft, rctx.formed_hop, err_re, err_im);   /* 應用端分析 (4ch: err = beam.spectrum 的平面，只分析 far) */
 ac_stft_push_planar(far_stft, ref, far_re, far_im);
 if (ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &amp;io) == 1)   /* 1 = 有一幀;0 = 本 hop 無模型幀 */
     ai_rc = board_run_npu(&amp;io.inputs, &amp;io.outputs);   /* io.outputs.output 已預填 NaN,必須寫滿 */
-ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* ai_rc!=0 或非有限 ⇒ identity;否則採用的增強頻譜 */
+ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* ai_rc != STREAM_RUN_OK 或非有限 ⇒ identity;否則採用的增強頻譜 */
 ac_istft_push_planar(istft, out_re, out_im, out);   /* 應用端合成剛好一個 hop */</pre>
 <p>DFN 範例的 <code>dfn_hop_nn_begin</code> 在迴圈裡(<code>while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) { rc = run_npu(&amp;job); dfn_hop_nn_end(&amp;hop, rc); }</code>),因為 rate bridge 在一個 native hop 內可能開 0..2 個 48 kHz 幀(板端每次跑前比對 <code>job.state_generation</code>(<code>dfn_hop_state_generation(&amp;hop)</code>),見 <a href="../../pipelines/reference/dfn2/integration.html">DFN2 pipeline 呼叫與時序</a>);ULCNet 板端同樣比對 <code>io.state_generation</code>(<code>ulcnet_stream_state_generation()</code>),變動時重載量化零。</p>
 <p>4 聲道 ULCNet 應用若要用由同一 hop 的 lane 頻譜算出的 mask 與 VAD,把 helper 的 hop 拆成 <code>array_sample_beam_process_front()</code> 與 <code>array_sample_beam_process_beam()</code>,呼叫端在兩者之間讀 <code>front.lane_error_spec[0]</code>(見 <a href="../../pipelines/4ch/align-ulcnet/index.html">四聲道 · Align-ULCNet</a>)。</p>

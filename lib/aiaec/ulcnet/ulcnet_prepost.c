@@ -349,21 +349,24 @@ int ulcnet_prepost_frame_finish(UlcnetPrepost *p) {
 }
 
 int ulcnet_prepost_frame_bypass(UlcnetPrepost *p) {
-    size_t bins, frame;
+    size_t bytes;
     if (!p || !p->frame_open) return -1;
-    bins = (size_t)p->frames * (size_t)p->n_bins * sizeof(float);
-    /* Identity: the error spectrum passes through; the armed transaction is not finished. */
-    memcpy(p->enh_re, p->err_re, bins);
-    memcpy(p->enh_im, p->err_im, bins);
-    /* The graph restarts the model at an armed packet's event frame; without the run, restart it here. A refused
-     * finish has already restarted it and cleared `prepared`. */
-    for (frame = 0; p->frames > 1 && p->prepared && frame < (size_t)p->frames; ++frame) {
-        if (!p->events[frame]) continue;
-        ulcnet_model_io_reset(p->io);
-        break;
-    }
+    bytes = (size_t)p->frames * (size_t)p->n_bins * sizeof(float);
+    memcpy(p->enh_re, p->err_re, bytes);
+    memcpy(p->enh_im, p->err_im, bytes);
     pp_close_frame(p);
     return 0;
+}
+
+int ulcnet_prepost_frame_fail(UlcnetPrepost *p, int run_started) {
+    size_t frame;
+    int restart = run_started != 0;
+    if (!p || !p->frame_open) return -1;
+    /* The graph restarts the model at an armed packet's event frame; without its run, restart it here. */
+    for (frame = 0; !restart && p->frames > 1 && p->prepared && frame < (size_t)p->frames; ++frame)
+        restart = p->events[frame] != 0;
+    if (restart) ulcnet_model_io_reset(p->io);
+    return ulcnet_prepost_frame_bypass(p);
 }
 
 int ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float *re, float *im) {

@@ -90,7 +90,7 @@ DFN2_DIR = ../lib/ainr/dfn2
 # The model stream (stream/aiaec/ulcnet) that mono/alignulcnet/main.c drives on its spectrum entries.
 STREAM_ULCNET_DIR = ../stream/aiaec/ulcnet
 # Include paths of every TU that includes ulcnet_stream.h.
-ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR)
+ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR) -I$(STREAM_COMMON_DIR)
 # The model stream (stream/ainr/dfn2) that dfn/dfn_hop.h drives and test_dfn_stream_equivalence
 # compares the stage with.
 STREAM_DFN2_DIR = ../stream/ainr/dfn2
@@ -588,7 +588,7 @@ $(OBJ_DIR)/mono_alignulcnet_main.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)
 
 # ulcnet_stream.o: the Align-ULCNet model stream (stream/aiaec/ulcnet), linked by the example and
 # the tests that run it. Not a member of any archive.
-$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 # test_mono_ulcnet: the mono linear AEC feeding the model stream (identity end to end, alignment

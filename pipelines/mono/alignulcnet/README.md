@@ -54,7 +54,7 @@ The network runs between the stream's two calls; there is no callback to install
 ```c
 UlcnetHopIO io;
 UlcnetStreamDelay delay;                                 /* from AecLinearView.delay_state */
-int ai_rc = -1;
+int ai_rc = STREAM_RUN_NOT_STARTED;
 aec_process_linear(aec, mic, ref);                       /* linear stage; AEC_RESIDUAL_STATE: */
 aec_process_residual(aec, NULL);                         /*   the selected residual, no gain */
 aec_get_residual(aec, &rctx);  aec_get_linear(aec, &lctx);
@@ -65,7 +65,7 @@ ac_stft_push_planar(far_stft, ref, far_re, far_im);
 pre = ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &io);  /* reprime / model restart */
 if (pre == 1)                                            /* 1 = a frame to run, 0 = the reprime hop */
     ai_rc = run_accelerator(NULL, &io.inputs, &io.outputs);   /* write every value of io.outputs.output */
-ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* accepted only if ai_rc == 0 and finite, else the error */
+ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im);   /* accepted only if ai_rc == STREAM_RUN_OK and finite, else the error */
 ac_istft_push_planar(istft, out_re, out_im, out);        /* the application's WOLA, one hop */
 /* on any negative return: aec_reset(aec); ulcnet_stream_reset(stream);
  *                         ac_stft_reset(err_stft); ac_stft_reset(far_stft); ac_istft_reset(istft); */
@@ -85,8 +85,8 @@ AEC's hard post-chain reset event (`aec_post_reset_serial()`) has nothing to res
 policy for a changed alignment is the `delay.changed` flag above, and following a reset event in the network state is
 application policy (this program: none beyond that flag, and it never resets the AEC in response).
 
-A hop closed with a non-zero `ai_rc`, a mask left unwritten or a non-finite mask or output is the identity
-(fail-open; the last three also restart the state generation); the reprime
+A hop closed with an `ai_rc` other than `STREAM_RUN_OK`, a mask left unwritten or a non-finite mask or output is the identity
+(fail-open; all but `STREAM_RUN_NOT_STARTED` also restart the state generation); the reprime
 hop after an alignment boundary has no model frame (`pre_process_freq` returns 0). The error is a time-domain
 hop here, so `main.c` owns a second `AcStft` for it; a caller whose error already is a spectrum (the 4-channel
 beam spectrum) passes its planes straight to `pre_process_freq`.

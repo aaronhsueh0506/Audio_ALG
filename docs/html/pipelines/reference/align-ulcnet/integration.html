@@ -107,7 +107,7 @@ int mono_ulcnet_run(void) {
         AecLinearView lctx = { .struct_size = sizeof(lctx) };
         UlcnetStreamDelay delay;
         UlcnetHopIO io;
-        int pre = -1, ai_rc = -1;
+        int pre = -1, ai_rc = STREAM_RUN_NOT_STARTED;
         if (aec_process_linear(aec, mic, ref) == AEC_OK &amp;&amp; aec_process_residual(aec, NULL) == AEC_OK &amp;&amp;
             aec_get_residual(aec, &amp;rctx) == AEC_OK &amp;&amp; aec_get_linear(aec, &amp;lctx) == AEC_OK) {
             delay.changed = lctx.delay_state == AEC_LINEAR_DELAY_CHANGED;
@@ -119,7 +119,6 @@ int mono_ulcnet_run(void) {
         if (pre == 1) {                                  /* 本 hop 有一幀;0 = alignment 邊界後的 identity hop */
             board_sync_state(io.state_generation);
             ai_rc = board_run_stateless(&amp;io.inputs, &amp;io.outputs);
-            if (ai_rc != 0) board_refill_state_zero();
         }
         if (pre &gt;= 0 &amp;&amp; ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im) == 1 &amp;&amp;
             ac_istft_push_planar(istft, out_re, out_im, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
@@ -209,7 +208,7 @@ int four_ulcnet_run(void) {
     while (next_hop4(mics, far, &amp;vad)) {
         ArraySampleBeamResult beam;  ArraySampleBeamInfo info;  UlcnetStreamDelay delay;
         UlcnetHopIO io;
-        int pre = -1, ai_rc = -1;
+        int pre = -1, ai_rc = STREAM_RUN_NOT_STARTED;
         if (array_sample_beam_process_with_activity(unit, mics, far, vad, vad, NULL, &amp;beam, &amp;info)
                 == AEC_OK) {
             delay.changed = info.delay.changed;  delay.solid = info.delay.solid;
@@ -220,7 +219,6 @@ int four_ulcnet_run(void) {
         if (pre == 1) {
             board_sync_state(io.state_generation);
             ai_rc = board_run_stateless(&amp;io.inputs, &amp;io.outputs);
-            if (ai_rc != 0) board_refill_state_zero();
         }
         if (pre &gt;= 0 &amp;&amp; ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im) == 1 &amp;&amp;
             ac_istft_push_planar(istft, out_re, out_im, out) == grid.hop) { emit_hop(out, grid.hop); continue; }
@@ -241,7 +239,7 @@ int four_ulcnet_run(void) {
 <tr><td><code>aec_init()</code>、<code>aec_init_ex()</code>、<code>array_sample_beam_init()</code>、<code>ulcnet_stream_init_ex()</code></td><td>物件指標</td><td>NULL:pool 未對齊(串流依 <code>req.alignment</code>,16-byte)、太小、config 無效、<code>_ex</code> 的 descriptor 不符;被拒的 init 不動 pool</td><td>重新查大小並配置</td></tr>
 <tr><td><code>ulcnet_stream_pre_process_freq()</code></td><td>1(幀已開,<code>io</code> 有效)、0(本 hop 無模型幀:alignment 邊界後的 identity hop,<code>io</code> 全零)</td><td>-1:NULL 引數、上一 hop 還沒 <code>post_process_freq</code>、封包串流;串流未動</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
 <tr><td>加速器(<code>run_accelerator()</code>)</td><td>0(mask 寫滿)</td><td>非 0 不是錯誤:把它交給 <code>post_process_freq</code>,該幀 identity,generation 不動</td><td>定點加速器重填量化 0(state 可能寫了一半)</td></tr>
-<tr><td><code>ulcnet_stream_post_process_freq(ai_rc)</code></td><td>1;每次輸出整個頻譜(hop #0 也是)</td><td><code>ai_rc == 0</code> 但 mask 沒寫滿、mask 或增強頻譜有非有限值不是錯誤:該幀 identity、state generation +1。-1 只在 NULL 引數或沒有對應的 <code>pre_process_freq</code>(此時不寫輸出)</td><td>-1 時 reset 前端 + 串流 + 應用端的 STFT／ISTFT;generation 變了就重載量化 0</td></tr>
+<tr><td><code>ulcnet_stream_post_process_freq(ai_rc)</code></td><td>1;每次輸出整個頻譜(hop #0 也是)</td><td><code>ai_rc == STREAM_RUN_OK</code> 但 mask 沒寫滿、mask 或增強頻譜有非有限值不是錯誤:該幀 identity、state generation +1;<code>ai_rc</code> 為 STREAM_RUN_NOT_STARTED 以外的非 0 值也是 identity、generation +1。-1 只在 NULL 引數或沒有對應的 <code>pre_process_freq</code>(此時不寫輸出)</td><td>-1 時 reset 前端 + 串流 + 應用端的 STFT／ISTFT;generation 變了就重載量化 0</td></tr>
 <tr><td><code>ac_istft_push_planar()</code></td><td><code>grid.hop</code></td><td>回的不是整個 hop 時由應用端判定為失敗</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
 <tr><td><code>array_sample_beam_process*()</code></td><td><code>AEC_OK</code></td><td><code>AEC_ERR_ARG</code>(NULL／非有限樣本,狀態未動)、<code>AEC_ERR_SEQUENCE</code>(<code>process_beam</code> 沒有待處理的 front,未改)、<code>AEC_ERR_DSP</code>(lane 拒絕,array 已 reset)</td><td>reset helper + 串流</td></tr>
 </table>
@@ -283,12 +281,12 @@ int four_ulcnet_run(void) {
   |&lt;- 1(io.inputs、io.outputs、io.state_generation)| 0(reprime 幀)| -1 ---|                              |
 -- 回 1 時:呼叫端跑加速器 ----------------------------------------------------------------------------------------------
   | io.state_generation 與上次不同 -&gt; 重載量化 0                                                          |
-  |-- io.inputs.* -&gt; 加速器 -&gt; io.outputs.output(每個值都要寫);ai_rc = 0 | 非 0 ----------------------&gt;|
+  |-- io.inputs.* -&gt; 加速器 -&gt; io.outputs.output(每個值都要寫);ai_rc = STREAM_RUN_OK | 其他 ----------------------&gt;|
 -- 收尾 ----------------------------------------------------------------------------------------------------------------
   | ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im)                                        |
   |----------------------------------------------------&gt;|                                                 |
-  |                          |                          | ai_rc == 0:frame_finish 驗證 mask 與增強頻譜有限(失敗:generation +1、frame_bypass)
-  |                          |                          | ai_rc != 0:frame_bypass;reprime 幀已在 pre 內 bypass
+  |                          |                          | ai_rc == STREAM_RUN_OK:frame_finish 驗證 mask 與增強頻譜有限(失敗:generation +1、frame_bypass)
+  |                          |                          | ai_rc != OK:frame_fail(ai_rc != NOT_STARTED);reprime 幀已在 pre 內 bypass
   |                          |                          | 採用的增強頻譜（否則 err）寫入 out_re／out_im，不合成
   | 1 | -1(NULL、沒有對應的 pre)                                                                          |
   | ac_istft_push_planar(istft, out_re, out_im, out)   應用端合成:每 hop 回整個 hop(含 hop #0,AC_OLA_ACCUMULATE) |</pre>
@@ -331,7 +329,7 @@ int four_ulcnet_run(void) {
   | 下一次跑加速器前:io.state_generation 變了,定點加速器自己的 state 緩衝填量化後的 0                    |
   |----------------------------------------------------------------------------------------------------&gt;|
 -- 不是錯誤、不要 reset --------------------------------------------------------------------------------------------------
-  | ai_rc != 0:該幀 identity,generation 不動;mask 沒寫滿或 mask／增強頻譜有非有限值:該幀 identity,state generation +1 |
+  | ai_rc == STREAM_RUN_NOT_STARTED:該幀 identity,generation 不動;其他非 0 的 ai_rc、mask 沒寫滿或 mask／增強頻譜有非有限值:該幀 identity,state generation +1 |
   | alignment 邊界(CHANGED／首次 solid):串流在 pre_process_freq 內自己重啟模型 state + reprime,不需要 App 動作      |</pre>
 <p>alignment 邊界(<code>CHANGED</code>，或 FIXED 首次 <code>UNLOCKED → LOCKED</code>)之後有 <code>ULCNET_STREAM_REPRIME_FRAMES</code>(= 1)個發射幀走 identity 且沒有模型幀;推導與兩個 grid 的實測見 <a href="configuration.html#details">Align-ULCNet pipeline 參數與狀態</a>。</p>
 </main>

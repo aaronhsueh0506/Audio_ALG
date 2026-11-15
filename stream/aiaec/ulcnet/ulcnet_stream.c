@@ -11,9 +11,10 @@
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+#include "stream_run.h"
 
 /* IDLE: no pending hop (post_process refuses with -1). FRAME_OPEN: frame_open() ran; post_process dispatches
- * frame_finish / frame_bypass on ai_rc. FRAME_CLOSED: a reprime hop, already bypassed in pre_process; ai_rc is ignored. */
+ * frame_finish / frame_fail on ai_rc. FRAME_CLOSED: a reprime hop, already bypassed in pre_process; ai_rc is ignored. */
 enum {
     ULCNET_STREAM_IDLE = 0,
     ULCNET_STREAM_FRAME_OPEN = 1,
@@ -455,11 +456,12 @@ int ulcnet_stream_post_process_freq(UlcnetStream *s, int ai_rc, float *re, float
     if (!s || !re || !im || s->hop_state == ULCNET_STREAM_IDLE) return -1;
 
     if (s->hop_state == ULCNET_STREAM_FRAME_OPEN) {
-        /* A finish that itself fails (non-finite mask, state or enhanced spectrum despite ai_rc == 0) leaves the
-         * frame open per ulcnet_prepost_frame_finish()'s doc, so it still needs an explicit
-         * bypass to close it and stay in sync with UlcnetPrepost. */
-        int rc = (ai_rc == 0) ? ulcnet_prepost_frame_finish(s->prepost) : -1;
-        if (rc != 0) ulcnet_prepost_frame_bypass(s->prepost);
+        if (ai_rc == STREAM_RUN_OK) {
+            /* A refused finish restarted the model; the frame is still open, so close it as identity. */
+            if (ulcnet_prepost_frame_finish(s->prepost) != 0) (void)ulcnet_prepost_frame_bypass(s->prepost);
+        } else {
+            (void)ulcnet_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+        }
     }
     /* ULCNET_STREAM_FRAME_CLOSED: already bypassed inside pre_process; ai_rc is not read. */
     s->hop_state = ULCNET_STREAM_IDLE;

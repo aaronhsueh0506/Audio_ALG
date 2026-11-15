@@ -1,6 +1,7 @@
 /* Align-ULCNet pre/post class, frequency domain only: the caller's spectra to the accelerator's tensors and back.
- * Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (or frame_bypass), post_process_freq. The recurrent
- * state is outside the pool: it belongs to the application and is optionally registered in the config.
+ * Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (frame_fail if the run did not succeed),
+ * post_process_freq. The recurrent state is outside the pool: it belongs to the application and is optionally
+ * registered in the config.
  *
  * Framing (the application's, with audiolib on the run-time UlcnetGrid; Python reference aiaec_streaming). Trained
  * against: sqrt-Hann (ac_window_build default); analysis AcStft from ac_stft_config_default(&sc, grid.n_fft),
@@ -86,8 +87,9 @@ void ulcnet_prepost_destroy(UlcnetPrepost *p);
  * Every pointer, the registration, the config and the pool stay; NULL is ignored. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
 
-/* Counter of state restarts: advances on reset and when frame_finish() refused a frame, registered or not; 0 for a
- * fresh instance or NULL. A fixed-point accelerator loads quantized zeros at start and on every change. */
+/* Counter of state restarts: advances on reset, when frame_finish() refused a frame and in the frame_fail() cases,
+ * registered or not; 0 for a fresh instance or NULL. A fixed-point accelerator loads quantized zeros at start and on every
+ * change. */
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 /* Built from the config's grid and layout; the five interior fields are 0. */
@@ -117,16 +119,22 @@ int ulcnet_prepost_frame_open(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs);
 
-/* Call after a successful accelerator run (frame_bypass() after a failed one); needs an open frame from frame_open(),
- * else refused. Validates a finite mask and registered state (each buffer scanned whole), applies the mask and inverse
- * compression, validates a finite enhanced spectrum and stages it. On failure (-1) the registered state is zeroed, the
- * generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
+/* Call after a successful accelerator run (frame_fail() after one that did not succeed); needs an open frame from
+ * frame_open(), else refused. Validates a finite mask and registered state (each buffer scanned whole), applies the mask
+ * and inverse compression, validates a finite enhanced spectrum and stages it. On failure (-1) the registered state is
+ * zeroed, the generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
 int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
 
-/* Identity for the current frame (after a failed run or a reprime): the error spectrum, without the AEC output guard (on a
- * guard hop it can exceed the capture). Returns 0, or -1. A packet is bypassed whole; one opened by frame_open() with an event
- * frame also zeroes the state and advances the generation (its run's restart). Otherwise state is left as is. */
+/* Identity for the current frame (a reprime hop, or after a refused frame_finish()): the error spectrum, without the AEC
+ * output guard (on a guard hop it can exceed the capture). State and generation are left as they are. Returns 0, or -1
+ * if no frame is open. */
 int ulcnet_prepost_frame_bypass(UlcnetPrepost *p);
+
+/* Closes the open frame after a run that did not succeed, with the frame_bypass() output. run_started != 0: the run may
+ * have touched the accelerator's state, so the registered state is zeroed and the generation advances. run_started == 0:
+ * only a frame_open()ed packet with an event frame restarts the model (generation +1), the restart its graph would have
+ * applied. Not for a frame whose frame_finish() was refused. Returns 0, or -1 if no frame is open. */
+int ulcnet_prepost_frame_fail(UlcnetPrepost *p, int run_started);
 
 /* The enhanced spectrum (n_bins bins; a packet: N * n_bins) of the frame just finished or bypassed. Returns 0, or -1. */
 int ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float *re, float *im);

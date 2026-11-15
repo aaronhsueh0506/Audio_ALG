@@ -2242,8 +2242,8 @@ static int phased_twin_matches(int mode, int hops) {
         if (memcmp(a, b, HOP_BYTES) != 0) ok = 0;
         for (int i = 0; i < HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
     }
-    /* A refused frame restarts the state generation; a failed run and an accepted one do not. */
-    want_refused = mode == PH_NAN || mode == PH_UNWRITTEN ? ran : 0;
+    /* A refused frame and a failed run (it started) restart the state generation; an accepted one does not. */
+    want_refused = mode == PH_RUN ? 0 : ran;
     ok = ok && ph->rig.refused == want_refused && ph->rig.broken == 0 && cb->rig.broken == 0 &&
          ulcnet_stream_state_generation(ph->rig.stream) == (uint32_t)(ph->rig.edges + want_refused);
     mu_destroy(ph);
