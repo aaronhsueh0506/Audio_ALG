@@ -78,12 +78,11 @@ include ../lib/deps.mk
 ALG_ROOT = ..
 
 # Align-ULCNet sources: the model I/O descriptor, the pre/post class and the model stream the
-# example and its tests run, and the accelerator adapter with its output check for the adapter's
-# own test, compiled by the rules below (none is in a producer archive).
+# example and its tests run, compiled by the rules below (none is in a producer archive).
 # Fixed repo-relative constants, not part of CFG_SIG's caller-varying axes, like AEC_DIR/NR_DIR
 # above. The Align-ULCNet grid is a run-time value of the programs (--sample-rate) and of the
-# tests; no object here holds one. AIAEC_DIR still names AIAEC/ itself (its Python side and
-# tests/test_ulcnet_accelerator_adapter.c stay there); ULCNET_DIR/DFN2_DIR point at the model
+# tests; no object here holds one. AIAEC_DIR still names AIAEC/ itself (its Python side
+# stays there); ULCNET_DIR/DFN2_DIR point at the model
 # cores, moved to lib/ainr/, lib/aiaec/ by the single-model-release restructuring.
 AIAEC_DIR = ../AIAEC
 ULCNET_DIR = ../lib/aiaec/ulcnet
@@ -458,8 +457,8 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(
 AEC_FWD = $(FWD) AEC_NO_ARRAY=$(AEC_NO_ARRAY) AEC_TESTING=0
 
 ifeq ($(COMMON_LIB),)
-.PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a
-all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a:
+.PHONY: all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a
+all test test_target_abi target-abi-test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(COMMON_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audiolib archive path (COMMON_DIR=$(COMMON_DIR) -- is audiolib present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(AEC_FWD) COMMON_DIR=$(abspath $(COMMON_DIR)) COMMON_LIB="$$ac" print-lib-path)"; \
@@ -492,7 +491,7 @@ TARGET_ABI_SRCS := tests/test_target_abi.c \
  $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c \
  ../lib/ainr/dfn3/dfn3_process.c ../lib/ainr/dfn3/dfn3_model_io.c \
  ../lib/ainr/dfn3/dfn3_prepost.c \
- $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_prepost.c \
+ $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_prepost.c \
  $(STREAM_ULCNET_DIR)/ulcnet_stream.c \
  ../lib/aiaec/deepvqe_s/deepvqe_process.c \
  ../lib/aiaec/deepvqe_s/deepvqe_prepost.c
@@ -507,7 +506,7 @@ TARGET_ABI_INCLUDES := $(DFN_HOP_INC) $(ULCNET_STREAM_INC) -I$(DFN2_DIR) -I../li
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) AEC_NO_ARRAY=$(AEC_NO_ARRAY) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono/aec_nr_res/main.c mono/aec_nr_res/tests/test_mono_chain.c mono/aec_nr_res/tests/test_no_stdio_stack.c mono/aec_nr_res/example_board_adapter.c $(STREAM_ULCNET_DIR)/ulcnet_stream.c mono/alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono/alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c dfn/tests/test_dfn_stream_equivalence.c $(STREAM_DFN2_DIR)/dfn2_stream.c 4ch/tests/test_array_sample_post.c tests/test_readme_flow.c mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_dfn_res/main.c dfn/tests/test_dfn_hop.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) AEC_NO_ARRAY=$(AEC_NO_ARRAY) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono/aec_nr_res/main.c mono/aec_nr_res/tests/test_mono_chain.c mono/aec_nr_res/tests/test_no_stdio_stack.c mono/aec_nr_res/example_board_adapter.c $(STREAM_ULCNET_DIR)/ulcnet_stream.c mono/alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_model_io.c mono/alignulcnet/main.c dfn/dfn_res_stage.c dfn/dfn_rate_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.c dfn/tests/test_dfn_res_stage.c dfn/tests/test_dfn_rate_bridge.c dfn/tests/test_dfn_stream_equivalence.c $(STREAM_DFN2_DIR)/dfn2_stream.c 4ch/tests/test_array_sample_post.c tests/test_readme_flow.c mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_dfn_res/main.c dfn/tests/test_dfn_hop.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where this repo's keyed obj/bin trees live (default obj/ and bin/ here). A
@@ -573,29 +572,19 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: mono/aec_nr_res/main.c example_cli.h | _cfg
 $(OBJ_DIR)/test_mono_chain.o: mono/aec_nr_res/tests/test_mono_chain.c mono/aec_nr_res/tests/conv_chain_mono.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# Align-ULCNet objects (AIAEC-owned sources, compiled here and never edited here): ulcnet_process.o
-# is the adapter's output check, ulcnet_model_io.o the grid, the descriptor and the graph's
-# front and back end.
-$(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
-
+# Align-ULCNet objects (AIAEC-owned sources, compiled here and never edited here): ulcnet_model_io.o
+# is the grid, the descriptor and the graph's front and back end.
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # ulcnet_prepost.o: the pre/post class -- one object owning the feature front end and the
 # per-frame accelerator transaction, frequency domain only (the application frames with audiolib).
 # A TU of its own, so that ulcnet_model_io.c stays independently linkable.
-$(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mono_alignulcnet_main.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h example_cli.h | _cfg_guard
 	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # ulcnet_stream.o: the Align-ULCNet model stream (stream/aiaec/ulcnet), linked by the example and
 # the tests that run it. Not a member of any archive.
@@ -671,7 +660,7 @@ DFN_PIPELINE_OBJS = $(OBJ_DIR)/dfn_rate_bridge.o $(OBJ_DIR)/ainr_bridge.o $(OBJ_
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a FORCE
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_mono_chain test_mono_ulcnet test_dfn_res_stage test_dfn_rate_bridge test_dfn_stream_equivalence test_mono_dfn test_array_sample_post test_readme_flow test_dfn_hop example-adapter libaudio_pipeline_dfn.a FORCE
 # This branch is entered through the recursive `$(MAKE) ... COMMON_LIB=... AEC_LIB=... NR_LIB=...`
 # re-invoke. Make folds command-line variables into MAKEOVERRIDES/MAKEFLAGS for every further
 # $(MAKE) recipe, where another Makefile's own producer variables would collide with them.
@@ -690,11 +679,10 @@ $(DFN_LIB_TARGET): $(DFN_PIPELINE_OBJS) | _cfg_guard
 
 # test: also builds and runs example_board_adapter, whose exit code signals any failed positive-flow
 # step or negative demonstration. `make example-adapter` (below) runs it standalone.
-test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_mono_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_dfn_stream_equivalence $(BIN_DIR)/test_mono_dfn $(BIN_DIR)/test_array_sample_post $(BIN_DIR)/test_readme_flow $(BIN_DIR)/test_dfn_hop $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
+test: $(BIN_DIR)/test_mono_chain $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_mono_ulcnet $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_dfn_stream_equivalence $(BIN_DIR)/test_mono_dfn $(BIN_DIR)/test_array_sample_post $(BIN_DIR)/test_readme_flow $(BIN_DIR)/test_dfn_hop $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
 	"$(abspath $(BIN_DIR))/test_mono_chain" "$(abspath $(BIN_DIR))" "$(abspath $(OBJ_DIR))"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
 	"$(abspath $(BIN_DIR))/test_mono_ulcnet"
-	"$(abspath $(BIN_DIR))/test_ulcnet_accelerator_adapter"
 	"$(abspath $(BIN_DIR))/test_dfn_res_stage"
 	"$(abspath $(BIN_DIR))/test_dfn_rate_bridge"
 	"$(abspath $(BIN_DIR))/test_dfn_stream_equivalence"
@@ -759,7 +747,6 @@ mono_alignulcnet: $(BIN_DIR)/mono_alignulcnet
 mono_aec_dfn_res: $(BIN_DIR)/mono_aec_dfn_res
 test_mono_chain: $(BIN_DIR)/test_mono_chain
 test_mono_ulcnet: $(BIN_DIR)/test_mono_ulcnet
-test_ulcnet_accelerator_adapter: $(BIN_DIR)/test_ulcnet_accelerator_adapter
 test_dfn_res_stage: $(BIN_DIR)/test_dfn_res_stage
 test_dfn_rate_bridge: $(BIN_DIR)/test_dfn_rate_bridge
 test_dfn_stream_equivalence: $(BIN_DIR)/test_dfn_stream_equivalence
@@ -811,18 +798,10 @@ $(BIN_DIR)/test_mono_ulcnet: $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJ
 	$(LINK) -o $@ $(OBJ_DIR)/test_mono_ulcnet.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "test_mono_ulcnet [$(BACKEND)] -> $@"
 
-# The adapter drives the pre/post class, so its test links ulcnet_prepost.o and ulcnet_model_io.o
-# with it, and ulcnet_process.o.
-ULCNET_ADAPTER_OBJS = $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
-                      $(OBJ_DIR)/ulcnet_prepost.o \
-                      $(OBJ_DIR)/ulcnet_model_io.o
-
 $(BIN_DIR)/mono_alignulcnet: $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/mono_alignulcnet_main.o $(ULCNET_PIPELINE_OBJS) $(AEC_LIB) $(COMMON_LIB) $(LDFLAGS)
 	@echo "mono_alignulcnet [$(BACKEND)] -> $@"
 
-$(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o $(ULCNET_ADAPTER_OBJS) $(OBJ_DIR)/ulcnet_process.o $(COMMON_LIB) $(LDFLAGS)
 
 # The mono DFN2 program composes lib/aec's Aec (its RES gain) with the DFN archive; it has no
 # denoiser.

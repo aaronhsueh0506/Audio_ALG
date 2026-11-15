@@ -181,7 +181,6 @@ _STATE_TABLE_SOURCES = (
     'test_ulcnet_prepost_c.py',
     'test_prepost_chains.c',
     'test_prepost_kernels.c',
-    'test_ulcnet_accelerator_adapter.c',
 )
 _STATE_TABLE_NAMES = ('CHANNELS', 'SCORE_FRAMES', 'GRU_ROWS', 'GRU_HIDDEN')
 

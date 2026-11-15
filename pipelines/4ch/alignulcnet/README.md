@@ -49,7 +49,7 @@ it is already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame
 the Align-ULCNet chain would otherwise compute, so nothing is reconstructed
 or re-analysed in between. The far branch pushes the SAME hop's raw far samples (the
 caller's reference, never the array's aligned copy) through a rolling `AcStft`
-(the framing contract of `ulcnet_process.h`; `center` 0, exactly one frame per push from the first push). Both branches
+(the framing contract of `ulcnet_prepost.h`; `center` 0, exactly one frame per push from the first push). Both branches
 therefore carry input hop t at pipeline hop t with no delay buffer on either
 side, and every hop from hop #0 is exactly one inference.
 

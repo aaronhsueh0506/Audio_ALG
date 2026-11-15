@@ -15,8 +15,7 @@ Cases, all in ONE driver selected by argv[1], the grid by argv[2]
 for the module):
 
   equiv     the class vs analysis + model-I/O transaction + synthesis,
-            hand-composed from ONLY the model-I/O TU (not
-            ulcnet_accelerator_adapter.c, which is built on the class)
+            hand-composed from ONLY the model-I/O TU
   stalepool the stale-pool gate accepts the matching MemReq and refuses every
             mismatched one; the pool follows the grid, not D
   lifecycle _create/_destroy against _init on a caller pool
@@ -269,7 +268,7 @@ static HopSpectra specs[HOPS];
 static HopOut outs_a[HOPS], outs_b[HOPS];
 
 /* The application's framing, built from audiolib directly: the documented
- * contract (ulcnet_process.h) is sqrt-Hann, center 0, hop = n_fft / 2,
+ * contract (ulcnet_prepost.h) is sqrt-Hann, center 0, hop = n_fft / 2,
  * unnormalised spectra, AC_OLA_ENV_NORM synthesis. */
 typedef struct Framing {
     AcStft *error, *far;

@@ -238,8 +238,8 @@ alignment state (`info.delay`). `array_sample_beam_process_with_activity(b, mics
 The recurrent state is the application's, not the library's. On a board the accelerator keeps it and nothing is registered with the
 library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
 that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
-and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class or
-adapter a caller drives directly (`ulcnet_prepost_state_generation()`, `ulcnet_accelerator_adapter_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
+and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class a
+caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
 its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all) and on a refused
 commit (a non-finite head) of a real frame; a model failure on a real frame and a committed frame leave it alone. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
 compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config

@@ -58,7 +58,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 （<code>UlcnetGridSpec</code> = <code>sample_rate</code>、<code>n_fft</code>、<code>delay_depth</code>），
 範例 main 以 <code>--sample-rate 16000|48000</code>（預設 16000）選；一支 binary 兩個 grid 皆可，
 exporter 只收這兩個（<code>SUPPORTED_GRIDS</code>），16 k 的 checkpoint 不能當 48 k 用</td>
-<td rowspan="2"><code>ulcnet_model_io.h</code>（<code>UlcnetGrid</code>）、<code>ulcnet_process.h</code>（framing 契約）、
+<td rowspan="2"><code>ulcnet_model_io.h</code>（<code>UlcnetGrid</code>）、<code>ulcnet_prepost.h</code>（framing 契約）、
 <code>stream/aiaec/ulcnet/ulcnet_stream.h</code>；<code>ta_bins</code> 由 exporter 的 <code>ta_bins_for()</code> 導出</td></tr>
 <tr><td>48 k</td><td><b>1024 / 512（513）</b>；ta_bins 52</td></tr>
 <tr><td rowspan="3">DFN2 變體（mono + 4ch）<br>
@@ -114,7 +114,7 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <tr><td>4ch 範例合成窗</td><td><code>pipelines/4ch/4ch_static.c</code>：main 自己初始化的 <code>AcIstft</code> 自帶的窗表（<code>ac_window_build()</code>，<code>audiolib/common/src/audio_window.c</code>）</td></tr>
 <tr><td>DFN rate bridge（原生格點合成 + 48 kHz 分析／合成）</td><td><code>stream/ainr/bridge/ainr_bridge.c</code>：bridge 自建的兩張表（<code>win_n</code>、<code>win48</code>，<code>ac_window_build()</code>），借給五個 <code>AcStft</code>／<code>AcIstft</code></td></tr>
 <tr><td>ULCNet 兩條範例</td><td>應用端（<code>main.c</code>）的 <code>AcStft</code>／<code>AcIstft</code>（<code>ac_stft_config_default()</code>，<code>AC_OLA_ACCUMULATE</code>）；範例走 <code>ulcnet_stream</code> 的頻譜進出口，不呼叫串流自己的 FFT</td></tr>
-<tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_process.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code> 檔頭</td></tr>
+<tr><td>Align-ULCNet／DeepVQE-S／DFN2／DFN3／GTCRN／RNNoise-ERB 的前後處理</td><td>函式庫不持有窗表、FFT handle 或 STFT 物件：應用端用 <code>ac_stft_config_default(&amp;sc, grid.n_fft)</code> 的預設窗建 <code>AcStft</code>／<code>AcIstft</code>，分析與合成共用；各模型要求的 <code>center</code>、<code>ola</code> 與縮放寫在 <code>ulcnet_prepost.h</code>、<code>deepvqe_prepost.h</code>、<code>dfn2_process.h</code>、<code>dfn3_process.h</code>、<code>gtcrn_process.h</code>、<code>lib/ainr/rnnoise_erb/process.h</code> 檔頭</td></tr>
 <tr><td>AIAEC Python streaming 參考</td>
 <td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
 </table>
@@ -157,7 +157,7 @@ partition 的因果半、清掉其餘，避免 wrap-around 能量漏進下一個
 <h2 id="section-4">centered framing 與串流（center=False）framing</h2>
 <p>AINR DFN2 的 C 是 center=False 串流（<code>dfn2_process.h</code> 檔頭的 framing 契約：與訓練 graph 的 center=True 只差一個 clip 的第一幀），
 Align-ULCNet 的 C 出貨路徑也是 center=False rolling 分析，與 torch <code>center=True</code>
-的穩態幀逐 bit 重合（<code>ulcnet_process.h</code> 檔頭）。</p>
+的穩態幀逐 bit 重合（<code>ulcnet_prepost.h</code> 檔頭）。</p>
 <p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
 sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
 [k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
@@ -178,7 +178,7 @@ push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；
 </ul>
 <p><b>ULCNet 的兩種分析排程並存，出貨路徑分兩派。</b>
 <code>AcStft</code> 的 <code>center</code> 0（應用端以 <code>ac_stft_config_default()</code> 的預設建立，
-契約在 <code>lib/aiaec/ulcnet/ulcnet_process.h</code>）是 rolling 分析：
+契約在 <code>lib/aiaec/ulcnet/ulcnet_prepost.h</code>）是 rolling 分析：
 <b>從第一次 push 起每次恰好一幀</b>（第一幀的前半段是被歸零的 history），
 且與 <code>center</code> 1 對同一個 pushed hop 所發的
 <b>最後一幀逐 bit 相同</b>——centered 排程只是多了開頭那個 reflect 前綴幀。
@@ -248,7 +248,7 @@ array 的增益級（<code>residual = FULL</code>）算 RES 增益，ULCNet 的 
 <td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResidualView.formed_hop</code>）</td></tr>
 <tr><td>Align-ULCNet 鏈（rolling center=False STFT ×2 → NN callback → WOLA）</td>
 <td>+1 hop（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td>
-<td><code>ulcnet_process.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
+<td><code>ulcnet_prepost.h</code>：第一幀無輸出（pipeline 補零）、hop#p 輸出
 對應輸入 [（p−1)·<code>grid.hop</code>, p·<code>grid.hop</code>)</td></tr>
 <tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
 <td><code>mono/alignulcnet/README.md</code>：延遲一個 hop，全部來自應用端 <code>AcIstft</code> 的合成(頻譜進出口不加延遲；hop #0 是真輸出，第一幀合成窗前半疊加零歷史)；輸出 hop p ≙ 輸入 hop p−1</td></tr>

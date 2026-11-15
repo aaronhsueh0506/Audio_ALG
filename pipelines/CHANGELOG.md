@@ -3,6 +3,16 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — Align-ULCNet accelerator adapter and `ulcnet_process` removed
+
+`lib/aiaec/ulcnet/ulcnet_accelerator_adapter.{c,h}`, `lib/aiaec/ulcnet/ulcnet_process.{c,h}` and `AIAEC/tests/test_ulcnet_accelerator_adapter.c` are deleted. Since the desktop pipelines moved to `ulcnet_stream_*_freq`, nothing called the adapter, `UlcnetModel`, `UlcnetNnJob` or `ulcnet_frame_is_finite()`; the board samples, the model stream and `aiaec.c` never did.
+
+- **Framing contract.** The audiolib framing the model is trained against (sqrt-Hann, center 0, `AC_OLA_ACCUMULATE`, scales 1) moved verbatim into the header comment of `ulcnet_prepost.h`, which now includes `ulcnet_model_io.h` directly. The docs that cited `ulcnet_process.h` point there.
+- **Build.** `libaiaec_prepost.a` is `ulcnet_model_io`, `ulcnet_prepost`, `deepvqe_process`, `deepvqe_prepost`. `pipelines/Makefile` drops the adapter objects, `test_ulcnet_accelerator_adapter` and `ulcnet_process.c` from `TARGET_ABI_SRCS`; the header lists of `pipelines/4ch/Makefile`, `stream/aiaec/Makefile` and `stream/aiaec/ulcnet/Makefile` drop `ulcnet_process.h`.
+- **No behaviour, pool or layout change.** The 49 remaining objects per SIMD setting (pipelines, 4ch, the AIAEC archive, `stream/aiaec`, `stream/aiaec/ulcnet`; no `-g`) are byte-identical at SIMD 1 and 0, the `ulcnet_stream_*_freq` digest is unchanged, and `ULCNET_MODEL_IO_LAYOUT_VERSION` 18 / 19, `ULCNET_PREPOST_CARVE_VERSION` 9 and `ULCNET_STREAM_LAYOUT_VERSION` 3 stay.
+- **Python tests.** Compile lists and strings only: `test_prepost_chains.py` no longer compiles `ulcnet_process.c`, `test_export_streaming_ulcnet.py` no longer pins the deleted test's state table, and two docstrings name `ulcnet_prepost.h`.
+- Docs: `AIAEC/Align_ULCNet/reference/deployment.md`, `docs/maintenance/models.md`, `docs/reference/board/sequence.md`, `docs/html/models/align-ulcnet/reference/core.html` (the callback example is gone), `docs/html/models/reference/onnx.html`, `docs/html/start/reference/grids.html`, `docs/html/pipelines/reference/align-ulcnet/configuration.html`, `pipelines/{mono,4ch}/alignulcnet/README.md`, `docs/c_python_function_map.md` (874 C functions).
+
 ## [Unreleased] — 2026-11-15 — The desktop Align-ULCNet pipelines run the model stream (`ulcnet_stream_*_freq`); `pipelines/ulcnet/` is retired
 
 The two example mains (`mono_alignulcnet`, `4ch_alignulcnet`) now drive the spectrum entries of the model-stream layer `stream/aiaec/ulcnet` (`ulcnet_stream_init_ex()`, `ulcnet_stream_pre_process_freq()` / `ulcnet_stream_post_process_freq()`) between their own `AcStft` / `AcIstft`. `pipelines/ulcnet/` (`ulcnet_nn_stage.{h,c}`, `tests/test_ulcnet_nn_stage.c`, `README.md`) is deleted; the examples no longer link `ulcnet_accelerator_adapter.o` or `ulcnet_process.o` (both stay in `lib/aiaec/ulcnet` and `libaiaec_prepost.a`, with `test_ulcnet_accelerator_adapter`). No library source changed apart from two comment lines of `ulcnet_stream.h` (`cc -E -P` identical); `ULCNET_STREAM_LAYOUT_VERSION` 3 stays. The Python twins are untouched.

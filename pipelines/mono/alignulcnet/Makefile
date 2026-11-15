@@ -4,11 +4,9 @@ all:
 	$(MAKE) -C ../.. mono_alignulcnet
 
 test: all
-	$(MAKE) -C ../.. test_mono_ulcnet \
-	  test_ulcnet_accelerator_adapter
+	$(MAKE) -C ../.. test_mono_ulcnet
 	set -e; bin="$$($(MAKE) -s -C ../.. print-bin-dir)"; \
 	  "$$bin/test_mono_ulcnet"; \
-	  "$$bin/test_ulcnet_accelerator_adapter"; \
 	  "$$bin/mono_alignulcnet"; \
 	  "$$bin/mono_alignulcnet" --delay-num-filters 1; \
 	  "$$bin/mono_alignulcnet" --sample-rate 48000; \

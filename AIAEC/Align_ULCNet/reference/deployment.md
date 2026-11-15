@@ -135,8 +135,7 @@ metadata. `query_now` is not state and is not returned. Delay distribution is
 debug-only and is not part of the production ABI.
 
 `ulcnet_model_io_state_generation()` (also exposed as
-`ulcnet_prepost_state_generation()` and
-`ulcnet_accelerator_adapter_state_generation()`) counts the times the C side
+`ulcnet_prepost_state_generation()`) counts the times the C side
 restarted the state: `reset` and each refused frame add one, whether or not
 state is registered; it is 0 after init. A board whose accelerator keeps
 fixed-point state loads the quantized representation of zero into its state
@@ -313,7 +312,7 @@ may compare or log `linear_aec_contract_version` against
 `ULCNET_MODEL_IO_FRONTEND_CONTRACT` in `ulcnet_model_io.h`
 (`aiaec-linear-error-v4`), e.g. to tell a graph exported from a retired v3
 checkpoint. The C code never reads the constant and
-`ulcnet_accelerator_adapter_init()` never refuses by front end. Enforcement is
+`ulcnet_prepost_init()` never refuses by front end. Enforcement is
 on the Python side (export, inference, calibration) and in the committed
 tests. The constant is not part of the descriptor and is not a layout bump; a
 test pins it to `LINEAR_AEC_CONTRACT_VERSION`. Export refuses a checkpoint
@@ -336,7 +335,9 @@ the graph.
 
 A descriptor written for any other layout fails `ulcnet_model_io_descriptor_validate()` on
 `layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION`, and
-`ulcnet_accelerator_adapter_init()` therefore returns NULL. The K/V and logit
+`ulcnet_prepost_get_mem_size()` and `_init()` refuse a nonzero
+`model_layout_version` other than this build's layout (18 for one frame per
+call, 19 for a packet). The K/V and logit
 windows are full windows (D and 5 frames) and the two GRU hiddens are one
 tensor. The mask is a quantization target of its own: the `complex_mask` 1x1
 Conv has no activation, so its range comes from calibration.
@@ -360,16 +361,15 @@ generation advances, the transaction is discarded and -1 is returned; the
 caller's outputs are untouched after a refused mask or state and hold no valid
 frame after a refused spectrum. A partial write to state is detectable only as
 a non-finite value. The enhanced-spectrum check is C only: the Python
-reference `host_back_end` returns the non-finite frame. `ulcnet_process.h` holds the `UlcnetModel` callback, the
-`UlcnetNnJob`, `ulcnet_frame_is_finite()` and the framing contract below, and
-no transform code. Board NPU drivers and mono/4ch pipeline wiring are outside
+reference `host_back_end` returns the non-finite frame. `ulcnet_prepost.h` states the
+framing contract below; the library holds no transform code. Board NPU drivers and mono/4ch pipeline wiring are outside
 this model-side deliverable.
 
 `ulcnet_prepost.c/.h` is the pre/post *class* over the model I/O layer: one
 opaque `UlcnetPrepost` that takes the error and far spectra and owns the
 feature front end and the per-frame accelerator transaction, so an integrator
 never composes `ulcnet_model_io` by hand. It is frequency domain only. The
-application frames with audiolib as `ulcnet_process.h` states: the analysis
+application frames with audiolib as `ulcnet_prepost.h` states: the analysis
 `AcStft` per stream from `ac_stft_config_default(&sc, grid.n_fft)` (sqrt-Hann,
 `spec_scale` 1, center 0, one frame per hop from hop 0) and one `AcIstft` with
 `ola = AC_OLA_ENV_NORM`, `ispec_scale` 1, whose first frame emits nothing (latency
@@ -383,11 +383,7 @@ reported failure is taken not to have written); the pool's `build_flags_hash`
 still folds D, so `_init_ex` refuses a pool recorded for another D although the
 bytes are equal. The class gate is `tests/test_ulcnet_prepost_c.py`.
 
-`ulcnet_accelerator_adapter.c/.h` is the reusable bridge from this explicit
-state ABI to `UlcnetModel`; it drives a `UlcnetPrepost` instance and takes the
-state registration (`UlcnetModelIoStateBuffers`, NULL on a board) at init. It
-is included in `libaiaec_prepost.a` (`make -C AIAEC print-lib-path`). The mono
-and four-channel example applications do not use it: they drive the model
+The mono and four-channel example applications drive the model
 stream's spectrum entries (`stream/aiaec/ulcnet/ulcnet_stream.h`) and add their
 board runtime call and surrounding audio flow.
 

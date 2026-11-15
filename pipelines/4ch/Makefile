@@ -387,7 +387,7 @@ $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcn
 
 # ulcnet_prepost.o: the AIAEC-owned pre/post class the model stream drives (the same TU
 # pipelines/Makefile links for the mono application).
-$(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_alignulcnet_main.o: alignulcnet/main.c array_sample_driver.h array_sample_beam.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h ../example_cli.h | _cfg_guard

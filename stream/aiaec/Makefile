@@ -152,7 +152,6 @@ DEEPVQE_CORE_HEADERS := ../../lib/aiaec/deepvqe_s/deepvqe_process.h \
 ULCNET_CORE_SOURCES := ../../lib/aiaec/ulcnet/ulcnet_model_io.c \
 	../../lib/aiaec/ulcnet/ulcnet_prepost.c
 ULCNET_CORE_HEADERS := ../../lib/aiaec/ulcnet/ulcnet_model_io.h \
-	../../lib/aiaec/ulcnet/ulcnet_process.h \
 	../../lib/aiaec/ulcnet/ulcnet_prepost.h
 ULCNET_STREAM_SOURCES := ulcnet/ulcnet_stream.c
 ULCNET_STREAM_HEADERS := ulcnet/ulcnet_stream.h

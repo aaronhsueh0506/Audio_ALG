@@ -149,6 +149,6 @@ make SIMD=0 test
 make SIMD=1 test
 ```
 
-`test` runs `test_mono_ulcnet` (both grids from one binary) and `test_ulcnet_accelerator_adapter`,
+`test` runs `test_mono_ulcnet` (both grids from one binary),
 the skeleton at n=5 and n=1 on both grids, and the malformed-number checks above. The stream's spectrum entries on their own
 (`stream/aiaec/ulcnet/tests/test_ulcnet_stream_freq.c`) run in `make -C stream/aiaec/ulcnet test`.

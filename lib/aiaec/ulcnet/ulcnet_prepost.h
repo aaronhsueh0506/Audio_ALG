@@ -1,7 +1,12 @@
-/* Align-ULCNet pre/post class, frequency domain only (framing: ulcnet_process.h): the caller's spectra to the
- * accelerator's tensors and back. Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (or frame_bypass),
- * post_process_freq. The recurrent state is outside the pool: it belongs to the application and is optionally
- * registered in the config.
+/* Align-ULCNet pre/post class, frequency domain only: the caller's spectra to the accelerator's tensors and back.
+ * Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (or frame_bypass), post_process_freq. The recurrent
+ * state is outside the pool: it belongs to the application and is optionally registered in the config.
+ *
+ * Framing (the application's, with audiolib on the run-time UlcnetGrid; Python reference aiaec_streaming). Trained
+ * against: sqrt-Hann (ac_window_build default); analysis AcStft from ac_stft_config_default(&sc, grid.n_fft),
+ * hop = grid.hop, spec_scale 1, center 0 (one frame per push; the Python reference is centered: 0, 2, then 1);
+ * synthesis AcIstft, same config, ola AC_OLA_ACCUMULATE, ispec_scale 1, every push emits a full hop (hop #0
+ * included), latency grid.hop. FftHandle and window table: caller-owned, shareable.
  *
  * Packet boundary (config frames_per_call N >= 2, model layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): the same
  * sequence with pre_process_packet in place of pre_process_freq, one NPU run for the N frames, and N * n_bins values
@@ -14,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "ulcnet_process.h"   /* ulcnet_model_io.h: UlcnetGrid */
+#include "ulcnet_model_io.h"   /* UlcnetGrid */
 
 #ifdef __cplusplus
 extern "C" {

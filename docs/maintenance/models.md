@@ -199,9 +199,8 @@ No production quality claim is required or permitted without trained models.
 
 ### 12.4 C pre/post archive
 
-`AIAEC/Makefile` builds `libaiaec_prepost.a` — `ulcnet_process`,
-`ulcnet_model_io`, `ulcnet_prepost`, `ulcnet_accelerator_adapter`,
-`deepvqe_process`, `deepvqe_prepost`.
+`AIAEC/Makefile` builds `libaiaec_prepost.a` — `ulcnet_model_io`,
+`ulcnet_prepost`, `deepvqe_process`, `deepvqe_prepost`.
 
 ```bash
 make -C AIAEC SIMD=1 WERROR=1 lib
@@ -213,8 +212,7 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
       `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`) and a signature collision
       is refused rather than reinterpreted; resolve it with `print-lib-path`.
 - [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
-      (`ulcnet_process`, `ulcnet_model_io`, `deepvqe_process`,
-      `deepvqe_prepost`); never mix a `SIMD=0` archive with a `SIMD=1`
+      (`ulcnet_model_io`, `deepvqe_process`, `deepvqe_prepost`); never mix a `SIMD=0` archive with a `SIMD=1`
       application, and resolve the archive with `print-lib-path`.
 - [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a translation
       unit of its own that uses `ulcnet_model_io` / `deepvqe_process`, which stay

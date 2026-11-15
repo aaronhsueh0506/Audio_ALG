@@ -56,11 +56,9 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 LIB := $(OBJ_DIR)/libaiaec_prepost.a
 # ulcnet_prepost.o and deepvqe_prepost.o are the pre/post classes, each a TU of
 # its own: they use ulcnet_model_io.o and deepvqe_process.o, which stay
-# independently linkable. The accelerator adapter drives the Align-ULCNet class.
-OBJECTS := $(OBJ_DIR)/ulcnet_process.o \
-	$(OBJ_DIR)/ulcnet_model_io.o \
+# independently linkable.
+OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o \
 	$(OBJ_DIR)/ulcnet_prepost.o \
-	$(OBJ_DIR)/ulcnet_accelerator_adapter.o \
 	$(OBJ_DIR)/deepvqe_process.o \
 	$(OBJ_DIR)/deepvqe_prepost.o
 

@@ -27,7 +27,7 @@ _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 _TEST_SOURCE = os.path.join(_THIS_DIR, 'test_prepost_chains.c')
 
 _ULCNET_SOURCES = tuple(os.path.join(_ULCNET_DIR, name) for name in (
-    'ulcnet_process.c', 'ulcnet_model_io.c', 'ulcnet_prepost.c'))
+    'ulcnet_model_io.c', 'ulcnet_prepost.c'))
 _DEEPVQE_SOURCES = (
     os.path.join(_DEEPVQE_DIR, 'deepvqe_process.c'),
     os.path.join(_DEEPVQE_DIR, 'deepvqe_prepost.c'),

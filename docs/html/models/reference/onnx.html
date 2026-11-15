@@ -61,8 +61,7 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
 <tr><td>Align-ULCNet</td><td>layout 18(唯一的 boundary):四個壓縮域特徵(error_mag/far_mag/error_cos/error_sin,host signed-pow 前端;壓縮域 error 頻譜留在 model_io state,不進 graph) + 四個 rank-4 state:K/V window <code>[1,32,D,TA]</code>(newest-first)、logit window <code>[1,32,5,D]</code>(oldest-first)、單一 <code>h_gru [1,4,1,128]</code>(由應用端持有)</td>
-<td>graph 止於 complex_mask 1×1 Conv,output = 複數 mask(planar <code>[1,2,1,K]</code>;host 以壓縮域 error 乘它再逆冪) + <b>每個 state 的完整下一個 window</b>(shape 同輸入;位移在 graph 內:輸入端 Slice 加 Concat)</td><td><code>lib/aiaec/ulcnet/ulcnet_process.c/h</code>、
-<code>ulcnet_model_io.c/h</code>(<code>ulcnet_model_io_prepare()</code>／<code>ulcnet_model_io_enhance_spectrum()</code> 內建前後端),
+<td>graph 止於 complex_mask 1×1 Conv,output = 複數 mask(planar <code>[1,2,1,K]</code>;host 以壓縮域 error 乘它再逆冪) + <b>每個 state 的完整下一個 window</b>(shape 同輸入;位移在 graph 內:輸入端 Slice 加 Concat)</td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.c/h</code>(<code>ulcnet_model_io_prepare()</code>／<code>ulcnet_model_io_enhance_spectrum()</code> 內建前後端),
 外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
 <td>real mask + next state</td><td>無（沒有 C 程式碼）</td></tr>
@@ -141,7 +140,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉�
 匯出時 <code>validate_inplace_state_graph()</code>（<code>AINR/onnx_streaming_contract.py</code>，AIAEC 匯出器經 <code>validate_inplace_state_contract</code> 呼叫同一份實作）逐檔檢查這個結構，metadata 帶 <code>state_binding = in_place_same_address</code>，
 並為每個 window 宣告丟哪一端（AINR 的 <code>state_slicing</code> 內 <code>drop</code>、AIAEC 的 <code>state_window_drop</code>：time-ordered window 為 <code>first</code>，newest-first ring 為 <code>last</code>），驗證器只接受那一端的 Slice 範圍。RNNoise-ERB 的匯出器只寫 <code>state_layout_version</code>，不寫 <code>state_binding</code>，也不跑這項檢查。</p>
 
-<p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 與 <code>ulcnet_accelerator_adapter_state_generation()</code> 依同一規則）、
+<p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 依同一規則）、
 <code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN2／DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate 各加一，有沒有登錄 state 都照算。
 pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>；舊的 <code>dfn_res_stage_state_generation()</code>／<code>dfn_rate_bridge_state_generation()</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
 板端 sample 比較這個值，與上次看到的不同就用量化後的 0 重填 state 輸入。
@@ -220,9 +219,8 @@ Align-CRUSE 與 CAGCRN 分別提供 real mask 和 complex mask 的頻域合成 h
 make -C AINR  lib &amp;&amp; make -C AINR  print-lib-path   # libainr_prepost.a
 make -C AIAEC test                                  # 建庫 + pytest</pre>
 
-<p><code>libaiaec_prepost.a</code> 成員：<code>ulcnet_process</code>、
+<p><code>libaiaec_prepost.a</code> 成員：
 <code>ulcnet_model_io</code>、<code>ulcnet_prepost</code>、
-<code>ulcnet_accelerator_adapter</code>、
 <code>deepvqe_process</code>、<code>deepvqe_prepost</code>。
 <code>libainr_prepost.a</code> 成員：<code>dfn2_process</code>、<code>dfn2_model_io</code>、
 <code>dfn2_prepost</code>、<code>dfn3_process</code>、<code>dfn3_model_io</code>、<code>dfn3_prepost</code>、<code>gtcrn_process</code>、<code>rnnoise_process</code>

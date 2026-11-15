@@ -1,7 +1,7 @@
 """Parity gate for the Align-ULCNet framing contract, its back end and the CCM kernel.
 
 The framing is the application's, built from audiolib directly (the contract
-the weights are trained against is stated in ulcnet_process.h). A tiny
+the weights are trained against is stated in ulcnet_prepost.h). A tiny
 file-driven test main (written to a temp dir, never to the repo) drives
 audiolib's AcStft / AcIstft in that configuration (sqrt-Hann, centered
 analysis, envelope-normalised synthesis) on random audio and compares, frame by

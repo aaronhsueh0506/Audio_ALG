@@ -78,11 +78,11 @@
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 295 | 39 | 19 | 20 | 256 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 145 | 48 | 25 | 23 | 97 | 0 | 2 | 17 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 106 | 35 | 20 | 15 | 71 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 884 | 176 | 98 | 78 | 708 | 0 | 57 | 62 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 96 | 35 | 20 | 15 | 61 | 0 | 0 | 15 |
+| `TOTAL` 合計 | 874 | 176 | 98 | 78 | 698 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：884 個 C 函式中，176 個有 Python 對應（mirror 98、partial 78），其中 62 個的配對是推論；708 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：874 個 C 函式中，176 個有 Python 對應（mirror 98、partial 78），其中 62 個的配對是推論；698 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -167,11 +167,9 @@
 | `lib/ainr/dfn2/dfn2_process.c` | all | 24 |
 | `lib/ainr/gtcrn/gtcrn_process.c` | all | 29 |
 | `lib/ainr/rnnoise_erb/process.c` | all | 31 |
-| `lib/aiaec/ulcnet/ulcnet_accelerator_adapter.c` | all | 9 |
 | `lib/aiaec/ulcnet/ulcnet_model_io.c` | all | 34 |
 | `lib/aiaec/ulcnet/ulcnet_model_io.h` | all | 1 |
 | `lib/aiaec/ulcnet/ulcnet_prepost.c` | all | 23 |
-| `lib/aiaec/ulcnet/ulcnet_process.c` | all | 1 |
 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c` | all | 33 |
 | `lib/aiaec/deepvqe_s/deepvqe_prepost.h` | all | 1 |
 | `lib/aiaec/deepvqe_s/deepvqe_process.c` | all | 4 |
@@ -356,7 +354,7 @@
 | AIAEC-UL-03 | `lib/aiaec/ulcnet/ulcnet_model_io.h: ulcnet_model_io_signed_pow` | `AIAEC/Align_ULCNet/model.py:_signed_power` | mirror | — | — | 檔內註解明載是 model.py `_signed_power` 的唯一 C 副本。 |
 | AIAEC-UL-06 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_pre_process_freq, ulcnet_prepost_pre_process_packet, ulcnet_prepost_frame_open` | `AIAEC/Align_ULCNet/export_onnx.py:stream_features` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）暫存一個 hop 的誤差頻譜與遠端頻譜，再送進 model I/O 的 prepare；頻譜由應用端的 AcStft 產生，類別不含框架。 |
 | AIAEC-UL-07 | `lib/aiaec/ulcnet/ulcnet_prepost.c: ulcnet_prepost_frame_finish, ulcnet_prepost_post_process_freq` | `AIAEC/Align_ULCNet/export_onnx.py:host_back_end` | partial | T-14 | `AIAEC/tests/test_ulcnet_prepost_c.py`（C 對 C） | （推論）把圖輸出送進 model I/O 的 `enhance_spectrum`，再交出增強後頻譜；合成由應用端的 AcIstft 完成。 |
-| AIAEC-UL-09 | `lib/aiaec/ulcnet/ulcnet_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_layout, pp_buffers, ulcnet_prepost_config_defaults, pp_check_config, pp_descriptor_for, ulcnet_prepost_get_mem_size, ulcnet_prepost_init_ex, ulcnet_prepost_init, ulcnet_prepost_create, ulcnet_prepost_destroy, ulcnet_prepost_reset, ulcnet_prepost_state_generation, ulcnet_prepost_descriptor, pp_close_frame, ulcnet_prepost_frame_bypass`<br>`lib/aiaec/ulcnet/ulcnet_process.c: ulcnet_frame_is_finite`<br>`lib/aiaec/ulcnet/ulcnet_model_io.c: mio_carve, mio_layout, ulcnet_grid_make, ulcnet_grid_validate, ulcnet_model_io_descriptor_default, ulcnet_model_io_descriptor_default_packet, ulcnet_model_io_descriptor_frames, boundary_is_consistent, ulcnet_model_io_descriptor_grid, ulcnet_model_io_descriptor_validate, ulcnet_model_io_get_mem_requirements, ulcnet_model_io_init, ulcnet_model_io_state_buffers_validate, zero_registered, all_finite_or_empty, clear_recurrent_state, ulcnet_model_io_reset, ulcnet_model_io_state_generation, frame_is_finite, ulcnet_model_io_descriptor`<br>`lib/aiaec/ulcnet/ulcnet_accelerator_adapter.c: adapter_config, adapter_layout, ulcnet_accelerator_adapter_get_mem_size, ulcnet_accelerator_adapter_init, infer, reset, ulcnet_accelerator_adapter_state_generation, ulcnet_accelerator_adapter_descriptor, ulcnet_accelerator_adapter_model` | — | C-only | T-14 | — | 記憶體池佈局、`UlcnetGrid` 與描述子驗證、已註冊遞迴狀態（全有或全無；函式庫只做有限性掃描與歸零，狀態形狀由應用端持有）、加速器 adapter 與 callback 步進；沒有 Python 孿生。 |
+| AIAEC-UL-09 | `lib/aiaec/ulcnet/ulcnet_prepost.c: pp_carve, pp_fnv1a, pp_build_hash, pp_layout, pp_buffers, ulcnet_prepost_config_defaults, pp_check_config, pp_descriptor_for, ulcnet_prepost_get_mem_size, ulcnet_prepost_init_ex, ulcnet_prepost_init, ulcnet_prepost_create, ulcnet_prepost_destroy, ulcnet_prepost_reset, ulcnet_prepost_state_generation, ulcnet_prepost_descriptor, pp_close_frame, ulcnet_prepost_frame_bypass`<br>`lib/aiaec/ulcnet/ulcnet_model_io.c: mio_carve, mio_layout, ulcnet_grid_make, ulcnet_grid_validate, ulcnet_model_io_descriptor_default, ulcnet_model_io_descriptor_default_packet, ulcnet_model_io_descriptor_frames, boundary_is_consistent, ulcnet_model_io_descriptor_grid, ulcnet_model_io_descriptor_validate, ulcnet_model_io_get_mem_requirements, ulcnet_model_io_init, ulcnet_model_io_state_buffers_validate, zero_registered, all_finite_or_empty, clear_recurrent_state, ulcnet_model_io_reset, ulcnet_model_io_state_generation, frame_is_finite, ulcnet_model_io_descriptor` | — | C-only | T-14 | — | 記憶體池佈局、`UlcnetGrid` 與描述子驗證、已註冊遞迴狀態（全有或全無；函式庫只做有限性掃描與歸零，狀態形狀由應用端持有）；沒有 Python 孿生。 |
 | AIAEC-DV-01 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: compress_planar` | `AIAEC/aiaec_common.py:compressed_ri_feature` | mirror | — | `AIAEC/tests/test_prepost_kernels.py`（NEON 對純量） | 壓縮 mic／far 最大差 4.77e-7（一次性量測）。 |
 | AIAEC-DV-02 | `lib/aiaec/deepvqe_s/deepvqe_process.c: deepvqe_ccm_init, deepvqe_ccm_reset, deepvqe_ccm_process, ccm_edge_bin` | `AIAEC/DeepVQE_S/model.py:DeepVQES._apply_ccm_frame`<br>`AIAEC/aiaec_common.py:apply_causal_tf_filter`<br>`AIAEC/_export_common.py:COMPOSITION` | mirror | — | `AIAEC/tests/test_ulcnet_process_c.py`（C↔Py） | 複數卷積遮罩（CCM）；最大差 7.63e-6（峰值 95）。兩個邊緣 bin 的越界 tap 略過，與乘零不同。兩個環由呼叫端借出，`deepvqe_ccm_reset` 只清環。 |
 | AIAEC-DV-03 | `lib/aiaec/deepvqe_s/deepvqe_prepost.c: deepvqe_prepost_pre_process_freq, deepvqe_prepost_frame_open` | `AIAEC/aiaec_common.py:compressed_ri_feature` | partial | T-14 | `AIAEC/tests/test_deepvqe_prepost_c.py`（C 對 C） | （推論）暫存一個 hop 的麥克風與遠端頻譜，再做壓縮特徵；頻譜由應用端的 AcStft 產生。 |
