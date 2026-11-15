@@ -216,7 +216,8 @@ int main(int argc, char **argv) {
 
     /* dfn2_model_io_descriptor_default() fills the external fields for the model grid
      * (args.model_grid) and does not inspect the model; the interior fields stay 0 and are never
-     * read. A product fills the descriptor from its model's exported metadata. */
+     * read. A host that reads the exported model metadata fills it from there; the board samples
+     * check ports only, which do not depend on the lookahead pair. */
     if (dfn2_model_io_descriptor_default(&args.model_grid, &descriptor) != 0) goto done;
     memset(&model, 0, sizeof(model));
     model.user = NULL;
