@@ -96,16 +96,16 @@ unsigned seen = ainr_state_generation(ctx);
 while (read_block(pcm_in, hop_in)) {
     StreamWork work;
     if (ainr_preprocess(ctx, pcm_in, &amp;work) != AINR_OK) return -1;   /* 1. 成功回 0 */
-    int ai_rc = -1, chk;
+    int run_status = STREAM_RUN_NOT_STARTED, chk;
     GRAPH_IO_CHECK_WORK(chk, &amp;model, &amp;work);               /* work 的數量與 shape 必須等於這一列 */
-    if (chk == GRAPH_IO_OK) ai_rc = run_ai3(&amp;work);          /* 2. 板端 sample 自己的 AI3；不符就不送件 */
-    if (ainr_postprocess(ctx, ai_rc, pcm_out) != AINR_OK) return -1; /* 3. ai_rc != 0 也要呼叫 */
+    if (chk == GRAPH_IO_OK) run_status = run_ai3(&amp;work);     /* 2. 板端 sample 自己的 AI3；不符就不送件。回 0、STREAM_RUN_NOT_STARTED 或 STREAM_RUN_FAILED */
+    if (ainr_postprocess(ctx, run_status, pcm_out) != AINR_OK) return -1; /* 3. 狀態非 0 也要呼叫 */
     write_block(pcm_out, hop_in);
 }</code></pre>
 <ul>
-<li>步驟 2 的 <code>run_ai3()</code> 把 <code>work.inputs</code> 依位置填進加速器、執行、把 <code>work.outputs</code> 讀回。state 留在加速器的 buffer，由 sample 依 <code>work.state_generation</code> 與失敗紀錄重載量化零，細節與範例在<a href="reference/board.html#state">板端整合</a>。</li>
-<li>送件前的核對失敗（數量或 shape 與模型設定的列不同）代表 stream 與接線資料不一致：該包不呼叫 AI3，<code>ai_rc</code> 填非零，照常呼叫 <code>ainr_postprocess()</code>。每次成功的 pre 仍恰好對應一次 post。</li>
-<li>執行或讀回失敗時，<code>ai_rc</code> 填非零並照常呼叫 <code>ainr_postprocess()</code>：當拍走近恆等直通（單位 mask、alpha 0），不是靜音，<code>pcm_out</code> 仍有 <code>hop_in</code> 個有效樣本。</li>
+<li>步驟 2 的 <code>run_ai3()</code> 把 <code>work.inputs</code> 依位置填進加速器、執行、把 <code>work.outputs</code> 讀回。state 留在加速器的 buffer，由 sample 依 <code>work.state_generation</code> 重載量化零，細節與範例在<a href="reference/board.html#state">板端整合</a>。</li>
+<li>送件前的核對失敗（數量或 shape 與模型設定的列不同）代表 stream 與接線資料不一致：該包不呼叫 AI3，狀態填 <code>STREAM_RUN_NOT_STARTED</code>，照常呼叫 <code>ainr_postprocess()</code>。每次成功的 pre 仍恰好對應一次 post。</li>
+<li>執行狀態（<code>stream/common/stream_run.h</code>）：0 = 每個 head 都由完成的執行寫好；<code>STREAM_RUN_NOT_STARTED</code> = 沒有執行開始，加速器的 state 沒動；其他值（<code>STREAM_RUN_FAILED</code> 是 -1）= state 可能已被寫髒。執行或讀回失敗時照常呼叫 <code>ainr_postprocess()</code>：當拍走近恆等直通（單位 mask、alpha 0），不是靜音，<code>pcm_out</code> 仍有 <code>hop_in</code> 個有效樣本。函式庫在 state 可能不再是該接續的那一份時推進 generation（reset、被拒的 commit、髒狀態、模型重啟，另有每個暖機拍），sample 在 generation 與上次歸零時不同時於執行前重載量化零；<code>STREAM_RUN_NOT_STARTED</code> 不推進，不會多歸零一次。</li>
 <li><code>ainr.h</code> 沒有 destroy 函式，pool 由呼叫端釋放。介面是檔案模式：ERB 表在 <code>ainr_init()</code> 從產品設定的路徑載入；沒有 stdio 的板子改用較低階的 <a href="../../../../stream/ainr/dfn2/dfn2_stream.h">dfn2_stream.h</a>。</li>
 <li><code>AinrInfo</code> 只有 <code>graph_path</code>、<code>trim_samples</code>、<code>queue_frames</code>、<code>tail_zero_blocks</code> 四欄；N 與 <code>hop_in</code> 不在其中，sample 由 config 算 N = <code>hop_in / (fft / 2)</code>。兩個家族（PCM、<code>_freq</code>）對同一組態填出相同的內容。</li>
 </ul>

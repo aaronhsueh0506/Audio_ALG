@@ -76,7 +76,7 @@ Specific to this one:
 
 - the `DFN2Grid` in its config decides everything that depends on the signal grid or the lookahead pair;
 - with `frames_per_call` 1, `pre_process_freq` returns 1 on every hop. The first `mask_lookahead` hops (M) are warm-up frames (the graph's
-  right-hand neighbours are not there yet): the accelerator runs on them, `frame_finish()` / `frame_bypass()` discard their heads,
+  right-hand neighbours are not there yet): the accelerator runs on them, `frame_finish()` / `frame_bypass()` / `frame_fail()` discard their heads,
   zero the registered state, advance the state generation by one and return 0, so the first real frame starts from zero state and
   the audio is as if the accelerator had not run. `dfn2_model_run_frame()` still returns 1 for a warm-up frame whose `infer()`
   succeeded. For N > 1 frames per call it keeps the older flow, see [Multi-frame export](reference/multiframe.md); with M = 0 there is no
@@ -94,8 +94,11 @@ Specific to this one:
   accelerator holds the state;
 - a commit that finds a non-finite head or state value zeroes the registered tensors, advances the state generation and returns -1
   with the frame still open; `dfn2_prepost_frame_bypass()` then passes the noisy spectrum through;
-- `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every warm-up frame and every refused
-  commit of a real frame (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
+- a run that did not succeed closes the frame with `dfn2_prepost_frame_fail(p, run_started)`: the same noisy-spectrum output as
+  `frame_bypass()`; `run_started != 0` (the accelerator may have rewritten its state) zeroes the registered tensors and advances the
+  state generation, `0` (nothing ran) leaves both. `dfn2_model_run_frame()` with a failing `infer()` is `frame_fail(p, 1)`;
+- `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every warm-up frame, every refused
+  commit of a real frame and every `frame_fail(p, 1)` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
   runtime that sees a different value than at the previous frame refills its state tensors with quantized zeros.
 
 Its gate is `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in `libainr_prepost.a` (`make -C .. print-lib-path` prints

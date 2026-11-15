@@ -58,13 +58,14 @@ for (each hop of grid.hop samples) {
     dfn2_prepost_pre_process_freq(p, re, im);          /* N=1:每 hop 回 1;前 M 拍是暖機幀 */
     DFN2PrepostInputs in; DFN2PrepostOutputs out;
     dfn2_prepost_frame_open(p, &amp;in, &amp;out);          /* 指向本實例 pool 與登錄 state 的 view;位址固定 */
-    if (dfn2_prepost_state_generation(p) != seen) {   /* reset、暖機幀或被拒的 commit 清了 state */
+    if (dfn2_prepost_state_generation(p) != seen) {   /* reset、暖機幀、被拒的 commit 或髒狀態清了 state */
         my_npu_fill_state_with_quantized_zero();      /* 板端:加速器自己那份定點 state 也要歸零 */
         seen = dfn2_prepost_state_generation(p);
     }
-    if (my_npu_run(&amp;in, &amp;out) != 0 ||              /* state 輸入與 *_next 綁同一個位址,就地寫入 */
-        dfn2_prepost_frame_finish(p) != 0)
-        dfn2_prepost_frame_bypass(p);                 /* 原頻譜直通,保住 framing 節奏 */
+    if (my_npu_run(&amp;in, &amp;out) != 0)               /* state 輸入與 *_next 綁同一個位址,就地寫入 */
+        dfn2_prepost_frame_fail(p, 1);                /* 執行已開始卻失敗:原頻譜直通,state 歸零、generation +1 */
+    else if (dfn2_prepost_frame_finish(p) != 0)
+        dfn2_prepost_frame_bypass(p);                 /* commit 被拒(finish 已歸零並 +1):原頻譜直通,保住 framing 節奏 */
     dfn2_prepost_post_process_freq(p, out_re, out_im, NULL);   /* 前 M+D 拍輸出零頻譜 */
     ac_istft_push_planar(istft, out_re, out_im, out_hop);      /* 每 hop 都 push */
 }</pre>
@@ -76,13 +77,14 @@ for (each hop of grid.hop samples) {
 <tr><td><code>_init(pool, bytes, cfg)</code><br><code>_init_ex(..., expected)</code></td><td>在呼叫端記憶體建構,起始即 reset;<code>_init_ex</code> 多一道 stale-pool gate(32-byte <code>DFN2PrepostMemReq</code> 不符即拒絕)</td></tr>
 <tr><td><code>_create(cfg)</code> / <code>_destroy(p)</code></td><td>host 工具/測試用;<code>destroy</code> 只釋放 <code>create</code> 配置的東西,對 <code>_init</code> 實例是 no-op,也從不釋放矩陣或登錄的 state</td></tr>
 <tr><td><code>_reset(p)</code></td><td>清空 ring、登錄的 state,丟掉未結束的 frame,時鐘與正規化器回 init 值;state generation 加 1。應用端自己的 <code>AcStft</code>／<code>AcIstft</code> 要另外 reset</td></tr>
-<tr><td><code>_state_generation(p)</code></td><td>遞迴 state 被函式庫歸零的次數計數:init 後為 1,每次 <code>_reset</code>、每個暖機幀與每次被拒的 <code>_frame_finish</code> 加 1;NULL 回 0。有自己一份定點 state 的 runtime 在啟動時先填成量化後的零,之後每發現數值變了就再填一次;沒有登錄 state 時函式庫只計數</td></tr>
+<tr><td><code>_state_generation(p)</code></td><td>遞迴 state 被函式庫歸零的次數計數:init 後為 1,每次 <code>_reset</code>、每個暖機幀、每次被拒的 <code>_frame_finish</code> 與每次 <code>_frame_fail(p, 1)</code> 加 1;NULL 回 0。有自己一份定點 state 的 runtime 在啟動時先填成量化後的零,之後每發現數值變了就再填一次;沒有登錄 state 時函式庫只計數</td></tr>
 <tr><td><code>_grid</code></td><td>查詢,失敗 NULL;實例的 grid。hop 與 bin 數取 <code>grid-&gt;hop</code>／<code>grid-&gt;n_bins</code>,延遲取 <code>dfn2_prepost_latency_frames(grid)</code> = M+D+N-1 框(出貨 2);圖契約版本是 <code>DFN2_MODEL_IO_LAYOUT_VERSION</code></td></tr>
 <tr><td><code>_pre_process_freq(p, re, im)</code></td><td>吃已分析好的一框(見下方尺度警告),回<b>這一拍需要的加速器呼叫次數</b>:N=1 每拍 1(前 M 拍暖機);N&gt;1 見細節頁。NULL／frame 仍開著 → -1</td></tr>
 <tr><td><code>_pre_process_freq_dual(p, est_re, est_im, app_re, app_im)</code></td><td><b>雙輸入</b>:<code>est</code> 餵<b>估計</b>分支(ERB/複數特徵、EMA 正規化器、<code>[t-(2-M)..t+M]</code> 圖視窗,即 heads),<code>app</code> 餵<b>套用</b>分支(mask／deep filter／atten-lim 作用的 noisy ring)。同一個 frame clock,兩者踩<b>互斥</b>的狀態,所以 <code>est == app</code> 時<b>恰等於</b> <code>_pre_process_freq()</code>。回傳同 <code>_pre_process_freq</code></td></tr>
 <tr><td><code>_frame_open(p, &amp;in, &amp;out)</code></td><td>公開本框加速器邊界;三個 head 預填 NaN,state 不預填(登錄的 buffer 原址、未登錄為 NULL／0)。無開啟的 frame → -1</td></tr>
 <tr><td><code>_frame_finish(p)</code></td><td>驗證每個 head 與登錄的 state 有限(純驗證,不複製)→ 建構增強頻譜(ERB 展開、deep filter、alpha blend、atten-lim)。暖機幀不看 heads:state 歸零、generation +1、回 0</td></tr>
-<tr><td><code>_frame_bypass(p)</code></td><td>本框取 identity:unit ERB mask + alpha 0;遞迴 state 維持原樣(就地路徑為加速器寫完的樣子;回報失敗的 runtime 視為沒有寫入),framing 與合成時鐘照走;暖機幀同 finish(歸零、+1)</td></tr>
+<tr><td><code>_frame_bypass(p)</code></td><td>本框取 identity:unit ERB mask + alpha 0;遞迴 state 與 generation 維持原樣,framing 與合成時鐘照走;暖機幀同 finish(歸零、+1)。用在 <code>_frame_finish</code> 已拒絕(已歸零並 +1)之後,或加速器根本沒有被呼叫的 frame</td></tr>
+<tr><td><code>_frame_fail(p, run_started)</code></td><td>關閉一個執行沒有成功的 frame,輸出與 <code>_frame_bypass</code> 相同。<code>run_started</code> 非 0(加速器可能已改寫 state):登錄的 state 歸零、generation 加 1;0(根本沒執行):兩者都不動。暖機幀照舊只推進一次。沒有開啟的 frame 或 NULL → -1</td></tr>
 <tr><td><code>_post_process_freq(p, re, im, &amp;valid)</code></td><td>輸出頻譜與輸入同一個 normalized=True 尺度;前 M+D 拍 <code>*valid</code> = 0 且頻譜為零(<code>valid</code> 只是資訊,可為 NULL),之後 1;frame 仍開著 → -1</td></tr>
 <tr><td><code>_output_frame_index(p, &amp;frame)</code></td><td>最近一次輸出屬於哪個 source frame(自 reset 起算);尚未輸出或 NULL → -1</td></tr>
 <tr><td><code>_set_erb_matrices(p, fwd, inv)</code> / <code>_set_atten_lim(p, db)</code></td><td><b>只能在 hop 之間</b>呼叫,保證邊界見 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a></td></tr>
@@ -94,6 +96,8 @@ for (each hop of grid.hop samples) {
 <li><code>frame_finish</code> 是<b>純驗證</b>:head 與登錄的 state 皆有限才進合成。就地路徑遇非有限值時 state 已被覆寫、無法回滾,
 <b>登錄的遞迴張量歸零、state generation 加 1</b>(沒有登錄 state 時只加 generation,由應用端重填加速器的 state),合成不執行、framing／feature window 不動、frame 維持開啟、回 -1;
 接著只有兩條路:<code>frame_bypass()</code>,或 <code>frame_open()</code> 從冷 state 重跑。寫一半而仍有限者偵測不到。
+</li>
+<li>加速器<b>執行失敗</b>(已開始):<code>frame_fail(p, 1)</code> 關閉這個 frame(輸出同 bypass),歸零登錄的 state 並讓 generation 加 1,應用端據此重填加速器那份 state;執行<b>沒有開始</b>(例如送件前核對失敗):<code>frame_fail(p, 0)</code>,state 與 generation 都不動。三者的輸出相同,差別只在 state。
 </li>
 <li><b>finish 前一定要有一次 <code>frame_open</code></b>(<code>prepared</code> 閂鎖):沒跑過的加速器不能把
 沒被碰過的 buffer 當結果。frame 開著時 <code>pre_process_freq</code> 回 -1。</li>
@@ -237,7 +241,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；48 kHz 1/1 為 92,608 bytes（本機量測；不含應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的 state；其他 grid 見 <a href="grid.html">DFN2 grid 與 ERB</a>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
 <li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／grid 查出來的陳舊 pool 大小」。</li>
 <li>每個 hop 同一條流程（<code>frames_per_call</code> N = 1）：<code>ac_stft_push_planar</code> → <code>pre_process_freq</code>（回 1）→ <code>frame_open</code> → 加速器 → <code>frame_finish</code>（或 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>；<code>valid</code> 只是資訊（可傳 NULL），<code>AC_OLA_ACCUMULATE</code> 下每 hop 都 push，零頻譜得零 hop。前 M 個 hop 是<b>暖機幀</b>：加速器照跑，heads 被丟棄、登錄 state 歸零、generation 加 1，所以首個真幀從零 state 開始，音訊不變；M = 0 沒有暖機幀，N &gt; 1 維持舊流程（見 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a>）。</li>
-<li>加速器那份定點 state 在啟動時填成量化後的 0，之後每次 <code>state_generation</code> 變了就重填（reset、每個暖機幀、被拒的 commit；M 個暖機幀各重填一次，串流開頭多 M 次加速器呼叫，見時序圖）。串流結尾：再餵全零 hop 並照常跑加速器才能排出尾端：M+D 個只排出最後一個頻譜框，PCM 要多 1 個（ISTFT 重疊），共 M+D+1 個（出貨 pair 3 個；identity 實跑確認）。</li>
+<li>加速器那份定點 state 在啟動時填成量化後的 0，之後每次 <code>state_generation</code> 變了就重填（reset、每個暖機幀、被拒的 commit、失敗的執行；M 個暖機幀各重填一次，串流開頭多 M 次加速器呼叫，見時序圖）。串流結尾：再餵全零 hop 並照常跑加速器才能排出尾端：M+D 個只排出最後一個頻譜框，PCM 要多 1 個（ISTFT 重疊），共 M+D+1 個（出貨 pair 3 個；identity 實跑確認）。</li>
 <li>重新開始一段串流：<code>dfn2_prepost_reset(p)</code>，並 reset 自己的 <code>AcStft</code>／<code>AcIstft</code>，然後把加速器 state 重填量化零；結束：<code>dfn2_prepost_destroy(p)</code>（對 <code>_init</code> 實例是 no-op）。</li>
 </ol>
 <p><a href="../../../../../AINR/DeepFilterNet2/README.md">完整頻域 C 範例</a></p>
@@ -251,7 +255,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <tr><td><code>pre_process_freq*</code></td><td>-1（N=1 正常回 1）</td><td>NULL 參數、上一個 frame 還開著（沒 finish 也沒 bypass）</td><td>先 <code>frame_finish</code>／<code>frame_bypass</code></td></tr>
 <tr><td><code>frame_open</code></td><td>-1</td><td>沒有開啟中的 frame（例如 N&gt;1 時 <code>pre_process_freq</code> 回 0 之後）</td><td>只在 <code>pre_process_freq</code> 回 1 後呼叫</td></tr>
 <tr><td><code>frame_finish</code></td><td>-1</td><td>三個 head 或登錄的遞迴 state 有非有限值，或沒先 <code>frame_open</code></td><td>登錄的 state 已歸零（未登錄時只有計數）、<code>state_generation</code> +1、frame 仍開著：呼叫 <code>frame_bypass</code>，或重新 <code>frame_open</code> 再跑一次加速器。暖機幀不檢查 heads，回 0（state 歸零、generation +1）</td></tr>
-<tr><td><code>frame_bypass</code></td><td>-1</td><td>沒有開啟中的 frame</td><td>—（成功即 identity，時鐘照走）</td></tr>
+<tr><td><code>frame_bypass</code>／<code>frame_fail</code></td><td>-1</td><td>沒有開啟中的 frame（<code>frame_fail</code> 另含 NULL）</td><td>—（成功即 identity，時鐘照走；<code>frame_fail(p, 1)</code> 另歸零 state 並讓 generation +1）</td></tr>
 <tr><td><code>post_process_freq</code></td><td>-1</td><td>NULL、frame 還開著</td><td>先關閉 frame</td></tr>
 <tr><td><code>set_atten_lim</code>／<code>set_erb_matrices</code></td><td>-1</td><td>NULL、非有限值，或 frame 開著</td><td>在 hop 之間呼叫</td></tr>
 </table></div>
@@ -326,8 +330,9 @@ dfn2_prepost_frame_open  ---> DFN2HopIO{inputs, outputs, state_generation}
   |                              (呼叫端:NPU / 替身跑 io.inputs -> io.outputs)
   |                                        |
   v                                        v
-dfn2_stream_post_process(ai_rc) <----------
-  |  ai_rc==0: frame_finish          ai_rc!=0: frame_bypass
+dfn2_stream_post_process(run_status) <----------
+  |  STREAM_RUN_OK: frame_finish (被拒 -> frame_bypass)
+  |  STREAM_RUN_NOT_STARTED: frame_fail(p, 0)    其他值: frame_fail(p, 1)
   v
 dfn2_prepost_post_process_freq
   |
@@ -347,12 +352,12 @@ PCM out (int16, 永遠完整一個 hop)
 hop   caller                    dfn2_stream                       NPU
 0     pcm_in -> pre_process --> STFT, pre_process_freq, open -->  (暖機) 跑一次, heads 丟棄
       <-- 1 (job開啟) -----------------------------------------
-      ai_rc=run_accelerator --------------------------------->   寫 outputs
-      post_process(ai_rc) -----> frame_finish, generation+1 -->
+      run_status=run_accelerator ---------------------------->   寫 outputs
+      post_process(run_status) -> frame_finish, generation+1 -->
       <-- 0 (靜音, 排水中) ------ ISTFT push, 飽和 -------------
 1     pcm_in -> pre_process --> STFT, pre_process_freq, open -->  (正式幀) 跑一次
-      ai_rc=run_accelerator --------------------------------->   寫 outputs
-      post_process(ai_rc) -----> frame_finish ----------------->
+      run_status=run_accelerator ---------------------------->   寫 outputs
+      post_process(run_status) -> frame_finish ---------------->
       <-- 0 (仍在 L+D 排水) ----- ISTFT push, 飽和 -------------
 2     ... 同上 ...
       <-- 1 (首個有效頻譜；尚未對齊第一拍 PCM) ------------------------------------
@@ -371,7 +376,7 @@ hop   caller                    dfn2_stream                       NPU
 <div class="tbl"><table>
 <tr><th>State</th><th>誰保存</th><th>跨 hop 保存什麼</th><th>何時歸零／推進</th></tr>
 <tr><td>STFT／ISTFT 歷史</td><td>本層（<code>AcStft</code>／<code>AcIstft</code>，pool 內）；<code>DFN2StreamConfig.freq_only</code> 的串流沒有這一列，分析與合成在呼叫端</td><td>重疊相加的樣本歷史</td><td><code>dfn2_stream_reset()</code>；<code>AC_OLA_ACCUMULATE</code> 不需額外排水邏輯</td></tr>
-<tr><td>GRU／df_convp 遞迴 state</td><td>一律由加速器自行持有——<code>DFN2StreamConfig</code> 沒有狀態登錄欄位（跟 <code>dfn2_prepost</code> 自己的 <code>DFN2PrepostConfig.gru_hidden/df_convp_history</code> 不同，這層 stream SDK 從不設定它們，一律留空），呼叫端只能靠 <code>io.state_generation</code> 判斷要不要回填量化零</td><td>模型的遞迴記憶</td><td>reset、每個暖機 hop、被拒的 commit 各歸零一次並讓 <code>state_generation</code> +1</td></tr>
+<tr><td>GRU／df_convp 遞迴 state</td><td>一律由加速器自行持有——<code>DFN2StreamConfig</code> 沒有狀態登錄欄位（跟 <code>dfn2_prepost</code> 自己的 <code>DFN2PrepostConfig.gru_hidden/df_convp_history</code> 不同，這層 stream SDK 從不設定它們，一律留空），呼叫端只能靠 <code>io.state_generation</code> 判斷要不要回填量化零</td><td>模型的遞迴記憶</td><td>reset、每個暖機 hop、被拒的 commit、執行已開始卻失敗的 hop（<code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 狀態）各歸零一次並讓 <code>state_generation</code> +1</td></tr>
 <tr><td><code>state_generation</code></td><td>本層轉呼叫 <code>dfn2_prepost_state_generation()</code></td><td>目前 generation 值</td><td>init=1；之後每次上列事件 +1；<code>io.state_generation</code> 在 <code>frame_open()</code> 後才取樣，已反映上一 hop 的暖機／拒絕</td></tr>
 <tr><td>ERB 矩陣</td><td>記憶體模式：呼叫端；檔案模式：本層 pool</td><td>forward（bin-major）／inverse（band-major）</td><td>stream 的生命週期內不變</td></tr>
 <tr><td>開／關 hop 旗標</td><td>本層內部</td><td>是否有待關閉的 <code>frame_open</code></td><td>每次成功 <code>pre_process</code>／<code>post_process</code> 切換</td></tr>

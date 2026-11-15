@@ -54,14 +54,15 @@
  * is the accelerator's own (its views are NULL/0 here), bound input to output in place and
  * refilled with quantized zeros whenever job.state_generation (dfn_hop_state_generation()) changes,
  * which includes the end of each warm-up frame (the first mask_lookahead hops run the model like
- * any other; their heads are discarded). Fill the heads in `outputs` and return 0. A nonzero return
- * takes the frame as the identity (dfn_hop.h). */
+ * any other; their heads are discarded). Fill the heads in `outputs` and return 0. Any other return takes the frame
+ * as the identity (dfn_hop.h): STREAM_RUN_NOT_STARTED when no run began (the device state is untouched),
+ * STREAM_RUN_FAILED, or any other nonzero value, once it did (the library then advances the state generation). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
                            DFN2PrepostOutputs *outputs) {
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* BOARD: invoke the stateless DFN2 graph. */
+    return STREAM_RUN_NOT_STARTED; /* BOARD: invoke the stateless DFN2 graph. */
 }
 
 /* Host grids accepted at parse time (0-terminated). */

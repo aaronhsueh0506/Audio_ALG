@@ -5,12 +5,18 @@
  *
  *   +1 on ainr_reset(); +1 after each of the first mask_lookahead warm-up blocks (48 kHz);
  *   +1 on a refused commit (postprocess status 0 with the heads left NaN, or one NaN/Inf element in any head);
- *   unchanged on a caller bypass (postprocess status != 0).
+ *   +1 on a run status that is neither STREAM_RUN_OK nor STREAM_RUN_NOT_STARTED (the device state may be dirty);
+ *   unchanged on STREAM_RUN_NOT_STARTED (no run started).
+ *
+ * run_status_table() closes the same block with each status next to a twin that closes it with NOT_STARTED: the output
+ * is the same bypass whatever the status, the heads of a failing run are never committed, and the generation steps by
+ * the rule above.
  *
  * A fault that hands the sample a stale or zero generation passes every functional test, so each
  * value is compared against the live counter after it has moved off zero. Not built under
  * NO_STDIO. */
 
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -126,11 +132,20 @@ static int run_family(Fam *f, int warm, const char *label) {
     CHECK(fam_post(f, 0) == AINR_OK, "commit post failed");
     CHECK(fam_gen(f) == g, "good commit moved the generation %u -> %u", g, fam_gen(f));
 
-    /* A caller bypass (failed run) does not move it. */
+    /* A run that did not start leaves it alone; a failed run moves it by one, and the next block shows it. */
     CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre failed");
     CHECK(io.state_generation == fam_gen(f), "pre before bypass: io %u != live %u", io.state_generation, fam_gen(f));
-    CHECK(fam_post(f, -1) == AINR_OK, "bypass post failed");
-    CHECK(fam_gen(f) == g, "caller bypass moved the generation %u -> %u", g, fam_gen(f));
+    CHECK(fam_post(f, STREAM_RUN_NOT_STARTED) == AINR_OK, "not-started post failed");
+    CHECK(fam_gen(f) == g, "STREAM_RUN_NOT_STARTED moved the generation %u -> %u", g, fam_gen(f));
+    CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre failed");
+    CHECK(fam_post(f, STREAM_RUN_FAILED) == AINR_OK, "failed-run post failed");
+    CHECK(fam_gen(f) == g + 1u, "STREAM_RUN_FAILED: %u -> %u, want +1", g, fam_gen(f));
+    g = fam_gen(f);
+    CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre failed");
+    CHECK(io.state_generation == g, "pre after a failed run: io %u != live %u", io.state_generation, g);
+    fill_heads(&io);
+    CHECK(fam_post(f, 0) == AINR_OK, "post after a failed run failed");
+    CHECK(fam_gen(f) == g, "a commit after a failed run moved the generation");
 
     /* A refused commit (status 0, heads still NaN) moves it by one, and the next block shows it. */
     CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre failed");
@@ -170,6 +185,96 @@ static int run_family(Fam *f, int warm, const char *label) {
     return 0;
 }
 
+static void fill_heads_with(StreamWork *io, float mask, float other) {
+    int o;
+    size_t i;
+    for (o = 0; o < io->output_count; ++o)
+        for (i = 0; i < io->outputs[o].elements; ++i) io->outputs[o].data[i] = (o == 0 ? mask : other);
+}
+
+static int out_equal(const Fam *a, const Fam *b) {
+    size_t cnt = (size_t)a->n * (size_t)a->n_bins;
+    if (a->family == FAM_PCM)
+        return memcmp(a->pcm_out, b->pcm_out, (size_t)a->cfg.hop_in * sizeof(int16_t)) == 0;
+    return memcmp(a->out_re, b->out_re, cnt * sizeof(float)) == 0 && memcmp(a->out_im, b->out_im, cnt * sizeof(float)) == 0;
+}
+
+static unsigned int status_step(int status) { return (status == STREAM_RUN_OK || status == STREAM_RUN_NOT_STARTED) ? 0u : 1u; }
+
+/* One status against its NOT_STARTED twin: same input, same history. A failing status is the twin's bypass output and
+ * moves the generation by status_step(); status 0 commits the heads (a different output) and leaves it. */
+static int run_status_one(Fam *f, Fam *twin, int warm, int status, const char *label) {
+    StreamWork io, tio;
+    unsigned int g, tg;
+    int blk = 0, w, k;
+
+    for (w = 0; w < warm + 2; ++w) {   /* the warm-up blocks, then two committed ones */
+        CHECK(fam_pre(f, blk, &io) == AINR_OK && fam_pre(twin, blk, &tio) == AINR_OK, "lead-in pre failed");
+        fill_heads(&io);
+        fill_heads(&tio);
+        CHECK(fam_post(f, 0) == AINR_OK && fam_post(twin, 0) == AINR_OK, "lead-in post failed");
+        ++blk;
+    }
+    CHECK(fam_gen(f) == fam_gen(twin), "lead-in generations differ");
+    g = fam_gen(f);
+    tg = fam_gen(twin);
+    for (k = 0; k < 3; ++k) {   /* the status block, then two more committed blocks on both */
+        CHECK(fam_pre(f, blk, &io) == AINR_OK && fam_pre(twin, blk, &tio) == AINR_OK, "pre failed");
+        CHECK(io.state_generation == fam_gen(f) && tio.state_generation == fam_gen(twin), "io generation is not live");
+        if (k == 0) {
+            fill_heads_with(&io, 0.9f, 0.7f);   /* a run that failed may have written anything */
+            fill_heads_with(&tio, 0.2f, 0.1f);
+            CHECK(fam_post(f, status) == AINR_OK && fam_post(twin, STREAM_RUN_NOT_STARTED) == AINR_OK, "post failed");
+            CHECK(fam_gen(f) == g + status_step(status), "status %d: generation %u -> %u, want +%u", status, g,
+                  fam_gen(f), status_step(status));
+            CHECK(fam_gen(twin) == tg, "twin (NOT_STARTED) moved the generation");
+            CHECK(status == 0 ? !out_equal(f, twin) : out_equal(f, twin),
+                  "status %d: output %s the bypass", status, status == 0 ? "equals" : "differs from");
+        } else {
+            fill_heads(&io);
+            fill_heads(&tio);
+            CHECK(fam_post(f, 0) == AINR_OK && fam_post(twin, 0) == AINR_OK, "follow-up post failed");
+            CHECK(fam_gen(f) == g + status_step(status), "status %d: a later commit moved the generation", status);
+            if (status != 0)
+                CHECK(out_equal(f, twin), "status %d: block %d after the failed one differs from the twin's", status, k);
+        }
+        ++blk;
+    }
+    return 0;
+}
+
+static int run_status_table(int sr, int fft, int n_erb, int n, int warm, const char *label) {
+    static const int statuses[] = { STREAM_RUN_NOT_STARTED, STREAM_RUN_FAILED, 1, 5, 7, -2,
+                                    STREAM_RUN_NOT_STARTED + 1, STREAM_RUN_NOT_STARTED - 1, INT_MAX, INT_MIN, 0 };
+    int fi, si, rc = 0;
+    char erb[160];
+    int n_bins = fft / 2 + 1;
+    snprintf(erb, sizeof(erb), "/tmp/ainr_runstatus_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    write_synthetic_erb(erb, n_bins, n_erb);
+    for (fi = 0; fi < 2; ++fi)
+        for (si = 0; si < (int)(sizeof(statuses) / sizeof(statuses[0])); ++si) {
+            Fam fs[2];
+            size_t cnt = (size_t)n * (size_t)n_bins;
+            int j;
+            for (j = 0; j < 2; ++j) {
+                memset(&fs[j], 0, sizeof(fs[j]));
+                fs[j].family = (Family)fi;
+                fs[j].cfg.sr = sr; fs[j].cfg.fft = fft; fs[j].cfg.hop_in = n * (fft / 2);
+                fs[j].n_bins = n_bins; fs[j].n = n;
+                fs[j].pcm_in = (int16_t *)calloc((size_t)fs[j].cfg.hop_in, sizeof(int16_t));
+                fs[j].pcm_out = (int16_t *)calloc((size_t)fs[j].cfg.hop_in, sizeof(int16_t));
+                fs[j].re = (float *)calloc(cnt, sizeof(float)); fs[j].im = (float *)calloc(cnt, sizeof(float));
+                fs[j].out_re = (float *)calloc(cnt, sizeof(float)); fs[j].out_im = (float *)calloc(cnt, sizeof(float));
+                if (fam_init(&fs[j], erb)) { fprintf(stderr, "%s: init failed\n", label); return 1; }
+            }
+            if (run_status_one(&fs[0], &fs[1], warm, statuses[si], label)) rc = 1;
+        }
+    unlink(erb);
+    if (!rc) printf("%s: run status table OK (%d statuses x 2 families)\n", label,
+                    (int)(sizeof(statuses) / sizeof(statuses[0])));
+    return rc;
+}
+
 static int run_case(int sr, int fft, int n_erb, int n, int warm, const char *label) {
     int fi, rc = 0;
     char erb[160];
@@ -199,10 +304,14 @@ int main(void) {
     int rc = 0;
 #ifdef DFN2_MASK_ONLY
     rc |= run_case(48000, 1024, 32, 1, 1, "stategen[lite 48k/1024 N=1]");
+    rc |= run_status_table(48000, 1024, 32, 1, 1, "runstatus[lite 48k/1024 N=1]");
 #else
     rc |= run_case(16000, 256, 24, 1, 0, "stategen[full 16k/256 N=1]");
     rc |= run_case(16000, 256, 24, 8, 0, "stategen[full 16k/256 N=8]");
     rc |= run_case(48000, 1024, 32, 1, 1, "stategen[full 48k/1024 N=1]");
+    rc |= run_status_table(16000, 256, 24, 1, 0, "runstatus[full 16k/256 N=1]");
+    rc |= run_status_table(16000, 256, 24, 8, 0, "runstatus[full 16k/256 N=8]");
+    rc |= run_status_table(48000, 1024, 32, 1, 1, "runstatus[full 48k/1024 N=1]");
 #endif
     if (rc) { printf("test_ainr_state_generation: FAIL\n"); return 1; }
     printf("test_ainr_state_generation: PASS\n");

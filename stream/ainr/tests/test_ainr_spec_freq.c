@@ -8,7 +8,7 @@
  *   1. N=1, both shipped catalog grids (16kHz/256, 48kHz/1024): ainr_preprocess()/ainr_postprocess() (PCM
  *      family) vs ainr_preprocess_freq()/ainr_postprocess_freq() through the test's own AcStft and AcIstft on
  *      the same PCM and the same fake-accelerator fill -- the PCM written back is bit-exact, with a forced
- *      bypass hop (infer_status != 0) mixed into the run.
+ *      bypass hop (run_status != 0) mixed into the run.
  *   2. N > 1 stash/ordering through the public _freq API on the catalog's 16 kHz/256 N=8 row: a committed block
  *      followed by a bypassed one, and the PCM family against _freq + AcIstft bit-exact over the same blocks.
  *   3. Trim / queue labeling: AinrInfo.queue_frames and trim_samples of both families against the lookahead
@@ -147,14 +147,14 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
 
     for (i = 0; i < hops && !bad; ++i) {
         StreamWork io_pcm, io_freq;
-        int infer_status = (i == bypass_hop) ? -1 : 0;
+        int run_status = (i == bypass_hop) ? -1 : 0;
         int rc;
 
         /* PCM family (reference). */
         rc = ainr_preprocess(ctx_pcm, pcm_in + (size_t)i * (size_t)hop, &io_pcm);
         if (rc != 0) { fprintf(stderr, "%s: pcm preprocess rc=%d at hop %d\n", label, rc, i); bad = 1; break; }
         fill_accel(&io_pcm, i);
-        rc = ainr_postprocess(ctx_pcm, infer_status, pcm_ref + (size_t)i * (size_t)hop);
+        rc = ainr_postprocess(ctx_pcm, run_status, pcm_ref + (size_t)i * (size_t)hop);
         if (rc != AINR_OK) { fprintf(stderr, "%s: pcm postprocess rc=%d at hop %d\n", label, rc, i); bad = 1; break; }
 
         /* _freq family, E == P from the caller's AcStft of the SAME PCM hop, same fill -- then the caller's ISTFT. */
@@ -162,7 +162,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
         rc = ainr_preprocess_freq(ctx_freq, af_re, af_im, af_re, af_im, &io_freq);
         if (rc != 0) { fprintf(stderr, "%s: freq preprocess rc=%d at hop %d\n", label, rc, i); bad = 1; break; }
         fill_accel(&io_freq, i);
-        rc = ainr_postprocess_freq(ctx_freq, infer_status, freq_re, freq_im);
+        rc = ainr_postprocess_freq(ctx_freq, run_status, freq_re, freq_im);
         if (rc != AINR_OK) { fprintf(stderr, "%s: freq postprocess rc=%d at hop %d\n", label, rc, i); bad = 1; break; }
         audio_synthesise(&audio, 1, freq_re, freq_im, pcm_from_freq + (size_t)i * (size_t)hop);
     }
@@ -204,7 +204,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
 #define T2_ERB 24
 
 /* Two consecutive blocks through the _freq family: block 1 committed, block 2 BYPASSED
- * (infer_status != 0). Confirms (a) block 2's oldest frame is not block 1's newest frame repeated
+ * (run_status != 0). Confirms (a) block 2's oldest frame is not block 1's newest frame repeated
  * (the ordering bug this kind of stash/deliver logic is prone to) and (b) a bypassed block still
  * delivers a full N-frame output of real (non-silent) spectra, not an error or a short block. */
 static int test_core_ordering_and_bypass(void) {
@@ -241,7 +241,7 @@ static int test_core_ordering_and_bypass(void) {
     rc = ainr_postprocess_freq(ctx, 0, re1, im1);
     if (rc != AINR_OK) { fprintf(stderr, "test_core_ordering: block1 post rc=%d\n", rc); return 1; }
 
-    /* Block 2: real job, BYPASSED (infer_status != 0) -- must still deliver n frames. */
+    /* Block 2: real job, BYPASSED (run_status != 0) -- must still deliver n frames. */
     fill_pcm(pcm_in, n * hop, 202);
     audio_analyse(&audio, pcm_in, n, in_re, in_im);
     rc = ainr_preprocess_freq(ctx, in_re, in_im, in_re, in_im, &io);
@@ -310,7 +310,7 @@ static int test_freq_core_matches_pcm_core(void) {
     if (!ctx_p || !ctx_f || audio_open(&audio, T2_FFT)) { fprintf(stderr, "test_freq_core_matches_pcm_core: init fail\n"); return 1; }
 
     for (block = 0; block < 2; ++block) {
-        int infer_status = (block == 0) ? 0 : -1;   /* block 0 committed, block 1 bypassed */
+        int run_status = (block == 0) ? 0 : -1;   /* block 0 committed, block 1 bypassed */
         StreamWork io_p, io_f;
 
         fill_pcm(pcm_in, n * hop, 300 + block);
@@ -318,7 +318,7 @@ static int test_freq_core_matches_pcm_core(void) {
         rc = ainr_preprocess(ctx_p, pcm_in, &io_p);
         if (rc != AINR_OK) { fprintf(stderr, "test_freq_core_matches_pcm_core: pcm pre rc=%d (block %d)\n", rc, block); return 1; }
         fill_accel(&io_p, 10 + block);
-        rc = ainr_postprocess(ctx_p, infer_status, pcm_ref);
+        rc = ainr_postprocess(ctx_p, run_status, pcm_ref);
         if (rc != AINR_OK) { fprintf(stderr, "test_freq_core_matches_pcm_core: pcm post rc=%d (block %d)\n", rc, block); return 1; }
 
         /* Audio-scale E == P spectra for this block's N frames, oldest first, from the SAME PCM. */
@@ -326,13 +326,13 @@ static int test_freq_core_matches_pcm_core(void) {
         rc = ainr_preprocess_freq(ctx_f, est_re, est_im, est_re, est_im, &io_f);
         if (rc != AINR_OK) { fprintf(stderr, "test_freq_core_matches_pcm_core: freq pre rc=%d (block %d)\n", rc, block); return 1; }
         fill_accel(&io_f, 10 + block);
-        rc = ainr_postprocess_freq(ctx_f, infer_status, out_re_freq, out_im_freq);
+        rc = ainr_postprocess_freq(ctx_f, run_status, out_re_freq, out_im_freq);
         if (rc != AINR_OK) { fprintf(stderr, "test_freq_core_matches_pcm_core: freq post rc=%d (block %d)\n", rc, block); return 1; }
         audio_synthesise(&audio, n, out_re_freq, out_im_freq, pcm_freq);
 
         if (memcmp(pcm_ref, pcm_freq, (size_t)n * (size_t)hop * sizeof(int16_t)) != 0) {
-            fprintf(stderr, "test_freq_core_matches_pcm_core: block %d mismatch (infer_status=%d)\n",
-                   block, infer_status);
+            fprintf(stderr, "test_freq_core_matches_pcm_core: block %d mismatch (run_status=%d)\n",
+                   block, run_status);
             return 1;
         }
     }

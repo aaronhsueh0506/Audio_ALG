@@ -113,13 +113,13 @@ int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
  * and discarded):
  *     dfn_rate_bridge_begin(b, E, P);                  // WOLA + resample up
  *     while (dfn_rate_bridge_nn_begin(b, &job) > 0) {  // 48 kHz frame open
- *         rc = run_model(&job);                        // 0 = every output written
+ *         rc = run_model(&job);                        // run status (stream_run.h): 0 = every output written
  *         dfn_rate_bridge_nn_end(b, rc);               // commit, or the identity
  *     }
  *     dfn_rate_bridge_finish(b, out_hop);              // emit one native hop
  * nn_begin returns 1 with the open frame's views in *job, 0 when the hop has no
- * further frame, -1 on a contract error. finish takes any frame left open as the
- * identity (fail-open). dfn_rate_bridge_process() runs this loop with the
+ * further frame, -1 on a contract error. finish takes any frame left open (STREAM_RUN_FAILED) or never
+ * fetched (STREAM_RUN_NOT_STARTED) as the identity (fail-open). dfn_rate_bridge_process() runs this loop with the
  * configured model callback. */
 int dfn_rate_bridge_begin(DfnRateBridge *b,
                           const Complex *estimate_spec,
@@ -145,8 +145,8 @@ int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);   /* floor of t
 int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
                                       int *denominator);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
-/* The stage's state generation (dfn_res_stage_state_generation(): resets, warm-up frames and refused
- * commits advance it); 0 for NULL. */
+/* The stage's state generation (dfn_res_stage_state_generation(): resets, warm-up frames, refused
+ * commits and dirty run statuses advance it); 0 for NULL. */
 unsigned int dfn_rate_bridge_state_generation(const DfnRateBridge *b);
 /* Frame counters for diagnostics: 48 kHz frames run in total and in the last hop. */
 void dfn_rate_bridge_get_counters(const DfnRateBridge *b,

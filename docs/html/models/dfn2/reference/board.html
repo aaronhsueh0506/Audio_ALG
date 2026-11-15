@@ -58,7 +58,7 @@
 <tr><td><code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）</td><td>定點 state 埠（任一端）的 <code>zero_point</code> 不是 0；float 的 state 埠不看 zero_point</td></tr>
 </tbody></table>
 <p>每個埠依序檢查格式、scale、軸、stride、容量；最後檢查每個 state 輸入與它的輸出。這條規則對 DFN2、DeepVQE-S 與 Align-ULCNet 相同：state 的清零是對 buffer 填位元組 0，只有 <code>zero_point</code> 為 0 時才等於量化後的 0（float 的 <code>0.0f</code> 也是零位元組）。主機端的 <code>stream/common</code> 的 <code>test_stream_bind</code> 以替身描述涵蓋這條路徑；真實的 descriptor 值要在取得正式 bin 後於板上核對。</p>
-<p>送件前的核對是另一道：每個成功的 pre 之後，<code>GRAPH_IO_CHECK_WORK</code> 比對 <code>work.input_count</code>／<code>work.output_count</code> 與每個 tensor 的元素數、[b,c,h,w] 和資料指標是否等於模型設定的列。不符回 <code>GRAPH_IO_ERR_COUNT</code>／<code>_ERR_SHAPE</code>／<code>_ERR_NULL</code>（共用程式的回傳碼範圍為 -301..-306）：不呼叫 AI3，該包以失敗交給 <code>ainr_postprocess()</code>（近恆等直通），仍是一次 pre 對一次 post。</p>
+<p>送件前的核對是另一道：每個成功的 pre 之後，<code>GRAPH_IO_CHECK_WORK</code> 比對 <code>work.input_count</code>／<code>work.output_count</code> 與每個 tensor 的元素數、[b,c,h,w] 和資料指標是否等於模型設定的列。不符回 <code>GRAPH_IO_ERR_COUNT</code>／<code>_ERR_SHAPE</code>／<code>_ERR_NULL</code>（共用程式的回傳碼範圍為 -301..-306）：不呼叫 AI3，該包以 <code>STREAM_RUN_NOT_STARTED</code> 交給 <code>ainr_postprocess()</code>（近恆等直通，generation 不動），仍是一次 pre 對一次 post。</p>
 
 <h2 id="float-io">Float I/O 模式</h2>
 <p>函式庫與 stream 層的 tensor 都是 float32，定點與 float 的軟體轉換只在板端 sample。每支 AI3 sample 開頭有編譯期的 <code>#define FLOAT_IN 0</code> 與 <code>#define FLOAT_OUT 0</code>（預設關閉，沒有執行期旗標）：<code>FLOAT_IN</code> 讓 NPU 量化訊號輸入，<code>FLOAT_OUT</code> 讓 NPU 反量化 head 輸出，CPU 不再轉換。開啟只省轉換，不省搬運：輸入的 <code>memcpy</code> 與 cache flush 仍在，head 讀回改為 flush 加 <code>memcpy(elem * 4)</code>。</p>
@@ -66,7 +66,7 @@
 <li>這些 model 的 state 就地繼承 input／output 的型別（state 的輸入與輸出共用同一塊 buffer，型別來自 SDK 回報），所以<b>要求 <code>FLOAT_IN == FLOAT_OUT</code></b>；混合設定只適用於不繼承 state 的模型，這裡的 AI3 sample 都不是，沒有在板上驗證過。<code>FLOAT_IN != FLOAT_OUT</code> 不會被編譯擋下，只有編譯警告（<code>#warning</code>；用 <code>-Werror</code> 建置時會變成錯誤）和啟動 log <code>[AI3] float_in=%d float_out=%d</code> 後面的 <code>WARNING: mixed setting</code>。</li>
 <li>State 埠不受這兩個 define 管，維持 SDK 回報的型別；清零是對 buffer 填位元組 0 並 flush cache，float 與定點通用，因為通過埠檢查的定點 state 兩端 <code>zero_point</code> 都是 0。</li>
 <li>模型永遠是定點，<code>FLOAT_IN</code>／<code>FLOAT_OUT</code> 只讓硬體在邊界轉換，SDK 回報的埠型別因此不能當作請求是否生效的依據，sample 不拿請求去比對回報的型別。<code>graph_io_check_ports()</code> 通過後、任何 buffer 覆寫之前，sample 印出 <code>[AI3] float_in=%d float_out=%d</code>（混合時尾端加 <code>WARNING: mixed setting</code>）與每個輸入、輸出埠一行 <code>[AI3] in[i]</code>／<code>out[i]</code>（<code>float</code>、<code>bits</code>、<code>scale_ratio</code>、<code>zero_point</code>），供板端 A/B 比對；埠檢查不會因 float 與定點的差異而失敗。</li>
-<li>float head 可以帶 NaN／Inf（定點會飽和），NaN 預填與函式庫的有限值檢查仍在：被拒的那拍走近恆等直通並推進 generation。DFN2 的 <code>df_alpha</code> 在 sample 端夾到 [0, 1] 的步驟也保留。</li>
+<li>float head 可以帶 NaN／Inf（定點會飽和），NaN 預填與函式庫的有限值檢查仍在：被拒的那拍走近恆等直通並推進 generation（commit 被拒）。DFN2 的 <code>df_alpha</code> 在 sample 端夾到 [0, 1] 的步驟也保留。</li>
 <li>只能上板確認的：CTRL 位元是否也作用在 state 埠、NPU 內建轉換與 host 呼叫的數值是否相等、現有 <code>model.bin</code> 是否直接接受 float I/O。步驟見維護文件 <code>docs/maintenance/float-io-board-ab.md</code>。</li>
 </ul>
 
@@ -74,24 +74,25 @@
 <ul>
 <li>recurrent state（<code>h_gru</code>、full 另有 <code>df_convp_history</code>）留在加速器的 buffer，不經 host。每對 state 輸入與輸出綁同一塊 buffer：輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>；shape 取自模型設定，函式庫不保存。</li>
 <li>定點 state 埠兩端的 <code>zero_point</code> 都必須是 0（清零用位元組填 0，只有 zero_point 0 時才等於量化後的 0）；不為 0 的 graph 在第一次送件前被埠檢查（<code>stream_check_ports()</code>）以 <code>STREAM_PORT_ERR_STATE_ZERO_POINT</code>（-110）拒絕，float 的 state 埠不看 zero_point，清零仍是填位元組 0（見<a href="#float-io">Float I/O 模式</a>）。</li>
-<li>每拍 <code>ainr_preprocess()</code> 之後，<code>work.state_generation</code> 與 sample 上次同步的值不同，就在這次執行前把 state 輸入 buffer 重載量化零。generation 在 <code>ainr_reset()</code>、暖機拍，以及 post 拒絕這拍的 head（例如 head 不是有限值）時前進。</li>
-<li>呼叫端自己通報的失敗（<code>infer_status != 0</code>）本身不推進 generation。但失敗的執行或讀回可能已經寫過 state，所以 sample 還要自己記一個「待回復」旗標：在 AI3 開始執行前設起，執行與全部 head 讀回都成功才清除；下一次送件前，generation 不同<b>或</b>旗標仍設著，就重載量化零。</li>
+<li>執行狀態（<code>stream_run.h</code>）：0 = 每個 head 都由完成的執行寫好；<code>STREAM_RUN_NOT_STARTED</code> = 沒有任何執行開始，加速器的 state 沒動；其他值（<code>STREAM_RUN_FAILED</code> 是 -1）= state 可能已被寫髒。函式庫在 device state 可能不再是該接續的那一份時推進 state generation：reset、被拒的 commit、髒狀態、模型重啟，另外每個暖機拍也推進一次。</li>
+<li>每拍 <code>ainr_preprocess()</code> 之後，<code>work.state_generation</code> 與 sample 上次歸零時記下的值不同，就在這次執行前把 state 輸入 buffer 重載量化零，並記下這個值。sample 不需要自己記失敗：執行已開始卻失敗的拍，以 <code>STREAM_RUN_FAILED</code> 交給 <code>ainr_postprocess()</code>，函式庫推進 generation，下一拍的 <code>work.state_generation</code> 就會不同；沒有開始的拍以 <code>STREAM_RUN_NOT_STARTED</code> 交出，generation 不動，不多歸零一次。</li>
 </ul>
-<pre><code>static void state_generation_sync(unsigned int generation)
+<pre><code>static int state_generation_sync(unsigned int generation)
 {
-    if (generation == g_state_gen_seen &amp;&amp; !g_state_pending_recovery) return;
-    state_refill_zero();                 /* 每個 state 輸入 buffer 寫量化零並 flush cache */
-    g_state_gen_seen = generation;
-    g_state_pending_recovery = 0;
+    if (generation == g_state_gen_seen) return OK;
+    if (state_refill_zero() != OK) return NG;   /* 每個 state 輸入 buffer 寫量化零並 flush cache */
+    g_state_gen_seen = generation;              /* 歸零失敗就不更新，下一拍再試 */
+    return OK;
 }
 
-/* 每拍：pre 之後、執行之前 */
-state_generation_sync(work.state_generation);
-g_state_pending_recovery = 1;            /* 從這裡起，加速器可能就地改寫 state */
-ret = run_and_read_back(&amp;work);          /* 執行 + 讀回全部 head */
-if (ret == OK) g_state_pending_recovery = 0;
-ainr_postprocess(ctx, ret == OK ? 0 : -1, pcm_out);</code></pre>
-<p>起始時 sample 先載入一次量化零，再把 <code>g_state_gen_seen</code> 設成 <code>ainr_state_generation(ctx)</code>。失敗的那一拍輸出近恆等直通，不是靜音；回復發生在下一次送件前。</p>
+/* 每拍：pre 之後 */
+int run_status = STREAM_RUN_NOT_STARTED;       /* 到 net_proc 之前的任何失敗都停在這裡 */
+if (check_work(&amp;work) == OK &amp;&amp; state_generation_sync(work.state_generation) == OK &amp;&amp; set_buffers(&amp;work) == OK) {
+    run_status = STREAM_RUN_FAILED;            /* 從 net_proc 起，加速器可能就地改寫 state */
+    if (net_proc() == OK &amp;&amp; read_back_all_heads(&amp;work) == OK) run_status = STREAM_RUN_OK;
+}
+ainr_postprocess(ctx, run_status, pcm_out);</code></pre>
+<p>起始時 sample 先載入一次量化零，再把 <code>g_state_gen_seen</code> 設成 <code>ainr_state_generation(ctx)</code>。失敗的那一拍輸出近恆等直通，不是靜音；回復發生在下一次送件前，由 generation 的變化觸發。DFN2 的暖機拍照樣帶一個 job（<code>work.action</code> 恆為 <code>STREAM_WORK_SUBMIT</code>，不分暖機拍），執行後 heads 被丟棄，generation 前進一次。</p>
 
 <h2 id="samples">板端 sample 的接線</h2>
 <p>板端 sample 是本庫以外的檔案（<code>audio_sample</code>），本庫沒有建置它們，也沒有目標板 SDK。AI3 的接線程式——開圖、設定緩衝、加速器執行呼叫、讀回、cache flush——是板端負責人的程式，原版不改；我方只加模型設定與共用接線（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/common/graph_io.h</code>）這一側。本庫提供 <code>ainr_*</code> 與 SDK 無關的檢查器 <code>stream_check_ports()</code>。五支 sample 的 stream 端接線一致：</p>
@@ -104,8 +105,8 @@ ainr_postprocess(ctx, ret == OK ? 0 : -1, pcm_out);</code></pre>
 <tr><th><code>alg_ai3_aec_dfn.c</code>（full）</th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td><code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 給模型 grid（N=1），SDK 呼叫之前做 size、pool、<code>ainr_init_freq()</code>；host 取樣率（<code>--sr</code>）不是模型的取樣率時另建 <code>AinrBridge</code>；查 full 的列；開圖後埠檢查。模型檔由 sample 依量化選項自己選</td></tr>
 <tr><th><code>uvc_audio_live2a.c</code></th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td>固定 48000／1024／512，16 kHz 的 pipeline 經 <code>AinrBridge</code>；同樣查列；開圖後埠檢查</td></tr>
 </tbody></table>
-<p>五支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都有「待回復」旗標（見上節），也都沒有 job_ready 分支：每次成功的 pre 都接一次 AI3 執行與一次 post。保留 full 的 alpha 對應與既有的數值處理。</p>
-<p>兩支 <code>_freq</code> sample 每個 hop 的 DFN2 步驟（橋接時是 <a href="bridge.html">AinrBridge</a> 的 frame 迴圈）有兩種失敗：AI3 執行或讀回失敗時，該 frame 以失敗狀態交給 <code>ainr_postprocess_freq()</code>，輸出近恆等，鏈不重置；<code>ainr_preprocess_freq()</code> 拒絕該包（非有限或超界的 bin）、橋接器或呼叫順序出錯時，該 hop 輸出全零，並在同一個 hop 重置 AEC、<code>ainr_reset_freq()</code> 與 <code>ainr_bridge_reset()</code>（直接路徑另清 sample 自己的合成），下一個 hop 從全新狀態開始，和啟動時相同：輸出先有一段零（橋接時約為 added delay），AEC 重新收斂。</p>
+<p>五支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都依 <code>work.state_generation</code> 與執行狀態回復 state（見上節），也都沒有 job_ready 分支：每次成功的 pre 都接一次 AI3 執行與一次 post。保留 full 的 alpha 對應與既有的數值處理。</p>
+<p>兩支 <code>_freq</code> sample 每個 hop 的 DFN2 步驟（橋接時是 <a href="bridge.html">AinrBridge</a> 的 frame 迴圈）有兩種失敗：AI3 執行或讀回失敗時，該 frame 以 <code>STREAM_RUN_FAILED</code>（執行未開始則 <code>STREAM_RUN_NOT_STARTED</code>）交給 <code>ainr_postprocess_freq()</code>，輸出近恆等，鏈不重置；<code>ainr_preprocess_freq()</code> 拒絕該包（非有限或超界的 bin）、橋接器或呼叫順序出錯時，該 hop 輸出全零，並在同一個 hop 重置 AEC、<code>ainr_reset_freq()</code> 與 <code>ainr_bridge_reset()</code>（直接路徑另清 sample 自己的合成），下一個 hop 從全新狀態開始，和啟動時相同：輸出先有一段零（橋接時約為 added delay），AEC 重新收斂。</p>
 <p>本庫未驗證的部分：正式量化後的 <code>model.bin</code>、目標板 SDK 的建置、板上的 descriptor 實值、音訊與每 hop 耗時。</p>
 
 <h2>參考</h2>

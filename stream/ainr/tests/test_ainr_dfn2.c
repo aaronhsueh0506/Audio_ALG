@@ -240,9 +240,10 @@ static int test_validation_ordering(void) {
     return 0;
 }
 
-/* 5. A failed accelerator run (infer_status != 0) still closes the block and leaves the next one
+/* 5. A run that did not succeed (run_status != 0) still closes the block and leaves the next one
  * able to proceed normally -- ainr_postprocess's return value is a contract-success flag, not a
- * pass-through of the model's internal spectral-validity bit. */
+ * pass-through of the model's internal spectral-validity bit. A failed run moves the state
+ * generation by one; STREAM_RUN_NOT_STARTED leaves it. */
 static int test_postprocess_failure_recovery(const char *erb_path) {
     AinrConfig cfg;
     StreamMemReq req;
@@ -293,11 +294,21 @@ static int test_postprocess_failure_recovery(const char *erb_path) {
                             "(expected pass-through, not silence)\n");
             return 1;
         }
-        /* A bypass alone (no reset, nothing non-finite to detect since no state is registered
-         * host-side in this deployment) must not advance state_generation. */
-        if (ainr_state_generation(ctx) != gen_before) {
-            fprintf(stderr, "test_postprocess_failure_recovery: state_generation changed from a "
-                            "bypass alone (%u -> %u)\n", gen_before, ainr_state_generation(ctx));
+        /* Each failed run (status -1) advanced the generation by one; the library zeroes its side and tells the
+         * sample to reload the device state. */
+        if (ainr_state_generation(ctx) != gen_before + 2u) {
+            fprintf(stderr, "test_postprocess_failure_recovery: two failed runs moved state_generation "
+                            "%u -> %u, want +2\n", gen_before, ainr_state_generation(ctx));
+            return 1;
+        }
+        /* A run that never started touches nothing. */
+        gen_before = ainr_state_generation(ctx);
+        rc = ainr_preprocess(ctx, pcm_in, &io);
+        if (rc != AINR_OK) { fprintf(stderr, "test_postprocess_failure_recovery: preprocess rc=%d\n", rc); return 1; }
+        rc = ainr_postprocess(ctx, STREAM_RUN_NOT_STARTED, pcm_out);
+        if (rc != AINR_OK || ainr_state_generation(ctx) != gen_before) {
+            fprintf(stderr, "test_postprocess_failure_recovery: STREAM_RUN_NOT_STARTED rc=%d, generation %u -> %u\n",
+                    rc, gen_before, ainr_state_generation(ctx));
             return 1;
         }
     }

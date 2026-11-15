@@ -14,8 +14,8 @@ the application gives it one, so step 1 comes first and its `DFN2Grid` goes to e
 5. `dfn2_model_io_descriptor_default(&grid, &d)`: the graph contract of this build for the grid, to compare with what the accelerator
    runtime reports (`dfn2_model_io_descriptor_validate(&grid, &d)`); a model exported for another grid or lookahead pair fails it.
 6. Per hop, the same flow on every hop (`frames_per_call` 1): `ac_stft_push_planar()`, `dfn2_prepost_pre_process_freq()` (returns 1),
-   `dfn2_prepost_frame_open()`, the model, `dfn2_prepost_frame_finish()` (`dfn2_prepost_frame_bypass()` when the model failed or the
-   commit was refused); then `dfn2_prepost_post_process_freq()` and `ac_istft_push_planar()`; `valid` is informational (the spectrum
+   `dfn2_prepost_frame_open()`, the model, `dfn2_prepost_frame_finish()` (`dfn2_prepost_frame_bypass()` when the commit was refused, `dfn2_prepost_frame_fail(p, run_started)`
+   when the run did not succeed); then `dfn2_prepost_post_process_freq()` and `ac_istft_push_planar()`; `valid` is informational (the spectrum
    is all zero while it is 0) and the argument may be NULL. `dfn2_model_run_frame(&model, p)` does the middle three for a `DFN2Model`
    that carries the descriptor. With `frames_per_call` > 1 the flow is the older one, see [Multi-frame export](multiframe.md#multi-frame-export).
 7. Flush: push `M + D + 1` zero audio hops (`M + D` zero spectra, one more for the overlap-add) with the accelerator running on all of them.
@@ -140,10 +140,12 @@ static int run_dfn2(const char *erb_path, RunModel run_model, const float *in, f
         DFN2PrepostInputs xin;
         DFN2PrepostOutputs xout;
         if (dfn2_prepost_frame_open(p, &xin, &xout) != 0) { rc = -1; break; }
-        /* dfn2_prepost_state_generation(p) changed since the last frame (a reset, a warm-up frame or a
-         * refused commit zeroed the state): an accelerator with its own state copy refills it first. */
-        if (run_model(&xin, &xout) != 0 || dfn2_prepost_frame_finish(p) != 0)
-            dfn2_prepost_frame_bypass(p);              /* the noisy spectrum, clocks advance */
+        /* dfn2_prepost_state_generation(p) changed since the last frame (a reset, a warm-up frame, a
+         * refused commit or a failed run zeroed the state): an accelerator with its own state copy refills it first. */
+        if (run_model(&xin, &xout) != 0)
+            dfn2_prepost_frame_fail(p, 1);             /* the noisy spectrum, state zeroed, generation + 1 */
+        else if (dfn2_prepost_frame_finish(p) != 0)
+            dfn2_prepost_frame_bypass(p);              /* refused commit (already zeroed): the noisy spectrum, clocks advance */
         if (dfn2_prepost_post_process_freq(p, out_re, out_im, NULL) != 0) { rc = -1; break; }   /* zeros for the first M + D hops */
         ac_istft_push_planar(istft, out_re, out_im, out + h * grid.hop);                         /* every hop: AC_OLA_ACCUMULATE */
     }

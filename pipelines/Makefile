@@ -605,8 +605,8 @@ $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_i
 $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn_res_stage.o: dfn/dfn_res_stage.c dfn/dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/dfn_res_stage.o: dfn/dfn_res_stage.c dfn/dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 # test_array_sample_post: the header-only glue of the four-channel programs; links no sample object.
 $(OBJ_DIR)/test_array_sample_post.o: 4ch/tests/test_array_sample_post.c 4ch/array_sample_post.h | _cfg_guard
@@ -615,23 +615,23 @@ $(OBJ_DIR)/test_array_sample_post.o: 4ch/tests/test_array_sample_post.c 4ch/arra
 $(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h dfn/dfn_hop_pool.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h mono/aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_dfn_res_stage.o: dfn/tests/test_dfn_res_stage.c dfn/dfn_res_stage.h dfn/tests/dfn_test_fixture.h dfn/dfn_unit_partition.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_dfn_res_stage.o: dfn/tests/test_dfn_res_stage.c dfn/dfn_res_stage.h dfn/tests/dfn_test_fixture.h dfn/dfn_unit_partition.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn_rate_bridge.o: dfn/dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/dfn_res_stage.h $(STREAM_BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_BRIDGE_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/dfn_rate_bridge.o: dfn/dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/dfn_res_stage.h $(STREAM_BRIDGE_DIR)/ainr_bridge.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ainr_bridge.o: $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(STREAM_BRIDGE_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
+$(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_stream_equivalence.o: dfn/tests/test_dfn_stream_equivalence.c dfn/dfn_res_stage.h $(STREAM_DFN2_DIR)/dfn2_stream.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_dfn_rate_bridge.o: dfn/tests/test_dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/test_dfn_rate_bridge.o: dfn/tests/test_dfn_rate_bridge.c dfn/dfn_rate_bridge.h dfn/tests/dfn_test_fixture.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_mono_dfn.o: mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_hop_pool.h dfn/tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<

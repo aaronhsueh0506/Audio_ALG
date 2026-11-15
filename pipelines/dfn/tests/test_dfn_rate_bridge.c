@@ -16,6 +16,7 @@
 #include "fft_wrapper.h"
 #include "utility/mem_align.h"   /* ALIGN16 */
 #include "dfn/tests/dfn_test_fixture.h"
+#include "stream_run.h"
 
 /* The tolerance-identity input (300, 1000, 2500 Hz) in the precision of T, and the same tones as
  * the reference at the exact delayed time. */
@@ -403,8 +404,11 @@ static int run_borrowed_sizes(void) {
  * caller writes reproduces the configured callback byte for byte on every
  * native grid, including the hops that carry two stage frames. The model-free
  * rows: a frame the caller reports as failed, and a frame it leaves open or
- * never fetches (finish takes it as the identity), equal a bridge with no
- * model. Sequence errors are refused. */
+ * never fetches (finish takes it as the identity), output-equal a bridge with no
+ * model. Their state generation differs from that bridge's by the run status: a
+ * reported failure and a frame left open (STREAM_RUN_FAILED) move it once per real
+ * frame, a frame never fetched (STREAM_RUN_NOT_STARTED) not at all. Sequence
+ * errors are refused. */
 /* behaviour of the caller in the phased twin */
 
 static int run_phased_grid(const Grid *g, int behaviour) {
@@ -417,6 +421,7 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     static float est[MAX_HOPS * (MAX_FFT / 2)], app[MAX_HOPS * (MAX_FFT / 2)];
     static float oa[MAX_FFT / 2], ob[MAX_FFT / 2];
     int hop = g->fft / 2, hops = 120, t, k, max_frames = 0, nonzero = 0;
+    long long first_frame = 0, stage_frames = 0, failed_real = 0;   /* real frames closed with STREAM_RUN_FAILED */
     DfnResStageJob job;
 
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
@@ -432,6 +437,7 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     for (k = 0; k < hops * hop; ++k) app[k] = 0.7f * est[k];
     for (t = 0; t < hops; ++t) {
         int r, frames_this_hop = 0;
+        first_frame = stage_frames;
         analyzer_push(&ae, est + t * hop, se);
         analyzer_push(&ap, app + t * hop, sa);
         if (dfn_rate_bridge_process(cb, se, sa, ob) != 0) return 3;
@@ -440,20 +446,28 @@ static int run_phased_grid(const Grid *g, int behaviour) {
             while ((r = dfn_rate_bridge_nn_begin(ph, &job)) == 1) {
                 int rc = 0;
                 ++frames_this_hop;
-                if (behaviour == BP_OPEN) break;       /* left open: finish takes the identity */
+                if (behaviour == BP_OPEN) {            /* left open: finish closes it as STREAM_RUN_FAILED */
+                    if (first_frame >= M_FRAMES) ++failed_real;
+                    break;
+                }
+                if (behaviour == BP_FAIL && first_frame + frames_this_hop - 1 >= M_FRAMES) ++failed_real;
                 if (behaviour == BP_RUN)
                     rc = dfn_fixture_half_mask_infer(NULL, &job.inputs, &job.outputs);
-                else rc = -1;
+                else rc = STREAM_RUN_FAILED;
                 if (dfn_rate_bridge_nn_end(ph, rc) != 0) return 5;
             }
             if (r < 0) return 6;
         }
         if (dfn_rate_bridge_finish(ph, oa) != 0) return 7;
+        dfn_rate_bridge_get_counters(ph, &stage_frames, NULL);
         if (frames_this_hop > max_frames) max_frames = frames_this_hop;
         if (memcmp(oa, ob, (size_t)hop * sizeof(float)) != 0) return 10 + t;
         for (k = 0; k < hop; ++k) if (oa[k] != 0.0f) nonzero = 1;
     }
     if (!nonzero) return 8;
+    if (dfn_rate_bridge_state_generation(ph) != dfn_rate_bridge_state_generation(cb) + (unsigned int)failed_real)
+        return 14;
+    if ((behaviour == BP_FAIL || behaviour == BP_OPEN) && failed_real < 1) return 15;
     /* the 1,2 schedules (and 0,1,1,1) are walked by the run above */
     if (behaviour == BP_RUN && max_frames < 1) return 9;
     dfn_rate_bridge_destroy(ph);
@@ -691,9 +705,10 @@ static int run_phased_sequence(void) {
 }
 
 /* The bridge reports its stage's state generation: 1 after create, plus one per reset, one per
- * warm-up frame (the first mask_lookahead stage frames, whatever the model wrote) and one per refused
- * commit of a real frame (a head the commit finds non-finite, closed through nn_end); a model that
- * reports failure leaves it alone. A caller that holds the model's state refills it when the value
+ * warm-up frame (the first mask_lookahead stage frames, whatever the model wrote or reported), one per
+ * refused commit of a real frame (a head the commit finds non-finite, closed through nn_end) and one per
+ * real frame closed with a run status that is neither STREAM_RUN_OK nor STREAM_RUN_NOT_STARTED; a frame
+ * that ran nothing leaves it alone. A caller that holds the model's state refills it when the value
  * changes. */
 static int run_state_generation(void) {
     DfnRateBridgeConfig cfg = bridge_config(16000, 256);
@@ -703,19 +718,23 @@ static int run_state_generation(void) {
     static float hopbuf[128], out[128];
     DfnResStageJob job;
     unsigned int expect = 1u;
-    int pass, t, refused = 0, warm = 0, seen = 0, r;
+    int pass, t, refused = 0, failed = 0, warm = 0, seen = 0, r;
 
     if (dfn_rate_bridge_state_generation(NULL) != 0u) return 1;
     if (!b || analyzer_init(&ae, 256) != 0 || analyzer_init(&ap, 256) != 0) return 2;
     memset(hopbuf, 0, sizeof(hopbuf));
     if (dfn_rate_bridge_state_generation(b) != expect) return 3;
-    for (pass = 0; pass < 2; ++pass) {   /* 0: heads with a NaN (refused commit), 1: failed model runs */
+    for (pass = 0; pass < 3; ++pass) {   /* 0: heads with a NaN (refused commit), 1: failed model runs, 2: runs that never started */
         for (t = 0; t < 12; ++t) {
             analyzer_push(&ae, hopbuf, se);
             analyzer_push(&ap, hopbuf, sa);
             if (dfn_rate_bridge_begin(b, se, sa) != 0) return 4;
             while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1) {
-                int rc = -1;
+                int rc = pass == 1 ? STREAM_RUN_FAILED : STREAM_RUN_NOT_STARTED;
+                if (pass == 1) {                       /* the warm-up frames are over by now: a failed run is +1 */
+                    ++expect;
+                    ++failed;
+                }
                 if (pass == 0) {
                     dfn_fixture_half_mask_infer(NULL, &job.inputs, &job.outputs);
                     job.outputs.erb_mask[3] = (float)NAN;
@@ -734,7 +753,8 @@ static int run_state_generation(void) {
         }
     }
     if (refused < 1) return 10;   /* the NaN pass must have refused commits of real frames */
-    if (warm != M_FRAMES || expect != 1u + (unsigned int)M_FRAMES + (unsigned int)refused) return 12;
+    if (failed < 1) return 13;    /* the failure pass must have run real frames */
+    if (warm != M_FRAMES || expect != 1u + (unsigned int)M_FRAMES + (unsigned int)refused + (unsigned int)failed) return 12;
     dfn_rate_bridge_reset(b);
     if (dfn_rate_bridge_state_generation(b) != expect + 1u) return 11;
     dfn_rate_bridge_destroy(b);

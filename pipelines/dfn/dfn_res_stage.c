@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "dfn_res_stage.h"
+#include "stream_run.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"
 
@@ -339,10 +340,13 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
     if (!s || !out_spec || s->phase != 2) return -1;
     grid = dfn2_prepost_grid(s->prepost);
     /* A warm-up frame (the first mask_lookahead hops) discards its heads and is not counted. A
-     * failed run or an unwritten/non-finite output takes the frame as the identity; the clocks
-     * advance once. */
-    committed = model_rc == 0 && dfn2_prepost_frame_finish(s->prepost) == 0;
-    if (!committed && dfn2_prepost_frame_bypass(s->prepost) != 0) {
+     * run that did not succeed or an unwritten/non-finite output takes the frame as the identity;
+     * the clocks advance once. A refused commit has zeroed the state and advanced the generation
+     * inside frame_finish(); a failing status closes through frame_fail(). */
+    committed = model_rc == STREAM_RUN_OK && dfn2_prepost_frame_finish(s->prepost) == 0;
+    if (!committed &&
+        (model_rc == STREAM_RUN_OK ? dfn2_prepost_frame_bypass(s->prepost)
+                                   : dfn2_prepost_frame_fail(s->prepost, model_rc != STREAM_RUN_NOT_STARTED)) != 0) {
         s->phase = 0;
         return -1;
     }
@@ -366,7 +370,7 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
 }
 
 int dfn_res_stage_infer(const DfnResStage *s, DfnResStageJob *job) {
-    if (!s || !job || !s->model.infer) return -1;
+    if (!s || !job || !s->model.infer) return STREAM_RUN_NOT_STARTED;
     return s->model.infer(s->model.user, &job->inputs, &job->outputs);
 }
 

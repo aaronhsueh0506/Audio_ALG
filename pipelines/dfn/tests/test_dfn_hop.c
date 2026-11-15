@@ -91,6 +91,16 @@ static int half_mask_then_fail_infer(void* user, const DFN2PrepostInputs* in, DF
     return -1;
 }
 
+/* A callback that ran nothing, and one whose run failed. */
+static int not_started_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
+    (void)user; (void)in; (void)out;
+    return STREAM_RUN_NOT_STARTED;
+}
+static int failed_run_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
+    (void)user; (void)in; (void)out;
+    return STREAM_RUN_FAILED;
+}
+
 static DFN2Model model_of(int (*infer)(void*, const DFN2PrepostInputs*, DFN2PrepostOutputs*), void* user) {
     DFN2Model m;
     memset(&m, 0, sizeof m);
@@ -344,7 +354,7 @@ static int phased(Rig* r, const Complex* e, const Complex* p, Behaviour b, float
         while ((rc = dfn_hop_nn_begin(&r->h, &job)) == 1) {
             f++;
             if (b == B_OPEN) { (void)dfn_hop_infer(&r->h, &job); break; }   /* heads written, frame left open */
-            rc = dfn_hop_nn_end(&r->h, b == B_RUN ? dfn_hop_infer(&r->h, &job) : -1);
+            rc = dfn_hop_nn_end(&r->h, b == B_RUN ? dfn_hop_infer(&r->h, &job) : STREAM_RUN_FAILED);
             if (rc != 0) return rc;
         }
         if (rc < 0) return rc;
@@ -354,12 +364,12 @@ static int phased(Rig* r, const Complex* e, const Complex* p, Behaviour b, float
 }
 
 /* The four behaviours over N hops with `infer`; seq[b][h] receives the hops. run_frames receives the
- * frames the B_RUN behaviour opened, run_calls the model runs and run_generation the state generation
- * it ended on. */
+ * frames the B_RUN behaviour opened, run_calls the model runs and gens[b] the state generation behaviour b
+ * ended on. */
 enum { N_BEH = 40 };
 static int run_behaviours(int bridge_mode, int (*infer)(void*, const DFN2PrepostInputs*, DFN2PrepostOutputs*),
                           float seq[4][N_BEH][MAXB], long long* run_frames, long long* run_calls,
-                          unsigned* run_generation, int* max_frames, int* first_hop_frames) {
+                          unsigned gens[4], int* max_frames, int* first_hop_frames) {
     Complex e[MAXB], p[MAXB];
     int bi, h, bad = 0, frames;
     *max_frames = 0;
@@ -379,10 +389,8 @@ static int run_behaviours(int bridge_mode, int (*infer)(void*, const DFN2Prepost
                 if (h == 0) *first_hop_frames = frames;
             }
         }
-        if (bi == B_RUN) {
-            *run_calls = g_model_calls;
-            *run_generation = dfn_hop_state_generation(&r.h);
-        }
+        if (bi == B_RUN) *run_calls = g_model_calls;
+        gens[bi] = dfn_hop_state_generation(&r.h);
         rig_free(&r);
     }
     return bad;
@@ -417,9 +425,9 @@ static void test_path(int bridge_mode) {
     {
         static float seq[4][N_BEH][MAXB], seq_half[4][N_BEH][MAXB];
         long long run_frames, run_calls, rf2, rc2;
-        unsigned generation, gen2;
+        unsigned gens[4], gens2[4];
         int max_frames, first_hop_frames = -1, mf2, fh2, bad;
-        bad = run_behaviours(bridge_mode, counting_identity_infer, seq, &run_frames, &run_calls, &generation,
+        bad = run_behaviours(bridge_mode, counting_identity_infer, seq, &run_frames, &run_calls, gens,
                              &max_frames, &first_hop_frames);
         CHECK(bad == 0, "phased calls succeed in every behaviour");
         CHECK(memcmp(seq[0], seq[1], sizeof seq[0]) == 0 && memcmp(seq[0], seq[2], sizeof seq[0]) == 0 &&
@@ -433,11 +441,19 @@ static void test_path(int bridge_mode) {
         CHECK(run_calls == run_frames && run_frames > 0,
               "the model runs once per frame it is shown, warm-up frames included");
         CHECK(bridge_mode || run_frames == N_BEH, "direct path: one model run per hop");
-        CHECK(generation == 1u + (unsigned)DFN2_MASK_LOOKAHEAD || bridge_mode,
+        CHECK(gens[B_RUN] == 1u + (unsigned)DFN2_MASK_LOOKAHEAD || bridge_mode,
               "direct path: the state generation is 1 plus one per warm-up frame (no reset, no refused commit)");
+        /* the run status decides the generation: a failed run (STREAM_RUN_FAILED) and a frame left open move it
+         * once per real frame, a frame never fetched (STREAM_RUN_NOT_STARTED) not at all */
+        CHECK(gens[B_UNFETCHED] == gens[B_RUN],
+              "a frame never fetched is STREAM_RUN_NOT_STARTED: the generation is the run behaviour's");
+        CHECK(gens[B_FAIL] > gens[B_RUN] && gens[B_OPEN] > gens[B_RUN],
+              "a reported failure and a frame left open advance the generation");
+        CHECK(bridge_mode || (gens[B_FAIL] == 1u + (unsigned)N_BEH && gens[B_OPEN] == gens[B_FAIL]),
+              "direct path: one step per frame, the warm-up frames included, for a failure and a frame left open");
 
         /* a model that changes the spectrum: only the run behaviour commits its heads */
-        bad = run_behaviours(bridge_mode, dfn_fixture_half_mask_infer, seq_half, &rf2, &rc2, &gen2, &mf2, &fh2);
+        bad = run_behaviours(bridge_mode, dfn_fixture_half_mask_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2);
         CHECK(bad == 0, "phased calls succeed with the half-mask model");
         CHECK(memcmp(seq_half[B_RUN], seq[B_RUN], sizeof seq_half[0]) != 0,
               "the half-mask model changes the output of the run behaviour");
@@ -446,7 +462,7 @@ static void test_path(int bridge_mode) {
               memcmp(seq_half[B_UNFETCHED], seq[B_RUN], sizeof seq[0]) == 0,
               "fail / left open / never fetched stay the identity whatever the model would have written");
         /* the model's own result decides: written heads with a failure code are not committed */
-        bad = run_behaviours(bridge_mode, half_mask_then_fail_infer, seq_half, &rf2, &rc2, &gen2, &mf2, &fh2);
+        bad = run_behaviours(bridge_mode, half_mask_then_fail_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2);
         CHECK(bad == 0, "phased calls succeed with a model that writes and then fails");
         CHECK(memcmp(seq_half[B_RUN], seq[B_RUN], sizeof seq_half[0]) == 0,
               "a model that writes its heads and reports failure is the identity, not the half mask");
@@ -584,6 +600,34 @@ static void test_model_hooks(void) {
         }
     }
     rig_free(&r);
+
+    {   /* the run status of the model callback decides the generation: no model and a callback that ran nothing
+         * (STREAM_RUN_NOT_STARTED) leave it, a callback whose run failed moves it once per real frame */
+        static const int HOPS = 10;
+        int k, h;
+        for (k = 0; k < 3; ++k) {
+            DFN2Model mm;
+            DfnHopJob job;
+            memset(&mm, 0, sizeof mm);
+            if (k == 1) mm = model_of(not_started_infer, NULL);
+            if (k == 2) mm = model_of(failed_run_infer, NULL);
+            CHECK(rig_init(&r, 0, mm) == 0, "status rig");
+            g_lcg = 5u;
+            for (h = 0; h < HOPS; ++h) {
+                make_frame(e, p, r.n);
+                CHECK(dfn_hop_process(&r.h, e, p, out) == 0, "a hop with a failing or absent model still closes");
+            }
+            CHECK(dfn_hop_state_generation(&r.h) ==
+                  1u + (unsigned)DFN2_MASK_LOOKAHEAD + (k == 2 ? (unsigned)(HOPS - DFN2_MASK_LOOKAHEAD) : 0u),
+                  "model status: absent and not-started leave the generation, a failed run advances it per real frame");
+            make_frame(e, p, r.n);
+            CHECK(dfn_hop_begin(&r.h, e, p) == 0 && dfn_hop_nn_begin(&r.h, &job) == 1, "status rig: a frame opens");
+            CHECK(dfn_hop_infer(&r.h, &job) == (k == 0 ? STREAM_RUN_NOT_STARTED : k == 1 ? STREAM_RUN_NOT_STARTED
+                                                                                      : STREAM_RUN_FAILED),
+                  "dfn_hop_infer reports the callback's status, STREAM_RUN_NOT_STARTED without one");
+            rig_free(&r);
+        }
+    }
 
     /* the pool plan refuses what the shipped stage refused */
     plan_for(&plan, model_of(counting_identity_infer, NULL));

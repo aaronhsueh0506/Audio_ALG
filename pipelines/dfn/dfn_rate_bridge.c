@@ -8,6 +8,7 @@
 
 #include "dfn_rate_bridge.h"
 #include "ainr_bridge.h"
+#include "stream_run.h"
 #include "utility/mem_align.h"
 
 #define ADAPTER_ALIGN 16u
@@ -207,10 +208,11 @@ int dfn_rate_bridge_finish(DfnRateBridge *b, float *out_hop) {
     DfnResStageJob job;
     int r;
     if (!b || !out_hop) return -1;
-    /* Frames left open or never fetched take the identity. */
-    if (b->frame_open && dfn_rate_bridge_nn_end(b, -1) != 0) return -1;
+    /* Frames left open (STREAM_RUN_FAILED: the caller may have run it) or never fetched (STREAM_RUN_NOT_STARTED)
+     * take the identity. */
+    if (b->frame_open && dfn_rate_bridge_nn_end(b, STREAM_RUN_FAILED) != 0) return -1;
     while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1)
-        if (dfn_rate_bridge_nn_end(b, -1) != 0) return -1;
+        if (dfn_rate_bridge_nn_end(b, STREAM_RUN_NOT_STARTED) != 0) return -1;
     if (r < 0) return -1;
     return ainr_bridge_finish(b->bridge, out_hop);
 }

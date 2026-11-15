@@ -1,11 +1,11 @@
 /* DfnResStage against dfn2_stream_*_freq (stream/ainr/dfn2, memory-mode init): two thin wrappers over
  * the same dfn2_prepost_* calls, the stream's caller applying dfn2_stft_scale / dfn2_stft_unscale
  * that the stage applies itself. For six grids (the catalog's 16k/256 and 48k/1024, 32k/512, 16k/512
- * and lookahead pairs 2/4, 2/3, 0/1 that no catalog row has) and ten scenarios of 400 hops each, fed the
+ * and lookahead pairs 2/4, 2/3, 0/1 that no catalog row has) and eleven scenarios of 400 hops each, fed the
  * same spectra and the same deterministic model, the model-visible windows, the output spectra
  * (bit for bit), the state generation, the return codes and the valid flag are compared every hop.
- * Scenarios: plain; attenuation limit from the start; a model that reports failure; heads left
- * unwritten; a NaN bin; E and P the same pointers; a 1e21 bin (beyond 2^63 at model scale);
+ * Scenarios: plain; attenuation limit from the start; a model that reports failure; a model that ran
+ * nothing (STREAM_RUN_NOT_STARTED); heads left unwritten; a NaN bin; E and P the same pointers; a 1e21 bin (beyond 2^63 at model scale);
  * the largest bin below the limit and the next float above it; a reset; an attenuation change.
  * The refusal scenarios also pin that a refused block leaves the generation untouched. Two injected
  * faults (a perturbed bin, a reset applied to one side only) must be reported, so the comparator
@@ -23,10 +23,11 @@
 
 typedef struct Row { int sr, fft, n_erb, df_bins, mask_la, df_la; } Row;
 
-enum { S_PLAIN, S_ATTEN, S_MODEL_RC, S_UNWRITTEN, S_NAN, S_SAME_EP, S_LARGE, S_LIMIT, S_RESET, S_ATTEN_CHANGE,
+enum { S_PLAIN, S_ATTEN, S_MODEL_RC, S_NOT_STARTED, S_UNWRITTEN, S_NAN, S_SAME_EP, S_LARGE, S_LIMIT, S_RESET, S_ATTEN_CHANGE,
        S_COUNT };
 static const char *const S_NAME[S_COUNT] = {
-    "plain", "attenuation limit 12 dB from the start", "model reports failure (3 hops)", "heads left unwritten (3 hops)",
+    "plain", "attenuation limit 12 dB from the start", "model reports failure (3 hops)", "model ran nothing (3 hops)",
+    "heads left unwritten (3 hops)",
     "NaN bin at hop 80", "E and P the same pointers", "1e21 bin at hop 80", "limit bin at hop 80, next float at 81",
     "reset at hop 100", "attenuation change at hop 100" };
 
@@ -144,7 +145,8 @@ static Result run(const Row *r, int scenario, int inject) {
         }
         if (inject == INJ_PERTURB && h >= 200) spr[5] = spr[5] * 1.0000002f;
         if (scenario == S_UNWRITTEN && (h == 60 || h == 61 || h == 200)) skip = 1;
-        if (scenario == S_MODEL_RC && (h == 40 || h == 41 || h == 120)) model_rc = -1;
+        if (scenario == S_MODEL_RC && (h == 40 || h == 41 || h == 120)) model_rc = STREAM_RUN_FAILED;
+        if (scenario == S_NOT_STARTED && (h == 40 || h == 41 || h == 120)) model_rc = STREAM_RUN_NOT_STARTED;
         if (scenario == S_RESET && h == 100) { dfn_res_stage_reset(st); if (inject != INJ_ONE_SIDED_RESET) dfn2_stream_reset(s); }
         if (scenario == S_ATTEN_CHANGE && h == 100) { dfn_res_stage_set_atten_lim(st, 9.0f); dfn2_stream_set_atten_lim(s, 9.0f); }
 

@@ -1,5 +1,5 @@
 /* The end-of-input tail through both families, against a bypassing stand-in accelerator
- * (infer_status != 0: unit mask, alpha 0 -- the near-identity pass-through). A single 16000-count
+ * (run_status != 0: unit mask, alpha 0 -- the near-identity pass-through). A single 16000-count
  * sample is placed at the very last real input sample; the test reads it back at output index
  * (real length - 1 + trim_samples) after the documented drain (ainr.h "Tail"): tail_zero_blocks
  * all-zero hop_in blocks after the last real block.

@@ -56,7 +56,7 @@ static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
     (void)user;
     (void)inputs;
     (void)outputs;
-    return -1; /* BOARD: invoke the stateless DFN2 graph. */
+    return STREAM_RUN_NOT_STARTED; /* BOARD: invoke the stateless DFN2 graph. */
 }
 
 /* Host grids accepted at parse time (0-terminated; no 8 kHz). */

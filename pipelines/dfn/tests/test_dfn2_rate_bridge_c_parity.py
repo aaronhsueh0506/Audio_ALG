@@ -28,6 +28,7 @@ from pipelines.dfn.tests.dfn2_pairs import C_PAIRS, SHIPPED, pair_config, pair_d
 DFN = ROOT / 'lib' / 'ainr' / 'dfn2'  # moved from AINR/DeepFilterNet2
 PIPELINES = ROOT / 'pipelines'
 BRIDGE = ROOT / 'stream' / 'ainr' / 'bridge'  # the bridge dfn_rate_bridge.c adapts
+STREAM_COMMON = ROOT / 'stream' / 'common'  # stream_run.h
 
 _SHIM = r'''
 #include <string.h>
@@ -97,7 +98,7 @@ def c_lib(pair, tmp_path_factory):
                        PIPELINES / 'dfn' / 'dfn_res_stage.c',
                        DFN / 'dfn2_process.c', DFN / 'dfn2_model_io.c',
                        DFN / 'dfn2_prepost.c'],
-        extra_includes=[PIPELINES, DFN, BRIDGE],
+        extra_includes=[PIPELINES, DFN, BRIDGE, STREAM_COMMON],
         defines=['AUDIO_PIPELINE_BACKEND_STR="ne10"'] + pair_defines(pair))
     fp = ctypes.POINTER(ctypes.c_float)
     lib.bridge_parity_create.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp]

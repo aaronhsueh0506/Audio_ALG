@@ -95,8 +95,9 @@ pre/post objects, and the older stage and rate bridge adapter (`dfn_res_stage.o`
 sample objects `array_sample_beam.o` and `array_sample_driver.o` are linked into
 the program, not archived. The board supplies the stateless model
 callback (`DFN2Model`; its recurrent state is the accelerator's, reloaded with quantized zeros when
-`job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, each warm-up frame or a
-refused commit) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
+`job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, each warm-up frame, a
+refused commit or a run that started and failed; a callback that ran nothing returns `STREAM_RUN_NOT_STARTED` and moves
+nothing) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
 `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for

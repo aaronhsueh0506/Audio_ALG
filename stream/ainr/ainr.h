@@ -10,11 +10,17 @@
  *     for each block of hop_in samples:
  *         ainr_preprocess(ctx, pcm_in, &work);          // always carries one job
  *         ...run the accelerator on work (state sync and readback recovery are the sample's)...
- *         ainr_postprocess(ctx, ai_rc, pcm_out);        // hop_in valid samples
+ *         ainr_postprocess(ctx, run_status, pcm_out);   // hop_in valid samples
  *     after the last real block (zero-padded to hop_in): info.tail_zero_blocks all-zero blocks through
  *         the same sequence, then drop info.trim_samples from the start of the output
  *
- * A failed run or readback still calls ainr_postprocess() with the failure status. An unregistered
+ * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
+ * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
+ * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
+ * accelerator's state when the generation differs from the value at the last zeroing. Each of the first
+ * mask_lookahead blocks after init or reset also advances it (the warm-up job's heads are discarded).
+ *
+ * A block whose run did not succeed still calls ainr_postprocess() with its run status. An unregistered
  * config is refused before any SDK call. Every successful preprocess pairs with one run and one
  * postprocess. StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
  * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
@@ -93,22 +99,19 @@ void ainr_reset(AinrCtx *ctx);
  * AINR_ERR_NULL for NULL; else 0. Kept by ainr_reset(). The _freq variant is the same. */
 int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
 
-/* Current state generation (0 for NULL): seeds the sample's sync after init or reset; advances on reset, each
- * warm-up hop and a refused commit (non-finite heads): reload quantized zero on a change. A failed run or
- * readback (status != 0) leaves the generation unchanged: zero the accelerator's state before its next run.
- * All-zero bytes are that zero: the port check refuses a fixed-point state port with zero_point != 0. */
+/* Current state generation (0 for NULL): seeds the sample's sync after init or reset; see the run-status rule above.
+ * All-zero bytes are quantized zero: the port check refuses a fixed-point state port with zero_point != 0. */
 unsigned int ainr_state_generation(const AinrCtx *ctx);
 
-/* One block in: exactly cfg->hop_in samples. AINR_OK: work (action SUBMIT) holds the block's one job: inputs[0] the
- * ERB window, inputs[1] the spec window; outputs[] erb_mask, then coefs and alpha in the full archive. Run the
- * accelerator, then ainr_postprocess(). AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no
- * block is open. */
+/* One block in: exactly cfg->hop_in samples. AINR_OK: work (action SUBMIT) holds the block's one job (inputs: ERB
+ * window, spec window; outputs: erb_mask, then coefs and alpha in the full archive); run it, then ainr_postprocess().
+ * AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no block is open. */
 int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work);
 
-/* Closes the block: infer_status 0 commits (full: df_alpha clamped to [0, 1] before use), anything else bypasses
- * with a near-identity pass-through (unit ERB mask, alpha 0). Returns 0 with hop_in samples in pcm_out either
- * way; AINR_ERR_SEQUENCE without a matching preprocess (pcm_out untouched). */
-int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out);
+/* Closes the block with its run status: 0 commits (full: df_alpha clamped to [0, 1]), anything else bypasses with a
+ * near-identity pass-through (unit ERB mask, alpha 0). Returns 0 with hop_in samples in pcm_out either way;
+ * AINR_ERR_SEQUENCE without a matching preprocess (pcm_out untouched). */
+int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out);
 
 /* ---- Spectrum -> spectrum ("_freq") family ----
  * Same config, AinrInfo and StreamWork as the PCM family; only the data crossing the block boundary differs.
@@ -146,7 +149,7 @@ int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est
 
 /* Closes the block like ainr_postprocess(), writing N frames of enhanced spectrum (out_re/out_im: N * n_bins
  * floats each). */
-int ainr_postprocess_freq(AinrFreqCtx *ctx, int infer_status, float *out_re, float *out_im);
+int ainr_postprocess_freq(AinrFreqCtx *ctx, int run_status, float *out_re, float *out_im);
 
 #ifdef __cplusplus
 }

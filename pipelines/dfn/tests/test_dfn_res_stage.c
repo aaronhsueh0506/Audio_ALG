@@ -16,6 +16,7 @@
 #include "dfn/dfn_res_stage.h"
 #include "audio_stft.h"
 #include "dfn/tests/dfn_test_fixture.h"
+#include "stream_run.h"
 
 #define FRAMES 6
 #define L_FRAMES DFN_TEST_LOOKAHEAD_FRAMES        /* output delay of the test grid's pair */
@@ -49,6 +50,13 @@ static int failing_infer(void *user, const DFN2PrepostInputs *in,
                          DFN2PrepostOutputs *out) {
     (void)user; (void)in; (void)out;
     return -1;
+}
+
+/* A callback that ran nothing and says so: the device state is untouched. */
+static int not_started_infer(void *user, const DFN2PrepostInputs *in,
+                             DFN2PrepostOutputs *out) {
+    (void)user; (void)in; (void)out;
+    return STREAM_RUN_NOT_STARTED;
 }
 
 /* Heads that are finite except one ERB mask element, reported as a success: the commit refuses. */
@@ -865,8 +873,9 @@ static int run_large_bin_refused(void) {
 }
 
 /* Generation of the model's recurrent state: 1 after init, plus one per reset, one per warm-up frame
- * (whatever the model wrote) and one per refused commit of a real frame (a head the commit finds
- * non-finite); a model that reports failure and a committed real frame leave it alone. */
+ * (whatever the model wrote or reported), one per refused commit of a real frame (a head the commit
+ * finds non-finite) and one per real frame whose run status is neither STREAM_RUN_OK nor
+ * STREAM_RUN_NOT_STARTED; a committed real frame and a model that ran nothing leave it alone. */
 static int run_state_generation(void) {
     DFN2ModelIoDescriptor descriptor;
     DfnResStageConfig cfg = base_config();
@@ -879,9 +888,9 @@ static int run_state_generation(void) {
     if (dfn_res_stage_state_generation(NULL) != 0u) return 1;
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 2;
     cfg.model.io_descriptor = &descriptor;
-    for (kind = 0; kind < 3; ++kind) {   /* committed frames, a failing model, a refused commit */
+    for (kind = 0; kind < 4; ++kind) {   /* committed frames, a failing model, a refused commit, a model that ran nothing */
         cfg.model.infer = kind == 0 ? dfn_fixture_identity_infer
-                        : kind == 1 ? failing_infer : nan_head_infer;
+                        : kind == 1 ? failing_infer : kind == 2 ? nan_head_infer : not_started_infer;
         s = dfn_res_stage_create(&cfg);
         if (!s) return 3;
         expect = 1u;
@@ -889,8 +898,9 @@ static int run_state_generation(void) {
         for (frame = 0; frame < FRAMES; ++frame) {
             fill_frame(estimate, apply, frame);
             if (dfn_res_stage_process(s, estimate, apply, out) < 0) return 5;
-            /* a warm-up frame discards its heads, NaN or not: exactly one; a real frame: only a refusal */
-            if (frame < M_FRAMES || kind == 2) ++expect;
+            /* a warm-up frame discards its heads, whatever they and the status say: exactly one; a real frame:
+             * a refusal or a failed run */
+            if (frame < M_FRAMES || kind == 1 || kind == 2) ++expect;
             if (dfn_res_stage_state_generation(s) != expect) return 6 + kind;
         }
         dfn_res_stage_get_counters(s, NULL, &commits, &skips);
@@ -908,9 +918,10 @@ static int run_state_generation(void) {
 /* The phased hop (begin / model / end) against the one-call process(): a
  * non-identity model (a uniform 0.5 band mask, so the output differs from the
  * input) run by the caller between begin and end reproduces the configured
- * callback byte for byte. The fail-open rows: a nonzero model result, a frame
- * left open (end without a model result is fed -1 by the caller), and a
- * non-finite head all take the identity; the counters follow. */
+ * callback byte for byte, the state generation included. The fail-open rows: a
+ * nonzero run status, a model that ran nothing (STREAM_RUN_NOT_STARTED), a frame
+ * the caller reports as success that nothing wrote, and a non-finite head all
+ * take the identity; the counters follow. */
 
 /* Writes every output validly, then reports failure: the result code alone
  * must send the frame down the identity path. */
@@ -923,7 +934,8 @@ static int half_mask_then_fail(void *user, const DFN2PrepostInputs *in,
 /* mode 0: caller runs dfn_fixture_half_mask_infer; 1: caller reports -1; 2: the model
  * writes a NaN head and reports success; 3: no model at all (config) and the
  * caller reports 0 on a frame it never ran (the commit refuses it); 4: the model
- * writes finite outputs and reports -1. */
+ * writes finite outputs and reports -1; 5: no model at all and the caller reports
+ * STREAM_RUN_NOT_STARTED, which is what the stage's own callback reports without a model. */
 static int run_phased_case(int mode) {
     DFN2ModelIoDescriptor descriptor;
     DfnResStageConfig phased_cfg = base_config();
@@ -940,7 +952,7 @@ static int run_phased_case(int mode) {
                        : mode == 1 ? failing_infer
                        : mode == 2 ? nan_head_infer
                        : mode == 4 ? half_mask_then_fail : NULL;
-    if (mode == 3) cb_cfg.model.io_descriptor = NULL;
+    if (mode == 3 || mode == 5) cb_cfg.model.io_descriptor = NULL;
     ph = dfn_res_stage_create(&phased_cfg);
     cb = dfn_res_stage_create(&cb_cfg);
     if (!ph || !cb) return 2;
@@ -957,6 +969,7 @@ static int run_phased_case(int mode) {
             else if (mode == 1) model_rc = -1;
             else if (mode == 2) model_rc = nan_head_infer(NULL, &job.inputs, &job.outputs);
             else if (mode == 4) model_rc = half_mask_then_fail(NULL, &job.inputs, &job.outputs);
+            else if (mode == 5) model_rc = STREAM_RUN_NOT_STARTED;   /* nothing ran */
             else model_rc = 0;   /* nothing was written: the NaN heads refuse the commit */
             if (dfn_res_stage_end(ph, model_rc, a) != rc_b) return 4;
         } else {
@@ -974,6 +987,10 @@ static int run_phased_case(int mode) {
     dfn_res_stage_get_counters(ph, &fa, &ca, &sa);
     dfn_res_stage_get_counters(cb, &fb, &cb_commits, &sb);
     if (fa != fb || ca != cb_commits || sa != sb) return 6;
+    /* mode 3 differs by design: the caller's 0 on an unwritten frame is a refused commit (+1), the stage's own
+     * callback without a model is NOT_STARTED (no step) */
+    if (mode != 3 && dfn_res_stage_state_generation(ph) != dfn_res_stage_state_generation(cb)) return 13;
+    if (mode == 3 && dfn_res_stage_state_generation(ph) <= dfn_res_stage_state_generation(cb)) return 14;
     if (opened != FRAMES + 4) return 12;
     if (!any) return 7;
     if (mode == 0 && (ca == 0 || !differs)) return 8;   /* the model really shaped it */
@@ -1171,7 +1188,7 @@ int main(void) {
     if (rc) { fprintf(stderr, "large-bin row failed: %d\n", rc); return 1; }
     rc = run_state_generation();
     if (rc) { fprintf(stderr, "state-generation row failed: %d\n", rc); return 1; }
-    for (rc = 0; rc < 5; ++rc) {
+    for (rc = 0; rc < 6; ++rc) {
         int r = run_phased_case(rc);
         if (r) { fprintf(stderr, "phased case %d failed: %d\n", rc, r); return 1; }
     }

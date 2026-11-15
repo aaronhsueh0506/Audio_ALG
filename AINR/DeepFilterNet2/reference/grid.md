@@ -110,8 +110,10 @@ ones. Defaults are 48000 and 1024.
 The samples take the port shapes and the recurrent-state shapes from `stream/ainr/graph_io_dfn2.h` (the core library knows none):
 `h_gru` `[1,5,1,256]` (mask-only `[1,3,1,256]`) and `df_convp_history` `[1,64,5,df_bins]`. They register nothing: the accelerator
 holds the state, each state input and its `*_out` output are bound to one buffer. Before every accelerator run a sample compares
-the block's `StreamWork.state_generation` with the last value it saw and, when it differs or the previous run or readback failed,
-reloads quantized zeros into the state input buffers. A sample refuses to start when the ports the loaded model reports differ
+the block's `StreamWork.state_generation` with the value at its last zeroing and, when it differs, reloads quantized zeros into the
+state input buffers. The sample keeps no failure flag of its own: it closes the block with a run status (`stream_run.h`; 0 every head
+written, `STREAM_RUN_NOT_STARTED` nothing ran, anything else a started run that failed) and the library advances the generation for a
+started run that failed. A sample refuses to start when the ports the loaded model reports differ
 from the model config.
 
 **The ERB matrices.** The core library (`lib/ainr/dfn2`) reads no file. It borrows two `const float` pointers, forward bin-major `[n_bins][n_erb]` and

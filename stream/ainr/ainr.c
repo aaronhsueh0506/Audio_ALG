@@ -571,11 +571,11 @@ static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
 }
 
 /* Close/deliver half of _freq: closes the real Nth hop via
- * dfn2_stream_post_process_freq() (ai_rc = infer_status), writes it to out_re/out_im's last slot,
+ * dfn2_stream_post_process_freq() (ai_rc = run_status), writes it to out_re/out_im's last slot,
  * then copies the n - 1 MODEL-scale stashed frames into the earlier slots -- the SAME
  * dfn2_stft_unscale() multiply applied uniformly to every frame, at delivery time, never twice and
  * never only to some frames. */
-static int ainr_close_spectrum(AinrCore *c, int infer_status, float *out_re, float *out_im)
+static int ainr_close_spectrum(AinrCore *c, int run_status, float *out_re, float *out_im)
 {
     int i, k, n_bins = c->grid.n_bins;
     int valid = 0;
@@ -584,7 +584,7 @@ static int ainr_close_spectrum(AinrCore *c, int infer_status, float *out_re, flo
     float *last_re = out_re + (size_t)(c->n - 1) * (size_t)n_bins;
     float *last_im = out_im + (size_t)(c->n - 1) * (size_t)n_bins;
 
-    if (dfn2_stream_post_process_freq(c->inner, infer_status, last_re, last_im, &valid) < 0)
+    if (dfn2_stream_post_process_freq(c->inner, run_status, last_re, last_im, &valid) < 0)
         return AINR_ERR_SEQUENCE;
     for (k = 0; k < n_bins; ++k) {
         last_re[k] *= unscale;
@@ -619,7 +619,7 @@ int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work)
     return AINR_OK;
 }
 
-int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out)
+int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out)
 {
     AinrCore *c;
     int i, hop;
@@ -629,7 +629,7 @@ int ainr_postprocess(AinrCtx *ctx, int infer_status, int16_t *pcm_out)
     if (!c->block_open) return AINR_ERR_SEQUENCE;
     hop = c->grid.hop;
 
-    if (dfn2_stream_post_process(c->inner, infer_status, pcm_out + (size_t)(c->n - 1) * (size_t)hop) < 0) {
+    if (dfn2_stream_post_process(c->inner, run_status, pcm_out + (size_t)(c->n - 1) * (size_t)hop) < 0) {
         c->block_open = 0;
         return AINR_ERR_SEQUENCE;
     }
@@ -673,7 +673,7 @@ int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est
     return AINR_OK;
 }
 
-int ainr_postprocess_freq(AinrFreqCtx *ctx, int infer_status, float *out_re, float *out_im)
+int ainr_postprocess_freq(AinrFreqCtx *ctx, int run_status, float *out_re, float *out_im)
 {
     AinrCore *c;
     int status;
@@ -681,7 +681,7 @@ int ainr_postprocess_freq(AinrFreqCtx *ctx, int infer_status, float *out_re, flo
     if (!ctx || !out_re || !out_im) return AINR_ERR_NULL;
     c = &ctx->core;
     if (!c->block_open) return AINR_ERR_SEQUENCE;
-    status = ainr_close_spectrum(c, infer_status, out_re, out_im);
+    status = ainr_close_spectrum(c, run_status, out_re, out_im);
     c->block_open = 0;
     return status;
 }
