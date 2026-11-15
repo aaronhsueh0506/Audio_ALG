@@ -99,6 +99,7 @@ CORE_HEADERS := ../../../lib/ainr/dfn2/dfn2_grid.h \
 
 STREAM_SOURCES := dfn2_stream.c
 STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h
+TEST_HEADERS := tests/erb_fixture.h
 
 LIB := $(OBJ_DIR)/libdfn2_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/dfn2_process.o $(OBJ_DIR)/dfn2_model_io.o $(OBJ_DIR)/dfn2_prepost.o \
@@ -119,10 +120,14 @@ ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) dfn2_stream.c
 
+# Memory-mode checks always; the file-mode ones too unless NO_STDIO (the test compiles under both).
+ERB_PARTITION_BIN := $(OBJ_DIR)/erb_partition
+ERB_PARTITION_SOURCES := tests/erb_partition.c $(CORE_SOURCES) dfn2_stream.c
+
 POOL_SIZE_BIN := $(OBJ_DIR)/pool_size
 POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size test-variant-guard audit-no-stdio clean _cfg_guard
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample pool-size erb-partition test-variant-guard audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -161,14 +166,14 @@ $(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
 
 COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
 
-$(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+$(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 smoke: $(SMOKE_BIN)
 	"$(SMOKE_BIN)"
 
-$(ERB_FILE_CHECK_BIN): $(ERB_FILE_CHECK_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+$(ERB_FILE_CHECK_BIN): $(ERB_FILE_CHECK_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
 	$(error check-erb-file needs the file-loader entry points; run with NO_STDIO=0)
 endif
@@ -178,7 +183,7 @@ endif
 check-erb-file: $(ERB_FILE_CHECK_BIN)
 	"$(ERB_FILE_CHECK_BIN)"
 
-$(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+$(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
@@ -186,14 +191,21 @@ verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
 	"$(VERIFY_VS_SAMPLE_BIN)"
 	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
 
-$(POOL_SIZE_BIN): $(POOL_SIZE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+$(POOL_SIZE_BIN): $(POOL_SIZE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(POOL_SIZE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 pool-size: $(POOL_SIZE_BIN)
 	"$(POOL_SIZE_BIN)"
 
-test: smoke check-erb-file verify-vs-sample pool-size test-variant-guard
+$(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+erb-partition: $(ERB_PARTITION_BIN)
+	"$(ERB_PARTITION_BIN)"
+
+test: smoke check-erb-file verify-vs-sample pool-size erb-partition test-variant-guard
 
 # test-variant-guard: builds BOTH full and mask-only archives, then links an external-consumer TU
 # (tests/variant_consumer.c, never the SDK's own .c files) against each in all four combinations.

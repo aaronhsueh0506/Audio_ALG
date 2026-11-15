@@ -37,13 +37,15 @@ static int write_erb(const char *path, int n_bins, int n_erb)
 {
     size_t elems = (size_t)n_bins * (size_t)n_erb * 2u, i;
     int32_t hdr[2];
-    float z = 0.0f;
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
     hdr[0] = n_bins; hdr[1] = n_erb;
     if (fwrite(hdr, sizeof(int32_t), 2, fp) != 2) { fclose(fp); return -1; }
-    for (i = 0; i < elems; ++i)
-        if (fwrite(&z, sizeof z, 1, fp) != 1) { fclose(fp); return -1; }
+    for (i = 0; i < elems; ++i) {   /* forward zero; inverse: band 0 owns every bin (a partition of unity) */
+        size_t inv = i - elems / 2u;
+        float v = (i >= elems / 2u && inv % (size_t)n_erb == 0u) ? 1.0f : 0.0f;
+        if (fwrite(&v, sizeof v, 1, fp) != 1) { fclose(fp); return -1; }
+    }
     return fclose(fp);
 }
 

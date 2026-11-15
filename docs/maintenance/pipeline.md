@@ -48,7 +48,7 @@ the example's `AcIstft` on the stage path and the bridge's own otherwise) and
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
-# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_mono_dfn, test_dfn_hop,
+# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_dfn_stream_equivalence, test_mono_dfn, test_dfn_hop,
 #       test_array_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
@@ -101,7 +101,7 @@ Pass conditions:
       `commits == 0`, `skips == hops - M` on the identity path, i.e. `hops - 1`
       for the shipped 1/1 pair).
 - [ ] `erb_inv` that is not a bitwise partition of unity is refused at
-      `get_mem_requirements()`.
+      `get_mem_requirements()` (stage) and at `init` (`dfn2_stream_init*`, `ainr_init*`).
 - [ ] `--erb-fwd FILE` and `--erb-inv FILE` take the two raw float32 ERB matrices of the
       model grid (exactly `n_bins * n_erb` floats each): a missing value or only one of the
       two exits 2, an unreadable file or a wrong float count exits 1; with neither option a

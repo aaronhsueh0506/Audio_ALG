@@ -102,7 +102,8 @@ typedef struct DFN2Stream DFN2Stream;
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
 /* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost,
- * no heap; starts reset. NULL on a bad config, a misaligned or small pool, or erb_fwd/erb_inv not both set. */
+ * no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or an erb_inv that
+ * is not a partition of unity (a unit band mask must expand to exactly 1.0f in every bin, summed band-ascending in float32). */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
 /* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, mode, variant or layout
@@ -112,7 +113,7 @@ DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t 
 
 /* As dfn2_stream_init, loading the ERB tables from `erb_path` into pool storage (cfg->erb_fwd/erb_inv NULL): int32 n_bins,
  * n_erb, then n_bins*n_erb float32 forward and inverse, both bin-major. NULL (pool not live) on a header not matching
- * cfg->grid or a short file. The only file I/O; out under -DDFN2_STREAM_NO_STDIO. */
+ * cfg->grid, a short file or an inverse table that is not a partition of unity (as dfn2_stream_init). The only file I/O; out under -DDFN2_STREAM_NO_STDIO. */
 DFN2Stream *dfn2_stream_init_from_erb_file(const DFN2StreamConfig *cfg, const char *erb_path,
                                            void *pool, size_t pool_bytes);
 

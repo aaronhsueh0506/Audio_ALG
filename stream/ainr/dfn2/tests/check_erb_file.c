@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "dfn2_stream.h"
+#include "erb_fixture.h"
 
 static DFN2Grid make_grid(void) {
     DFN2GridSpec spec;
@@ -84,7 +85,8 @@ int main(void) {
     snprintf(bad_path, sizeof(bad_path), "/tmp/dfn2_stream_scratch_erb_bad_%d.bin", (int)getpid());
     snprintf(short_path, sizeof(short_path), "/tmp/dfn2_stream_scratch_erb_short_%d.bin", (int)getpid());
 
-    for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; inv_bin_major[i] = (float)((i + 3) % 11) * 0.02f; }
+    for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; }
+    erb_fixture_split_inv_bin_major(inv_bin_major, (int)n_bins, (int)n_erb);
     for (bin = 0; bin < n_bins; ++bin)
         for (band = 0; band < n_erb; ++band)
             inv_band_major[band * n_bins + bin] = inv_bin_major[bin * n_erb + band];

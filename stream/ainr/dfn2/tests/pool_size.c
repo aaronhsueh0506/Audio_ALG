@@ -6,8 +6,9 @@
  *     (before_*) less those two tables (2 * align16(fft_get_mem_size));
  *   - init_ex() succeeds on exactly that many bytes and refuses one aligned unit less;
  *   - 16 hops of a fixed input through a fixed stand-in accelerator hash to the golden value of
- *     that own-table stream. The mask-only grid has a separate golden for the NEON kernels (not
- *     bit-identical to the scalar ones); the byte counts do not depend on SIMD. */
+ *     that stream, with a stand-in inverse ERB table in which every bin splits 0.75 / 0.25 between
+ *     two bands (a partition of unity, which init requires). The hash is the same for the NEON and the scalar kernels
+ *     (a Row can still carry a separate NEON golden); the byte counts do not depend on SIMD. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include "fft_wrapper.h"
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"   /* SK_HAVE_NEON */
+#include "erb_fixture.h"
 
 typedef struct Row {
     int sr, fft, n_erb, mask_lookahead, df_lookahead, n;
@@ -29,13 +31,13 @@ typedef struct Row {
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 103936, 300928, 156640, 353632, 0xcb761989f38d9434ull, 0xc50a2aa70f79da9dull },
+    { 48000, 1024, 32, 1, 0, 1, 103936, 300928, 156640, 353632, 0x4e50404eea4130c5ull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 66448, 103600, 80752, 117904, 0x3249a26ef177c9b1ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 121824, 158976, 136128, 173280, 0xd426f2bbb757d1e3ull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 164304, 361296, 217008, 414000, 0x5970f6d7938c79a7ull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 66448, 103600, 80752, 117904, 0xf1d08272f6a453e0ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 121824, 158976, 136128, 173280, 0xb48673d60e844efcull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 164304, 361296, 217008, 414000, 0x047a1f7cb0fca41cull, 0 },
 };
 #endif
 
@@ -102,7 +104,8 @@ static void run_row(const Row *r, int idx) {
 
     fwd = (float *)malloc((size_t)n_bins * (size_t)r->n_erb * sizeof(float));
     inv = (float *)malloc((size_t)n_bins * (size_t)r->n_erb * sizeof(float));
-    for (i = 0; i < (size_t)n_bins * (size_t)r->n_erb; ++i) { fwd[i] = 1.0f / (float)r->n_erb; inv[i] = 1.0f; }
+    for (i = 0; i < (size_t)n_bins * (size_t)r->n_erb; ++i) { fwd[i] = 1.0f / (float)r->n_erb; }
+    erb_fixture_split_inv_band_major(inv, n_bins, r->n_erb);   /* two bands per bin, so expansion sums */
     cfg_mem = make_cfg(r, fwd, inv);
     cfg_file = make_cfg(r, NULL, NULL);
 

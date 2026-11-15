@@ -73,7 +73,7 @@ static int refused(Fam f, const AinrConfig *cfg, const char *erb, unsigned char 
     return 0;
 }
 
-static int run_family(Fam f, const AinrConfig *cfg, const char *erb, const char *label) {
+static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, const char *label) {
     StreamMemReq req;
     unsigned char *buf;
     size_t bytes;
@@ -124,6 +124,21 @@ static int run_family(Fam f, const AinrConfig *cfg, const char *erb, const char 
         REQUIRE(memcmp(&i3, &before3, sizeof(i3)) == 0, "missing ERB file: info written");
     }
 
+    /* an ERB file whose inverse is not a partition of unity: refused the same way, ctx NULL, info untouched */
+    {
+        AinrInfo i4, before4;
+        void *c4 = NULL;
+        char bad[200];
+        snprintf(bad, sizeof(bad), "%s.bad", erb);
+        write_non_partition_erb(bad, cfg->fft / 2 + 1, n_erb);
+        memset(&i4, 0x5a, sizeof(i4));
+        before4 = i4;
+        EXPECT(try_init(f, cfg, bad, buf, bytes, &c4, &i4), AINR_ERR_ERB_FILE, "non-partition ERB file");
+        REQUIRE(c4 == NULL, "non-partition ERB file: ctx set");
+        REQUIRE(memcmp(&i4, &before4, sizeof(i4)) == 0, "non-partition ERB file: info written");
+        unlink(bad);
+    }
+
     /* the refusals left nothing behind: the same pool initialises again */
     rc = try_init(f, cfg, erb, buf, bytes, &ctx, &info);
     EXPECT(rc, AINR_OK, "init after refusals");
@@ -140,7 +155,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * (fft / 2);
     snprintf(erb, sizeof(erb), "/tmp/ainr_poolgates_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
     write_synthetic_erb(erb, fft / 2 + 1, n_erb);
-    for (f = FAM_PCM; f <= FAM_FREQ; ++f) rc |= run_family((Fam)f, &cfg, erb, label);
+    for (f = FAM_PCM; f <= FAM_FREQ; ++f) rc |= run_family((Fam)f, &cfg, erb, n_erb, label);
     unlink(erb);
     return rc;
 }

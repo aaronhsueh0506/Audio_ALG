@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "dfn2_stream.h"
+#include "erb_fixture.h"
 
 static float *alloc_filled(size_t n, float fill) {
     float *p = (float *)malloc(n * sizeof(float));
@@ -64,7 +65,8 @@ int main(void) {
     if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) { fprintf(stderr, "grid_make fail\n"); return 1; }
 
     erb_fwd = alloc_filled((size_t)grid.n_bins * (size_t)grid.n_erb, 1.0f / (float)grid.n_erb);
-    erb_inv = alloc_filled((size_t)grid.n_erb * (size_t)grid.n_bins, 1.0f);
+    erb_inv = alloc_filled((size_t)grid.n_erb * (size_t)grid.n_bins, 0.0f);
+    erb_fixture_unit_inv(erb_inv, grid.n_bins, grid.n_erb);
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.grid = grid;

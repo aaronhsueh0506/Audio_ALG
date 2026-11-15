@@ -22,17 +22,19 @@
 #include "ainr.h"
 #include "ainr_test.h"
 
-/* A zero-filled ERB file of the grid's size: init only checks the header and the length. */
+/* An ERB file of the grid's size: zero forward table, inverse with band 0 owning every bin (init checks the
+ * header, the length and that the inverse is a partition of unity). */
 static int write_erb(const char *path, int n_bins, int n_erb) {
     size_t elems = (size_t)n_bins * (size_t)n_erb * 2u, i;
     int32_t hdr[2];
-    float z = 0.0f;
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
     hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;
     if (fwrite(hdr, sizeof(int32_t), 2, fp) != 2) { fclose(fp); return -1; }
-    for (i = 0; i < elems; ++i)
-        if (fwrite(&z, sizeof(float), 1, fp) != 1) { fclose(fp); return -1; }
+    for (i = 0; i < elems; ++i) {
+        float v = (i >= elems / 2u && (i - elems / 2u) % (size_t)n_erb == 0u) ? 1.0f : 0.0f;
+        if (fwrite(&v, sizeof(float), 1, fp) != 1) { fclose(fp); return -1; }
+    }
     return fclose(fp);
 }
 

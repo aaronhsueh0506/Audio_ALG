@@ -269,20 +269,24 @@ static int test_postprocess_failure_recovery(const char *erb_path) {
 
     {
         unsigned int gen_before = ainr_state_generation(ctx);
-        int all_zero = 1, i;
+        int all_zero = 1, i, pass;
 
-        rc = ainr_preprocess(ctx, pcm_in, &io);
-        if (rc != AINR_OK) { fprintf(stderr, "test_postprocess_failure_recovery: preprocess rc=%d\n", rc); return 1; }
-        ainr_fill_accel(&io);   /* the accelerator "ran" successfully, but report failure anyway */
-        rc = ainr_postprocess(ctx, -1 /* simulated bind/infer/readback failure */, pcm_out);
-        if (rc != AINR_OK) {
-            fprintf(stderr, "test_postprocess_failure_recovery: postprocess after failure rc=%d, "
-                            "expected AINR_OK (PCM still written)\n", rc);
-            return 1;
+        /* The ERB table is a partition of unity, so a bypassed hop is an exact pass-through and the
+         * first output hop is the (zero) history half of the overlap-add; the second hop carries the
+         * first one's samples. */
+        for (pass = 0; pass < 2; ++pass) {
+            rc = ainr_preprocess(ctx, pcm_in, &io);
+            if (rc != AINR_OK) { fprintf(stderr, "test_postprocess_failure_recovery: preprocess rc=%d\n", rc); return 1; }
+            ainr_fill_accel(&io);   /* the accelerator "ran" successfully, but report failure anyway */
+            rc = ainr_postprocess(ctx, -1 /* simulated bind/infer/readback failure */, pcm_out);
+            if (rc != AINR_OK) {
+                fprintf(stderr, "test_postprocess_failure_recovery: postprocess after failure rc=%d, "
+                                "expected AINR_OK (PCM still written)\n", rc);
+                return 1;
+            }
         }
-        /* Bypass is a near-identity pass-through, not silence -- a nonzero input must come back
-         * nonzero, not a zeroed block (this is what ainr.h's doc comment claims; nothing in this
-         * test checked the actual samples before). */
+        /* Bypass is a pass-through, not silence -- a nonzero input must come back nonzero, not a
+         * zeroed block (this is what ainr.h's doc comment claims). */
         for (i = 0; i < hop; ++i) { if (pcm_out[i] != 0) { all_zero = 0; break; } }
         if (all_zero) {
             fprintf(stderr, "test_postprocess_failure_recovery: bypassed block came back all-zero "

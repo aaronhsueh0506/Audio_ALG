@@ -9,6 +9,7 @@
 
 #include "dfn2_stream.h"
 #include "stream_mem.h"   /* stream_saturate_s16(): shared by all three stream modules, checked once here */
+#include "erb_fixture.h"
 
 static float *alloc_filled(size_t n, float fill) {
     float *p = (float *)malloc(n * sizeof(float));
@@ -91,7 +92,8 @@ static int run_smoke(int frames_per_call) {
     }
 
     erb_fwd = alloc_filled((size_t)grid.n_bins * (size_t)grid.n_erb, 1.0f / (float)grid.n_erb);
-    erb_inv = alloc_filled((size_t)grid.n_erb * (size_t)grid.n_bins, 1.0f);
+    erb_inv = alloc_filled((size_t)grid.n_erb * (size_t)grid.n_bins, 0.0f);
+    erb_fixture_unit_inv(erb_inv, grid.n_bins, grid.n_erb);
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.grid = grid;

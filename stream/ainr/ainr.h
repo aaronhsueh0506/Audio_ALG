@@ -50,7 +50,7 @@ enum {
     AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* mask_lookahead > 0 with N > 1 */
     AINR_ERR_FRAMES_PER_CALL = -6,              /* N has no delivered graph */
     AINR_ERR_POOL = -7,                         /* pool too small or misaligned */
-    AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short or of another size */
+    AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short, of another size, or an inverse that is not a partition of unity */
     AINR_ERR_SEQUENCE = -9,                     /* preprocess/postprocess not called in pairs */
     AINR_ERR_NONFINITE_INPUT = -10              /* _freq bin NaN/Inf or beyond 2^63 * sqrt(fft); NaN/Inf atten_lim */
 };

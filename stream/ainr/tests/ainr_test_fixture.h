@@ -8,9 +8,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* ERB_PATTERN: fwd[i] = (i % 17) * 0.01, inv[i] = ((i + 3) % 11) * 0.02 (bin-major both). ERB_IDENTITY: every bin in
- * one contiguous band, forward = band mean, inverse = 1, so a unit mask is a unit gain. */
-typedef enum AinrFixtureErb { ERB_PATTERN = 0, ERB_IDENTITY = 1 } AinrFixtureErb;
+/* ERB_PATTERN: fwd[i] = (i % 17) * 0.01 and an inverse that splits bin k 0.75 / 0.25 over bands k % n_erb and
+ * (k + 1) % n_erb (bin-major both; ainr_init refuses an inverse that is not a partition of unity). ERB_IDENTITY: every bin in
+ * one contiguous band, forward = band mean, inverse = 1, so a unit mask is a unit gain.
+ * ERB_NOT_PARTITION: inv[i] = ((i + 3) % 11) * 0.02, an inverse whose bins do not sum to 1 (refused by init). */
+typedef enum AinrFixtureErb { ERB_PATTERN = 0, ERB_IDENTITY = 1, ERB_NOT_PARTITION = 2 } AinrFixtureErb;
 
 /* Writes the ERB file ainr_init_from_erb_file() reads: int32 n_bins, n_erb, then both tables; exits on failure. */
 static inline void write_erb_file(const char *path, int n_bins, int n_erb, AinrFixtureErb mode)
@@ -31,10 +33,16 @@ static inline void write_erb_file(const char *path, int n_bins, int n_erb, AinrF
             fwd[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f / (float)size[e];
             inv[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f;
         }
-    } else {
+    } else if (mode == ERB_NOT_PARTITION) {
         for (i = 0; i < elems; ++i) {
             fwd[i] = (float)(i % 17) * 0.01f;
             inv[i] = (float)((i + 3) % 11) * 0.02f;
+        }
+    } else {
+        for (i = 0; i < elems; ++i) fwd[i] = (float)(i % 17) * 0.01f;
+        for (k = 0; k < n_bins; ++k) {   /* a partition of unity: bin k splits 0.75 / 0.25 over two bands */
+            inv[(size_t)k * (size_t)n_erb + (size_t)(k % n_erb)] = 0.75f;
+            inv[(size_t)k * (size_t)n_erb + (size_t)((k + 1) % n_erb)] = 0.25f;
         }
     }
     fp = fopen(path, "wb");
@@ -50,6 +58,11 @@ static inline void write_erb_file(const char *path, int n_bins, int n_erb, AinrF
 static inline void write_synthetic_erb(const char *path, int n_bins, int n_erb)
 {
     write_erb_file(path, n_bins, n_erb, ERB_PATTERN);
+}
+
+static inline void write_non_partition_erb(const char *path, int n_bins, int n_erb)
+{
+    write_erb_file(path, n_bins, n_erb, ERB_NOT_PARTITION);
 }
 
 static inline void write_identity_erb(const char *path, int n_bins, int n_erb)

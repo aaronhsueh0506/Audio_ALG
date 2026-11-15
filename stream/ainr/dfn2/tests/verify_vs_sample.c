@@ -20,6 +20,7 @@
 #include "fft_wrapper.h"
 #include "audio_stft.h"
 #include "hpf.h"
+#include "erb_fixture.h"
 
 /* ---- shared deterministic fake accelerator: pure function of (global hop, force_fail) ---- */
 static int shared_fake(long long ghop, int force_fail, DFN2PrepostOutputs *out) {
@@ -197,7 +198,7 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
     {
         size_t i;
         for (i = 0; i < n_bins * n_erb; ++i) erb_fwd[i] = 1.0f / (float)n_erb;
-        for (i = 0; i < n_erb * n_bins; ++i) erb_inv[i] = 1.0f;
+        erb_fixture_unit_inv(erb_inv, (int)n_bins, (int)n_erb);
     }
 
     if (board_init(&A, &grid, erb_fwd, erb_inv, hpf_enable, hpf_cutoff_hz) != 0) {

@@ -29,7 +29,11 @@ static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
     int32_t hdr[2];
     FILE *fp;
     if (!fwd || !inv) exit(1);
-    for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; inv[i] = (float)((i + 3) % 11) * 0.02f; }
+    for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; inv[i] = 0.0f; }
+    for (i = 0; i < (size_t)n_bins; ++i) {   /* a partition of unity: bin i splits 0.75 / 0.25 over two bands */
+        inv[i * (size_t)n_erb + i % (size_t)n_erb] = 0.75f;
+        inv[i * (size_t)n_erb + (i + 1) % (size_t)n_erb] = 0.25f;
+    }
     fp = fopen(path, "wb");
     if (!fp) { fprintf(stderr, "fopen write fail (%s)\n", path); exit(1); }
     hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;

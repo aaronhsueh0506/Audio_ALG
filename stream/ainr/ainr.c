@@ -703,7 +703,7 @@ const char *ainr_status_text(int code)
         return "mask_lookahead > 0 with frames_per_call > 1: the first block cannot carry a real job";
     case AINR_ERR_FRAMES_PER_CALL: return "no shipped graph for the resolved frames_per_call";
     case AINR_ERR_POOL: return "pool too small or misaligned";
-    case AINR_ERR_ERB_FILE: return "ERB file open/header/short-read/dimension mismatch";
+    case AINR_ERR_ERB_FILE: return "ERB file open/header/short-read/dimension mismatch, or the inverse is not a partition of unity";
     case AINR_ERR_SEQUENCE: return "preprocess/postprocess called out of sequence";
     case AINR_ERR_NONFINITE_INPUT: return "non-finite input (spectrum bin or attenuation limit); refused, state untouched";
     default: return "unknown ainr status";

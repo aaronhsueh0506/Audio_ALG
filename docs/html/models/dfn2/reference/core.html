@@ -526,7 +526,10 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <code>require_partition_of_unity()</code>(後者被拒時檔案已寫出)——照 <code>skn_erb_expand_mask_f32</code> 的順序逐 band
 以 float32 累加後<b>逐位元</b>比對 <code>1.0f</code>(一般路徑另印 <code>inverse_unity_max_error</code>)。C 側 host
 (<code>pipelines/dfn/dfn_res_stage.c</code>)在 <code>get_mem_requirements()</code> 再驗一次,所以載到一份
-inverse 不是 partition of unity 的 ERB 矩陣會被 init 擋下,而不是讓 identity 悄悄變成近似。</li>
+inverse 不是 partition of unity 的 ERB 矩陣會被 init 擋下,而不是讓 identity 悄悄變成近似。
+串流層 <code>dfn2_stream_init[_ex]</code>／<code>dfn2_stream_init_from_erb_file[_ex]</code>(<code>stream/ainr/dfn2/dfn2_stream.c</code>)
+在 init 用同一條規則(band 由小到大逐 band 以 float32 累加、逐位元比對 <code>1.0f</code>)檢查,不符回 NULL
+(<code>ainr_init*</code> 回 <code>AINR_ERR_ERB_FILE</code>);pool 大小與 descriptor 不含表內容,不變。</li>
 </ul>
 </main>
 </body>
