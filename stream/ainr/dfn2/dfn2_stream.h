@@ -118,9 +118,9 @@ DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t poo
 DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
                                 const DFN2StreamMemReq *expected);
 
-/* As dfn2_stream_init, loading the ERB tables from `erb_path` into pool storage (cfg->erb_fwd/erb_inv NULL): int32 n_bins,
- * n_erb, then n_bins*n_erb float32 forward and inverse, both bin-major. NULL (pool not live) on a header not matching
- * cfg->grid, a short file or an inverse table that is not a partition of unity (as dfn2_stream_init). The only file I/O; out under -DDFN2_STREAM_NO_STDIO. */
+/* As dfn2_stream_init, loading the ERB tables from `erb_path` into pool storage (cfg->erb_fwd/erb_inv NULL): int32 n_bins, n_erb,
+ * then n_bins*n_erb float32 forward and inverse, both bin-major, nothing after. NULL (pool not live) on another grid's header, a short
+ * or longer file, a non-finite forward value or a non-partition inverse (as dfn2_stream_init). Out under -DDFN2_STREAM_NO_STDIO. */
 DFN2Stream *dfn2_stream_init_from_erb_file(const DFN2StreamConfig *cfg, const char *erb_path,
                                            void *pool, size_t pool_bytes);
 

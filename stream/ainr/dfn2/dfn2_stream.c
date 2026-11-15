@@ -521,11 +521,12 @@ static int read_inv_band_major(FILE *fp, const DFN2Grid *grid, float *band_major
 }
 
 /* Reads n_bins*n_erb floats into fwd_out (kept bin-major) and the inverse table into inv_out, band-major.
- * 0, or -1 after closing the file on an open/header/short-read/dimension-mismatch failure. */
+ * 0, or -1 after closing the file on an open/header/short-read/dimension-mismatch failure, a byte after the
+ * two tables or a forward value that is not finite. */
 static int load_erb_file(const char *path, const DFN2Grid *grid, float *fwd_out, float *inv_out) {
     FILE *fp;
     int32_t hdr[2];
-    size_t want = (size_t)grid->n_bins * (size_t)grid->n_erb;
+    size_t want = (size_t)grid->n_bins * (size_t)grid->n_erb, k;
     int rc;
 
     fp = fopen(path, "rb");
@@ -544,7 +545,10 @@ static int load_erb_file(const char *path, const DFN2Grid *grid, float *fwd_out,
         return -1;
     }
     rc = read_inv_band_major(fp, grid, inv_out);
+    if (rc == 0 && (fgetc(fp) != EOF || ferror(fp))) rc = -1;   /* the file ends after the two tables */
     fclose(fp);
+    for (k = 0; rc == 0 && k < want; ++k)
+        if (!isfinite(fwd_out[k])) rc = -1;
     return rc;
 }
 

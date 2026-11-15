@@ -1,7 +1,10 @@
 /* Checks dfn2_stream_init_from_erb_file against dfn2_stream_init: writes a synthetic ERB file,
  * loads it via the file entry point, and confirms the resulting stream's per-hop PCM is
  * byte-identical to the memory-entry point given the same (correctly transposed) tables -- plus
- * two negative cases (dimension mismatch, truncated file). Needs stdio; not built under NO_STDIO. */
+ * the refusals: dimension mismatch, truncated file, bytes after the two tables and a forward value that
+ * is not finite, each against the same file without the defect, for a full and a freq_only context.
+ * Needs stdio; not built under NO_STDIO. */
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +47,76 @@ static int zero_accel(DFN2PrepostOutputs *out) {
     for (i = 0; i < out->df_convp_window_elements; ++i) out->df_convp_window_next[i] = 0.0f;
 #endif
     return 0;
+}
+
+/* The test file with `trailing` zero bytes appended and, when at < elems, fwd[at] replaced by value. */
+static void write_variant(const char *path, const DFN2Grid *g, const float *fwd, const float *inv_bin,
+                          size_t trailing, size_t at, float value) {
+    size_t elems = (size_t)g->n_bins * (size_t)g->n_erb, i;
+    int32_t hdr[2];
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { fprintf(stderr, "fopen write fail\n"); exit(1); }
+    hdr[0] = (int32_t)g->n_bins; hdr[1] = (int32_t)g->n_erb;
+    fwrite(hdr, sizeof(int32_t), 2, fp);
+    for (i = 0; i < elems; ++i) {
+        float v = i == at ? value : fwd[i];
+        fwrite(&v, sizeof(float), 1, fp);
+    }
+    fwrite(inv_bin, sizeof(float), elems, fp);
+    for (i = 0; i < trailing; ++i) fputc(0, fp);
+    fclose(fp);
+}
+
+/* 1 when the file initialises a stream (full or freq_only) in `pool`. */
+static int loads(const DFN2Grid *g, int freq_only, const char *path, void *pool, size_t bytes) {
+    DFN2StreamConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = *g;
+    cfg.freq_only = freq_only;
+    return dfn2_stream_init_from_erb_file(&cfg, path, pool, bytes) != NULL;
+}
+
+static int check_defects(const DFN2Grid *g, const float *fwd, const float *inv_bin, const char *path) {
+    const size_t elems = (size_t)g->n_bins * (size_t)g->n_erb, none = (size_t)-1;
+    const struct { const char *name; size_t trailing, at; float value; int ok; } CASES[] = {
+        { "no defect",                    0, none,          0.0f,      1 },
+        { "one byte after the tables",    1, none,          0.0f,      0 },
+        { "one float after the tables",   4, none,          0.0f,      0 },
+        { "NaN first forward value",      0, 0,             NAN,       0 },
+        { "+Inf last forward value",      0, elems - 1u,    INFINITY,  0 },
+        { "-Inf middle forward value",    0, elems / 2u,    -INFINITY, 0 },
+        { "NaN last forward value",       0, elems - 1u,    NAN,       0 },
+        { "3e38 forward value (finite)",  0, elems - 1u,    3.0e38f,   1 },
+        { "no defect, after refusals",    0, none,          0.0f,      1 },
+    };
+    int kind, fail = 0;
+    size_t c;
+    for (kind = 0; kind < 2; ++kind) {
+        DFN2StreamConfig cfg;
+        DFN2StreamMemReq req;
+        void *pool = NULL;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.grid = *g;
+        cfg.freq_only = kind;
+        if (dfn2_stream_get_mem_size(&cfg, &req) != 0 || posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) {
+            fprintf(stderr, "defects: sizing fail\n");
+            return 1;
+        }
+        for (c = 0; c < sizeof(CASES) / sizeof(CASES[0]); ++c) {
+            int got;
+            write_variant(path, g, fwd, inv_bin, CASES[c].trailing, CASES[c].at, CASES[c].value);
+            got = loads(g, kind, path, pool, (size_t)req.bytes);
+            if (got != CASES[c].ok) {
+                fprintf(stderr, "FAIL: %s context, %s: %s\n", kind ? "freq_only" : "full", CASES[c].name,
+                        got ? "accepted" : "refused");
+                fail = 1;
+            }
+        }
+        remove(path);
+        free(pool);
+    }
+    if (!fail) printf("trailing bytes and non-finite forward values correctly refused (full and freq_only)\n");
+    return fail;
 }
 
 static void run_hops(DFN2Stream *s, int hops, int16_t *digest_out) {
@@ -181,6 +254,8 @@ int main(void) {
             printf("short read correctly refused\n");
             free(pool_bad);
         }
+
+        if (check_defects(&grid, fwd, inv_bin_major, bad_path)) return 1;
 
         free(pool_mem);
         free(pool_file);

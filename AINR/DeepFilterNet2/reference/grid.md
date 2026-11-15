@@ -129,8 +129,8 @@ The pipeline example mains take the `--runtime-bins` pair as `--erb-fwd FILE` an
 For every DFN2 board sample `ainr_init()` / `ainr_init_freq()` reads `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example
 `fb_48000_32.bin`; `<sr>` is the model grid's rate, not the host's; the directory is `-DAINR_ERB_MATRIX_DIR` on `ainr.c`), one
 deployment set for all of them: the exporter's `erb_matrix.bin` renamed for its grid. The stream checks the header against the
-grid's `n_bins` and `n_erb`, transposes the inverse to band-major once at init and checks that it is a partition of unity; a
-mismatch is `AINR_ERR_ERB_FILE`. This repo holds no board run of these samples.
+grid's `n_bins` and `n_erb`, requires the file to end after the two matrices and every forward value to be finite, transposes the
+inverse to band-major once at init and checks that it is a partition of unity; a mismatch is `AINR_ERR_ERB_FILE`. This repo holds no board run of these samples.
 
 **Tests and pipelines.** The tests choose their grid when they are built, through a header of their own, not through the library:
 `AINR/tests/dfn2_test_grid.h` and `pipelines/dfn/tests/dfn_test_grid.h` (`-DDFN2_GRID_KHZ=16|32|48`, with `-DDFN2_MASK_LOOKAHEAD` /

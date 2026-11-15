@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### DFN2 ERB file loader: the file must end after the two tables and the forward table must be finite
+
+`dfn2_stream_init_from_erb_file[_ex]` and so `ainr_init*` refuse (`AINR_ERR_ERB_FILE`) a file with bytes after the forward and inverse tables or with a NaN / infinite forward value; before, a NaN forward value loaded and reached the accelerator's inputs on every hop. Init-time check only: numbers, pool sizes, descriptors and layout versions unchanged. Every exporter output and shipped `fb_*.bin` copy found here still loads.
+
 ### DFN2 file mode: one chunked ERB loader for both entry families
 
 `dfn2_stream_init_from_erb_file[_ex]` without `freq_only` (so `ainr_init()` and `ainr_init_from_erb_file()`) reads the inverse ERB table 64 floats at a time into band-major order, as a `freq_only` context does, and no longer carves a table-sized load scratch: the PCM pools are `n_bins * n_erb * 4` bytes smaller (`ainr_get_mem_size()` at 48 kHz / 1024 361,392 -> 295,728 B, mask-only 301,024 -> 235,360 B, 16 kHz / 256 103,696 -> 91,312 B). `DFN2_STREAM_LAYOUT_VERSION` 4 -> 5. Outputs are bit-identical; memory mode and the `_freq` pools are unchanged. Board samples on the PCM family size their pool at run time and only need a rebuild.

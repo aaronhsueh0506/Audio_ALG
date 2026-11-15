@@ -226,7 +226,7 @@ warm-up frames, so a stream start makes M extra NPU runs whose heads are discard
 stage / bridge, 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
 
 The DFN2 stream loads the ERB matrices of the resolved grid from the board's release-asset directory during `ainr_init()`; a sample
-neither names nor opens that file, and a missing file, a header or size mismatch, or an inverse matrix that is not a partition of unity (every bin's band weights sum to exactly 1.0f, as `export_erb_matrix.py` checks before it writes) returns `AINR_ERR_ERB_FILE`. The file has the layout
+neither names nor opens that file, and a missing file, a header or size mismatch, bytes after the two matrices, a forward value that is not finite, or an inverse matrix that is not a partition of unity (every bin's band weights sum to exactly 1.0f, as `export_erb_matrix.py` checks before it writes) returns `AINR_ERR_ERB_FILE`. The file has the layout
 of the DFN2 exporter's `erb_matrix.bin`: int32 `n_bins`, int32 `n_bands`, the forward matrix, the inverse matrix (float32; both
 `[n_bins][n_erb]`, bin-major). The stream transposes the inverse to band-major `[n_erb][n_bins]` once at init into pool-owned storage.
 The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.

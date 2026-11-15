@@ -1,11 +1,13 @@
 /* The init gates of both families (PCM, _freq): init recomputes the size itself. A pool one byte short or
  * misaligned is refused (AINR_ERR_POOL) before anything is written; a larger pool is accepted; NULL
- * arguments are AINR_ERR_NULL; a missing ERB file is AINR_ERR_ERB_FILE. Every refusal leaves *ctx NULL
+ * arguments are AINR_ERR_NULL; a missing ERB file, one with bytes after the tables and one with a non-finite
+ * forward value are AINR_ERR_ERB_FILE. Every refusal leaves *ctx NULL
  * and *info untouched (a pool refusal also leaves the pool bytes unchanged), and the same pool then
  * initialises normally. The size of each family is the literal of its case (_freq: no analysis, synthesis or PCM
  * buffer, so the smaller one), and blocks run on a pool of exactly that size leave the bytes after it alone.
  * Not built under NO_STDIO. */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,24 @@ static int try_init(Fam f, const AinrConfig *cfg, const char *erb, void *pool, s
     }
     }
     return rc;
+}
+
+/* A copy of the ERB file `src` with one defect: 0 a byte appended, 1 the first forward value NaN, 2 the last
+ * forward value +Inf. */
+static void write_defective_erb(const char *src, const char *dst, int n_bins, int n_erb, int defect) {
+    size_t elems = (size_t)n_bins * (size_t)n_erb, n = 8u + 8u * elems;
+    unsigned char *buf = (unsigned char *)malloc(n + 1u);
+    float v = defect == 1 ? (float)NAN : (float)INFINITY;
+    FILE *fp = fopen(src, "rb");
+    if (!buf || !fp || fread(buf, 1, n, fp) != n) exit(1);
+    fclose(fp);
+    if (defect == 1) memcpy(buf + 8, &v, sizeof(v));
+    if (defect == 2) memcpy(buf + 8 + 4u * (elems - 1u), &v, sizeof(v));
+    buf[n] = 0;
+    fp = fopen(dst, "wb");
+    if (!fp || fwrite(buf, 1, n + (defect == 0 ? 1u : 0u), fp) != n + (defect == 0 ? 1u : 0u)) exit(1);
+    fclose(fp);
+    free(buf);
 }
 
 #define EXPECT(got, want, what) do { if ((got) != (want)) { \
@@ -176,6 +196,26 @@ static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, 
         REQUIRE(c4 == NULL, "non-partition ERB file: ctx set");
         REQUIRE(memcmp(&i4, &before4, sizeof(i4)) == 0, "non-partition ERB file: info written");
         unlink(bad);
+    }
+
+    /* bytes after the tables, a NaN first / Inf last forward value: refused the same way */
+    {
+        static const char *const WHAT[3] = { "ERB file with a byte after the tables", "ERB file with a NaN forward value",
+                                             "ERB file with an Inf last forward value" };
+        int d;
+        for (d = 0; d < 3; ++d) {
+            AinrInfo i5, before5;
+            void *c5 = NULL;
+            char bad[200];
+            snprintf(bad, sizeof(bad), "%s.defect", erb);
+            write_defective_erb(erb, bad, cfg->fft / 2 + 1, n_erb, d);
+            memset(&i5, 0x5a, sizeof(i5));
+            before5 = i5;
+            EXPECT(try_init(f, cfg, bad, buf, bytes, &c5, &i5), AINR_ERR_ERB_FILE, WHAT[d]);
+            REQUIRE(c5 == NULL, "defective ERB file: ctx set");
+            REQUIRE(memcmp(&i5, &before5, sizeof(i5)) == 0, "defective ERB file: info written");
+            unlink(bad);
+        }
     }
 
     /* the refusals left nothing behind: the same pool initialises again */

@@ -3,6 +3,14 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-15 — The DFN2 ERB file loader refuses bytes after the two tables and a forward table that is not finite (`AINR_ERR_ERB_FILE`)
+
+`dfn2_stream_init_from_erb_file[_ex]` (both kinds of context; so `ainr_init*` with `AINR_ERR_ERB_FILE`) now also returns NULL when the file goes on after the forward and inverse tables (one more byte is enough) or when a forward value is NaN or infinite. Before, such a file loaded: a NaN forward value passed init and put non-finite values into the accelerator's input tensors on every hop. Checked at init only; no hop code, numbers, pool size, descriptor or layout version changed. Memory mode (caller tables) is unchanged.
+
+- **Real files.** The 15 `fb_*.bin` copies found on this machine and `export_erb_matrix.py --format bin` outputs for six grids (48000 / 1024 / 32, 32000 / 512 / 28, 16000 / 512 / 32 and 24, 16000 / 256 / 24, 8000 / 256 / 24) are all exactly 8 + 2 tables and load under both variants (`erb_partition SR FFT N_ERB FILE`); the 48 kHz exporter file with one byte appended, or with its first forward value set to NaN, is refused.
+- **Tests.** `stream/ainr/dfn2/tests/check_erb_file.c`: one byte and one float after the tables, NaN first, +Inf last, -Inf middle and NaN last forward values refused, a finite 3e38 and the clean file accepted, for a full and a `freq_only` context, in the same pool after the refusals. `stream/ainr/tests/test_ainr_pool_gates.c`: a byte appended, a NaN first and an Inf last forward value are `AINR_ERR_ERB_FILE` for both families, ctx NULL and info untouched. Eight mutations of the loader (no EOF probe, a float-sized probe, the probe's result ignored, no scan, a scan skipping the first or the last value, NaN-only, a range limit) are each killed.
+- Docs: `stream/ainr/ainr.h` (`AINR_ERR_ERB_FILE`), `ainr_status_text()`, `docs/html/models/dfn2/index.html`, `docs/html/models/dfn2/reference/grid.html`, `docs/reference/board/build.md`, `AINR/DeepFilterNet2/reference/grid.md`.
+
 ## [Unreleased] — 2026-11-15 — DFN2 file mode reads the ERB file in chunks for both entry families: the PCM pools lose the table-sized load scratch
 
 `dfn2_stream_init_from_erb_file[_ex]` on a context without `freq_only` (and so `ainr_init()` / `ainr_init_from_erb_file()`) now loads the inverse ERB table the way a `freq_only` context does: 64 floats at a time straight into band-major order. The table-sized load scratch (`n_bins * n_erb * 4` bytes: 65,664 B at 48 kHz / 1024 / 32 bands, 12,384 B at 16 kHz / 256 / 24) is no longer carved; one loader serves both kinds of context. Header, short-file, foreign-grid and partition-of-unity refusals are unchanged.
