@@ -82,7 +82,7 @@ unsigned int dfn3_model_io_ready_frames(const DFN3ModelIOState *state);
 
 /* Push one feature frame: erb[n_erb] and spec[2][df_bins] (re, then im). Returns 1 when the window of
  * heads[t] is complete and the graph may emit it, 0 for the first mask_lookahead frames, -1 on NULL or no grid.
- * To flush the final heads, push mask_lookahead all-zero frames. */
+ * heads[t] is complete with the push of frame t + mask_lookahead. */
 int dfn3_model_io_push_features(DFN3ModelIOState *state, const float *erb,
                                 const float *spec);
 

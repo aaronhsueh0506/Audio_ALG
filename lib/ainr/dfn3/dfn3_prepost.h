@@ -135,10 +135,9 @@ int dfn3_prepost_set_atten_lim(DFN3Prepost *p, float atten_lim_db);
 
 /* One analysed frame (n_bins bins). Returns 1 with a frame open from hop M on, 0 for the first M hops (no frame
  * open: the enhance clock advances without heads, no job runs), -1 on NULL args, a non-finite spectrum or with a
- * frame open. With df_lookahead > M the accelerator also runs on frames that emit nothing yet. Flush with
- * output_delay zero spectra while it keeps running: that drains the last analysed frame; draining the last real
- * PCM hop through a full STFT/OLA needs one more (output_delay + 1 zero audio hops), the extra one being the
- * overlap-add tail. */
+ * frame open. With df_lookahead > M the accelerator also runs on frames that emit nothing yet. The enhanced
+ * spectrum of frame t is ready after hop t + output_delay; through an AcStft / AcIstft pair the audio trails the
+ * input by output_delay + 1 hops (output_delay plus one framing hop). */
 int dfn3_prepost_pre_process_freq(DFN3Prepost *p, const float *spec_re, const float *spec_im);
 
 /* Dual input: `est` feeds the features and heads, `app` the noisy ring the mask, deep filter and attenuation limit
