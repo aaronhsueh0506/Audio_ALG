@@ -6,6 +6,7 @@
  *   - a clean run commits: generation unchanged; STREAM_RUN_NOT_STARTED leaves the state and the generation alone and
  *     gives N zero frames; any other status, a refused validate_run and a non-finite enhanced bin each restart the
  *     registered state and advance the generation exactly once, and give N zero frames;
+ *   - the frames of a committed call equal hand-driven CCM calls in slot order over the raw mic spectra passed in;
  *   - an overflow in frame k > 0 of a PCM call gives the PCM of a twin whose call failed (no frame < k reaches the ISTFT);
  *   - the head is NaN before every run, whatever the previous run wrote;
  *   - a NaN, +Inf or -Inf bin in any of the four _freq planes (first and last position) is DEEPVQE_STREAM_ERR_RANGE with
@@ -242,6 +243,42 @@ static void failure_table(const Row *row, int freq_only, int pcm, const char *la
     free(buf); free(pc);
 }
 
+/* The N output frames of a committed call equal N hand-driven CCM calls, in slot order, over the raw mic spectra the caller
+ * passed in (the ring carries across calls): a stream that ran the slots out of order, or took another spectrum as the raw
+ * mic, differs. */
+static void commit_equals_ccm(const Row *row, int freq_only, const char *label) {
+    Rig r;
+    Call c;
+    Out o;
+    DeepVqeCcmState ccm;
+    const size_t nb = (size_t)row->fft / 2u + 1u, taps_per_frame = nb * 18u;
+    float *buf = (float *)calloc(nb * (size_t)row->n * 8u, sizeof(float));
+    float *ring = (float *)calloc(2u * 3u * nb, sizeof(float));
+    int call, k, real = 0;
+    if (!buf || !ring || rig_make(&r, row, freq_only) != 0) exit(2);
+    memset(&c, 0, sizeof c);
+    c.mr = buf; c.mi = buf + r.plane; c.fr = buf + 2u * r.plane; c.fi = buf + 3u * r.plane;
+    o.re = buf + 4u * r.plane; o.im = buf + 5u * r.plane; o.pcm = NULL;
+    if (deepvqe_ccm_init(&ccm, r.g.n_bins, ring, ring + 3u * nb) != 0) exit(2);
+    for (call = 0; call < 4; ++call) {
+        DeepVqeHopIO io;
+        float *want_re = buf + 6u * r.plane, *want_im = buf + 7u * r.plane;
+        make_call(&r, &c, 500 + call, -1);
+        CHECK(pre(&r, &c, 0, &io) == 1, "%s: pre", label);
+        dev(&r, &io, DEV_OK, 0, 0);
+        for (k = 0; k < row->n; ++k)
+            deepvqe_ccm_process(&ccm, c.mr + (size_t)k * nb, c.mi + (size_t)k * nb, io.outputs.taps + (size_t)k * taps_per_frame,
+                                want_re + (size_t)k * nb, want_im + (size_t)k * nb);
+        CHECK(post(&r, 0, STREAM_RUN_OK, &o) == 1, "%s: post", label);
+        CHECK(memcmp(o.re, want_re, r.plane * sizeof(float)) == 0 && memcmp(o.im, want_im, r.plane * sizeof(float)) == 0,
+              "%s: call %d differs from the hand-driven CCM", label, call);
+        real += !all_zero_f(o.re, r.plane);
+    }
+    CHECK(real == 4, "%s: the reference is silent", label);
+    rig_free(&r);
+    free(buf); free(ring);
+}
+
 /* PCM: an overflow in frame k of a batched call gives the PCM of a twin whose call failed, and so does every call after it. */
 static void overflow_all_or_none(const Row *row, const char *label) {
     Rig a, b;
@@ -352,6 +389,7 @@ int main(void) {
             }
             snprintf(label, sizeof label, "%d/%d N=%d %s", ROWS[i].sr, ROWS[i].fft, ROWS[i].n, fo ? "freq_only" : "full");
             range_refusal(&ROWS[i], fo, label);
+            commit_equals_ccm(&ROWS[i], fo, label);
         }
         if (ROWS[i].n > 1) {
             snprintf(label, sizeof label, "%d/%d N=%d pcm", ROWS[i].sr, ROWS[i].fft, ROWS[i].n);
