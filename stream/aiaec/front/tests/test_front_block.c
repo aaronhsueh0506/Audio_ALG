@@ -1,10 +1,11 @@
 /* aiaec_front feeding the real Align-ULCNet block entry (test catalog): the events the front derives
  * from the AEC drive exactly the block's own restart edges. One delay change is one CHANGED hop and
- * must cost exactly one event: one BYPASS block at N = 1, one frame_reset bit at N = 8 -- the LOCKED
+ * must cost exactly one event: one BYPASS block at N = 1, one frame_reset bit at N = PN -- the LOCKED
  * hop after the CHANGED hop is an ordinary hop. The accelerator is an identity mask, so the PCM the
  * block returns is the front's float residual, one hop late, the event hops included (an event
- * restarts only the model; the analysis and synthesis keep running); N = 8 returns the same PCM as
- * N = 1, sample for sample. */
+ * restarts only the model; the analysis and synthesis keep running); N = PN returns the same PCM as
+ * N = 1, sample for sample. The grid is 16 kHz / 256 with PN = 8 (test_front_block) or, built through
+ * test_front_block_48k.c, 48 kHz / 1024 with PN = 2. */
 
 #include <math.h>
 #include <stdio.h>
@@ -18,9 +19,16 @@
 static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); ++g_fail; } } while (0)
 
-#define BINS 129
-#define HOP 128
-#define BLOCKS 504   /* hops; a multiple of 8 */
+#ifndef BLK_SR
+#define BLK_SR 16000
+#define BLK_FFT 256
+#define BLK_PN 8       /* the packet size */
+#define BLK_BLOCKS 504   /* hops; a multiple of BLK_PN */
+#define BLK_DELAY 480    /* samples */
+#endif
+#define HOP (BLK_FFT / 2)
+#define BINS (HOP + 1)
+#define BLOCKS BLK_BLOCKS
 
 typedef struct Pass {
     int16_t pcm[BLOCKS * HOP];
@@ -29,7 +37,7 @@ typedef struct Pass {
     int changed;             /* CHANGED hops */
     int bypass_blocks;       /* BYPASS blocks */
     int submit_blocks;
-    int reset_ones;          /* frame_reset values equal to 1 (N = 8) */
+    int reset_ones;          /* frame_reset values equal to 1 (N = BLK_PN) */
 } Pass;
 
 /* The accelerator of the graph with an identity mask: mask real = 1, imaginary = 0, for every frame. */
@@ -56,7 +64,7 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
     int err = 0, b, k, had_hop = 0, prev_solid = 0;
 
     memset(p, 0, sizeof(*p));
-    cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = hop_in;
+    cfg.sr = BLK_SR; cfg.fft = BLK_FFT; cfg.hop_in = hop_in;
     CHECK(aiaec_get_mem_size(&cfg, &req) == AIAEC_OK, "N=%d block mem size", n);
     if (posix_memalign(&bpool, req.alignment, (size_t)req.bytes) != 0) abort();
     err = aiaec_init(&cfg, bpool, (size_t)req.bytes, &ctx, &info);
@@ -117,23 +125,23 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
 
 int main(void) {
     static Pass p1, p8;
-    Scene sc = scene_make(BLOCKS * HOP, 480);
+    Scene sc = scene_make(BLOCKS * HOP, BLK_DELAY);
     int b, i, compared = 0, discriminating = 0, edges1 = 0, edges8 = 0;
 
     run_pass(&sc, 1, &p1);
-    run_pass(&sc, 8, &p8);
+    run_pass(&sc, BLK_PN, &p8);
     if (g_fail) return 1;
 
     for (b = 0; b < BLOCKS; ++b) { edges1 += p1.edge[b]; edges8 += p8.edge[b]; }
-    CHECK(p1.changed >= 1 && p1.changed == p8.changed && edges1 == edges8, "N=1 changed %d edges %d, N=8 changed %d edges %d",
-          p1.changed, edges1, p8.changed, edges8);
-    for (b = 0; b < BLOCKS; ++b) CHECK(p1.edge[b] == p8.edge[b], "hop %d: edge N=1 %d N=8 %d", b, p1.edge[b], p8.edge[b]);
+    CHECK(p1.changed >= 1 && p1.changed == p8.changed && edges1 == edges8, "N=1 changed %d edges %d, N=%d changed %d edges %d",
+          p1.changed, edges1, BLK_PN, p8.changed, edges8);
+    for (b = 0; b < BLOCKS; ++b) CHECK(p1.edge[b] == p8.edge[b], "hop %d: edge N=1 %d N=%d %d", b, p1.edge[b], BLK_PN, p8.edge[b]);
 
     /* One delay change is one event: the CHANGED hop and nothing else. */
     CHECK(p1.bypass_blocks == p1.changed && edges1 == p1.changed, "N=1: %d BYPASS blocks, %d edges for %d CHANGED hops",
           p1.bypass_blocks, edges1, p1.changed);
-    CHECK(p8.reset_ones == p8.changed && p8.bypass_blocks == 0, "N=8: %d frame_reset ones, %d BYPASS blocks for %d CHANGED hops",
-          p8.reset_ones, p8.bypass_blocks, p8.changed);
+    CHECK(p8.reset_ones == p8.changed && p8.bypass_blocks == 0, "N=%d: %d frame_reset ones, %d BYPASS blocks for %d CHANGED hops",
+          BLK_PN, p8.reset_ones, p8.bypass_blocks, p8.changed);
     for (b = 1; b < BLOCKS; ++b) CHECK(!(p1.edge[b] && p1.edge[b - 1]), "hops %d and %d are both events", b - 1, b);
     CHECK(p1.submit_blocks == BLOCKS - p1.bypass_blocks, "N=1 submit blocks %d", p1.submit_blocks);
 
@@ -151,8 +159,11 @@ int main(void) {
     }
     CHECK(compared > 100, "only %d hops compared", compared);
     CHECK(discriminating > 1000, "residual never differs from the mic (%d samples): the test cannot tell them apart", discriminating);
-    CHECK(memcmp(p1.pcm, p8.pcm, sizeof(p1.pcm)) == 0, "PCM at N=8 differs from N=1");
-    CHECK(memcmp(p1.resid, p8.resid, sizeof(p1.resid)) == 0, "front residual at N=8 differs from N=1");
+    CHECK(memcmp(p1.pcm, p8.pcm, sizeof(p1.pcm)) == 0, "PCM at N=%d differs from N=1", BLK_PN);
+    CHECK(memcmp(p1.resid, p8.resid, sizeof(p1.resid)) == 0, "front residual at N=%d differs from N=1", BLK_PN);
+    for (i = 0; i < BLOCKS * HOP; ++i) {
+        if (!isfinite(p1.resid[i]) || !isfinite(p8.resid[i])) { CHECK(0, "residual sample %d is not finite", i); break; }
+    }
 
     {
         const int codes[] = { AIAEC_OK, AIAEC_ERR_GRID, AIAEC_ERR_INPUT_SIZE, AIAEC_FRONT_ERR_DELAY, AIAEC_FRONT_ERR_AEC, -999 };
@@ -169,7 +180,7 @@ int main(void) {
 
     scene_free(&sc);
     if (g_fail) { fprintf(stderr, "test_front_block: %d failure(s)\n", g_fail); return 1; }
-    printf("test_front_block: PASS (CHANGED hops %d: N=1 bypass=%d, N=8 frame_reset=%d; %d hops compared, %d discriminating samples)\n",
-           p1.changed, p1.bypass_blocks, p8.reset_ones, compared, discriminating);
+    printf("test_front_block[%d Hz / %d]: PASS (CHANGED hops %d: N=1 bypass=%d, N=%d frame_reset=%d; %d hops compared, %d discriminating samples)\n",
+           BLK_SR, BLK_FFT, p1.changed, p1.bypass_blocks, BLK_PN, p8.reset_ones, compared, discriminating);
     return 0;
 }

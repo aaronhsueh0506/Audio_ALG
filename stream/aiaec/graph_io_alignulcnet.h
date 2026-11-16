@@ -29,6 +29,8 @@ static const GraphIoAlignulcnetGrid GRAPH_IO_ALIGNULCNET_GRIDS[] = {
     { 16000, 256, 1 },
     { 16000, 256, 8 },
     { 16000, 512, 1 },
+    { 48000, 1024, 1 },
+    { 48000, 1024, 2 },
 };
 
 #define GRAPH_IO_ALIGNULCNET_ROW_COUNT \

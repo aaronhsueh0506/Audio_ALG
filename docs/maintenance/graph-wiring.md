@@ -18,7 +18,7 @@
 
 `ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。
 
-接線表登錄的組態比函式庫目前交付的 graph 多：AIAEC 的正式目錄（`aiaec.c`）只有兩個模型的 16 kHz／fft 256／N=1 與 16 kHz／fft 512／N=1 帶 graph 路徑（同一個模型的兩個 grid 共用一個路徑），兩個模型的 16k／256／N=8 有接線、沒有交付的 graph，正式建置在 init 就拒絕它們（測試目錄 `-DAIAEC_TEST_CATALOG` 才接受，見 `stream/aiaec/tests/test_aiaec_graph_io.c`）。
+接線表的列與 AIAEC 正式目錄（`aiaec.c`）的組態一致：兩個模型各有 16 kHz／fft 256 的 N=1 與 N=8、16 kHz／fft 512 的 N=1、48 kHz／fft 1024 的 N=1 與 N=2，每列都帶 graph 路徑（同一個模型的所有列共用一個路徑：卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑，sample 在開圖後以 `graph_io_check_ports()` 拒絕其他組態）。表外的 N（例如 16k／512 的 N=8）沒有列，正式建置在 init 就拒絕。測試目錄（`-DAIAEC_TEST_CATALOG`）與正式目錄的列集合相同，只有路徑是佔位字串，見 `stream/aiaec/tests/test_aiaec_graph_io.c`。
 
 ## 規則
 
@@ -84,7 +84,7 @@ make -C stream/ainr MASK_ONLY=1 test-ainr-graph-io
 make -C stream/aiaec test-aiaec-graph-io
 ```
 
-- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `StreamWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 16k/256 N=1、N=8、16k/512 N=1；Align-ULCNet 同三組）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
+- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `StreamWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 與 Align-ULCNet 各 16k/256 N=1、N=8、16k/512 N=1、48k/1024 N=1、N=2）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
   （二）另用 `make -C stream/aiaec graph-io-dumper`（環境變數 `AIAEC_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_deepvqes.h`／`graph_io_alignulcnet.h` 的每一列，逐列比對全新匯出的圖：layout 版本、訊號／head／輸入／輸出的數量、每個輸入輸出的 shape、state 名稱與順序、輸出名稱 `<輸入>_out`、state 兩端同 shape，以及 Align-ULCNet N>1 的 `frame_reset` 為最後一個訊號；列集合必須恰為匯出的六個案例。
 - `test_dfn2_port_order.py` 對 DFN2 full 與 lite、N=1 與 8 的匯出圖做名稱順序與 state 形狀檢查，並用 `make -C stream/ainr [MASK_ONLY=1] work-dumper` 建的傾印程式，把四個登錄列（full 16 kHz/256 的 N=1 與 8、full 與 lite 48 kHz/1024 的 N=1）的 `StreamWork` 對匯出圖的訊號輸入與 head 輸出，另驗拒絕的組態回傳碼。它也用 `make -C stream/ainr graph-io-dumper`（`AINR_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_dfn2.h` 的每一列，逐列比對全新匯出的圖（`test_sample_row_equals_a_fresh_export`，項目同上），列集合必須恰為登錄的四列。
 - `test-ainr-graph-io` 另驗每個家族的第二個 block 與第一個同形狀，以及 `ainr_get_mem_size()` 的每個拒絕碼由三個 init 家族原樣回傳（`*ctx` 為 NULL、`*info` 不動）。

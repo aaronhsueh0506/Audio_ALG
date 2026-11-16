@@ -10,8 +10,9 @@ input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinn
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
 ``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
 resolve) prints the graph path of a real init and the StreamWork of the first real pre call for each family
-(PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1
-and N=8, DeepVQE-S 16k/512 N=1, Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19) and 16k/512 N=1.
+(PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1 and N=8, 16k/512 N=1
+and 48k/1024 N=1 and N=2, and Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19), 16k/512 N=1 and
+48k/1024 N=1 and N=2.
 The dumped signal inputs and head output are compared with the exported graph's leading inputs and outputs
 by position and exact padded shape, for both families, and the two families must print one and the
 same views. Align-ULCNet's frame_reset values and the BYPASS block of an
@@ -54,9 +55,13 @@ CASES = [
     ('deepvqe_s', 16000, 256, 1),
     ('deepvqe_s', 16000, 256, 8),
     ('deepvqe_s', 16000, 512, 1),
+    ('deepvqe_s', 48000, 1024, 1),
+    ('deepvqe_s', 48000, 1024, 2),
     ('align_ulcnet', 16000, 256, 1),
     ('align_ulcnet', 16000, 256, 8),
     ('align_ulcnet', 16000, 512, 1),
+    ('align_ulcnet', 48000, 1024, 1),
+    ('align_ulcnet', 48000, 1024, 2),
 ]
 
 

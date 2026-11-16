@@ -17,12 +17,14 @@
 <thead><tr><th>sr / fft</th><th>hop_in → N</th><th>正式登錄表</th><th>測試登錄表（僅主機測試）</th></tr></thead>
 <tbody>
 <tr><th>16000 / 256</th><td>128 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
-<tr><th>16000 / 256</th><td>1024 → 8</td><td>無 graph，init 拒絕</td><td>可建構（封包 graph）</td></tr>
+<tr><th>16000 / 256</th><td>1024 → 8</td><td>有登錄的 graph，接受</td><td>可建構（封包 graph）</td></tr>
 <tr><th>16000 / 512</th><td>256 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
 <tr><th>16000 / 512</th><td>2048 → 8</td><td>無 graph，init 拒絕</td><td>無，init 拒絕</td></tr>
+<tr><th>48000 / 1024</th><td>512 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
+<tr><th>48000 / 1024</th><td>1024 → 2</td><td>有登錄的 graph，接受</td><td>可建構（封包 graph）</td></tr>
 </tbody></table>
-<p>沒有交付 graph 的組態（16 kHz／256 與 16 kHz／512 的 N=8），<code>aiaec_get_mem_size()</code>／<code>aiaec_init()</code> 回 <code>AIAEC_ERR_FRAMES_PER_CALL</code>，不會呼叫任何 SDK。測試登錄表只存在於主機測試用的測試建置，不在交付的 archive 裡，以佔位路徑讓主機測試能走完整個 API，不代表有 graph。表外的 <code>(sr, fft)</code> 回 <code>AIAEC_ERR_GRID</code>；不是模型 hop 倍數的 <code>hop_in</code>（例如 16 kHz／256 的 129）回 <code>AIAEC_ERR_IN_HOP</code>。</p>
-<p>板端 graph 路徑：16 kHz／256／N=1 與 16 kHz／512／N=1 兩列共用 <code>/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin</code>（登錄表裡只寫一次）。卡上的 graph 只能在它自己的 grid 跑：另一個 grid 的 graph 在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_alignulcnet.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256（257 bins，D = 32）。</p>
+<p>沒有交付 graph 的組態（16 kHz／512 的 N=8、48 kHz／1024 的 N=4 以上等未登錄的 N），<code>aiaec_get_mem_size()</code>／<code>aiaec_init()</code> 回 <code>AIAEC_ERR_FRAMES_PER_CALL</code>，不會呼叫任何 SDK。測試登錄表只存在於主機測試用的測試建置，不在交付的 archive 裡，以佔位路徑讓主機測試能走完整個 API，不代表有 graph。表外的 <code>(sr, fft)</code> 回 <code>AIAEC_ERR_GRID</code>；不是模型 hop 倍數的 <code>hop_in</code>（例如 16 kHz／256 的 129）回 <code>AIAEC_ERR_IN_HOP</code>。</p>
+<p>板端 graph 路徑：16k／256（N=1、N=8）、16k／512／N=1 與 48k／1024（N=1、N=2）各列共用 <code>/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin</code>（登錄表裡只寫一次）。卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑：另一個 grid 的 graph 在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_alignulcnet.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256（257 bins，D = 32）。</p>
 
 <h2>建置與連結</h2>
 <p>Align-ULCNet 的單模型產品用 <code>AIAEC_MODEL=align</code> 建置，連結 <code>libaiaec.a</code>、該款 backend <code>libulcnet_stream.a</code> 與 audiolib 的 <code>libaudio_common.a</code>。路徑一律用 <code>print-lib-path</code> 查，且查詢要帶與建置相同的 <code>AIAEC_MODEL</code>、<code>SIMD</code>、<code>CC</code>、<code>EXTRA_CFLAGS</code>，否則得到另一組設定的路徑。</p>
@@ -63,6 +65,8 @@ cc app.c -Istream/aiaec -Istream/aiaec/front -Istream/common -I$AUDIOLIB/common 
 <tr><th>16k／256／N=1</th><td>129</td><td>63</td><td>13</td><td>4</td></tr>
 <tr><th>16k／256／N=8</th><td>129</td><td>63</td><td>13</td><td>5</td></tr>
 <tr><th>16k／512／N=1</th><td>257</td><td>32</td><td>26</td><td>4</td></tr>
+<tr><th>48k／1024／N=1</th><td>513</td><td>47</td><td>52</td><td>4</td></tr>
+<tr><th>48k／1024／N=2</th><td>513</td><td>47</td><td>52</td><td>5</td></tr>
 </tbody></table>
 <p><code>frame_reset</code> 是 stream 依逐 hop 事件產生的控制值（N 個 0.0／1.0，事件 hop 為 1.0），放在 <code>StreamWork.inputs[4]</code>；sample 不判斷事件，把它當第五個普通訊號輸入依位置搬進加速器，沒有特例。<code>StreamWork.inputs[0..3]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>StreamWork</code> 裡。括號內的名稱是匯出器的 ONNX 名稱，C 端與 sample 不讀名稱。</p>
 
@@ -121,13 +125,15 @@ in.u.align_ulcnet.events      = ev;
 in.u.align_ulcnet.event_count = N;</code></pre>
 <p><code>aiaec_init()</code> 回 0 或負的 <code>AIAEC_ERR_*</code>，pool 小於 <code>aiaec_get_mem_size()</code> 的位元組數或未對齊時回 <code>AIAEC_ERR_POOL</code>，較大的 pool 可以。<code>aiaec_preprocess()</code> 成功回 <code>AIAEC_OK</code>（0），是否要跑加速器看 <code>work.action</code>。每包 pre／post 只交換這一包的特徵（前四個訊號輸入；N&gt;1 的最後一個訊號輸入是 <code>frame_reset</code>）與模型 head（複數 mask）。開圖後、第一次執行前，共用接線程式的 <code>graph_io_check_ports()</code>（內部呼叫 SDK 無關的檢查器 <code>stream_check_ports()</code>，在 <code>stream/common</code>，<code>libaiaec.a</code> 不含它）檢查每個埠的格式、軸、stride、容量與 state 配對；每包送件前 <code>GRAPH_IO_CHECK_WORK</code> 再核對 <code>work</code> 的數量與 shape。N=8 的每一包恆為一次 SUBMIT；N=1 時事件 hop 是 BYPASS。</p>
 <p><b>輸入檢查</b>：<code>aiaec_preprocess()</code> 與 <code>aiaec_preprocess_freq()</code> 在 kind、size、NULL 檢查之後、任何 frame 進入 stream 之前掃一次輸入。<code>_freq</code> 的四個平面（各 N × n_bins 個 float）有任何一個 NaN 或 Inf，或 PCM 入口的 <code>residual_in</code>、<code>far_in</code> 有任何一個 NaN、Inf，或絕對值超過 2<sup>112</sup>（<code>AIAEC_PCM_LIMIT_BITS</code>；float PCM 自己的分析在 2<sup>120</sup> 起溢位，限值留 8 個位元的餘裕），整包以 <code>AIAEC_ERR_NONFINITE_INPUT</code>（-10）拒絕。拒絕時 stream、分析器與 state generation 都沒有動，也沒有開啟的 block：sample 不要跑加速器，也不要呼叫 post，同一個 ctx 直接接下一包，輸出與從未收到這包相同。有限的頻譜 bin（到 FLT_MAX 為止）照常處理，送進加速器的特徵都是有限值，模型無法表示的結果由函式庫旁路，不會輸出 Inf。<code>aiaec_front_preprocess()</code> 的殘差在線性 AEC 跑完之後才掃到：回這個碼時 reset front 與 ctx。</p>
-<p>pool 大小（本庫 host 建置讀出，單位 bytes；正式登錄表有 16k／256／N=1 與 16k／512／N=1，16k／256／N=8 只存在於測試登錄表）：</p>
+<p>pool 大小（本庫 host 建置讀出，單位 bytes）：</p>
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th><code>_freq</code></th></tr></thead>
 <tbody>
-<tr><td>16k／256／N=1</td><td>53728</td><td>7904</td></tr>
-<tr><td>16k／256／N=8</td><td>125888</td><td>58400</td></tr>
-<tr><td>16k／512／N=1</td><td>103392</td><td>15072</td></tr>
+<tr><td>16k／256／N=1</td><td>52688</td><td>7888</td></tr>
+<tr><td>16k／256／N=8</td><td>124848</td><td>58384</td></tr>
+<tr><td>16k／512／N=1</td><td>101328</td><td>15056</td></tr>
+<tr><td>48k／1024／N=1</td><td>198608</td><td>29392</td></tr>
+<tr><td>48k／1024／N=2</td><td>239616</td><td>58096</td></tr>
 </tbody></table>
 <p><code>_freq</code> 的 pool 不含 FFT、STFT／ISTFT 與 PCM 暫存（呼叫端自己做分析與合成），所以比 PCM 小。</p>
 
@@ -173,6 +179,7 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <tr><td>16 kHz／256／N=1</td><td>128</td></tr>
 <tr><td>16 kHz／256／N=8</td><td>128</td></tr>
 <tr><td>16 kHz／512／N=1</td><td>256</td></tr>
+<tr><td>48 kHz／1024／N=1、N=2</td><td>512</td></tr>
 </tbody></table>
 <p>函式庫不修剪也不補尾：每一包照常前端／pre／AI3／post，輸出與輸入逐包對應，起點晚上述延遲。外部 ISTFT 的 <code>AC_OLA_ACCUMULATE</code> 沒有 flush（<code>ac_istft_flush()</code> 回 0）。</p>
 
@@ -182,14 +189,15 @@ in.u.align_ulcnet.event_count = N;</code></pre>
 <thead><tr><th>組態</th><th>主機替身</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
 <tbody>
 <tr><th>16k／256／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：C <code>_freq</code> 家族接 ONNX Runtime 執行 layout 18 的單拍 graph（隨機權重）</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
-<tr><th>16k／256／N=8</th><td>僅測試登錄表</td><td>已驗：C <code>_freq</code> 家族接 ONNX Runtime 執行 layout 19 的封包 graph（隨機權重）</td><td>無 graph，init 拒絕</td><td>未驗</td></tr>
+<tr><th>16k／256／N=8</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：C <code>_freq</code> 家族接 ONNX Runtime 執行 layout 19 的封包 graph（隨機權重）</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
 <tr><th>16k／512／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>未驗（只有 work 對匯出圖的對照）</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
+<tr><th>48k／1024／N=1、N=2</th><td>正式登錄表與測試登錄表都已測；<code>test_front_block_48k</code>（AEC 前端接 block，測試登錄表）N=2 對 N=1 逐樣本一致、輸出為殘差晚一個 hop</td><td>隨機權重匯出圖的 shape 已驗（<code>test_aiaec_bind_info_pin.py</code>）；未經 ONNX Runtime 串流</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
 <tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
 <li><b>主機替身</b>：<code>make -C stream/aiaec test</code> 涵蓋 catalog 拒絕順序、PCM／<code>_freq</code> 兩個家族、N=8 封包（含事件與 N=1 逐樣本對照）、work 的形狀與 <code>frame_reset</code> 值，以及兩個單模型建置。替身加速器自己實作 <code>frame_reset</code> 語意，不是 AI3 的圖。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_aiaec_packet_ort.py</code> 只涵蓋 16k／256，逐 frame 與 Python 逐 hop 串流及 C 的 N=1 串流比對，事件組合包含無事件、單一與多個事件、相鄰事件、每包一個、每 frame 都是、solid 邊緣與跨包邊緣，並驗證 N=8 每包只呼叫一次加速器、事件不改變 generation。<code>test_aiaec_packet_ort_events.py</code> 以同一份事件記錄檔，比對 <code>inference.py --events</code>（N=1、N=8）與 C 的 <code>frame_reset</code>、加速器呼叫數與 PCM。</li>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8 與 16k／512 N=1，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8、16k／512 N=1 與 48k／1024 N=1、N=2，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code> 與匯出圖的訊號輸入、head 輸出（N=1：4 個訊號；N=8：5 個，<code>frame_reset</code> 為最後一個）與形狀，檢查匯出器的 ONNX 名稱順序符合上述規則（含 state 兩端同 shape），並固定 N=8 第 3 個 hop 事件的 <code>frame_reset</code> 為 <code>00100000</code>、N=1 事件 hop 是沒有任何 tensor 的 BYPASS。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_alignulcnet.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape、N&gt;1 時 <code>frame_reset</code> 為最後一個訊號），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 </ul>
 
 <h2>參考</h2>

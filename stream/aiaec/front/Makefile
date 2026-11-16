@@ -72,7 +72,7 @@ ALIGN_SOURCES := ../aiaec.c ../../../lib/aiaec/ulcnet/ulcnet_model_io.c ../../..
 ALIGN_CPPFLAGS := -DAIAEC_ENABLE_DEEPVQE_S=0 -DAIAEC_ENABLE_ALIGN_ULCNET=1 -DAIAEC_PRODUCT_MODEL_ID=10 \
 	-DAIAEC_TEST_CATALOG -I../deepvqe_s -I../../../lib/aiaec/deepvqe_s -I../ulcnet -I../../../lib/aiaec/ulcnet
 
-.PHONY: all lib print-lib-path test test-front-events test-front-scene test-front-block test-front-oneshot test-front-refusal \
+.PHONY: all lib print-lib-path test test-front-events test-front-scene test-front-block test-front-block-48k test-front-oneshot test-front-refusal \
 	audit-libaiaec-no-aec clean _cfg_guard _aec_lib
 
 all: lib
@@ -119,6 +119,9 @@ test-front-scene: $(LIB) _aec_lib
 test-front-block: $(LIB) _aec_lib $(ALIGN_SOURCES) ../aiaec.h ../aiaec_product.h
 	$(call BUILD_TEST,test_front_block,$(ALIGN_CPPFLAGS),$(ALIGN_SOURCES))
 
+test-front-block-48k: $(LIB) _aec_lib $(ALIGN_SOURCES) ../aiaec.h ../aiaec_product.h
+	$(call BUILD_TEST,test_front_block_48k,$(ALIGN_CPPFLAGS) -Itests,$(ALIGN_SOURCES))
+
 test-front-oneshot: $(LIB) _aec_lib $(ALIGN_SOURCES) ../aiaec.h ../aiaec_product.h
 	$(call BUILD_TEST,test_front_oneshot,$(ALIGN_CPPFLAGS),$(ALIGN_SOURCES))
 
@@ -149,7 +152,7 @@ audit-libaiaec-no-aec: $(LIB) _aec_lib
 	done; \
 	echo "audit-libaiaec-no-aec: PASS (control: libaiaec_front.a overlaps the AEC archive on $$(echo "$$front_hits" | wc -l | tr -d ' ') symbols)"
 
-test: test-front-events test-front-scene test-front-block test-front-oneshot test-front-refusal audit-libaiaec-no-aec
+test: test-front-events test-front-scene test-front-block test-front-block-48k test-front-oneshot test-front-refusal audit-libaiaec-no-aec
 
 clean:
 	rm -rf "$(BUILD_DIR)"

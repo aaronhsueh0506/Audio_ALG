@@ -4,7 +4,7 @@
  * graph paths for the rows below so the gated API constructs; the production catalog (no delivered
  * graph for most rows) is covered by test_aiaec_catalog.c.
  *
- *   DeepVQE-S (N=1 and N=8 at 16k/256, N=1 at 16k/512): the block path against the deepvqe_stream
+ *   DeepVQE-S (N=1 and N=8 at 16k/256, N=1 at 16k/512, N=1 and N=2 at 48k/1024): the block path against the deepvqe_stream
  *     packet entries driven directly, bit-exact PCM and identical accelerator-side tensors;
  *     batching against an independent N=1 stream; fail-closed; identity-accelerator delay.
  *   Align-ULCNet (N=1): normal, realignment-bypass and forced-failure hops against ulcnet_stream_*
@@ -30,11 +30,15 @@ static int g_fail = 0;
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } while (0)
 #define CHECK(cond, ...) do { if (!(cond)) FAIL(__VA_ARGS__); } while (0)
 
-static AiaecConfig make_cfg(int fft, int n) {
+static AiaecConfig make_cfg_sr(int sr, int fft, int n) {
     AiaecConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.sr = 16000; cfg.fft = fft; cfg.hop_in = (fft / 2) * n;
+    cfg.sr = sr; cfg.fft = fft; cfg.hop_in = (fft / 2) * n;
     return cfg;
+}
+
+static AiaecConfig make_cfg(int fft, int n) {
+    return make_cfg_sr(16000, fft, n);
 }
 
 static AiaecCtx *make_ctx_info(const AiaecConfig *cfg, void **pool_out, const char *who, AiaecInfo *info) {
@@ -116,11 +120,11 @@ static void dv_input(AiaecInput *in, const int16_t *mic, const int16_t *far, int
     in->u.deepvqe_s.far_in = far;
 }
 
-static int dv_grid(int fft, int n, DeepVqeGrid *grid) {
+static int dv_grid(int sr, int fft, int n, DeepVqeGrid *grid) {
     DeepVqeGridSpec spec;
     memset(&spec, 0, sizeof(spec));
-    spec.sample_rate = 16000; spec.n_fft = fft;
-    spec.delay_depth = (int)ceilf(0.5f * 16000.0f / (float)(fft / 2));
+    spec.sample_rate = sr; spec.n_fft = fft;
+    spec.delay_depth = (int)ceilf(0.5f * (float)sr / (float)(fft / 2));
     spec.frames_per_call = n;
     return deepvqe_grid_make(grid, &spec) == DEEPVQE_GRID_OK ? 0 : -1;
 }
@@ -140,8 +144,8 @@ static DeepVqeStream *dv_stream(const DeepVqeGrid *grid) {
  * the tensors the accelerator sees (element counts, input spectra) identical. The 8x
  * amplitude keeps the compare above the int16 rounding threshold, where an earlier cold-start bug
  * passed with zero mismatches. */
-static int section_deepvqe_block_vs_stream(int n, int fft) {
-    AiaecConfig cfg = make_cfg(fft, n);
+static int section_deepvqe_block_vs_stream(int sr, int n, int fft) {
+    AiaecConfig cfg = make_cfg_sr(sr, fft, n);
     void *pool = NULL;
     AiaecCtx *ctx = make_ctx(&cfg, &pool, "block_vs_stream");
     DeepVqeGrid grid;
@@ -152,7 +156,7 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
     int b, k, bad = 0;
 
     if (!ctx) return 1;
-    if (dv_grid(fft, n, &grid) != 0 || !(ref = dv_stream(&grid))) { FAIL("block_vs_stream: reference stream"); return 1; }
+    if (dv_grid(sr, fft, n, &grid) != 0 || !(ref = dv_stream(&grid))) { FAIL("block_vs_stream: reference stream"); return 1; }
     mic_in = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     far_in = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     pcm_blk = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
@@ -193,7 +197,7 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
         }
         ghop += n;
     }
-    printf("section_deepvqe_block_vs_stream(fft=%d N=%d): %d blocks bit-exact vs deepvqe_stream_*\n", fft, n, blocks);
+    printf("section_deepvqe_block_vs_stream(%d Hz fft=%d N=%d): %d blocks bit-exact vs deepvqe_stream_*\n", sr, fft, n, blocks);
     free(mic_in); free(far_in); free(pcm_blk); free(pcm_ref); free(pool);
     return bad;
 }
@@ -202,13 +206,13 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
  * the same delay (one hop of STFT/ISTFT framing), so the two PCM streams are equal sample for
  * sample. Block boundaries of the two do not line up, so one global concatenated buffer per side
  * is compared. */
-static int section_batching_vs_n1(int n) {
-    AiaecConfig cfg = make_cfg(256, n);
+static int section_batching_vs_n1(int sr, int fft, int n) {
+    AiaecConfig cfg = make_cfg_sr(sr, fft, n);
     void *pool = NULL;
     AiaecCtx *ctx = make_ctx(&cfg, &pool, "batching");
     DeepVqeGrid rgrid;
     DeepVqeStream *ref;
-    const int hop = 128, blocks = 6;
+    const int hop = fft / 2, blocks = 6;
     const size_t total = (size_t)blocks * (size_t)n * (size_t)hop;
     int16_t *mic_in, *far_in, *full_blk, *full_ref;
     float *taps_ref;
@@ -216,7 +220,7 @@ static int section_batching_vs_n1(int n) {
     int b, k, bad = 0;
 
     if (!ctx) return 1;
-    if (dv_grid(256, 1, &rgrid) != 0 || !(ref = dv_stream(&rgrid))) { FAIL("batching: reference stream"); return 1; }
+    if (dv_grid(sr, fft, 1, &rgrid) != 0 || !(ref = dv_stream(&rgrid))) { FAIL("batching: reference stream"); return 1; }
     mic_in = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     far_in = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     full_blk = calloc(total, sizeof(int16_t));
@@ -251,10 +255,10 @@ static int section_batching_vs_n1(int n) {
     if (memcmp(full_blk, full_ref, total * sizeof(int16_t)) != 0) {
         size_t s;
         for (s = 0; s < total; ++s)
-            if (full_blk[s] != full_ref[s]) { FAIL("N=%d: batched PCM diverges from the N=1 stream at sample %zu", n, s); break; }
+            if (full_blk[s] != full_ref[s]) { FAIL("%d Hz N=%d: batched PCM diverges from the N=1 stream at sample %zu", sr, n, s); break; }
         bad = 1;
     }
-    printf("section_batching_vs_n1(N=%d): %zu samples compared, %s\n", n, total, bad ? "DIVERGED" : "bit-exact");
+    printf("section_batching_vs_n1(%d Hz fft=%d N=%d): %zu samples compared, %s\n", sr, fft, n, total, bad ? "DIVERGED" : "bit-exact");
     free(mic_in); free(far_in); free(full_blk); free(full_ref); free(taps_ref); free(pool);
     return bad;
 }
@@ -391,8 +395,8 @@ static int section_fail_closed(void) {
  * forced to the (delay 0, centre frequency tap) coefficient 1+0j, so the only reason input and
  * output can differ is the pure sample shift being measured. Every block's output must equal the
  * input delayed by one model hop. */
-static int section_trim(int n, int fft) {
-    AiaecConfig cfg = make_cfg(fft, n);
+static int section_trim(int sr, int n, int fft) {
+    AiaecConfig cfg = make_cfg_sr(sr, fft, n);
     void *pool = NULL;
     AiaecInfo bi;
     AiaecCtx *ctx = make_ctx_info(&cfg, &pool, "delay", &bi);
@@ -417,7 +421,7 @@ static int section_trim(int n, int fft) {
               !pcm16_close(pcm_out, mic_in + (size_t)bidx * bs, (size_t)bs),
               "delay N=%d fft=%d block %d: output is not exactly the input delayed by one hop", n, fft, bidx);
     }
-    printf("section_trim(N=%d fft=%d): identity accelerator confirms %d samples\n", n, fft, hop);
+    printf("section_trim(%d Hz N=%d fft=%d): identity accelerator confirms %d samples\n", sr, n, fft, hop);
     free(mic_in); free(far_zero); free(pcm_out); free(pool);
     return 0;
 }
@@ -808,14 +812,19 @@ static int section_pool(void) {
 
 int main(void) {
 #if PRODUCT_DV
-    g_fail |= section_deepvqe_block_vs_stream(1, 256);
-    g_fail |= section_deepvqe_block_vs_stream(8, 256);
-    g_fail |= section_deepvqe_block_vs_stream(1, 512);
-    g_fail |= section_batching_vs_n1(8);
+    g_fail |= section_deepvqe_block_vs_stream(16000, 1, 256);
+    g_fail |= section_deepvqe_block_vs_stream(16000, 8, 256);
+    g_fail |= section_deepvqe_block_vs_stream(16000, 1, 512);
+    g_fail |= section_deepvqe_block_vs_stream(48000, 1, 1024);
+    g_fail |= section_deepvqe_block_vs_stream(48000, 2, 1024);
+    g_fail |= section_batching_vs_n1(16000, 256, 8);
+    g_fail |= section_batching_vs_n1(48000, 1024, 2);
     g_fail |= section_fail_closed();
-    g_fail |= section_trim(1, 256);
-    g_fail |= section_trim(8, 256);
-    g_fail |= section_trim(1, 512);
+    g_fail |= section_trim(16000, 1, 256);
+    g_fail |= section_trim(16000, 8, 256);
+    g_fail |= section_trim(16000, 1, 512);
+    g_fail |= section_trim(48000, 1, 1024);
+    g_fail |= section_trim(48000, 2, 1024);
 #endif
 #if PRODUCT_AL
     g_fail |= section_align_block();

@@ -77,6 +77,10 @@ static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
     { 1, "test://aiaec/deepvqe_s/16k_fft512_n1" },
     { 8, (const char *)0 },
 };
+static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
+    { 1, "test://aiaec/deepvqe_s/48k_fft1024_n1" },
+    { 2, "test://aiaec/deepvqe_s/48k_fft1024_n2" },
+};
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
     { 1, "test://aiaec/align_ulcnet/16k_fft256_n1" },
     { 8, "test://aiaec/align_ulcnet/16k_fft256_n8" },   /* the packet graph (layout 19) */
@@ -85,37 +89,51 @@ static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
     { 1, "test://aiaec/align_ulcnet/16k_fft512_n1" },
     { 8, (const char *)0 },
 };
+static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
+    { 1, "test://aiaec/align_ulcnet/48k_fft1024_n1" },
+    { 2, "test://aiaec/align_ulcnet/48k_fft1024_n2" },   /* the packet graph (layout 19) */
+};
 #else
-/* Board graph path per model, shared by its 16k/256 and 16k/512 rows: the card holds one graph, which
- * runs only at its own --fft-size; the sample's graph_io_check_ports() refuses the other grid at init. */
+/* Board graph path per model, shared by every row of that model: the card holds one graph, which runs only at its own
+ * grid and N; the sample's graph_io_check_ports() refuses any other at init. */
 #define AIAEC_DEEPVQE_S_GRAPH "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin"
 #define AIAEC_ULCNET_GRAPH    "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin"
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
     { 1, AIAEC_DEEPVQE_S_GRAPH },
-    { 8, (const char *)0 },
+    { 8, AIAEC_DEEPVQE_S_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
     { 1, AIAEC_DEEPVQE_S_GRAPH },
     { 8, (const char *)0 },
 };
+static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
+    { 1, AIAEC_DEEPVQE_S_GRAPH },
+    { 2, AIAEC_DEEPVQE_S_GRAPH },
+};
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
     { 1, AIAEC_ULCNET_GRAPH },
-    { 8, (const char *)0 },
+    { 8, AIAEC_ULCNET_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
     { 1, AIAEC_ULCNET_GRAPH },
     { 8, (const char *)0 },
 };
+static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
+    { 1, AIAEC_ULCNET_GRAPH },
+    { 2, AIAEC_ULCNET_GRAPH },
+};
 #endif
 
-/* 0.5 s target physical delay span for every row: D = 32 at hop 256, 63 at hop 128. */
+/* 0.5 s target physical delay span for every row: D = 32 at hop 256, 63 at hop 128, 47 at hop 512 (48 kHz). */
 #define AIAEC_MAX_DELAY_SECONDS 0.5f
 
 static const AiaecModelEntry AIAEC_CATALOG[] = {
     { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_16K_FFT256_VARIANTS, 2 },
     { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_16K_FFT512_VARIANTS, 2 },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_48K_FFT1024_VARIANTS, 2 },
     { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_16K_FFT256_VARIANTS,  2 },
     { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_16K_FFT512_VARIANTS,  2 },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_48K_FFT1024_VARIANTS, 2 },
 };
 #define AIAEC_CATALOG_ROWS ((int)(sizeof(AIAEC_CATALOG) / sizeof(AIAEC_CATALOG[0])))
 
