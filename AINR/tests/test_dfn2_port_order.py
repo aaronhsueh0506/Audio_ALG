@@ -215,15 +215,15 @@ def test_the_l0_customer_arithmetic(work_dumpers):
 
 
 def test_the_customer_arithmetic_picks_the_exported_n(work_dumpers):
-    """N = hop_in / (fft / 2); the time axis of the signals is N + 2 and of the heads N; a config with no
-    registered graph is refused with no work."""
+    """N = hop_in / (fft / 2) at any mask_lookahead; the time axis of the signals is N + 2 and of the heads N;
+    a config with no registered graph is refused with no work."""
     full, lite = work_dumpers[False], work_dumpers[True]
-    for hop_in, n in ((128, 1), (1024, 8)):
-        dump = run_work_dumper(full, 16000, 256, hop_in)
+    for sr, fft, hop_in, n in ((16000, 256, 128, 1), (16000, 256, 1024, 8), (48000, 1024, 512, 1), (48000, 1024, 1024, 2)):
+        dump = run_work_dumper(full, sr, fft, hop_in)
         assert dump['rc'] == 0 and dump['in'][0][0][2] == n + 2 and dump['out'][0][0][2] == n
     assert run_work_dumper(full, 16000, 256, 100)['rc'] == -4       # AINR_ERR_IN_HOP
     assert run_work_dumper(full, 16000, 256, 256)['rc'] == -6       # N = 2: AINR_ERR_FRAMES_PER_CALL
-    assert run_work_dumper(full, 48000, 1024, 1024)['rc'] == -5     # N = 2 with lookahead
+    assert run_work_dumper(full, 48000, 1024, 2048)['rc'] == -6     # N = 4
     assert run_work_dumper(full, 16000, 512, 256)['rc'] == -3       # AINR_ERR_GRID
     assert run_work_dumper(lite, 16000, 256, 128)['rc'] == -3       # lite has only 48 kHz / 1024
 
