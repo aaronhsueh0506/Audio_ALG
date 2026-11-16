@@ -203,8 +203,6 @@ static int pp_check_config(const DFN2PrepostConfig *cfg) {
     /* Mask expansion and the ERB feature branch run on the spectrum side. */
     if (!cfg->erb_fwd || !cfg->erb_inv) return -1;
     if (!isfinite(cfg->atten_lim_db)) return -1;
-    /* A block's graph reads its own N frames and two before them, no frame beyond: L == 0. */
-    if (cfg->grid.mask_lookahead > 0 && cfg->grid.frames_per_call > 1) return -1;
     if (dfn2_registration_check(cfg->gru_hidden, cfg->gru_hidden_elements,
                                 cfg->df_convp_history,
                                 cfg->df_convp_history_elements) != 0)

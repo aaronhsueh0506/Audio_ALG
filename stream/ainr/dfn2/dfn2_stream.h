@@ -1,7 +1,8 @@
 /* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and the dfn2_prepost per-frame functions
  * around int16 PCM, grid.frames_per_call N in [1, 64]. The stream sequences a call (N pre_frame, one job, validate_run,
- * N post_frame or post_frame_identity) and holds the application-spectrum staging of the call. N == 1: one hop per call, a job on every hop from hop L (io.action ==
- * STREAM_WORK_SUBMIT; the first mask_lookahead hops after init or reset are STREAM_WORK_BYPASS). N > 1 (L == 0 only): one packet of N hops per call and one job
+ * N post_frame or post_frame_identity) and holds the application-spectrum staging of the call. N == 1: one hop per call, a
+ * job on every hop from hop L (io.action == STREAM_WORK_SUBMIT; the first mask_lookahead hops after init or reset are
+ * STREAM_WORK_BYPASS). N > 1: one packet of N hops per call and one job at any L, every packet a SUBMIT
  * (dfn2_stream_{pre,post}_process_packet, below); the per-hop entries refuse it.
  *
  *     ctx = dfn2_stream_init_from_erb_file(&cfg, erb_path, pool, pool_bytes);

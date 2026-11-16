@@ -18,10 +18,10 @@ extern "C" {
 #define DFN2_MODEL_IO_LAYOUT_VERSION       DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
 #endif
 
-/* Heads per call: N = frames_per_call, L = mask_lookahead. The graph reads N + 2 feature frames and returns
- * N heads plus the state after the last; N > 1 means readiness every N pushes and N heads per commit (the pre/post
- * class takes the N frames of a call at once, with L == 0, so a call adds no latency). A call's window is frames [t-(2-L) .. t+N-1+L] for heads[t .. t+N-1] (head i from
- * the three frames starting at slot i); frames before the stream start read as zero. */
+/* Heads per call: N = frames_per_call, L = mask_lookahead. The graph reads N + 2 feature frames and returns N heads plus the
+ * state after the last. The window of a call is the newest N + 2 frames, frames t-N-1 .. t, for heads[t-N+1-L .. t-L] (head i
+ * from the three frames starting at slot i); frames before the stream start read as zero. N == 1 has its first call after L + 1
+ * frames; N > 1 has a call after every N frames from the first, whose first L heads belong to frames before the stream start. */
 
 /* A graph's external contract, compared field by field. The six interior fields (GRU layers and width, encoder
  * channels, pathway window) are caller bookkeeping: 0 by default, never read or validated here. */
@@ -90,7 +90,7 @@ int dfn2_model_io_init(DFN2ModelIOState *state, void *block, size_t bytes,
                        size_t gru_hidden_elements, float *df_convp_history,
                        size_t df_convp_history_elements);
 
-/* Feature frames the first call needs: mask_lookahead + frames_per_call; 0 for NULL or no grid. */
+/* Feature frames the first call needs: mask_lookahead + 1 for N == 1, frames_per_call for N > 1; 0 for NULL or no grid. */
 unsigned int dfn2_model_io_ready_frames(const DFN2ModelIOState *state);
 
 /* Check the recurrent arrays after the accelerator wrote them in place (element counts; df_convp_history
@@ -100,13 +100,13 @@ int dfn2_model_io_validate_arrays(float *gru_hidden, size_t gru_count,
                                   float *df_convp_history, size_t convp_count);
 
 /* Push feature frame f: erb[n_erb], spec[2][df_bins] (re, then im). Returns 1 when the window of
- * heads[f-L-N+1 .. f-L] is complete (after L + N pushes, then every N), 0 otherwise, -1 on NULL or no grid.
+ * heads[f-L-N+1 .. f-L] is complete (after ready_frames() pushes, then every N), 0 otherwise, -1 on NULL or no grid.
  * The newest head trails the pushed frame by L frames, the oldest of the N by L + N - 1. */
 int dfn2_model_io_push_features(DFN2ModelIOState *state, const float *erb,
                                 const float *spec);
 
 /* Index among the N heads of the next call of the head the latest push completes (N - 1 exactly when
- * push_features returned 1); -1 for the first L frames, before any push, and for NULL. */
+ * push_features returned 1); -1 for the first L frames at N == 1, before any push, and for NULL. */
 int dfn2_model_io_frame_slot(const DFN2ModelIOState *state);
 
 /* Call after each invocation: validate_arrays() on the registered state (none: 0); -1 on NULL or non-finite. */

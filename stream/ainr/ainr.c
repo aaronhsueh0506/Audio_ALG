@@ -87,6 +87,7 @@ static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_16X16[] = {
 };
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_16X16[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x16/dfn2/nvt_model_48k_n1.bin" },   /* shipped grid */
+    { 2, AINR_MODEL_DIR_BASE "/16x16/dfn2/nvt_model_48k_n2.bin" },   /* the same checkpoint, N = 2 heads per call */
 };
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_16X8[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_16k_n1.bin" },
@@ -94,11 +95,13 @@ static const AinrDfn2FramesVariant AINR_DFN2_FULL_16K_256_N_16X8[] = {
 };
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_16X8[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_48k_n1.bin" },
+    { 2, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_48k_n2.bin" },
 };
 
 /* AINR_MODEL_ID_DFN2_FULL_L0: mask_lookahead 0, df_lookahead 0 at every grid; its 16 kHz rows are the graphs above. The 32 and
  * 48 kHz paths are NULL (refused as an unlisted N) until set; AINR_TEST_CATALOG gives them test:// paths. The 32 kHz ERB file
- * is fb_32000_28.bin. */
+ * is fb_32000_28.bin. Its 48 kHz N = 2 file is another graph than the mask_lookahead 1 one named above: it must not reuse
+ * nvt_model_48k_n2.bin. */
 #ifdef AINR_TEST_CATALOG
 static const AinrDfn2FramesVariant AINR_DFN2_FULL_L0_32K_512_N[] = {
     { 1, "test://ainr/dfn2_l0/32k_fft512_n1" },
@@ -123,11 +126,11 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
     { AINR_MODEL_ID_DFN2_FULL,      16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_16K_256_N_16X16, 2 },
     { AINR_MODEL_ID_DFN2_FULL,      48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
-      AINR_DFN2_FULL_48K_1024_N_16X16, 1 },
+      AINR_DFN2_FULL_48K_1024_N_16X16, 2 },
     { AINR_MODEL_ID_DFN2_FULL_ALT2, 16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_16K_256_N_16X8, 2 },
     { AINR_MODEL_ID_DFN2_FULL_ALT2, 48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
-      AINR_DFN2_FULL_48K_1024_N_16X8, 1 },
+      AINR_DFN2_FULL_48K_1024_N_16X8, 2 },
     { AINR_MODEL_ID_DFN2_FULL_L0,   16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_16K_256_N_16X16, 2 },
     { AINR_MODEL_ID_DFN2_FULL_L0,   32000, 512,  28, 96, 5, 0, 0, 0.0f, 0, 0.0f,
@@ -138,7 +141,7 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
 #define AINR_DFN2_CATALOG_ROWS ((int)(sizeof(AINR_DFN2_CATALOG) / sizeof(AINR_DFN2_CATALOG[0])))
 #else
 /* Lite (mask-only, no deep filter): df_order/df_lookahead are 0. Only the 48 kHz/1024 row exists
- * (frames_per_call = 1; mask_lookahead = 1 forces N = 1, same rule as full). Board assets
+ * (frames_per_call = 1: no N > 1 graph is delivered). Board assets
  * (model.bin and ERB matrix present and matching) are not verified yet.
  * AINR_MODEL_ID_DFN2_LITE -> 16x16 (default); _ALT1 -> 8x8; _ALT2 -> 16x8. */
 static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_16X16[] = {
@@ -175,9 +178,9 @@ typedef enum AinrFamily { AINR_FAMILY_PCM = 0, AINR_FAMILY_FREQ } AinrFamily;
 
 /* Resolves cfg to a catalog entry, frames_per_call, and that variant's graph path for the
  * product's bound model. Order: the bound model belongs to this archive variant (see
- * ainr_model_id_in_build()); (model_id, sr, fft) row match; hop_in divisibility; frames_per_call > 1
- * requires mask_lookahead = 0; then the shipped-variants list, where "shipped" also requires a non-NULL graph_path (a
- * listed N with no graph is treated as unlisted, never resolved to another N's graph).
+ * ainr_model_id_in_build()); (model_id, sr, fft) row match; hop_in divisibility; then the shipped-variants list, where
+ * "shipped" also requires a non-NULL graph_path (a listed N with no graph is treated as unlisted, never resolved to another
+ * N's graph).
  * graph_path_out may be NULL. */
 static int ainr_resolve(const AinrConfig *cfg, const AinrDfn2ModelEntry **entry_out, int *n_out,
                         const char **graph_path_out)
@@ -201,8 +204,6 @@ static int ainr_resolve(const AinrConfig *cfg, const AinrDfn2ModelEntry **entry_
     model_hop = cfg->fft / 2;
     if (model_hop <= 0 || cfg->hop_in <= 0 || cfg->hop_in % model_hop != 0) return AINR_ERR_IN_HOP;
     n = cfg->hop_in / model_hop;
-
-    if (entry->mask_lookahead > 0 && n > 1) return AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED;
 
     for (j = 0; j < entry->n_variants; ++j) {
         if (entry->variants[j].frames_per_call == n) { graph_path = entry->variants[j].graph_path; break; }
@@ -671,7 +672,7 @@ const char *ainr_status_text(int code)
     case AINR_ERR_GRID: return "no catalog entry for (sr, fft)";
     case AINR_ERR_IN_HOP: return "hop_in is not a positive multiple of model_hop";
     case AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED:
-        return "frames_per_call > 1 requires mask_lookahead = 0";
+        return "not returned: frames_per_call > 1 runs at every mask_lookahead";
     case AINR_ERR_FRAMES_PER_CALL: return "no shipped graph for the resolved frames_per_call";
     case AINR_ERR_POOL: return "pool too small or misaligned";
     case AINR_ERR_ERB_FILE: return "ERB file open/header/short-read/dimension mismatch, bytes after the tables, a non-finite forward value, or the inverse is not a partition of unity";

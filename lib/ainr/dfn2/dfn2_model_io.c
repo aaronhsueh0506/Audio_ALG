@@ -101,7 +101,8 @@ int dfn2_model_io_init(DFN2ModelIOState *state, void *block, size_t bytes,
 unsigned int dfn2_model_io_ready_frames(const DFN2ModelIOState *state)
 {
     if (state == NULL || state->n_erb == 0) return 0u;
-    return (unsigned int)state->mask_lookahead + (unsigned int)state->frames_per_call;
+    if (state->frames_per_call > 1) return (unsigned int)state->frames_per_call;
+    return (unsigned int)state->mask_lookahead + 1u;
 }
 
 #ifdef DFN2_MASK_ONLY
@@ -209,8 +210,8 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state, const float *erb,
                                   state->input_frames);
     dfn2_model_io_push_spec_window(state->spec_window, spec, state->df_bins,
                                    state->input_frames);
-    /* The count runs to L + N and, after each complete call, steps back by N,
-     * so it stays at L + 1 .. L + N once the warm-up is over. */
+    /* The count runs to ready_frames() and, after each complete call, steps back by N,
+     * so it stays at L + 1 .. L + N (N == 1) or 1 .. N (N > 1) once the first call is ready. */
     if (state->feature_frames_seen == ready)
         state->feature_frames_seen -= (unsigned int)state->frames_per_call;
     if (state->feature_frames_seen < ready)
@@ -220,13 +221,12 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state, const float *erb,
 
 int dfn2_model_io_frame_slot(const DFN2ModelIOState *state)
 {
-    unsigned long long seen;
+    unsigned long long seen, skip;
     if (state == NULL) return -1;
+    skip = state->frames_per_call > 1 ? 0ull : (unsigned long long)state->mask_lookahead;
     seen = state->feature_frames_seen;
-    if (seen <= (unsigned long long)state->mask_lookahead ||
-        seen > dfn2_model_io_ready_frames(state))
-        return -1;
-    return (int)(seen - (unsigned long long)state->mask_lookahead - 1U);
+    if (seen <= skip || seen > dfn2_model_io_ready_frames(state)) return -1;
+    return (int)(seen - skip - 1U);
 }
 
 int dfn2_model_io_validate_state(DFN2ModelIOState *state)

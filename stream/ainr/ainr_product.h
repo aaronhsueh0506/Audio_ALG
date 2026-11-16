@@ -1,8 +1,8 @@
 /* AINR product binding, for the product build and this directory's tests. A product ships ONE model, DFN2
  * full or lite (the DFN2_MASK_ONLY variant), at one quantization: the build-time AINR_PRODUCT_MODEL_ID that
  * ainr.c resolves. Bind another with -DAINR_PRODUCT_MODEL_ID=<an ID below>; the IDs are placeholders.
- * AINR_MODEL_ID_DFN2_FULL_L0 is the full model with mask_lookahead 0 at every grid, the one that serves frames_per_call > 1;
- * its 48 kHz / 1024 N = 1 graph shares key and shapes with AINR_MODEL_ID_DFN2_FULL's, so a product binds one of the two. */
+ * AINR_MODEL_ID_DFN2_FULL_L0 is the full model with mask_lookahead 0 at every grid; its 48 kHz / 1024 N = 1 and N = 2 graphs share
+ * key and shapes with AINR_MODEL_ID_DFN2_FULL's, so a product binds one of the two. */
 
 #ifndef AINR_PRODUCT_H
 #define AINR_PRODUCT_H

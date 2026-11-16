@@ -24,7 +24,7 @@
 #include "graph_io_dfn2.h"
 
 /* The ids with catalog rows in this build (_ALT1 and the other variant's are refused by every entry), and how many
- * (sr, fft, N) configurations each accepts: 3 (full default, _ALT2), 1 (lite), 2 (mask_lookahead 0 model; 6 on the test catalog). */
+ * (sr, fft, N) configurations each accepts: 4 (full default, _ALT2), 1 (lite), 2 (mask_lookahead 0 model; 6 on the test catalog). */
 #ifdef DFN2_MASK_ONLY
 #define ID_HAS_ROWS (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_LITE || AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_LITE_ALT2)
 #define EXPECTED_ACCEPTED (ID_HAS_ROWS ? 1 : 0)
@@ -36,8 +36,8 @@
 #else
 #define L0_ACCEPTED 2
 #endif
-#define EXPECTED_ACCEPTED (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0 ? L0_ACCEPTED : ID_HAS_ROWS ? 3 : 0)
-/* Blocks after init without a job at 48 kHz: mask_lookahead of the id's graph */
+#define EXPECTED_ACCEPTED (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0 ? L0_ACCEPTED : ID_HAS_ROWS ? 4 : 0)
+/* Blocks after init without a job at 48 kHz, N = 1: mask_lookahead of the id's graph (N > 1 has none) */
 #define FIRST_JOB_HOP_48K (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0 ? 0 : 1)
 #endif
 
@@ -81,7 +81,7 @@ static void check_refusals(const char *erb)
         { 44100, 256, 128, AINR_ERR_GRID, "unregistered grid" },
         { 48000, 1024, 100, AINR_ERR_IN_HOP, "hop_in not a multiple of model_hop" },
 #ifdef DFN2_MASK_ONLY
-        { 48000, 1024, 1024, AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED, "lookahead grid with N = 2" },
+        { 48000, 1024, 1024, AINR_ERR_FRAMES_PER_CALL, "N = 2 has no graph" },
 #else
         { 16000, 256, 512, AINR_ERR_FRAMES_PER_CALL, "N = 4 has no graph" },
 #if AINR_PRODUCT_MODEL_ID == 3
@@ -92,7 +92,7 @@ static void check_refusals(const char *erb)
         { 48000, 1024, 1024, AINR_ERR_FRAMES_PER_CALL, "N = 2 graph not delivered" },
 #endif
 #else
-        { 48000, 1024, 1024, AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED, "lookahead grid with N = 2" },
+        { 48000, 1024, 2048, AINR_ERR_FRAMES_PER_CALL, "N = 4 has no graph" },
         { 32000, 512, 256, AINR_ERR_GRID, "32 kHz is not a grid of this model" },
 #endif
 #endif
@@ -154,9 +154,9 @@ static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoCo
     memset(&work, 0, sizeof work);
     if (rc == AINR_OK) {
 #ifdef DFN2_MASK_ONLY
-        int bypassed = 0, want_bypassed = 1;
+        int bypassed = 0, want_bypassed = n == 1;
 #else
-        int bypassed = 0, want_bypassed = cfg->sr == 48000 ? FIRST_JOB_HOP_48K : 0;
+        int bypassed = 0, want_bypassed = cfg->sr == 48000 && n == 1 ? FIRST_JOB_HOP_48K : 0;
 #endif
         for (;;) {
             rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)

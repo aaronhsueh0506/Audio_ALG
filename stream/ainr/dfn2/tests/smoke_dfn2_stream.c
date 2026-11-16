@@ -288,7 +288,7 @@ static int run_smoke_packet(int sample_rate, int n_fft, int n_erb, int frames_pe
         }
     }
     if (jobs_run != packets) return 1;
-    {   /* a mask_lookahead > 0 N > 1 grid is not accepted by the prepost, hence not by the stream */
+    {   /* a mask_lookahead > 0 N > 1 grid is sized like any other (tests/lookahead_blocks.c runs it) */
         DFN2GridSpec lk = spec;
         DFN2Grid lkg;
         DFN2StreamConfig lkc = cfg;
@@ -296,8 +296,8 @@ static int run_smoke_packet(int sample_rate, int n_fft, int n_erb, int frames_pe
         lk.mask_lookahead = 1;
         if (dfn2_grid_make(&lkg, &lk) != DFN2_GRID_OK) { fprintf(stderr, "grid with lookahead refused\n"); return 1; }
         lkc.grid = lkg;
-        if (dfn2_stream_get_mem_size(&lkc, &lkr) != -1) {
-            fprintf(stderr, "mask_lookahead 1 with N=%d accepted by the stream\n", frames_per_call);
+        if (dfn2_stream_get_mem_size(&lkc, &lkr) != 0 || lkr.bytes == 0u) {
+            fprintf(stderr, "mask_lookahead 1 with N=%d refused by the stream\n", frames_per_call);
             return 1;
         }
     }

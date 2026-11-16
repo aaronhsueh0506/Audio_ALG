@@ -133,7 +133,11 @@ PACKET_EQUIV_SOURCES := tests/packet_equiv.c $(CORE_SOURCES) dfn2_stream.c
 LIFECYCLE_BIN := $(OBJ_DIR)/lifecycle
 LIFECYCLE_SOURCES := tests/lifecycle.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
+# Blocks of N > 1 frames on a mask_lookahead > 0 grid against a one-frame reference of the same stand-in accelerator.
+LOOKAHEAD_BLOCKS_BIN := $(OBJ_DIR)/lookahead_blocks
+LOOKAHEAD_BLOCKS_SOURCES := tests/lookahead_blocks.c $(CORE_SOURCES) dfn2_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle lookahead-blocks erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -228,6 +232,13 @@ $(LIFECYCLE_BIN): $(LIFECYCLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_
 lifecycle: $(LIFECYCLE_BIN)
 	"$(LIFECYCLE_BIN)"
 
+$(LOOKAHEAD_BLOCKS_BIN): $(LOOKAHEAD_BLOCKS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(LOOKAHEAD_BLOCKS_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+lookahead-blocks: $(LOOKAHEAD_BLOCKS_BIN)
+	"$(LOOKAHEAD_BLOCKS_BIN)"
+
 $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
@@ -235,7 +246,7 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle erb-partition test-variant-guard check-header-cxx
+test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle lookahead-blocks erb-partition test-variant-guard check-header-cxx
 
 # check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
 # a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.

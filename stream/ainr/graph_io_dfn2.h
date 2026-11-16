@@ -1,8 +1,8 @@
 /* DFN2 graph rows (full and lite) for the board samples, one per registered (grid, N), from AINR/DeepFilterNet2/
  * export_onnx.py. Inputs: erb, spec, h_gru [, df_convp_history]; outputs: erb_mask [, df_coefs, df_alpha], then the
  * states as <name>_out. Signal windows hold N + 2 frames, heads N. The shapes do not depend on the lookahead pair, so a
- * row serves every graph of its (grid, N): the 48 kHz / 1024 N = 1 row is the mask_lookahead 1 graph's and the
- * mask_lookahead 0 graph's alike, and the port check cannot tell the two apart. */
+ * row serves every graph of its (grid, N): the 48 kHz / 1024 N = 1 and N = 2 rows are the mask_lookahead 1 graphs' and the
+ * mask_lookahead 0 graphs' alike, and the port check cannot tell the two apart. */
 
 #ifndef GRAPH_IO_DFN2_H
 #define GRAPH_IO_DFN2_H
@@ -44,7 +44,7 @@ static const GraphIoRow GRAPH_IO_DFN2_ROWS[] = {
       { {1, 1, 3, 32}, {1, 2, 3, 96} },
       { {1, 1, 1, 32}, {1, 1, 96, 10}, {1, 1, 1, 1} },
       { {1, 5, 1, 256}, {1, 64, 5, 96} } },
-    /* full, 48 kHz / fft 1024, N = 2 (mask_lookahead 0) */
+    /* full, 48 kHz / fft 1024, N = 2 (mask_lookahead 0 or 1) */
     { GRAPH_IO_DFN2_FULL, 48000, 1024, 2, GRAPH_IO_DFN2_LAYOUT_FULL, 2, 3, 2,
       { {1, 1, 4, 32}, {1, 2, 4, 96} },
       { {1, 1, 2, 32}, {1, 2, 96, 10}, {1, 1, 2, 1} },

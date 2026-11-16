@@ -1,8 +1,7 @@
 """The DFN2 C host for N frames per call equals the one-frame host.
 
-A grid with ``frames_per_call = N`` (``mask_lookahead = 0`` only) runs the accelerator once per block of N
-frames, on an ``N + 2`` frame window (the block's N frames and the two before them), and returns the N heads in
-one burst. The stand-in accelerator below is a pure function of (three-frame window slice, state) -> (heads, next
+A grid with ``frames_per_call = N`` runs the accelerator once per block of N frames, on an ``N + 2`` frame
+window (the block's N frames and the two before them), and returns the N heads (the frames L earlier) in one burst. The stand-in accelerator below is a pure function of (three-frame window slice, state) -> (heads, next
 state), applied to the N slices in order the way the exported graph is, so the block host and the one-frame
 host see the same arithmetic and must agree BYTE FOR BYTE, hop for hop, with no shift. One driver binary takes N
 as an argument:
@@ -13,19 +12,19 @@ as an argument:
   reset        a reset between two blocks; both segments agree
   refuse       a block whose head or state comes back non-finite is refused, the state is
                zeroed and the N frames pass as the identity, the same as N one-frame refusals
-  contract     readiness (L + N hops, then every N; N == 1: every hop from hop L, the first L
+  contract     readiness (N > 1: every N hops from the first; N == 1: every hop from hop L, the first L
                hops open no frame), the window rows at the grid's stride, the
                descriptor's input_frames (N + 2), the latency accessor (L + D for every N), element
                counts, a descriptor made for another grid refused before infer() runs, and a pool of
-               the one-frame grid or of another grid refused; a grid with mask_lookahead > 0 and
-               N > 1 is refused at sizing and at init
+               the one-frame grid or of another grid refused
   abi          the 72-byte descriptor, filled and checked through a grid of either N: nothing
                written or read past it, a descriptor of 3 input frames refused by N > 1
 
 A stand-in reading the wrong window slice fails the comparison, so it is not vacuous.
 
 The one-frame host (N == 1) opens no frame for the first L hops of its stream start and the stand-in
-is not called for them; the block hosts have L == 0 and no such hops.
+is not called for them; a block host opens one at every block, the first block's first L heads belonging to
+frames before the stream start.
 
 The recurrent state is the host's: the driver registers the two buffers. The driver runs the
 grid of ``dfn2_test_grid.h`` (the shipped 48 kHz grid unless ``-DDFN2_GRID_KHZ`` says otherwise)
@@ -44,7 +43,8 @@ import dfn_pairs
 FAMILY = 'DeepFilterNet2'
 _SOURCES = ('prepost', 'process', 'model_io')
 PAIRS = ((1, 1), (0, 0), (2, 4), (0, 1), (2, 0))
-# N > 1 needs mask_lookahead == 0; the other pairs run at N == 1 and are refused above it.
+# The stream tests need mask_lookahead == 0 (the one-frame host has no frames before its start to compare against);
+# the contract runs at every pair.
 BLOCK_PAIRS = tuple(pair for pair in PAIRS if pair[0] == 0)
 LOOKAHEAD_PAIRS = tuple(pair for pair in PAIRS if pair[0] > 0)
 FRAMES = (2, 3, 5, 10)
@@ -429,7 +429,7 @@ static int case_contract(void) {
     /* Readiness, slots and the window rows, frame by frame. */
     CHECK(dfn2_model_io_ready_frames(NULL) == 0);
     CHECK(dfn2_model_io_init(&io, io_block, io_bytes, grid, NULL, 0, NULL, 0) == 0);
-    CHECK(dfn2_model_io_ready_frames(&io) == (unsigned int)(LA + NF));
+    CHECK(dfn2_model_io_ready_frames(&io) == (unsigned int)(NF > 1 ? NF : LA + 1));
     CHECK(dfn2_model_io_frame_slot(&io) == -1);
     CHECK(dfn2_model_io_frame_slot(NULL) == -1);
     for (f = 0; f < LA + 6 * NF + 3; ++f) {
@@ -440,9 +440,9 @@ static int case_contract(void) {
             spec[1][b] = -(float)(1000 * (f + 1) + b);
         }
         ready = dfn2_model_io_push_features(&io, erb, &spec[0][0]);
-        want = f + 1 >= LA + NF && (f + 1 - LA) % NF == 0;
+        want = NF > 1 ? (f + 1) % NF == 0 : f >= LA;
         CHECK(ready == want);
-        CHECK(dfn2_model_io_frame_slot(&io) == (f < LA ? -1 : (f - LA) % NF));
+        CHECK(dfn2_model_io_frame_slot(&io) == (NF > 1 ? f % NF : (f < LA ? -1 : 0)));
         for (s = 0; s < WF; ++s) {
             const int frame = f - (WF - 1) + s;
             for (b = 0; b < E; ++b)
@@ -455,17 +455,6 @@ static int case_contract(void) {
         }
     }
     free(io_block);
-
-    /* mask_lookahead > 0 with N > 1 is not a grid the class builds: refused at sizing and at init. */
-    if (LA > 0 && NF > 1) {
-        CHECK(dfn2_prepost_config_defaults(&cfg, grid) == 0);
-        cfg.erb_fwd = &erb_fwd[0][0];
-        cfg.erb_inv = &erb_inv[0][0];
-        CHECK(dfn2_prepost_get_mem_size(&cfg, &freq_req) == -1);
-        CHECK(make() == NULL);
-        printf("refused\n");
-        return 0;
-    }
 
     /* The class: pre_process readiness, views, latency, first output. */
     p = make();
@@ -856,16 +845,9 @@ def test_contract_readiness_window_descriptor_and_latency(drivers, pair,
 @pytest.mark.parametrize('frames', (1,) + FRAMES)
 @pytest.mark.parametrize('pair', LOOKAHEAD_PAIRS, ids=_pair_id)
 def test_contract_with_mask_lookahead(drivers, pair, frames):
-    """The window and descriptor contract holds at every pair, the class runs at N == 1 and is refused (sizing and
-    init) above it: a block's graph needs no frame beyond its own."""
-    driver = drivers(pair)
-    if frames == 1:
-        _contract(driver, frames)
-        return
-    done = subprocess.run([str(driver), 'contract', str(frames)],
-                          capture_output=True, text=True)
-    assert done.returncode == 0, (done.stdout, done.stderr)
-    assert done.stdout.splitlines()[-1] == 'refused', done.stdout
+    """The window and descriptor contract holds at every pair and every N: a block's heads are the frames
+    mask_lookahead before its newest, the first block's first heads are before the stream start."""
+    _contract(drivers(pair), frames)
 
 
 @pytest.mark.parametrize('frames', (1, 3, 5))

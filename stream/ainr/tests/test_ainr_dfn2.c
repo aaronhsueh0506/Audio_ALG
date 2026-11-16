@@ -11,6 +11,7 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "ainr_product.h"
 #include "ainr_test_fixture.h"
 #include "dfn2_stream.h"
 
@@ -203,10 +204,9 @@ static int test_n8_two_blocks_matches_reference(const char *erb_path) {
     return 0;
 }
 
-/* 4. Validation ordering: an unshipped N must not be confused with N > 1 on a grid with mask_lookahead > 0
- * -- the two are different failure reasons and must get different error codes. */
+/* 4. Validation ordering: an unshipped N is AINR_ERR_FRAMES_PER_CALL on every grid, a lookahead grid included. */
 static int test_validation_ordering(void) {
-    AinrConfig cfg_unshipped, cfg_lookahead_blocked;
+    AinrConfig cfg_unshipped, cfg_lookahead_unshipped;
     StreamMemReq req;
     int status;
 
@@ -220,12 +220,12 @@ static int test_validation_ordering(void) {
         return 1;
     }
 
-    cfg_lookahead_blocked.sr = 48000;
-    cfg_lookahead_blocked.fft = 1024;
-    cfg_lookahead_blocked.hop_in = 8 * 512;   /* N = 8 against the shipped mask_lookahead=1 grid */
-    status = ainr_get_mem_size(&cfg_lookahead_blocked, &req);
-    if (status != AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED) {
-        fprintf(stderr, "test_validation_ordering: 48kHz N=8 -> %d (%s), expected AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED\n",
+    cfg_lookahead_unshipped.sr = 48000;
+    cfg_lookahead_unshipped.fft = 1024;
+    cfg_lookahead_unshipped.hop_in = 8 * 512;   /* N = 8 against the shipped mask_lookahead=1 grid: no graph */
+    status = ainr_get_mem_size(&cfg_lookahead_unshipped, &req);
+    if (status != AINR_ERR_FRAMES_PER_CALL) {
+        fprintf(stderr, "test_validation_ordering: 48kHz N=8 -> %d (%s), expected AINR_ERR_FRAMES_PER_CALL\n",
                status, ainr_status_text(status));
         return 1;
     }
@@ -546,6 +546,35 @@ static int test_graph_path_resolution(const char *erb_path) {
         fprintf(stderr, "test_graph_path_resolution: unknown grid expected AINR_ERR_GRID, ctx NULL and info untouched\n");
         return 1;
     }
+
+#if !defined(DFN2_MASK_ONLY) && AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL
+    {   /* the 48 kHz grid (mask_lookahead 1) delivers N = 1 and N = 2, each its own graph; N = 4 has none */
+        char erb48[64];
+        AinrInfo n1, n2;
+        int rc1, rc2, rc4;
+        erb_fixture_scratch_path(erb48, sizeof(erb48), "ainr_dfn2_scratch_erb48");
+        write_synthetic_erb(erb48, 513, 32);
+        cfg.sr = 48000; cfg.fft = 1024; cfg.hop_in = 512;
+        rc1 = init_for(&cfg, erb48, &ctx, &n1);
+        cfg.hop_in = 1024;
+        rc2 = init_for(&cfg, erb48, &ctx, &n2);
+        bi_n8 = sentinel;
+        cfg.hop_in = 2048;
+        rc4 = init_for(&cfg, erb48, &ctx, &bi_n8);
+        unlink(erb48);
+        if (rc1 != AINR_OK || rc2 != AINR_OK || !n1.graph_path || !n2.graph_path ||
+            strstr(n1.graph_path, "16x16/dfn2/nvt_model_48k_n1.bin") == NULL ||
+            strstr(n2.graph_path, "16x16/dfn2/nvt_model_48k_n2.bin") == NULL || n1.queue_frames != 2 || n2.queue_frames != 2) {
+            fprintf(stderr, "test_graph_path_resolution: 48 kHz N=1 / N=2 (%d, %d): %s, %s\n", rc1, rc2,
+                    n1.graph_path ? n1.graph_path : "(null)", n2.graph_path ? n2.graph_path : "(null)");
+            return 1;
+        }
+        if (rc4 != AINR_ERR_FRAMES_PER_CALL || ctx != NULL || memcmp(&bi_n8, &sentinel, sizeof(bi_n8)) != 0) {
+            fprintf(stderr, "test_graph_path_resolution: 48 kHz N=4 expected AINR_ERR_FRAMES_PER_CALL\n");
+            return 1;
+        }
+    }
+#endif
 
     printf("test_graph_path_resolution: PASS\n");
     return 0;

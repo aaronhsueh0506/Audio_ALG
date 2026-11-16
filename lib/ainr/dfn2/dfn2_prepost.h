@@ -125,8 +125,8 @@ typedef struct DFN2PrepostOutputs {
 /* Fill a config for `grid` (copied), the rest NULL/0; -1 on NULL or an invalid grid. */
 int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, const DFN2Grid *grid);
 
-/* Exact pool size; -1 (req untouched) on NULL, missing ERB matrices, non-finite atten_lim_db, an invalid grid or state
- * registration, or mask_lookahead > 0 with frames_per_call > 1. */
+/* Exact pool size; -1 (req untouched) on NULL, missing ERB matrices, non-finite atten_lim_db, or an invalid grid or state
+ * registration. */
 int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
                               DFN2PrepostMemReq *req);
 
