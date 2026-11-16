@@ -96,7 +96,7 @@ Specific to this one:
   with the frame still open; `dfn2_prepost_frame_bypass()` then passes the noisy spectrum through;
 - a run that did not succeed closes the frame with `dfn2_prepost_frame_fail(p, run_started)`: the same noisy-spectrum output as
   `frame_bypass()`; `run_started != 0` (the accelerator may have rewritten its state) zeroes the registered tensors and advances the
-  state generation, `0` (nothing ran) leaves both. `dfn2_model_run_frame()` with a failing `infer()` is `frame_fail(p, 1)`;
+  state generation, `0` (nothing ran) leaves both. `dfn2_model_run_frame()` with a failing `infer()` is `frame_fail(p, 1)`, with `infer()` returning `STREAM_RUN_NOT_STARTED` (it ran nothing) `frame_fail(p, 0)`;
 - `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every warm-up frame, every refused
   commit of a real frame and every `frame_fail(p, 1)` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
   runtime that sees a different value than at the previous frame refills its state tensors with quantized zeros.

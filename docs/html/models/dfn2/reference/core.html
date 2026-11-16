@@ -452,7 +452,7 @@ power 全有限時正向和依 <code>erb_fwd_k0/k1</code> 逐 band 算(相鄰四
 
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
 <p><code>dfn2_model_run_frame()</code>(<code>io_descriptor</code> 為 NULL 或不通過 <code>dfn2_model_io_descriptor_validate()</code> 時回 -1,且不呼叫 <code>infer()</code>)把一個已開啟的 frame 走完:<code>frame_open()</code>(head 預填 NaN)→ <code>infer()</code> →
-<code>frame_finish()</code>;<code>infer()</code> 回非 0 或 finish 被拒時改走 <code>frame_bypass()</code>,
+<code>frame_finish()</code>;<code>infer()</code> 回非 0 時改走 <code>frame_fail()</code>(回 <code>STREAM_RUN_NOT_STARTED</code> 表示沒有跑:state 與 generation 不動;其他非 0 值:state 歸零、generation +1),finish 被拒時改走 <code>frame_bypass()</code>,
 所以 framing 與合成兩個時鐘<b>永遠恰好前進一次</b>(N=1 的暖機幀上 <code>infer()</code> 成功也回 1,雖然它的 heads 被丟棄)。有限性規則不在這裡重寫一份——那是
 <code>frame_finish()</code> 的責任。回 1 = heads 已 commit、0 = 該幀被 bypass、-1 = 契約錯誤(model/instance 為 NULL、
 沒有 <code>infer</code>、或沒有開啟中的 frame)。<b>與 AIAEC 的 identity 政策不同</b>:被 bypass 的幀仍然吐出 M+D 拍前的 source frame

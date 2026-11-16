@@ -602,8 +602,8 @@ $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h
 $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_io.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn_res_stage.o: dfn/dfn_res_stage.c dfn/dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<

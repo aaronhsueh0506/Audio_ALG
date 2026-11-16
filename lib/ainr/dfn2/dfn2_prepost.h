@@ -226,8 +226,9 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
 /* Source frame (from 0) of the last emission, written to *frame; -1 on NULL or before the first emission. */
 int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
-/* Accelerator callbacks: infer() gets the open frame's views, returns 0 once every output is written; reset()
- * optional; a model that infers must publish an io_descriptor passing dfn2_model_io_descriptor_validate(). */
+/* Accelerator callbacks: infer() gets the open frame's views and returns the run status (stream_run.h): 0 once every
+ * output is written, STREAM_RUN_NOT_STARTED when it ran nothing, any other value for a run that started and failed;
+ * reset() optional; a model that infers must publish an io_descriptor passing dfn2_model_io_descriptor_validate(). */
 typedef struct DFN2Model {
     void *user;
     int (*infer)(void *user, const DFN2PrepostInputs *inputs,
@@ -236,8 +237,8 @@ typedef struct DFN2Model {
     const DFN2ModelIoDescriptor *io_descriptor;   /* NULL = not published */
 } DFN2Model;
 
-/* Drive one open frame: open, infer(), finish; a nonzero infer() takes frame_fail(p, 1), a refused commit
- * frame_bypass() (clocks advance once either way). 1 committed, 0 skipped, -1 contract error (NULL args, no infer,
+/* Drive one open frame: open, infer(), finish; a nonzero infer() takes frame_fail() (run_started 0 for
+ * STREAM_RUN_NOT_STARTED, else 1), a refused commit frame_bypass() (clocks advance once either way). 1 committed, 0 skipped, -1 contract error (NULL args, no infer,
  * bad io_descriptor, no frame open). A warm-up frame (N == 1) also returns 1 when infer() succeeds, although its
  * heads are discarded. */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);

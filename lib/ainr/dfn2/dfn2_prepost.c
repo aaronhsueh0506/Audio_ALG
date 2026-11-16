@@ -4,6 +4,7 @@
 
 #include "dfn2_prepost.h"
 #include "dfn2_model_io_priv.h"
+#include "stream_run.h"
 
 #include "utility/mem_align.h"
 #include "utility/simd_kernel_nn.h"
@@ -700,12 +701,15 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
     DFN2PrepostInputs inputs;
     DFN2PrepostOutputs outputs;
+    int run_status;
     if (!model || !model->infer || !p || !p->frame_open ||
         dfn2_model_io_descriptor_validate(&p->grid, model->io_descriptor) != 0)
         return -1;
     if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
-    if (model->infer(model->user, &inputs, &outputs) != 0) {
-        return dfn2_prepost_frame_fail(p, 1) == 0 ? 0 : -1;   /* infer() is the run itself: it started */
+    run_status = model->infer(model->user, &inputs, &outputs);
+    if (run_status != STREAM_RUN_OK) {
+        /* infer() is the run itself: every status but "not started" is a run that started */
+        return dfn2_prepost_frame_fail(p, run_status != STREAM_RUN_NOT_STARTED) == 0 ? 0 : -1;
     }
     if (dfn2_prepost_frame_finish(p) != 0) {
         /* refused commit: take the frame as the identity so the clocks advance once */

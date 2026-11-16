@@ -5,7 +5,7 @@ CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # The floating-point contract and project include paths are invariants of the
 # C/Python parity boundary. Keep them even when a board build overrides
 # CFLAGS on the command line.
-override CFLAGS += -ffp-contract=off -fno-math-errno -I.
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I$(abspath ../stream/common)
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -83,6 +83,7 @@ HEADERS := \
 	../lib/ainr/dfn2/dfn2_model_io.h \
 	../lib/ainr/dfn2/dfn2_model_io_priv.h \
 	../lib/ainr/dfn2/dfn2_prepost.h \
+	../stream/common/stream_run.h \
 	../lib/ainr/dfn3/dfn3_process.h \
 	../lib/ainr/dfn3/dfn3_model_io.h \
 	../lib/ainr/dfn3/dfn3_model_io_priv.h \

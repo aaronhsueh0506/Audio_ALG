@@ -82,6 +82,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "tests/dfn2_test_grid.h"   /* the grid this program runs, and the library header */
+#include "stream_run.h"
 #include "utility/mem_align.h"
 #include "tests/ainr_test_hop.h"
 
@@ -1049,7 +1050,8 @@ static int case_dual_guards(void) {
 
 typedef struct {
     int mode;     /* 0 full write, 1 refuse (rc -1), 2 leave alpha unwritten
-                   * after writing the state in place                       */
+                   * after writing the state in place, 3 run nothing
+                   * (STREAM_RUN_NOT_STARTED)                               */
     int calls;
     int resets;
 } StubModel;
@@ -1059,6 +1061,7 @@ static int stub_infer(void *user, const DFN2PrepostInputs *in,
     StubModel *m = (StubModel *)user;
     ++m->calls;
     if (m->mode == 1) return -1;
+    if (m->mode == 3) return STREAM_RUN_NOT_STARTED;
     fake_run(in, out);
     if (m->mode == 2) out->alpha[0] = (float)NAN;   /* one output unwritten */
     return 0;
@@ -1167,6 +1170,21 @@ static int case_model_run(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru1, convp1);
     CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
+    /* infer() returning STREAM_RUN_NOT_STARTED ran nothing: the frame is the identity and the hop still emits, but
+     * the recurrent state and the generation stay as they were. */
+    stub.mode = 3;
+    calls = stub.calls;
+    gen = dfn2_prepost_state_generation(p);
+    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(stub.calls == calls + 1);
+    CHECK(dfn2_prepost_state_generation(p) == gen);
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(valid == 1);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    snapshot_state(p, gru0, convp0);
+    CHECK(identical(gru0, gru1, TEST_GRU_ELEMENTS));
+    CHECK(identical(convp0, convp1, TEST_CONVP_WINDOW_ELEMENTS));
     /* A failed inference (nonzero return) is a run that started: taken as the identity, frame closed, the hop
      * still emits, both recurrent tensors zeroed and the generation advanced. */
     stub.mode = 1;
@@ -3034,7 +3052,9 @@ def test_model_run_frame_finishes_or_takes_the_identity(driver):
     mask_lookahead or df_lookahead differs from the instance's grid, or one
     made for a grid that differs in any other value; a full write returns 1 and steps the
     recurrent state; a failed inference returns 0, zeroes both recurrent
-    tensors, advances the generation and still emits; a partial write
+    tensors, advances the generation and still emits; a return of
+    STREAM_RUN_NOT_STARTED also takes the identity and emits but leaves the
+    recurrent state and the generation alone; a partial write
     (state written in place, one head unwritten) returns 0 with both
     recurrent tensors zeroed and still emits; a model that always fails emits
     exactly the all-frame_bypass stream."""
