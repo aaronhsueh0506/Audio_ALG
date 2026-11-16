@@ -618,7 +618,7 @@ int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out)
 }
 
 /* True when every bin of the block's n frames (frame-major, contiguous) passes the stream's guard at the model scale
- * ainr_open_freq() applies, so a block accepted here is never refused midway. */
+ * ainr_open_freq() applies; a refusal maps to AINR_ERR_NONFINITE_INPUT, not the stream's sequence error. */
 static int ainr_freq_block_in_range(const AinrCore *c, const float *est_re, const float *est_im,
                                     const float *app_re, const float *app_im)
 {
