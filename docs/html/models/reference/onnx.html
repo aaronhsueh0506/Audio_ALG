@@ -145,7 +145,7 @@ state 已被加速器就地覆寫、<b>無法回滾</b>，所以遇到任何一�
 （Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2：<code>h_gru</code> 與 <code>df_convp_history</code> 兩個遞迴張量；DeepVQE-S：16 個 state）。
 加速器執行沒成功（狀態不是 OK）時由 stream 呼叫 <code>zero_state</code>（狀態歸零、generation 加一），輸出同上；<code>STREAM_RUN_NOT_STARTED</code> 什麼都不動。
 <code>post_frame</code> 回 −2（DeepVQE-S、Align-ULCNet 的增強後頻譜有非有限 bin）時，stream 呼叫一次 <code>zero_state</code>，整包 identity。
-lib 沒有每包的 latch：沒有 <code>views</code> 就呼叫的 <code>validate_run</code> 會看到預填的 NaN，所以「加速器根本沒跑」不會被當成結果收下；
+lib 沒有每包的 latch：<code>views</code> 每次執行都重新預填 NaN，所以「加速器根本沒跑」不會被當成結果收下（stream 在每次執行前呼叫 <code>views</code>）；lib 層級沒有 <code>views</code> 就呼叫的 <code>validate_run</code> 不會被擋下。
 序列錯誤（上一包還沒收就再 pre、沒有 pre 就 post）由 stream 的 <code>pending</code> 擋下，回 −1。DFN3 的 <code>frame_finish</code> 沒有 <code>frame_open</code> 就回 −1，幀還開著時再呼叫 <code>pre_process_freq</code> 回 −1，<code>frame_bypass</code> 該幀取 identity、遞迴 state 維持原樣。</p>
 
 <p><b>遞迴 state：就地綁定，由應用端持有</b>。每個 state 張量只有一個 buffer、位址在實例壽命內不變，沒有交替的 bank、沒有指標交換、沒有複製路徑。

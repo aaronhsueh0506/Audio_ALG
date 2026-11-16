@@ -226,7 +226,7 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
       (`test_stale_pool_gate_holds_and_the_pool_follows_the_grid`), and a refused
       `validate_run` advances the state generation and zeroes any registered state
       (DeepVQE-S: `test_state_generation_counts_restarts`; Align-ULCNet: `test_reset_clears_state` and
-      `test_frame_state_machine_guards`; 0 after init for both classes).
+      `test_per_frame_functions_refuse_misuse_and_report_each_failure`; 0 after init for both classes).
 
 ## 13. Customer header set
 
