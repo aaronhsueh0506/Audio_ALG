@@ -396,7 +396,7 @@ static void descriptor(const Pair *a, const Pair *b)
     DFN2PrepostConfig cb;
     DFN2Model model;
     DFN2Prepost *p;
-    int valid, run1, run2 = -9, calls1, calls2, i, ready = 0;
+    int valid, run1, run2 = -9, calls1, calls2, i, ready = 0, bad = 0;
     if (dfn2_model_io_descriptor_default(&a->grid, &da) ||
         dfn2_model_io_descriptor_default(&b->grid, &db) ||
         make_config(&cb, &b->grid) || !(p = dfn2_prepost_create(&cb))) {
@@ -404,12 +404,18 @@ static void descriptor(const Pair *a, const Pair *b)
         return;
     }
     valid = dfn2_model_io_descriptor_validate(&b->grid, &da);
-    /* the first mask_lookahead hops are warm-up frames (open, closed by the bypass, no callback);
-     * the next one is the first real frame, left open for the callback boundary */
-    for (i = 0; i <= b->grid.mask_lookahead; ++i) {
-        ready = dfn2_prepost_pre_process_freq(p, zero_bins, zero_bins);
-        if (i < b->grid.mask_lookahead && (ready != 1 || dfn2_prepost_frame_bypass(p) != 0)) ready = -1;
+    /* the first mask_lookahead hops carry no job: pre_process returns 0, no frame opens (frame_open is refused) and
+     * the generation stays; the next one is the first real frame, left open for the callback boundary */
+    for (i = 0; i < b->grid.mask_lookahead; ++i) {
+        DFN2PrepostInputs in;
+        DFN2PrepostOutputs out;
+        unsigned gen = dfn2_prepost_state_generation(p);
+        if (dfn2_prepost_pre_process_freq(p, zero_bins, zero_bins) != 0 ||
+            dfn2_prepost_frame_open(p, &in, &out) != -1 || dfn2_prepost_state_generation(p) != gen)
+            bad = 1;
     }
+    ready = dfn2_prepost_pre_process_freq(p, zero_bins, zero_bins);
+    if (bad) ready = -1;
     memset(&model, 0, sizeof model);
     model.infer = infer;
     model.io_descriptor = &da;
