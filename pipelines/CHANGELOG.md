@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — Dependency pins follow the final audiolib, AEC and NR heads; the AINR product pool table is re-measured on the layered streams
+
+- **Pins.** `lib/audiolib.pin`, `lib/aec.pin`, `lib/nr.pin` and the `lib/aec` and `lib/nr` gitlinks name the heads that carry the pyc-parity tie registration (AEC), the NEON frozen-run twin fix (audiolib) and the `run_hops = 0` test row (NR); none of the three moves a pool or a layout version. `make -C pipelines check-pins` passes with no gitlink note.
+- **Pool table of `docs/html/models/dfn2/reference/board.html`** (`ainr_get_mem_size()` / `ainr_get_mem_size_freq()`, 64-bit host, `ne10`, `SIMD=1`): full 16 kHz / 256 N = 1 88,016 / 72,480 B, N = 8 128,832 / 127,744, 48 kHz / 1024 N = 1 283,216 / 223,904, lite 48 kHz N = 1 222,832 / 163,520, the mask_lookahead 0 model 32 kHz / 512 N = 1 150,448 / 120,320, N = 4 171,088 / 153,296, 48 kHz / 1024 N = 2 292,176 / 241,072. The same rows are measured on the tree before the layering and on this one with the same sibling libraries; every other pool and version cell of the pages already followed the layering.
+
 ## [Unreleased] — 2026-11-16 — DFN2, DeepVQE-S and Align-ULCNet: per-frame functions in the lib, the call lifecycle and the input range check in the stream
 
 Outputs are bit-identical for every existing entry, grid and N; the graph-facing layouts do not change. The lib keeps the per-frame functions and the model state; the stream owns the per-call lifecycle (submit or bypass, the tensor views, finish / fail / bypass sequencing), the STFT / ISTFT, N > 1 as N per-frame lib calls around one accelerator call, and the range checks. DFN3, GTCRN and RNNoise-ERB have no stream layer and keep their `pre_process_freq` / `frame_open` / `frame_finish` classes.
