@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     if (rc == AINR_OK) {
         hop = cfg.fft / 2;
         bins = hop + 1;
-        n_erb = cfg.sr == 16000 ? 24 : 32;
+        n_erb = cfg.sr == 16000 ? 24 : cfg.sr == 32000 ? 28 : 32;
         erb_fixture_scratch_path(erb, sizeof(erb), "ainr_dump_work");
         write_erb_file(erb, bins, n_erb, ERB_BAND0);
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;

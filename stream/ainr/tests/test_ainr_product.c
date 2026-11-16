@@ -1,12 +1,15 @@
 /* The product binding (ainr_product.h): ainr.c compiled with -DAINR_PRODUCT_MODEL_ID=<id> resolves
- * the same customer config {sr, fft, hop_in} to that model's own catalog rows. One source, three
- * builds selected by -DAINR_TEST_PRODUCT=1|2|3:
+ * the same customer config {sr, fft, hop_in} to that model's own catalog rows. One source, five
+ * builds selected by -DAINR_TEST_PRODUCT=1..5:
  *   1  quantization alternate 2 (16x8): graph paths differ from the default's (16x16), N=1/N=8 rows
  *      resolve (full).
  *   2  quantization alternate 1 (8x8): not registered -- every config is refused (AINR_ERR_GRID),
  *      by the sizing call and by init, which leaves its outputs untouched.
  *   3  the OTHER archive variant's id (lite id in a full archive, full id in a lite one): every
  *      config is refused with AINR_ERR_MODEL_ID.
+ *   4  the mask_lookahead 0 model (id 3, full only), production catalog: 16 kHz N 1 and 8 resolve, the 32 and 48 kHz
+ *      graphs (not delivered) are refused with AINR_ERR_FRAMES_PER_CALL.
+ *   5  the same model on the test catalog: every row resolves (test:// paths) with queue_frames 0.
  * Not built under NO_STDIO. */
 
 #include <stdint.h>
@@ -45,7 +48,7 @@ static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
     free(fwd); free(inv);
 }
 
-#if AINR_TEST_PRODUCT == 1
+#if AINR_TEST_PRODUCT == 1 || AINR_TEST_PRODUCT == 5
 /* Init of cfg with a fresh pool; the info is returned, the context and pool are released. */
 static int init_info(const AinrConfig *cfg, const char *erb, AinrInfo *info) {
     StreamMemReq req;
@@ -61,7 +64,7 @@ static int init_info(const AinrConfig *cfg, const char *erb, AinrInfo *info) {
 }
 #endif
 
-#if AINR_TEST_PRODUCT != 1
+#if AINR_TEST_PRODUCT != 1 && AINR_TEST_PRODUCT != 5
 /* A refused init: the code, ctx NULL, info byte-for-byte as it was. */
 static void expect_refused(const AinrConfig *cfg, int want, const char *what) {
     _Alignas(16) static unsigned char pool[64];
@@ -113,6 +116,61 @@ int main(void) {
             CHECK(path && strstr(path, "16x8") != NULL && strstr(path, "n8") != NULL, "alt2 N=8 path: %s", path ? path : "(null)");
         }
 #endif
+    }
+#elif AINR_TEST_PRODUCT == 4
+    {
+        static const struct { int sr, fft, hop_in; const char *what; } undelivered[] = {
+            { 32000, 512, 256, "32 kHz N 1" }, { 32000, 512, 1024, "32 kHz N 4" }, { 32000, 512, 512, "32 kHz N 2" },
+            { 48000, 1024, 512, "48 kHz N 1" }, { 48000, 1024, 1024, "48 kHz N 2" },
+        };
+        AinrInfo bi;
+        AinrConfig n8 = n1;
+        size_t i;
+        CHECK(rc == AINR_OK, "L0 16 kHz N 1 get_mem_size rc=%d (%s)", rc, ainr_status_text(rc));
+        n8.hop_in = 8 * 128;
+        {
+            AinrCtx *ctx = NULL;
+            StreamMemReq r8;
+            void *pool = NULL;
+            CHECK(ainr_get_mem_size(&n8, &r8) == AINR_OK, "L0 16 kHz N 8 sizing");
+            if (posix_memalign(&pool, r8.alignment, (size_t)r8.bytes) != 0) exit(1);
+            CHECK(ainr_init_from_erb_file(&n8, erb, pool, (size_t)r8.bytes, &ctx, &bi) == AINR_OK && ctx, "L0 16 kHz N 8 init");
+            CHECK(bi.graph_path && strstr(bi.graph_path, "16x16") != NULL && strstr(bi.graph_path, "n8") != NULL,
+                  "L0 16 kHz N 8 path: %s", bi.graph_path ? bi.graph_path : "(null)");
+            free(pool);
+        }
+        for (i = 0; i < sizeof undelivered / sizeof undelivered[0]; ++i) {
+            AinrConfig c;
+            c.sr = undelivered[i].sr; c.fft = undelivered[i].fft; c.hop_in = undelivered[i].hop_in;
+            expect_refused(&c, AINR_ERR_FRAMES_PER_CALL, undelivered[i].what);
+        }
+        {
+            AinrConfig c = { 44100, 256, 128 };
+            expect_refused(&c, AINR_ERR_GRID, "44.1 kHz");
+        }
+    }
+#elif AINR_TEST_PRODUCT == 5
+    {
+        static const struct { int sr, fft, n_erb, n; const char *marker; } rows[] = {
+            { 16000, 256, 24, 1, "16x16" }, { 16000, 256, 24, 8, "16x16" },
+            { 32000, 512, 28, 1, "test://ainr/dfn2_l0/32k_fft512_n1" }, { 32000, 512, 28, 4, "test://ainr/dfn2_l0/32k_fft512_n4" },
+            { 48000, 1024, 32, 1, "test://ainr/dfn2_l0/48k_fft1024_n1" }, { 48000, 1024, 32, 2, "test://ainr/dfn2_l0/48k_fft1024_n2" },
+        };
+        size_t i;
+        for (i = 0; i < sizeof rows / sizeof rows[0]; ++i) {
+            AinrConfig c;
+            AinrInfo bi;
+            char erb_row[96];
+            c.sr = rows[i].sr; c.fft = rows[i].fft; c.hop_in = rows[i].n * (rows[i].fft / 2);
+            erb_fixture_scratch_path(erb_row, sizeof(erb_row), "ainr_product_l0_erb");
+            write_synthetic_erb(erb_row, rows[i].fft / 2 + 1, rows[i].n_erb);
+            CHECK(init_info(&c, erb_row, &bi) == AINR_OK, "L0 %d Hz N %d init", rows[i].sr, rows[i].n);
+            CHECK(bi.graph_path && strstr(bi.graph_path, rows[i].marker) != NULL, "L0 %d Hz N %d path: %s", rows[i].sr, rows[i].n,
+                  bi.graph_path ? bi.graph_path : "(null)");
+            CHECK(bi.queue_frames == 0, "L0 %d Hz N %d: queue_frames %d, want 0", rows[i].sr, rows[i].n, bi.queue_frames);
+            unlink(erb_row);
+        }
+        CHECK(rc == AINR_OK, "L0 16 kHz N 1 get_mem_size rc=%d", rc);
     }
 #elif AINR_TEST_PRODUCT == 2
     CHECK(rc == AINR_ERR_GRID, "alt1 get_mem_size rc=%d (%s), want AINR_ERR_GRID", rc, ainr_status_text(rc));

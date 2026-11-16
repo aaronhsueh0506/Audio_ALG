@@ -1,8 +1,9 @@
 /* The board samples' DFN2 graph rows (stream/ainr/graph_io_dfn2.h) against the StreamWork a real preprocess
  * call returns, for this build's variant (full, or lite under -DDFN2_MASK_ONLY) and product id
  * (AINR_PRODUCT_MODEL_ID, incl. the quantization alternates): every PCM and _freq block must pass
- * GRAPH_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) exactly
- * when the row exists (a product id with no catalog rows refuses every configuration). The other variant's row
+ * GRAPH_IO_CHECK_WORK against the row of its configuration, and the library accepts a (sr, fft, N) only when the row exists
+ * (a row whose graph is not delivered, or of another id's grid, is refused; the accepted ones are counted). The
+ * mask_lookahead 0 model runs on the test catalog (AINR_TEST_CATALOG) and is refused on the production one. The other variant's row
  * of the same grid must reject this variant's work. The second block of a family carries the same shapes as the
  * first, and every refusal of ainr_get_mem_size() comes back from the two init families with *ctx NULL and
  * *info untouched. The rows against a fresh export are pinned by AINR/tests/test_dfn2_port_order.py. Not built
@@ -22,12 +23,22 @@
 #include "graph_io.h"
 #include "graph_io_dfn2.h"
 
-/* The product id has catalog rows in this build (ainr.c: the default and _ALT2 of the variant; _ALT1 and the
- * other variant's ids are refused by every entry). */
+/* The ids with catalog rows in this build (_ALT1 and the other variant's are refused by every entry), and how many
+ * (sr, fft, N) configurations each accepts: 3 (full default, _ALT2), 1 (lite), 2 (mask_lookahead 0 model; 6 on the test catalog). */
 #ifdef DFN2_MASK_ONLY
 #define ID_HAS_ROWS (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_LITE || AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_LITE_ALT2)
+#define EXPECTED_ACCEPTED (ID_HAS_ROWS ? 1 : 0)
 #else
-#define ID_HAS_ROWS (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL || AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_ALT2)
+#define ID_HAS_ROWS (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL || AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_ALT2 || \
+                     AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0)
+#ifdef AINR_TEST_CATALOG
+#define L0_ACCEPTED 6
+#else
+#define L0_ACCEPTED 2
+#endif
+#define EXPECTED_ACCEPTED (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0 ? L0_ACCEPTED : ID_HAS_ROWS ? 3 : 0)
+/* Blocks after init without a job at 48 kHz: mask_lookahead of the id's graph */
+#define FIRST_JOB_HOP_48K (AINR_PRODUCT_MODEL_ID == AINR_MODEL_ID_DFN2_FULL_L0 ? 0 : 1)
 #endif
 
 static int g_fail;
@@ -69,9 +80,21 @@ static void check_refusals(const char *erb)
     static const struct { int sr, fft, hop_in, want; const char *what; } cases[] = {
         { 44100, 256, 128, AINR_ERR_GRID, "unregistered grid" },
         { 48000, 1024, 100, AINR_ERR_IN_HOP, "hop_in not a multiple of model_hop" },
+#ifdef DFN2_MASK_ONLY
         { 48000, 1024, 1024, AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED, "lookahead grid with N = 2" },
-#ifndef DFN2_MASK_ONLY
+#else
         { 16000, 256, 512, AINR_ERR_FRAMES_PER_CALL, "N = 4 has no graph" },
+#if AINR_PRODUCT_MODEL_ID == 3
+        { 32000, 512, 768, AINR_ERR_FRAMES_PER_CALL, "N = 3 has no graph" },
+        { 48000, 1024, 2048, AINR_ERR_FRAMES_PER_CALL, "N = 4 has no graph" },
+#ifndef AINR_TEST_CATALOG
+        { 32000, 512, 256, AINR_ERR_FRAMES_PER_CALL, "N = 1 graph not delivered" },
+        { 48000, 1024, 1024, AINR_ERR_FRAMES_PER_CALL, "N = 2 graph not delivered" },
+#endif
+#else
+        { 48000, 1024, 1024, AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED, "lookahead grid with N = 2" },
+        { 32000, 512, 256, AINR_ERR_GRID, "32 kHz is not a grid of this model" },
+#endif
 #endif
     };
     _Alignas(16) static unsigned char pool[1 << 21];
@@ -130,7 +153,11 @@ static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoCo
     if (!pcm_in || !zeros || !out_re || !out_im) exit(2);
     memset(&work, 0, sizeof work);
     if (rc == AINR_OK) {
-        int bypassed = 0, want_bypassed = cfg->sr == 48000 ? 1 : 0;
+#ifdef DFN2_MASK_ONLY
+        int bypassed = 0, want_bypassed = 1;
+#else
+        int bypassed = 0, want_bypassed = cfg->sr == 48000 ? FIRST_JOB_HOP_48K : 0;
+#endif
         for (;;) {
             rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
                              : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
@@ -214,7 +241,7 @@ int main(void)
         lib_ok = ainr_get_mem_size(&cfg, &req) == AINR_OK;
         row_ok = graph_io_dfn2_find(GRAPH_IO_DFN2_PRODUCT, cfg.sr, cfg.fft, n, &mc) == GRAPH_IO_OK;
         accepted += lib_ok;
-        CHECK(lib_ok == (ID_HAS_ROWS && row_ok), "sr %d fft %d N %d: library %s, model config %s", cfg.sr, cfg.fft, n,
+        CHECK(!lib_ok || (ID_HAS_ROWS && row_ok), "sr %d fft %d N %d: library %s, model config %s", cfg.sr, cfg.fft, n,
               lib_ok ? "accepts" : "refuses", row_ok ? "has a row" : "has no row");
         CHECK(row_ok || (mc.n == 0 && mc.wiring.input_count == 0), "a refused find leaves cfg zeroed");
         if (!lib_ok || !row_ok) continue;
@@ -245,9 +272,10 @@ int main(void)
             ++compared;
         }
     }
-    /* every row of this build's model is the configuration of one accepted library config, and none is spare */
-    CHECK(accepted == (ID_HAS_ROWS ? own_rows : 0), "library accepted %d configs, model config has %d rows (id has rows: %d)",
-          accepted, own_rows, ID_HAS_ROWS);
+    /* the configurations this id accepts are exactly the expected ones, each with a row; the table may hold more rows
+     * than an id accepts (the other id's grids, graphs not delivered yet) */
+    CHECK(accepted == EXPECTED_ACCEPTED, "library accepted %d configs, expected %d (id has rows: %d, rows in the table %d)",
+          accepted, (int)EXPECTED_ACCEPTED, ID_HAS_ROWS, own_rows);
     /* the variant switch: a model with no row at a grid is refused, an unknown model id is refused */
     {
         GraphIoConfig c;

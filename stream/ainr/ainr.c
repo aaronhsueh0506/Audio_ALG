@@ -24,7 +24,7 @@ static const int AINR_BUILD_VARIANT_MODEL_IDS[] = {
 };
 #else
 static const int AINR_BUILD_VARIANT_MODEL_IDS[] = {
-    AINR_MODEL_ID_DFN2_FULL, AINR_MODEL_ID_DFN2_FULL_ALT1, AINR_MODEL_ID_DFN2_FULL_ALT2
+    AINR_MODEL_ID_DFN2_FULL, AINR_MODEL_ID_DFN2_FULL_ALT1, AINR_MODEL_ID_DFN2_FULL_ALT2, AINR_MODEL_ID_DFN2_FULL_L0
 };
 #endif
 #define AINR_BUILD_VARIANT_MODEL_IDS_ROWS \
@@ -96,6 +96,29 @@ static const AinrDfn2FramesVariant AINR_DFN2_FULL_48K_1024_N_16X8[] = {
     { 1, AINR_MODEL_DIR_BASE "/16x8/dfn2/nvt_model_48k_n1.bin" },
 };
 
+/* AINR_MODEL_ID_DFN2_FULL_L0: mask_lookahead 0, df_lookahead 0 at every grid; its 16 kHz rows are the graphs above. The 32 and
+ * 48 kHz paths are NULL (refused as an unlisted N) until set; AINR_TEST_CATALOG gives them test:// paths. The 32 kHz ERB file
+ * is fb_32000_28.bin. */
+#ifdef AINR_TEST_CATALOG
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_L0_32K_512_N[] = {
+    { 1, "test://ainr/dfn2_l0/32k_fft512_n1" },
+    { 4, "test://ainr/dfn2_l0/32k_fft512_n4" },
+};
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_L0_48K_1024_N[] = {
+    { 1, "test://ainr/dfn2_l0/48k_fft1024_n1" },
+    { 2, "test://ainr/dfn2_l0/48k_fft1024_n2" },
+};
+#else
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_L0_32K_512_N[] = {
+    { 1, (const char *)0 },
+    { 4, (const char *)0 },
+};
+static const AinrDfn2FramesVariant AINR_DFN2_FULL_L0_48K_1024_N[] = {
+    { 1, (const char *)0 },
+    { 2, (const char *)0 },
+};
+#endif
+
 static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
     { AINR_MODEL_ID_DFN2_FULL,      16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_16K_256_N_16X16, 2 },
@@ -105,6 +128,12 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
       AINR_DFN2_FULL_16K_256_N_16X8, 2 },
     { AINR_MODEL_ID_DFN2_FULL_ALT2, 48000, 1024, 32, 96, 5, 1, 1, 0.0f, 0, 0.0f,
       AINR_DFN2_FULL_48K_1024_N_16X8, 1 },
+    { AINR_MODEL_ID_DFN2_FULL_L0,   16000, 256,  24, 96, 5, 0, 0, 0.0f, 0, 0.0f,
+      AINR_DFN2_FULL_16K_256_N_16X16, 2 },
+    { AINR_MODEL_ID_DFN2_FULL_L0,   32000, 512,  28, 96, 5, 0, 0, 0.0f, 0, 0.0f,
+      AINR_DFN2_FULL_L0_32K_512_N, 2 },
+    { AINR_MODEL_ID_DFN2_FULL_L0,   48000, 1024, 32, 96, 5, 0, 0, 0.0f, 0, 0.0f,
+      AINR_DFN2_FULL_L0_48K_1024_N, 2 },
 };
 #define AINR_DFN2_CATALOG_ROWS ((int)(sizeof(AINR_DFN2_CATALOG) / sizeof(AINR_DFN2_CATALOG[0])))
 #else

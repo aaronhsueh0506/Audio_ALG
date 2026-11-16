@@ -72,7 +72,7 @@ endif
 VPATH := . ../common
 
 .PHONY: all lib print-lib-path print-cflags print-sources test dfn2-lib \
-	test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-freq-nonfinite \
+	test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-blocks test-ainr-freq-nonfinite \
 	test-ainr-state-generation test-ainr-pool-gates test-ainr-product test-ainr-graph-io \
 	test-link-only-ainr work-dumper graph-io-dumper audit-no-stdio clean _cfg_guard
 
@@ -207,6 +207,19 @@ test-ainr-pool-gates: $(OBJ_DIR)/test_ainr_pool_gates
 test-ainr-atten-lim: $(OBJ_DIR)/test_ainr_atten_lim
 	"$(OBJ_DIR)/test_ainr_atten_lim"
 
+# test-ainr-blocks: the mask_lookahead 0 model (id AINR_MODEL_ID_DFN2_FULL_L0) on the test catalog: the block stream of
+# every N > 1 row against the N == 1 stream. Full variant only.
+test-ainr-blocks: | _cfg_guard
+ifeq ($(NO_STDIO),1)
+	$(error test-ainr-blocks needs the file-loader entry points; run with NO_STDIO=0)
+endif
+ifeq ($(MASK_ONLY),1)
+	$(error test-ainr-blocks is full-variant only (the mask_lookahead 0 model has no lite build); run with MASK_ONLY=0)
+endif
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) -DAINR_TEST_CATALOG -DAINR_PRODUCT_MODEL_ID=3 tests/test_ainr_blocks.c \
+		$(GENERIC_TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_ainr_blocks"
+	"$(OBJ_DIR)/test_ainr_blocks"
+
 # work-dumper: builds tests/dump_work.c for this variant and prints the binary path. It prints the init result
 # and the StreamWork views (counts, shapes, element counts) of one config from real preprocess calls, for the
 # Python pins and the sample model-config check to compare against the exporter.
@@ -221,39 +234,49 @@ work-dumper: $(OBJ_DIR)/dump_work
 	@echo "$(abspath $(OBJ_DIR))/dump_work"
 
 # test-ainr-product: ainr.c compiled with a different AINR_PRODUCT_MODEL_ID (the product binding,
-# ainr_product.h) in three extra test binaries -- the only way a test reaches the quantization
+# ainr_product.h) in extra test binaries -- the only way a test reaches the quantization
 # alternates, since the customer config has no model field. Ids per archive variant: alternate 2
 # (16x8), alternate 1 (8x8, not registered), and the other variant's default id.
+# The full build adds the mask_lookahead 0 model (id 3), once on the production catalog and once on the test catalog.
 ifeq ($(MASK_ONLY),1)
 PRODUCT_ID_ALT2 := 21
 PRODUCT_ID_ALT1 := 20
 PRODUCT_ID_OTHER := 1
+PRODUCT_L0_SPECS :=
 else
 PRODUCT_ID_ALT2 := 11
 PRODUCT_ID_ALT1 := 10
 PRODUCT_ID_OTHER := 2
+PRODUCT_L0_SPECS := "4 3" "5 3 -DAINR_TEST_CATALOG"
 endif
 test-ainr-product: | _cfg_guard
 ifeq ($(NO_STDIO),1)
 	$(error test-ainr-product needs the file-loader entry points; run with NO_STDIO=0)
 endif
-	@set -e; for spec in "1 $(PRODUCT_ID_ALT2)" "2 $(PRODUCT_ID_ALT1)" "3 $(PRODUCT_ID_OTHER)"; do \
-	  set -- $$spec; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) -DAINR_TEST_PRODUCT=$$1 -DAINR_PRODUCT_MODEL_ID=$$2 \
+	@set -e; for spec in "1 $(PRODUCT_ID_ALT2)" "2 $(PRODUCT_ID_ALT1)" "3 $(PRODUCT_ID_OTHER)" $(PRODUCT_L0_SPECS); do \
+	  set -- $$spec; test=$$1; id=$$2; shift 2; \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) "$$@" -DAINR_TEST_PRODUCT=$$test -DAINR_PRODUCT_MODEL_ID=$$id \
 	    tests/test_ainr_product.c $(GENERIC_TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm \
-	    -o "$(OBJ_DIR)/test_ainr_product_$$1"; \
-	  "$(OBJ_DIR)/test_ainr_product_$$1"; \
+	    -o "$(OBJ_DIR)/test_ainr_product_$$test"; \
+	  "$(OBJ_DIR)/test_ainr_product_$$test"; \
 	done
 
 # test-ainr-graph-io: the DFN2 graph rows (graph_io_dfn2.h) against the StreamWork of real preprocess calls
 # for this variant, with the default product id and the three others of ainr_product.h (alt2, alt1, the other
-# variant's). The port check of the model-config header links ../common/stream_bind.c (samples only, not the archive).
+# variant's); the full build also binds the mask_lookahead 0 model (AINR_MODEL_ID_DFN2_FULL_L0) on the test catalog
+# (placeholder graph paths for the 32 and 48 kHz graphs) and on the production one (those graphs refused).
+# The port check of the model-config header links ../common/stream_bind.c (samples only, not the archive).
+ifeq ($(MASK_ONLY),1)
+GRAPH_IO_EXTRA_SPECS :=
+else
+GRAPH_IO_EXTRA_SPECS := "4 -DAINR_PRODUCT_MODEL_ID=3 -DAINR_TEST_CATALOG" "5 -DAINR_PRODUCT_MODEL_ID=3"
+endif
 test-ainr-graph-io: $(GENERIC_TEST_SOURCES) tests/test_ainr_graph_io.c graph_io_dfn2.h ../common/graph_io.h $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
 	$(error test-ainr-graph-io needs the file-loader entry points; run with NO_STDIO=0)
 endif
 	@set -e; for spec in "0 " "1 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_ALT2)" "2 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_ALT1)" \
-	    "3 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_OTHER)"; do \
+	    "3 -DAINR_PRODUCT_MODEL_ID=$(PRODUCT_ID_OTHER)" $(GRAPH_IO_EXTRA_SPECS); do \
 	  set -- $$spec; tag=$$1; shift; \
 	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) "$$@" tests/test_ainr_graph_io.c $(GENERIC_TEST_SOURCES) \
 	    ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_ainr_graph_io_$$tag"; \
@@ -312,7 +335,7 @@ ifeq ($(MASK_ONLY),1)
 test: test-ainr-latency test-ainr-freq-nonfinite test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim \
 	test-ainr-product test-ainr-graph-io test-link-only-ainr
 else
-test: test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-freq-nonfinite \
+test: test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-blocks test-ainr-freq-nonfinite \
 	test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim test-ainr-product test-ainr-graph-io test-link-only-ainr
 endif
 
