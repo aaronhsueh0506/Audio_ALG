@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 280 | 54 | 34 | 20 | 226 | 0 | 55 | 18 |
+| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 279 | 54 | 34 | 20 | 225 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 146 | 49 | 25 | 24 | 97 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 98 | 35 | 14 | 21 | 63 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 877 | 177 | 92 | 85 | 700 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 876 | 177 | 92 | 85 | 699 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：877 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；700 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：876 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；699 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -129,7 +129,7 @@
 | `pipelines/dfn/dfn_res_stage.c` | all | 27 |
 | `pipelines/dfn/dfn_unit_partition.h` | all | 1 |
 | `pipelines/mono/aec_dfn_res/main.c` | all | 9 |
-| `pipelines/4ch/array_sample_beam.c` | all | 23 |
+| `pipelines/4ch/array_sample_beam.c` | all | 22 |
 | `pipelines/4ch/array_sample_post.h` | all | 2 |
 | `pipelines/4ch/array_sample_unit.h` | all | 7 |
 | `pipelines/4ch/4ch_external_static.c` | all | 12 |
@@ -230,7 +230,7 @@
 | PL-MCAB-19 | — | `pipelines/4ch/pipeline.py:McabPipeline.realign_soft_lane_count` | Python-only | — | — | C 側已併入 AEC 函式庫 `src/aec_array.c`：`aec_array_realign_soft_lane_count`（函式對照見 AEC repo 的 `docs/c_python_function_map.md`）。— |
 | PL-MCAB-20 | — | `pipelines/4ch/pipeline.py:McabPipeline.__init__` | Python-only | — | — | （推論）C 側已併入 AEC 函式庫 `src/aec_array.c`：`aec_hop_size`、`aec_resolve_signal_grid`（n_freqs = hop + 1）（函式對照見 AEC repo 的 `docs/c_python_function_map.md`）。Python 在建構時把 grid 存成屬性，沒有獨立的存取方法。 |
 | PL-MCAB-22 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_process, array_sample_beam_process_with_activity` | `pipelines/4ch/pipeline.py:McabPipeline.process` | partial | D-43；S-32 | — | （推論）sample helper：C 含 SRP-PHAT 與波束器（bf）（沒有 Python 版），輸出是 BF 後頻譜與權重，不含 `aec_process_residual`、增益、NR、合成；Python 的波束器是由外部供應的接縫（EqualWeightBeamformer 只供測試）。 |
-| PL-MCAB-23 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_default_params, flag_valid, params_valid, fill_uca_geometry, fill_ula_geometry, array_sample_spatial_config, helper_layout, array_sample_beam_get_mem_size, take, array_sample_beam_init, array_sample_beam_destroy, fill_info, array_sample_beam_process_beam, floats_finite, auto_vad, array_sample_beam_bf_effective_adapt_interval, array_sample_beam_bf_lambda, array_sample_beam_spatial_backend` | — | C-only | D-43 | — | sample helper（不在模組 archive）：參數驗證、SRP／bf 陣列幾何與設定導出、helper 自己的池、VAD 自動判斷、DOA／bf 存取函式；沒有 Python 版。 |
+| PL-MCAB-23 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_default_params, flag_valid, params_valid, fill_uca_geometry, fill_ula_geometry, array_sample_spatial_config, helper_layout, array_sample_beam_get_mem_size, take, array_sample_beam_init, array_sample_beam_destroy, fill_info, array_sample_beam_process_beam, auto_vad, array_sample_beam_bf_effective_adapt_interval, array_sample_beam_bf_lambda, array_sample_beam_spatial_backend` | — | C-only | D-43 | — | sample helper（不在模組 archive）：參數驗證、SRP／bf 陣列幾何與設定導出、helper 自己的池、VAD 自動判斷、DOA／bf 存取函式；沒有 Python 版。 |
 | PL-MCAB-24 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_reset` | `pipelines/4ch/pipeline.py:McabPipeline.reset` | partial | — | — | （推論）C 重置陣列（`aec_reset`）、SRP、bf 與備援 VAD；Python 的 `reset` 重置共用 delay 與四條 lane。NR 與合成不在 helper 內，由呼叫端一起重置。 |
 | PL-MCAB-25 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_process_front` | `pipelines/4ch/pipeline.py:McabPipeline.process_front` | partial | D-39 | — | （推論）呼叫 `aec_process_linear` 與 `aec_get_array`（PL-MCAB-04）；C 另管 helper 的 phase 守衛（`process_beam` 要有待處理的 front）。 |
 | PL-MCAB-26 | `pipelines/4ch/array_sample_beam.c: array_sample_beam_fuse` | `pipelines/4ch/pipeline.py:McabPipeline.fuse` | partial | T-16 | — | （推論）helper 用自己的權重與 BF 後頻譜呼叫 `aec_process_residual`（PL-MCAB-06）並以 `aec_get_residual` 填 `AecResidualView`（增益留在陣列，由呼叫端 `aec_apply_gain`）；C 在 fuse 失敗（SEQUENCE 與 MODE 除外）時重置陣列、SRP 與 BF，Python 的 `fuse` 由呼叫端傳入 McabFront 與外部 BF 結果。 |
