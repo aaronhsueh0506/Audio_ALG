@@ -44,7 +44,6 @@ with the lookahead pair:
   (`dfn2_prepost_latency_frames(grid)` + 1; 10 hops, 106.7 ms, at the shipped pair
   with N = 8). A refused commit zeroes the registered state and advances the
   generation, and `frame_bypass()` passes all N frames as the noisy spectrum;
-  flushing means pushing zero hops until the last real one has been emitted (`M + D + N` of them);
 - `DFN2ModelIoDescriptor` keeps its 18 fields and 72 bytes: N is
   `input_frames - 2` (`input_frames` = N + 2, metadata `input_feature_frames`),
   so `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse

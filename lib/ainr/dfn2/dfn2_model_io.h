@@ -101,7 +101,7 @@ int dfn2_model_io_validate_arrays(float *gru_hidden, size_t gru_count,
 
 /* Push feature frame f: erb[n_erb], spec[2][df_bins] (re, then im). Returns 1 when the window of
  * heads[f-L-N+1 .. f-L] is complete (after L + N pushes, then every N), 0 otherwise, -1 on NULL or no grid.
- * Flush: N = 1 push L zero frames, else push zero frames until the call holding the last head has run. */
+ * The newest head trails the pushed frame by L frames, the oldest of the N by L + N - 1; nothing is flushed. */
 int dfn2_model_io_push_features(DFN2ModelIOState *state, const float *erb,
                                 const float *spec);
 

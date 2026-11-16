@@ -23,8 +23,7 @@ heads for frame ``t`` are ready once frame ``t + M`` has been pushed, and the
 output emitted on frame ``t`` belongs to source frame ``t - (M + D)`` (a
 cascade, not a maximum), so the first ``M + D`` frames emit nothing; after the
 last real frame the caller pushes ``M + D`` all-zero frames (``flush``) to drain
-the last source frames, with the heads still being evaluated on them -- the
-same tail discipline the C class documents.  The ring and the deep-filter
+the last source frames, with the heads still being evaluated on them.  The ring and the deep-filter
 history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)`` slots and
 ``DF_ORDER - D - 1`` past taps.
 

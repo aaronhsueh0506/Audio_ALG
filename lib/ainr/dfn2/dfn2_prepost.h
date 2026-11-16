@@ -180,8 +180,7 @@ int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
 /* One analysed frame (n_bins bins), no transform. Returns the accelerator invocations needed: 1 at the
  * zero-indexed hop L + N - 1, then every N hops after (N == 1: every hop from hop L), 0 otherwise; on a 0 the
- * clocks have advanced and no frame is open. -1 on NULL args or with a frame open. Flush:
- * push zero spectra and run the accelerator until the last real frame is emitted. Bins are not checked: each must be
+ * clocks have advanced and no frame is open. -1 on NULL args or with a frame open. Bins are not checked: each must be
  * finite with |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
                                   const float *spec_im);

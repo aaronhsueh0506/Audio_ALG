@@ -112,7 +112,7 @@ def work_dumpers():
 
 
 def run_work_dumper(path, sr, fft, hop_in, family=0):
-    """rc, info, counts and the work views (b, c, h, w) with element counts of the first real preprocess."""
+    """rc, queue, counts and the work views (b, c, h, w) with element counts of the first real preprocess."""
     text = subprocess.run([path, str(sr), str(fft), str(hop_in), str(family)], check=True,
                           capture_output=True, text=True).stdout
     dump = {'in': [], 'out': []}
@@ -121,7 +121,7 @@ def run_work_dumper(path, sr, fft, hop_in, family=0):
         if fields[0] == 'rc':
             dump['rc'] = int(fields[1])
         elif fields[0] == 'info':
-            dump['info'] = (int(fields[2]), int(fields[4]), int(fields[6]))
+            dump['queue'] = int(fields[2])
         elif fields[0] == 'counts':
             dump['counts'] = (int(fields[2]), int(fields[4]))
         elif fields[0] in ('in', 'out'):

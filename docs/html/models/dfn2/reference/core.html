@@ -226,7 +226,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <code>mask_lookahead + df_lookahead</code> 框,<u>相加而非取 max</u>。</li>
 <li>STFT framing 結構延遲:win−hop = 512 samples = 10.67 ms(WOLA 重疊)。</li>
 <li>Warm-up:<code>dfn2_enhance_spectrum_stream()</code> 前 M+D 次呼叫回 0(無輸出,不送 ISTFT);
-右端 flush 須再推 M+D+1 個全零 hop(含 ISTFT 重疊 1 個),加速器照跑;N 個 frame 時再加 N-1。</li>
+輸出落後輸入 M+D+1 個 hop(含 ISTFT 重疊 1 個),N 個 frame 時再多 N-1;沒有 flush。</li>
 <li>正規化器 EMA warm-up:tau = 1.0 s(α=0.989,有效 tau 0.9644 s ≈ 90.4 框,3·tau ≈ 271 框);init 用 libDF linspace 值。</li>
 <li>對齊守衛:<code>tests/test_c_prepost.c: test_dfn_stream_alignment()</code> 用逐框變動的 mask/coefs 驗證
 <code>output_frame_index</code> 與逐 bin 3e-6 一致性,off-by-one 的配對無法以「輸出有限」矇混過關。</li>
@@ -241,11 +241,11 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；48 kHz 1/1 為 92,608 bytes（本機量測；不含應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的 state；其他 grid 見 <a href="grid.html">DFN2 grid 與 ERB</a>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
 <li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／grid 查出來的陳舊 pool 大小」。</li>
 <li>每個 hop 同一條流程（<code>frames_per_call</code> N = 1）：<code>ac_stft_push_planar</code> → <code>pre_process_freq</code>（前 M 個 hop 回 0：沒有 job，跳到 post；之後回 1）→ <code>frame_open</code> → 加速器 → <code>frame_finish</code>（或 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>；<code>valid</code> 只是資訊（可傳 NULL），<code>AC_OLA_ACCUMULATE</code> 下每 hop 都 push，零頻譜得零 hop。前 M 個 hop <b>沒有 job</b>：不開 frame、加速器不跑，登錄 state 與 generation 不動，首個有 job 的 hop 從啟動時的 state 開始；M = 0 每個 hop 都有 job，N &gt; 1 維持舊流程（見 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a>）。</li>
-<li>加速器那份定點 state 在啟動時填成量化後的 0，之後每次 <code>state_generation</code> 變了就重填（reset、被拒的 commit、失敗的執行；串流開頭的 M 個 hop 沒有 job，不呼叫加速器，見時序圖）。串流結尾：再餵全零 hop 並照常跑加速器才能排出尾端：M+D 個只排出最後一個頻譜框，PCM 要多 1 個（ISTFT 重疊），共 M+D+1 個（出貨 pair 3 個；identity 實跑確認）。</li>
+<li>加速器那份定點 state 在啟動時填成量化後的 0，之後每次 <code>state_generation</code> 變了就重填（reset、被拒的 commit、失敗的執行；串流開頭的 M 個 hop 沒有 job，不呼叫加速器，見時序圖）。輸出落後輸入 M+D+1 個 hop（含 ISTFT 重疊 1 個；出貨 pair 3 個；identity 實跑確認），沒有排尾。</li>
 <li>重新開始一段串流：<code>dfn2_prepost_reset(p)</code>，並 reset 自己的 <code>AcStft</code>／<code>AcIstft</code>，然後把加速器 state 重填量化零；結束：<code>dfn2_prepost_destroy(p)</code>（對 <code>_init</code> 實例是 no-op）。</li>
 </ol>
 <p><a href="../../../../../AINR/DeepFilterNet2/README.md">完整頻域 C 範例</a></p>
-<p class="note">以上片語可在 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 下編譯；接 unit mask、alpha 0 的替身加速器（出貨 grid 與 pair 1/1），輸出等於輸入延遲 3 hops（40 個 hop 加 M+D+1 = 3 個全零 hop：加速器跑 43 次、state 重填 2 次，少推一個全零 hop 就排不完）。估計與套用分支來自不同頻譜時用 <code>_pre_process_freq_dual</code>。</p>
+<p class="note">以上片語可在 <code>-std=c11 -Wall -Wextra -Wpedantic -Werror</code> 下編譯；接 unit mask、alpha 0 的替身加速器（出貨 grid 與 pair 1/1），輸出等於輸入延遲 3 hops。估計與套用分支來自不同頻譜時用 <code>_pre_process_freq_dual</code>。</p>
 
 <h3>錯誤處理速查</h3>
 <div class="tbl"><table>
@@ -387,7 +387,6 @@ hop   caller                    dfn2_stream                       NPU
 <tr><td>hop</td><td>512 samples = 10.67 ms</td><td>該 grid 的 hop / sample_rate</td></tr>
 <tr><td>模型延遲 L+D+N-1</td><td>2 個模型 hop</td><td><code>dfn2_prepost_latency_frames()</code></td></tr>
 <tr><td>PCM 對齊延遲</td><td>3 個 hop（32 ms；框化多疊 1 個 hop）</td><td>與 <a href="core.html#frequency-api">DeepFilterNet2 頻域與模型契約</a> 低階範例的量測一致</td></tr>
-<tr><td>排尾所需全零 hop 數</td><td>L+D+1 = 3</td><td>標頭文件；board sample 的 <code>if (written != hop) memset(...)</code> 行為一致</td></tr>
 <tr><td>沒有 job 的 hop 數（N = 1）</td><td>L = 1（出貨）</td><td><code>grid.mask_lookahead</code></td></tr>
 </table></div>
 

@@ -296,8 +296,7 @@ int ainr_get_mem_size_freq(const AinrConfig *cfg, StreamMemReq *req)
     return ainr_get_mem_size_family(AINR_FAMILY_FREQ, cfg, req);
 }
 
-static void ainr_fill_info(const AinrConfig *cfg, const DFN2Grid *grid, const char *graph_path,
-                           AinrInfo *info);
+static void ainr_fill_info(const DFN2Grid *grid, const char *graph_path, AinrInfo *info);
 
 /* Shared by every init: erb_path is the explicit file (test entry points) or NULL for the
  * release-asset path of the resolved grid (customer entry points). Writes *core and *info only on
@@ -349,7 +348,7 @@ static int ainr_init_common(AinrFamily family, const AinrConfig *cfg, const char
     lay.core->stash = lay.stash;
     lay.core->scratch = lay.scratch;
     lay.core->block_open = 0;
-    ainr_fill_info(cfg, &grid, graph_path, info);
+    ainr_fill_info(&grid, graph_path, info);
     *core_out = lay.core;
     return AINR_OK;
 }
@@ -698,17 +697,14 @@ int ainr_postprocess_freq(AinrFreqCtx *ctx, int run_status, float *out_re, float
 }
 
 /* ---------------------------------------------------------------------------------------------
- * Init info: graph, trim / queue / tail lengths.
+ * Init info: graph, queue length.
  * ------------------------------------------------------------------------------------------- */
 
-static void ainr_fill_info(const AinrConfig *cfg, const DFN2Grid *grid, const char *graph_path,
-                           AinrInfo *info)
+static void ainr_fill_info(const DFN2Grid *grid, const char *graph_path, AinrInfo *info)
 {
     memset(info, 0, sizeof(*info));
     info->graph_path = graph_path;
     info->queue_frames = dfn2_prepost_latency_frames(grid);
-    info->trim_samples = (info->queue_frames + 1) * grid->hop;
-    info->tail_zero_blocks = (info->trim_samples + cfg->hop_in - 1) / cfg->hop_in;
 }
 
 const char *ainr_status_text(int code)

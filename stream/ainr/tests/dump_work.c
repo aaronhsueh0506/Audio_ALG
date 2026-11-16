@@ -7,7 +7,7 @@
  *     rc <int>                                    status of ainr_get_mem_size*() / ainr_init*() / the
  *                                                 preprocess calls (a refused config prints this line only)
  *     graph <path>                                AinrInfo.graph_path
- *     info trim <int> queue <int> tail <int>      AinrInfo trim_samples / queue_frames / tail_zero_blocks
+ *     info queue <int>                            AinrInfo.queue_frames
  *     counts inputs <int> outputs <int>           StreamWork input_count / output_count
  *     in <i> <b> <c> <h> <w> <elements>           StreamWork.inputs[i], signal inputs only
  *     out <i> <b> <c> <h> <w> <elements>          StreamWork.outputs[i], heads only
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
     printf("rc %d\n", rc);
     if (rc != AINR_OK) { free(pool); free(pcm_in); free(pcm_out); free(zeros); return 0; }
     printf("graph %s\n", info.graph_path);
-    printf("info trim %d queue %d tail %d\n", info.trim_samples, info.queue_frames, info.tail_zero_blocks);
+    printf("info queue %d\n", info.queue_frames);
     printf("counts inputs %d outputs %d\n", work.input_count, work.output_count);
     for (i = 0; i < work.input_count; ++i)
         printf("in %d %u %u %u %u %zu\n", i, work.inputs[i].b, work.inputs[i].c, work.inputs[i].h, work.inputs[i].w,

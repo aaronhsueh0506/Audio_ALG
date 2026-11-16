@@ -199,7 +199,7 @@ test-ainr-spec-freq: $(AINR_SPEC_FREQ_TEST_BIN)
 	"$(AINR_SPEC_FREQ_TEST_BIN)"
 
 # Variant-agnostic host suites (they pick the full or the lite catalog rows by DFN2_MASK_ONLY): the
-# end-of-input tail through both families (test_ainr_tail.c) and the other single-purpose suites below.
+# stream latency through both families (test_ainr_tail.c) and the other single-purpose suites below.
 # Never built under NO_STDIO.
 GENERIC_TEST_SOURCES := $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
 

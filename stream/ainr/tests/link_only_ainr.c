@@ -124,8 +124,8 @@ static int run_round_trip(void) {
         fprintf(stderr, "ainr_init_from_erb_file fail\n"); return 1;
     }
 
-    if (info.graph_path == NULL || info.tail_zero_blocks < 1) {
-        fprintf(stderr, "ainr_init: graph_path %p, tail_zero_blocks %d\n", (const void *)info.graph_path, info.tail_zero_blocks);
+    if (info.graph_path == NULL) {
+        fprintf(stderr, "ainr_init: graph_path NULL\n");
         return 1;
     }
     for (i = 0; i < hop; ++i) pcm_in[i] = (int16_t)((i * 13) % 211 - 100);

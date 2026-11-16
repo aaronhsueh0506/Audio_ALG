@@ -144,7 +144,7 @@ static int run_family(Fam f, const AinrConfig *cfg, const char *erb, int n_erb, 
     memset(buf + bytes, 0xC3, 128);
     rc = try_init(f, cfg, erb, buf, bytes, &ctx, &info);
     EXPECT(rc, AINR_OK, "exact pool");
-    REQUIRE(ctx != NULL && info.graph_path != NULL && info.tail_zero_blocks >= 1, "exact pool: ctx/info not set");
+    REQUIRE(ctx != NULL && info.graph_path != NULL, "exact pool: ctx/info not set");
     EXPECT(run_blocks(f, ctx, cfg), AINR_OK, "blocks on the exact pool");
     {
         size_t k;

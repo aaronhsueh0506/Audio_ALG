@@ -22,7 +22,7 @@
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
  * accelerator's state when the generation differs from the value at the last zeroing.
  * A hop without a job (io.job_ready 0) emits silence and the status passed to post_process is ignored.
- * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one.
+ * The output trails the input by mask_lookahead + df_lookahead + N hops; nothing is flushed.
  *
  * A caller with its own analysis and synthesis uses dfn2_stream_pre_process_freq_dual() /
  * dfn2_stream_post_process_freq() instead; cfg.freq_only then keeps the HPF, STFT/ISTFT and PCM buffers out of the pool. */

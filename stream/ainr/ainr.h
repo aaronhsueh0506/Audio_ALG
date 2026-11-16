@@ -12,8 +12,7 @@
  *         ...SUBMIT: run the accelerator on work (state sync and readback recovery are the sample's);
  *            BYPASS: no accelerator call...
  *         ainr_postprocess(ctx, run_status, pcm_out);   // hop_in valid samples, BYPASS block included
- *     after the last real block (zero-padded to hop_in): info.tail_zero_blocks all-zero blocks through
- *         the same sequence, then drop info.trim_samples from the start of the output
+ *     the output trails the input by info.queue_frames + 1 model hops; nothing is trimmed or flushed
  *
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
  * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
@@ -68,16 +67,11 @@ enum {
 /* Short text for a status code, for a log line. Never NULL. */
 const char *ainr_status_text(int code);
 
-/* Tail: AC_OLA_ACCUMULATE has no flush. After the last real block push info.tail_zero_blocks zero blocks,
- * drop info.trim_samples from the start, keep the real length. _freq: feed the upstream analyser the same
- * zero blocks first, then drain the queue with the same count. */
-
 /* Result of one init, the same for both families of a config. */
 typedef struct AinrInfo {
     const char  *graph_path;           /* model.bin of this configuration; a static string */
-    int          trim_samples;         /* samples dropped from the start of the final PCM: (queue_frames + 1) * model_hop */
-    int          queue_frames;         /* mask_lookahead + df_lookahead + N - 1 */
-    int          tail_zero_blocks;     /* zero hop_in blocks after the last real block: ceil(trim_samples / hop_in) */
+    int          queue_frames;         /* mask_lookahead + df_lookahead + N - 1: the final PCM trails the input by queue_frames + 1 model hops
+                                              (_freq: after the caller's own ISTFT) */
 } AinrInfo;
 
 /* ---- PCM family ----

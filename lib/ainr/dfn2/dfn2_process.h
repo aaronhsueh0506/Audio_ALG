@@ -126,10 +126,9 @@ int dfn2_enhance_spectrum(DFN2State *st,
 /* Streaming form: one CURRENT spectrum per call plus the heads as they arrive. heads_valid = 1: the
  * heads are those of frame current - mask_lookahead; 0 only for the first mask_lookahead frames
  * (head pointers may then be NULL). A valid out is frame current - mask_lookahead - df_lookahead,
- * reported by output_frame_index (may be NULL). Mask-only: the masked noisy head frame. No right
- * flush: keep calling with zero spectra and the accelerator's heads for them. alpha is clamped to [0, 1]
- * before use. atten_lim_db 0 = off, else a |atten_lim_db| dB limit (sign ignored) mixed against the
- * delayed noisy target. Returns 1 = valid out, 0 = warm-up, -1 = pointer,
+ * reported by output_frame_index (may be NULL). Mask-only: the masked noisy head frame. Nothing is flushed.
+ * alpha is clamped to [0, 1] before use. atten_lim_db 0 = off, else a |atten_lim_db| dB limit (sign ignored)
+ * mixed against the delayed noisy target. Returns 1 = valid out, 0 = warm-up, -1 = pointer,
  * timing or non-finite alpha / atten_lim_db error. */
 int dfn2_enhance_spectrum_stream(DFN2State *st,
                         const float *current_spec_re,

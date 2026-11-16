@@ -11,8 +11,8 @@
  *      bypass hop (run_status != 0) mixed into the run.
  *   2. N > 1 stash/ordering through the public _freq API on the catalog's 16 kHz/256 N=8 row: a committed block
  *      followed by a bypassed one, and the PCM family against _freq + AcIstft bit-exact over the same blocks.
- *   3. Trim / queue labeling: AinrInfo.queue_frames and trim_samples of both families against the lookahead
- *      hops of the grid, spelled out per row.
+ *   3. Queue labeling: AinrInfo.queue_frames of both families against the lookahead hops of the grid, spelled
+ *      out per row (the output trails the input by queue_frames + 1 model hops).
  *
  * Not built under NO_STDIO (ainr.c's only entry points, including the new families', are
  * file-mode only). MASK_ONLY-only concepts (coefs/alpha outputs) are already guarded by ainr.h's
@@ -346,11 +346,11 @@ static int test_freq_core_matches_pcm_core(void) {
     return 0;
 }
 
-/* ---- Test 3: trim / queue labeling. ---- */
+/* ---- Test 3: queue labeling. ---- */
 
 /* L / D are the mask / deep-filter lookahead hops of the catalog row. Expected values are spelled
- * out here (queue_frames = L + D + N - 1; trim_samples = (queue_frames + 1) * hop), not read from
- * the library, and must be identical for both families' init info. */
+ * out here (queue_frames = L + D + N - 1), not read from the library, and must be identical for both
+ * families' init info. */
 static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, const char *label) {
     AinrConfig cfg;
     StreamMemReq req_pcm, req_freq;
@@ -361,8 +361,6 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
     AinrInfo bi[2];
     int hop = fft / 2, n_bins = fft / 2 + 1, i;
     int want_queue = L + D + n - 1;
-    int want_trim = (want_queue + 1) * hop;
-    int want_tail = (want_trim + n * hop - 1) / (n * hop);
 
     cfg.sr = sr;
     cfg.fft = fft;
@@ -387,17 +385,13 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
             fprintf(stderr, "%s: [%d] graph differs from the PCM family's\n", label, i);
             return 1;
         }
-        if (bi[i].queue_frames != want_queue || bi[i].trim_samples != want_trim ||
-            bi[i].tail_zero_blocks != want_tail) {
-            fprintf(stderr, "%s: [%d] queue=%d trim=%d tail=%d, want %d / %d / %d\n", label, i,
-                    bi[i].queue_frames, bi[i].trim_samples, bi[i].tail_zero_blocks,
-                    want_queue, want_trim, want_tail);
+        if (bi[i].queue_frames != want_queue) {
+            fprintf(stderr, "%s: [%d] queue=%d, want %d\n", label, i, bi[i].queue_frames, want_queue);
             return 1;
         }
     }
 
-    printf("%s: PASS (queue_frames=%d trim_samples=%d tail_zero_blocks=%d, hop=%d)\n",
-           label, want_queue, want_trim, want_tail, hop);
+    printf("%s: PASS (queue_frames=%d, hop=%d)\n", label, want_queue, hop);
     free(pool_pcm); free(pool_freq);
     unlink(erb_path);
     return 0;
