@@ -62,9 +62,8 @@ check-stream-run: stream_run.h tests/stream_run_c99_probe.c tests/stream_run_cxx
 	@echo "check-stream-run: PASS"
 
 # The header must also compile as C++ (the samples may be built by a C++ driver).
-check-graph-io-cxx: graph_io.h stream_bind.h | $(BUILD_DIR)
-	@printf '#include "graph_io.h"\nint probe(const GraphIoRow *r, GraphIoConfig *c) {\n  struct W { int input_count, output_count; struct { const float *data; size_t elements; unsigned w, h, c, b; } inputs[1], outputs[1]; } wk = {0, 0, {{0, 0, 0, 0, 0, 0}}, {{0, 0, 0, 0, 0, 0}}};\n  int rc = graph_io_expand(r, c);\n  GRAPH_IO_CHECK_WORK(rc, c, &wk);\n  return rc + graph_io_frames(256, 128) + graph_io_state_count(c) + (int)graph_io_input_bytes(c, 0, 4);\n}\n' > "$(BUILD_DIR)/graph_io_cxx_probe.cpp"
-	$(CXX) -std=c++11 -Wall -Wextra -Wpedantic -Werror -I. -fsyntax-only "$(BUILD_DIR)/graph_io_cxx_probe.cpp"
+check-graph-io-cxx: graph_io.h stream_bind.h tests/graph_io_cxx_probe.cpp
+	$(CXX) -std=c++11 -Wall -Wextra -Wpedantic -Werror -I. -fsyntax-only tests/graph_io_cxx_probe.cpp
 	@echo "check-graph-io-cxx: PASS"
 
 # The customer header set compiles as C99 -Wpedantic and as C++11 with only the documented include roots, and
@@ -83,7 +82,7 @@ audit-no-stdio: $(BUILD_DIR)/stream_bind.o | $(BUILD_DIR)
 	  echo "audit-no-stdio: positive control did not match"; exit 1; fi
 	@echo "audit-no-stdio: PASS"
 
-test: test-stream-bind test-stream-mem test-graph-io test-stream-run check-stream-run check-graph-io-cxx check-public-headers audit-no-stdio
+test: test-stream-bind test-stream-mem test-graph-io test-stream-run check-stream-run check-public-headers audit-no-stdio
 
 clean:
 	rm -rf "$(BUILD_DIR)"
