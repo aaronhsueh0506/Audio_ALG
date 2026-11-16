@@ -589,7 +589,7 @@ $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_i
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
 # test_array_sample_post: the header-only glue of the four-channel programs; links no sample object.
 $(OBJ_DIR)/test_array_sample_post.o: 4ch/tests/test_array_sample_post.c 4ch/array_sample_post.h | _cfg_guard

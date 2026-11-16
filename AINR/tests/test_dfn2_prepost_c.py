@@ -1633,6 +1633,29 @@ static int case_reject(void) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
         CHECK(p != NULL);
+        {   /* the lib verbs refuse NULL arguments and a slot outside 0 .. N - 1 themselves, without touching the state */
+            const int nb = dfn2_prepost_grid(p)->n_bins, frames = dfn2_prepost_grid(p)->frames_per_call;
+            float *z = (float *)calloc((size_t)nb * 4u, sizeof(float));
+            float *er = z, *ei = z + nb, *oi = z + 3 * (size_t)nb, *orr = z + 2 * (size_t)nb;
+            const uint32_t gen = dfn2_prepost_state_generation(p);
+            CHECK(z != NULL);
+            CHECK(dfn2_prepost_pre_frame(NULL, er, ei) == -1 && dfn2_prepost_pre_frame(p, NULL, ei) == -1 &&
+                  dfn2_prepost_pre_frame(p, er, NULL) == -1);
+            CHECK(dfn2_prepost_views(NULL, &inputs, &outputs) == -1 && dfn2_prepost_views(p, NULL, &outputs) == -1 &&
+                  dfn2_prepost_views(p, &inputs, NULL) == -1);
+            CHECK(dfn2_prepost_validate_run(NULL) == -1);
+            CHECK(dfn2_prepost_post_frame(NULL, 0, er, ei, orr, oi) == -1 && dfn2_prepost_post_frame(p, 0, NULL, ei, orr, oi) == -1 &&
+                  dfn2_prepost_post_frame(p, 0, er, NULL, orr, oi) == -1 && dfn2_prepost_post_frame(p, 0, er, ei, NULL, oi) == -1 &&
+                  dfn2_prepost_post_frame(p, 0, er, ei, orr, NULL) == -1);
+            CHECK(dfn2_prepost_post_frame(p, -1, er, ei, orr, oi) == -1 && dfn2_prepost_post_frame(p, frames, er, ei, orr, oi) == -1);
+            CHECK(dfn2_prepost_post_frame_identity(NULL, er, ei, orr, oi) == -1 &&
+                  dfn2_prepost_post_frame_identity(p, NULL, ei, orr, oi) == -1 &&
+                  dfn2_prepost_post_frame_identity(p, er, NULL, orr, oi) == -1 &&
+                  dfn2_prepost_post_frame_identity(p, er, ei, NULL, oi) == -1 &&
+                  dfn2_prepost_post_frame_identity(p, er, ei, orr, NULL) == -1);
+            CHECK(dfn2_prepost_state_generation(p) == gen);
+            free(z);
+        }
         CHECK(dfn2_life_pre_process_freq(NULL, pcm_in, pcm_in) == -1);
         CHECK(dfn2_life_frame_open(NULL, &inputs, &outputs) == -1);
         CHECK(dfn2_life_frame_open(p, NULL, &outputs) == -1);
@@ -2948,11 +2971,11 @@ def test_dual_entry_estimates_on_est_and_applies_on_app(driver):
 
 def test_dual_entry_guards_and_gain_accessor(driver):
     """The dual entry is refused on any NULL argument and with a frame open
-    and a frame_bypass closes it; the carve version is 12."""
+    and the identity step closes it; the carve version is 13."""
     _run(driver, 'dual_guards')
 
 
-def test_model_run_frame_finishes_or_takes_the_identity(driver):
+def test_life_model_run_frame_finishes_or_takes_the_identity(driver):
     """dfn2_life_model_run_frame: contract errors (-1) for no open frame, a NULL
     model/instance, no infer callback, a NULL io_descriptor or one whose
     mask_lookahead or df_lookahead differs from the instance's grid, or one
@@ -2963,7 +2986,7 @@ def test_model_run_frame_finishes_or_takes_the_identity(driver):
     recurrent state and the generation alone; a partial write
     (state written in place, one head unwritten) returns 0 with both
     recurrent tensors zeroed and still emits; a model that always fails emits
-    exactly the all-frame_bypass stream."""
+    exactly the all-identity stream."""
     assert 'model_run:' in _run(driver, 'model_run')
 
 

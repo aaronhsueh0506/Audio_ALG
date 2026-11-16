@@ -18,10 +18,9 @@ extern "C" {
 #define DFN2_MODEL_IO_LAYOUT_VERSION       DFN2_MODEL_IO_LAYOUT_VERSION_MASK_ONLY
 #endif
 
-/* Heads per call: N = frames_per_call, L = mask_lookahead. The graph reads N + 2 feature frames and returns N heads plus the
- * state after the last. The window of a call is the newest N + 2 frames, frames t-N-1 .. t, for heads[t-N+1-L .. t-L] (head i
- * from the three frames starting at slot i); frames before the stream start read as zero. N == 1 has its first call after L + 1
- * frames; N > 1 has a call after every N frames from the first, whose first L heads belong to frames before the stream start. */
+/* Heads per call: N = frames_per_call, L = mask_lookahead. The graph reads the newest N + 2 frames t-N-1 .. t and returns heads
+ * [t-N+1-L .. t-L] (head i from the three frames from slot i) plus the state; earlier frames read as zero. N == 1 has its first
+ * call after L + 1 frames; N > 1 after every N frames from the first, its first L heads before the stream start. */
 
 /* A graph's external contract, compared field by field. The six interior fields (GRU layers and width, encoder
  * channels, pathway window) are caller bookkeeping: 0 by default, never read or validated here. */

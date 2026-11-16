@@ -155,10 +155,9 @@ typedef struct DFN2HopIO {
  * post_process, a freq_only context or frames_per_call > 1. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
-/* Closes the hop, once per pre_process: on a SUBMIT hop ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other
- * value bypasses and advances the generation (otherwise ai_rc is ignored); one hop is then drained to pcm_out through
- * the ISTFT. Returns the spectral-validity flag (1/0) of the hop's post_frame, -1 on error (a freq_only
- * context included); it is not an alignment: count L + D hops. */
+/* Closes the hop, once per pre_process: on SUBMIT ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other value
+ * bypasses and advances the generation (ignored otherwise); one hop drains to pcm_out through the ISTFT. Returns the
+ * validity flag (1/0) of post_frame, -1 on error (freq_only included); not an alignment: count L + D hops. */
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
 
 /* As dfn2_stream_pre_process() on spectra, for either kind of context: est and app are n_bins floats each, MODEL scale; est drives features and

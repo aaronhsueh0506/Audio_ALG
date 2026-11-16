@@ -1,9 +1,6 @@
-/* Test-only call lifecycle over the DFN2 per-frame lib functions, for lib-only builds (no dfn2_stream.c): pre -> views ->
- * accelerator -> validate_run -> post, as dfn2_stream.c sequences it, with the application-spectrum and output staging the lib
- * no longer holds. One state record per instance, found by pointer; every create / init / init_ex / reset / destroy goes through
- * the dfn2_life_* wrappers below, so a pool reused at the same address starts clean.
- * Entry points keep the old call shapes (dfn2_life_pre_process_freq, _frame_open, _frame_finish, _frame_bypass, _frame_fail,
- * _post_process_freq, the block entries, _model_run_frame) so the digests of the chain tests compare against the old class. */
+/* Test-only call lifecycle over the DFN2 per-frame lib functions for lib-only builds (no dfn2_stream.c): pre, views, accelerator,
+ * validate_run, post, with the application-spectrum and output staging kept here. One state record per instance, found by pointer;
+ * create / init / init_ex / reset / destroy go through the dfn2_life_* wrappers below, so a pool reused at one address starts clean. */
 #ifndef DFN2_LIFECYCLE_DRIVER_H
 #define DFN2_LIFECYCLE_DRIVER_H
 

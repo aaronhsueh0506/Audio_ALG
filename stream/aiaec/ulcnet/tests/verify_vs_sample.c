@@ -151,7 +151,7 @@ static int board_always_bypass_pre(BoardDriver *d, const int16_t *err_in, const 
     return 0;
 }
 
-/* Stage 3 (alignment edge) + Stage 4 + the reprime-or-frame_open half of Stage 5, taking
+/* Stage 3 (alignment edge) + Stage 4 + the reprime-or-views half of Stage 5, taking
  * err_in/far_in already as full-scale float, exactly like the real board sample's own Stage 4
  * (alg_ai3_alignulcnet.c:1582: AecResidualView.formed_hop and its float ref_f straight into
  * ac_stft_push_planar, no int16 step at all). Returns 1 (a real accelerator job is due, in/out
@@ -361,7 +361,7 @@ static int run_matrix(int inject_shift) {
         }
 
         /* Feature-array memcmp gated on BOTH sides returning 1 -- on a reprime hop io_b's inputs
-         * are zeroed (ulcnet_stream.h's own documented contract) and A never called frame_open
+         * are zeroed (ulcnet_stream.h's own documented contract) and A never built model inputs
          * either, so comparing them would be meaningless, not just noisy. */
         if (pre_rc_a == 1 && pre_rc_b == 1) {
             if (in_a.spectrum_bins_elements != io_b.inputs.spectrum_bins_elements ||
@@ -444,7 +444,7 @@ static int run_matrix(int inject_shift) {
          * contribution -- not a clean "is bypass correct" signal. By hop 18 (the SECOND
          * consecutive bypassed hop), both the current and the carried-over tail come from
          * bypassed hops, so A's (and B's) PCM at hop 18 must exactly equal C's (always-bypass
-         * from hop 0) PCM at hop 18 -- a confound-free proof that frame_bypass() really does pass
+         * from hop 0) PCM at hop 18 -- a confound-free proof that a bypassed hop really does pass
          * the error spectrum through unchanged, not some other transformation, and specifically
          * not silence. */
         if (ghop == 18) {

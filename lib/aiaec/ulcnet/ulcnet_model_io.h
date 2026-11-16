@@ -149,11 +149,9 @@ typedef struct UlcnetModelIoInputs {
     size_t frame_reset_elements;
 } UlcnetModelIoInputs;
 
-/* `output` is planar: BINS real, then BINS imaginary (packet: the N * BINS real values, then the N * BINS imaginary ones,
- * spectrum_ri_elements = 2 * N * BINS). Each state *_out has the address of the input it continues
- * (NULL and 0 elements when none), fixed for the life of the state: the runtime reads all state inputs before writing
- * any state output. views() NaN-fills `output`, so an unwritten mask is refused by validate_run(); a refused
- * run zeroes the registered state, advances the generation and is discarded. */
+/* `output` is planar: BINS real, then BINS imaginary (packet: N * BINS real, then N * BINS imaginary). Each state *_out sits at
+ * the address of the input it continues (NULL and 0 when none), fixed for the state's life; the runtime reads all state inputs
+ * before writing any output. views() NaN-fills it, so validate_run() refuses an unwritten mask and zeroes the state (generation +1). */
 typedef struct UlcnetModelIoOutputs {
     float *output;
     float *key_history_out;

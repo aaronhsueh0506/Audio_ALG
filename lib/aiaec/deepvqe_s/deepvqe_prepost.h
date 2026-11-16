@@ -240,10 +240,9 @@ void deepvqe_prepost_reset(DeepVqePrepost *p);
  * windows stay. NULL is ignored. */
 void deepvqe_prepost_zero_state(DeepVqePrepost *p);
 
-/* Counter of state restarts (reset, zero_state, a refusing validate_run); 0 after
- * init and for NULL; kept whether or not a state is registered. Every advance also empties the CCM
- * ring, so the next frame is a cold start. A fixed-point accelerator loads quantized zeros into its
- * own copy of the state at start and on every change. */
+/* Counter of state restarts (reset, zero_state, a refusing validate_run); 0 after init and for NULL, kept whether or not a
+ * state is registered. Every advance also empties the CCM ring (the next frame is a cold start); a fixed-point accelerator
+ * loads quantized zeros into its own state copy at start and on every change. */
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(

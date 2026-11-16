@@ -1,6 +1,7 @@
 /* The packet entries (N > 1, mask_lookahead 0) against N one-frame hops of one stateful stand-in accelerator (head i from window
  * slice i, state carried): PCM and spectrum output equal hop for hop, bit for bit, through a failed run, a non-finite head and a reset
- * on packet boundaries, with N times fewer jobs; a stand-in on the wrong slice must differ. Four grids, 16 to 48 kHz. */
+ * on packet boundaries, with N times fewer jobs; a stand-in on the wrong slice must differ. Four grids, 16 to 48 kHz; the PCM
+ * entries also with the input high-pass on. */
 
 #include <math.h>
 #include <stdint.h>
@@ -26,6 +27,7 @@ static const Row ROWS[] = {
 };
 
 static int g_fail;
+static int g_hpf;   /* the PCM streams run with the input high-pass */
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); \
                                        fprintf(stderr, "\n"); ++g_fail; } } while (0)
 
@@ -136,6 +138,8 @@ static int run(const DFN2Grid *g, const float *fwd, const float *inv, int block,
     cfg.erb_fwd = fwd;
     cfg.erb_inv = inv;
     cfg.freq_only = freq;
+    cfg.hpf_enable = g_hpf && !freq;
+    cfg.hpf_cutoff_hz = 80.0f;
     if (!block) cfg.grid.frames_per_call = 1;
     if (cfg.grid.frames_per_call == 1) {   /* the one-frame grid of the same signal grid */
         DFN2GridSpec spec;
@@ -216,7 +220,7 @@ static void run_row(const Row *r) {
     DFN2Grid g;
     float *fwd, *inv;
     Out one, blk, bad;
-    int freq, nb, N = r->n;
+    int variant, freq, nb, N = r->n;
     size_t total;
     char label[64];
 
@@ -241,7 +245,10 @@ static void run_row(const Row *r) {
     erb_fixture_split_inv_band_major(inv, nb, g.n_erb);
     CHECK(dfn2_prepost_latency_frames(&g) == r->df_lookahead, "%s: latency %d", label, dfn2_prepost_latency_frames(&g));
 
-    for (freq = 0; freq < 2; ++freq) {
+    for (variant = 0; variant < 3; ++variant) {   /* PCM, spectrum, PCM with the input high-pass */
+        freq = variant == 1;
+        g_hpf = variant == 2;
+        snprintf(label, sizeof label, "%d/%d D=%d N=%d%s", r->sr, r->fft, r->df_lookahead, N, g_hpf ? " hpf" : "");
         total = freq ? (size_t)nb * 2u * (size_t)N * PACKETS * sizeof(float) : (size_t)g.hop * (size_t)N * PACKETS * sizeof(int16_t);
         run(&g, fwd, inv, 0, freq, 0, &one);
         run(&g, fwd, inv, 1, freq, 0, &blk);

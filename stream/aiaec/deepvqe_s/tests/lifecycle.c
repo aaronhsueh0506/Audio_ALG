@@ -94,9 +94,10 @@ static int state_is_zero(const Rig *r) {
 }
 
 /* Device kinds: 0 clean, 1 a NaN tap, 2 a NaN in one registered buffer, 3 an overflowing enhanced bin in frame `frame`,
- * 4 nothing written. A clean run leaves a non-zero registered state. The overflow is a taps value of 3e38 on PCM input and
- * a mic bin of 3e38 under a tap of 2 on _freq input (make_call). */
-enum { DEV_OK, DEV_NAN_TAP, DEV_NAN_STATE, DEV_OVERFLOW, DEV_UNWRITTEN };
+ * 4 nothing written, 5 as 3 with the overflow only in the imaginary plane. A clean run leaves a non-zero registered state.
+ * The overflow is a taps value of 3e38 on PCM input and a mic bin of 3e38 under a tap of 2 on _freq input (make_call); kind 5
+ * has the _freq input only: the mic bin is imaginary, so the real plane stays finite. */
+enum { DEV_OK, DEV_NAN_TAP, DEV_NAN_STATE, DEV_OVERFLOW, DEV_UNWRITTEN, DEV_OVERFLOW_IM };
 
 static void dev(const Rig *r, DeepVqeHopIO *io, int kind, int frame, int pcm) {
     const size_t taps = io->outputs.taps_elements;
@@ -109,7 +110,7 @@ static void dev(const Rig *r, DeepVqeHopIO *io, int kind, int frame, int pcm) {
         for (k = 0; k < io->outputs.state_elements[id]; ++k) io->outputs.state_out[id][k] = 0.25f + 0.01f * (float)id;
     if (kind == DEV_NAN_TAP) io->outputs.taps[taps / 2u] = NAN;
     if (kind == DEV_NAN_STATE) io->outputs.state_out[DEEPVQE_STATE_H_GRU][1] = NAN;
-    if (kind == DEV_OVERFLOW) {
+    if (kind == DEV_OVERFLOW || kind == DEV_OVERFLOW_IM) {
         const size_t base = ((size_t)frame * (size_t)r->g.n_bins + 3u) * per_bin;
         for (i = 0; i < 9u; ++i) io->outputs.taps[base + 2u * i] = pcm ? 3.0e38f : 2.0f;
     }
@@ -207,6 +208,7 @@ static void failure_table(const Row *row, int freq_only, int pcm, const char *la
         { STREAM_RUN_OK, DEV_NAN_STATE, 1, 1, 1, "refused: a NaN state element" },
         { STREAM_RUN_OK, DEV_UNWRITTEN, 1, 1, 1, "refused: nothing written (the head stayed NaN)" },
         { STREAM_RUN_OK, DEV_OVERFLOW, 1, 1, 1, "refused: an enhanced bin overflows" },
+        { STREAM_RUN_OK, DEV_OVERFLOW_IM, 1, 1, 1, "refused: an enhanced bin overflows in the imaginary plane only" },
         { STREAM_RUN_NOT_STARTED, DEV_OK, 0, 1, 0, "not started" },
         { STREAM_RUN_FAILED, DEV_OK, 1, 1, 1, "failed" },
         { 12345, DEV_OK, 1, 1, 1, "odd status" },
@@ -228,12 +230,14 @@ static void failure_table(const Row *row, int freq_only, int pcm, const char *la
         const int frame = row->n > 1 ? row->n - 2 : 0;   /* a later frame of a batched call */
         int rc;
         long delta;
+        if (T[t].kind == DEV_OVERFLOW_IM && pcm) continue;
         for (warm = 0; warm < 4; ++warm) {   /* a warm state: the zeroing is visible */
             make_call(&r, &c, 10 + warm, -1);
             (void)one_call(&r, &c, pcm, STREAM_RUN_OK, DEV_OK, 0, &o, &rc);
         }
         CHECK(!state_is_zero(&r), "%s %s: no state to restart", label, T[t].what);
         make_call(&r, &c, 100 + t, T[t].kind == DEV_OVERFLOW && !pcm ? frame : -1);
+        if (T[t].kind == DEV_OVERFLOW_IM) c.mi[(size_t)frame * (size_t)r.g.n_bins + 3u] = 3.0e38f;
         delta = one_call(&r, &c, pcm, T[t].status, T[t].kind, frame, &o, &rc);
         CHECK(rc == 1, "%s %s: post rc %d", label, T[t].what, rc);
         CHECK(delta == (long)T[t].delta, "%s %s: generation moved by %ld, expected %d", label, T[t].what, delta, T[t].delta);

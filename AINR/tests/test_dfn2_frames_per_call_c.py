@@ -254,7 +254,7 @@ static DFN2PrepostOutputs views_out;
 
 #define MAX_BLOCK 16
 
-/* freq, reset, refuse: one stream through dfn2_model_run_frame; N == 1 per hop, N > 1 one block of N frames per
+/* freq, reset, refuse: one stream through dfn2_life_model_run_frame; N == 1 per hop, N > 1 one block of N frames per
  * call (hops is a multiple of N, a reset falls between two blocks). */
 static int run_stream(int real, int hops, int reset_hop, long long plo, long long phi, int pkind) {
     DFN2Prepost *p;

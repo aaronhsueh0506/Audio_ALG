@@ -2,7 +2,8 @@
  * event or a misordered call does to the hop's frames and to the state generation, one hop and packet (N = 4), on the
  * spectrum entries of a spectrum-only stream and on both entry families of a full stream.
  *
- *   guards    a post with nothing open, a second pre while a hop is open, a reset with a hop open, NULL arguments
+ *   guards    a post with nothing open, a second pre while a hop is open, a reset with a hop open, an entry of the other N,
+ *             NULL arguments
  *   reprime   an alignment edge at one hop: the hop is the error spectrum, no job, io zeroed, ai_rc ignored, one restart
  *   outcomes  every status and mask fault x {one hop, packet without event, packet with an event}: which frames are the
  *             error spectrum, how far the generation moves (once, however many frames are bad), and the next hop
@@ -148,6 +149,39 @@ static void row_guards(void) {
             CHECK(post_call(&r, STREAM_RUN_NOT_STARTED, re, im, pcm) == 1, "guards: post after reset");
             rig_free(&r);
         }
+    {   /* an entry of the other N is refused and leaves nothing open: the stream still takes its own entry */
+        static const struct { int n, fam; } rows[] = { { 1, FAM_PCM }, { NP, FAM_PCM }, { 1, FAM_FREQ_FULL }, { NP, FAM_FREQ_FULL } };
+        size_t i;
+        for (i = 0; i < sizeof rows / sizeof rows[0]; ++i) {
+            Rig r;
+            Input in;
+            UlcnetHopIO io;
+            UlcnetStreamDelay d[NP];
+            float re[PLANE_MAX], im[PLANE_MAX];
+            int16_t pcm[NP * HOP];
+            uint32_t seed = 21u, gen;
+            int k, rc;
+            CHECK(rig_make(&r, rows[i].n, rows[i].fam) == 0, "guards: wrong-N setup row %zu", i);
+            if (!r.s) continue;
+            for (k = 0; k < NP; ++k) d[k] = quiet();
+            make_input(&in, &seed, NP);
+            gen = ulcnet_stream_state_generation(r.s);
+            if (rows[i].n == 1) {
+                rc = rows[i].fam == FAM_PCM ? ulcnet_stream_pre_process_packet_f32(r.s, in.epcm, in.fpcm, d, &io)
+                                            : ulcnet_stream_pre_process_packet_freq(r.s, in.er, in.ei, in.fr, in.fi, d, &io);
+            } else {
+                rc = rows[i].fam == FAM_PCM ? ulcnet_stream_pre_process_f32(r.s, in.epcm, in.fpcm, d[0], &io)
+                                            : ulcnet_stream_pre_process_freq(r.s, in.er, in.ei, in.fr, in.fi, d[0], &io);
+            }
+            CHECK(rc == -1, "guards: an entry of the other N must be refused (n=%d fam=%d, rc=%d)", rows[i].n, rows[i].fam, rc);
+            if (rows[i].n == 1 && rows[i].fam == FAM_FREQ_FULL)
+                CHECK(ulcnet_stream_pre_process_packet_f32(r.s, in.epcm, in.fpcm, d, &io) == -1, "guards: packet f32 on N = 1");
+            CHECK(ulcnet_stream_state_generation(r.s) == gen, "guards: the refused entry moved the generation");
+            CHECK(pre_call(&r, &in, d, &io) == 1, "guards: the stream takes its own entry after the refusal (n=%d fam=%d)", rows[i].n, rows[i].fam);
+            CHECK(post_call(&r, STREAM_RUN_NOT_STARTED, re, im, pcm) == 1, "guards: its own hop closes");
+            rig_free(&r);
+        }
+    }
     {   /* NULL arguments change nothing */
         Rig r;
         Input in;
