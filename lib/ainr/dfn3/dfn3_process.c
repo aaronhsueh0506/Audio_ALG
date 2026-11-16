@@ -98,19 +98,6 @@ static inline void df_common_features(
 #pragma GCC diagnostic pop
 #endif
 
-/* erb_inv: caller-loaded matrix, band-major [n_bands][n_bins]; the inner loop
- * runs over the band's nonzero bins, or the whole row for a non-finite gain.
- * Calls the shared kernel in utility/simd_kernel_nn.h. */
-static inline void df_common_expand_mask(const float *band_gain,
-                                         const float *erb_inv,
-                                         const uint16_t *inv_lo,
-                                         const uint16_t *inv_hi,
-                                         int n_bins, int n_bands,
-                                         float *bin_gain) {
-    skn_erb_expand_mask_f32(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
-                            n_bands, bin_gain);
-}
-
 /* enh = noisy*lim + enh*mix, expressed as sk_ema_f32 (state=enh, x=noisy,
  * alpha=mix, beta=lim). */
 static inline void df_common_atten_lim(const float *noisy_re,
@@ -485,10 +472,10 @@ int dfn3_enhance_spectrum(DFN3State* st,
     if (!skn_all_finite_f32(erb_mask, (size_t)st->grid.n_erb) ||
         !skn_all_finite_f32(coefs, frame_coefs)) return 0;
     /* DFN3 owns low bins with the raw spectrum; ERB masking owns highs. */
-    df_common_expand_mask(erb_mask, st->erb_inv,
-                          st->erb_inv_lo, st->erb_inv_hi,
-                          n_bins, st->grid.n_erb,
-                          st->scratch_power);
+    skn_erb_expand_mask_f32(erb_mask, st->erb_inv,
+                            st->erb_inv_lo, st->erb_inv_hi,
+                            n_bins, st->grid.n_erb,
+                            st->scratch_power);
     slot = st->df_ring_idx;
     memcpy(st->df_ring_re + (size_t)slot * low, spec_re, low * sizeof(float));
     memcpy(st->df_ring_im + (size_t)slot * low, spec_im, low * sizeof(float));
@@ -578,10 +565,10 @@ int dfn3_enhance_spectrum_stream(DFN3State* st,
     if (current < mask_lookahead) return 0;
     head_frame = current - mask_lookahead;
     head_slot = (int)(head_frame % ring);
-    df_common_expand_mask(erb_mask, st->erb_inv,
-                          st->erb_inv_lo, st->erb_inv_hi,
-                          n_bins, st->grid.n_erb,
-                          st->scratch_power);
+    skn_erb_expand_mask_f32(erb_mask, st->erb_inv,
+                            st->erb_inv_lo, st->erb_inv_hi,
+                            n_bins, st->grid.n_erb,
+                            st->scratch_power);
     if (st->grid.df_lookahead > mask_lookahead) {
         /* The output frame is df_lookahead - mask_lookahead calls behind these heads: keep
          * what it needs from them (the coefficients, and the masked high band, which reads
