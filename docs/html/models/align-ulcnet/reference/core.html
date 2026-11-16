@@ -169,7 +169,7 @@ push 只剩 Python parity gate 使用（mono 範例 <code>pipelines/mono/alignul
 演算法延遲仍是 <b>HOP samples</b>＝16 kHz 256 smp（16 ms）、48 kHz 512 smp（10.67 ms），但它來自
 <b>synthesis 的半窗 trim</b>、不是分析排程（<code>ulcnet_prepost.h</code> 檔頭明文）。</li>
 <li>C 前後處理 vs Python：float-ULP 級（實測 ~2e-5 絕對值，NE10 f32 FFT vs torch
-double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔頭）。</li>
+double twiddles），非 bit-exact（<code>test_aiaec_framing_backend_c.py</code> 檔頭）。</li>
 </ul>
 
 <h2 id="frequency-api">頻域 API</h2>

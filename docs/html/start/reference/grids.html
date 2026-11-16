@@ -194,7 +194,7 @@ AEC/BF seam 自己的頻譜（一 hop 一幀、從 hop 0 起）配對，一手�
 另一手就得用同一個排程才對得上 hop；mono 的 error/far 兩路本來就同 hop 推入，換成
 rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1 發射對齊。</li>
 <li>用 <code>center</code> 1：只剩 Python parity gate
-（<code>AIAEC/tests/test_ulcnet_process_c.py</code>）與
+（<code>AIAEC/tests/test_aiaec_framing_backend_c.py</code>）與
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例，兩者都需要
 0/2/1 排程本身作為比對基準，不代表任何出貨 pipeline。</li>
 </ul>

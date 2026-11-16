@@ -32,6 +32,10 @@
 - `docs/c_python_function_map.md`: PL-DFN-01, -02, -03, -05, -06 and -11 are removed (`Dfn2Stage.push` and `Dfn2Stage.reset` are now covered only by the partial rows AINR-DFN2-15, -16 and -17; `dfn2_stream.c` is not a covered file), PL-DFN-07, -09, -10 and -13 name `ainr_bridge.c` only; 879 -> 827 C functions.
 - No layout version, descriptor or pool size of a retained module changes.
 
+## [Unreleased] — 2026-11-16 — `AIAEC/tests/test_ulcnet_process_c.py` is `test_aiaec_framing_backend_c.py`
+
+- The file checks the application's framing (AcStft / AcIstft against the Python reference), the Align-ULCNet back end and the DeepVQE-S CCM kernel; it was named after the removed `ulcnet_process`. Content unchanged (`git mv`); `docs/c_python_function_map.md`, `docs/html/start/reference/grids.html` and `docs/html/models/align-ulcnet/reference/core.html` name the new file.
+
 ## [Unreleased] — 2026-11-16 — Align-ULCNet stream: the int16 pre_process entry is removed (`ULCNET_STREAM_LAYOUT_VERSION` 6)
 
 - **Public API removed** `ulcnet_stream_pre_process()` (the `int16_t` entry; no product code called it). A caller feeds `ulcnet_stream_pre_process_f32()` (full-scale float, `/ 32768.0f` of the old int16 samples gives the same input bit for bit), the packet entry or the `_freq` entries. `ulcnet_stream_post_process()` still writes int16 PCM.
