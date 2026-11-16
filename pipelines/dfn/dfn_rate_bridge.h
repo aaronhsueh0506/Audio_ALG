@@ -96,7 +96,8 @@ int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
  * nn_begin returns 1 with the open frame's views in *job, 0 when the hop has no
  * further frame, -1 on a contract error. finish takes any frame left open (STREAM_RUN_FAILED) or never
  * fetched (STREAM_RUN_NOT_STARTED) as the identity (fail-open). dfn_rate_bridge_process() runs this loop with the
- * configured model callback. */
+ * configured model callback. begin returns -1 with the bridge idle for a bin that is non-finite or beyond
+ * AINR_BRIDGE_BIN_LIMIT_BITS; a frame the model grid inflates beyond it is not handed out (zero output). */
 int dfn_rate_bridge_begin(DfnRateBridge *b,
                           const Complex *estimate_spec,
                           const Complex *apply_spec);

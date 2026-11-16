@@ -190,19 +190,15 @@ static inline int dfn_hop_close_frame(DfnHop* h, int model_rc, Complex* out) {
 }
 
 /* Starts a hop on the host-grid spectra E and P (borrowed for this call only). A non-finite bin, or one beyond the
- * model-scale bound the direct path enforces (|bin| * scale > 2^63, i.e. 2^68 at the host grid), is refused with the hop
- * still idle (DFN_HOP_INVALID). Bins just under the bound (in phase over the grid, from about 2^66) can still reach
- * the model grid beyond it: nn_begin then refuses the frame and the recovery is the reset described above. */
+ * bound of the path (|bin| * scale > 2^63; on the bridge path ainr_bridge_begin's 2^68), is refused with the hop still
+ * idle (DFN_HOP_INVALID). On the bridge path a model-grid frame that the resamplers push beyond the bound is not
+ * run: its output spectrum is zero and the hop completes. */
 static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
     if (!h || !e || !p) return DFN_HOP_INVALID;
     if (h->phase != 0) return DFN_HOP_SEQUENCE_ERROR;
     h->job_pending = 0;
     h->frame_ended = 0;
     if (h->bridge) {
-        const size_t n = 2u * (size_t)ainr_bridge_n_freqs(h->bridge);
-        if (!dfn2_stream_bins_in_range((const float*)e, n, h->scale) ||
-            !dfn2_stream_bins_in_range((const float*)p, n, h->scale))
-            return DFN_HOP_INVALID;
         if (ainr_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
     } else {
         if (dfn_hop_open_frame(h, e, p, &h->job) != 0) return DFN_HOP_INVALID;

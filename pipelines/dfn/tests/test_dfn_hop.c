@@ -500,6 +500,25 @@ static void test_path(int bridge_mode) {
             CHECK(dfn_hop_begin(&r.h, e, p) == 0 && dfn_hop_end(&r.h, out) == 0,
                   "the hop is usable after a refusal, with no reset");
         }
+        if (bridge_mode) {   /* bins just under the bridge's bound, in phase over the grid (the resamplers push them past
+                              * it on the model grid): the hop completes, and so does every hop after it, with no reset */
+            Complex hb[MAXB], pb[MAXB];
+            int i, failed = 0, nonfinite = 0;
+            for (k = 0; k < r.n; ++k) {
+                hb[k].r = pb[k].r = (k & 1) ? -2.9e20f : 2.9e20f;
+                hb[k].i = pb[k].i = (k & 1) ? 2.9e20f : -2.9e20f;
+            }
+            for (i = 0; i < 40; ++i) {
+                if (i == 0) { if (dfn_hop_process(&r.h, hb, pb, out) != 0) ++failed; }
+                else {
+                    make_frame(e, p, r.n);
+                    if (dfn_hop_process(&r.h, e, p, out) != 0) ++failed;
+                    else if (i > 20) for (k = 0; k < r.hop; ++k) if (!isfinite(out[k])) nonfinite = 1;
+                }
+            }
+            CHECK(failed == 0, "a bin under the bound that the model grid pushes over it wedges nothing");
+            CHECK(nonfinite == 0, "and the output is finite again after it");
+        }
         rig_free(&r);
     }
 

@@ -467,6 +467,67 @@ static int run_contract(void) {
     return 0;
 }
 
+/* ---- bins beyond the limit ------------------------------------------------------------------ */
+/* Every bin the model could be handed is finite and at most 2^68; a host block beyond that is refused with the
+ * bridge idle; in-phase bins just under it, which the resamplers and windows push over the limit on the model
+ * grid, cost the frames that carry them (zero out_spec) and nothing after. */
+static int run_range_grid(const Grid *g) {
+    AinrBridge *b = make(g->sr, g->fft, 1);
+    Analyzer ae, ap;
+    Model m;
+    static Complex se[MAX_BINS], sa[MAX_BINS], big[MAX_BINS];
+    static float sig[(MAX_FFT / 2) * 60], out[MAX_FFT / 2];
+    const float limit = 2.9e20f;                 /* below 2^68 = 2.95e20 */
+    const int hop = g->fft / 2, n_freqs = g->fft / 2 + 1;
+    int t, k, r, handed_over_limit = 0, skipped_hop = 0, failed_after = 0, nonfinite_after = 0;
+
+    CHECK(b != NULL && analyzer_init(&ae, g->fft) == 0 && analyzer_init(&ap, g->fft) == 0, 1);
+    model_reset(&m, LANE_APPLY, 1);
+    for (k = 0; k < 60 * hop; ++k) sig[k] = 0.3f * sinf(2.0f * (float)PI_D * 440.0f * (float)k / (float)g->sr);
+    analyzer_push(&ae, sig, se);
+    analyzer_push(&ap, sig, sa);
+    /* refused blocks leave the bridge idle: the good block is taken at once */
+    for (r = 0; r < 4; ++r) {
+        memcpy(big, sa, sizeof(Complex) * (size_t)n_freqs);
+        if (r == 0) big[3].r = (float)NAN;
+        else if (r == 1) big[5].i = -(float)INFINITY;
+        else if (r == 2) big[7].r = 1.0e21f;
+        else big[n_freqs - 1].i = -3.0e20f;
+        CHECK(ainr_bridge_begin(b, se, big) == -1 && ainr_bridge_begin(b, big, sa) == -1, 2);
+    }
+    CHECK(run_hop(b, &m, se, sa, out) == 0, 3);
+    ainr_bridge_reset(b);
+    model_reset(&m, LANE_APPLY, 1);
+    for (t = 0; t < 60; ++t) {
+        AinrBridgeFrame f;
+        analyzer_push(&ae, sig + t * hop, big);
+        if (t == 20)
+            for (k = 0; k < n_freqs; ++k) { big[k].r = (k & 1) ? -limit : limit; big[k].i = (k & 1) ? limit : -limit; }
+        analyzer_push(&ap, sig + t * hop, sa);
+        if (ainr_bridge_begin(b, big, sa) != 0) { failed_after += t >= 20; continue; }
+        while ((r = ainr_bridge_model_begin(b, &f)) == 1) {
+            for (k = 0; k < AINR_BRIDGE_MODEL_BINS; ++k) {
+                float v[4] = { f.estimate_spec[k].r, f.estimate_spec[k].i, f.apply_spec[k].r, f.apply_spec[k].i };
+                int j;
+                for (j = 0; j < 4; ++j)
+                    if (!(fabsf(v[j]) <= 2.95147905e20f)) handed_over_limit = 1;
+            }
+            model_run(&m, &f);
+            CHECK(ainr_bridge_model_end(b) == 0, 4);
+        }
+        if (r < 0 || ainr_bridge_finish(b, out) != 0) { failed_after += t >= 20; continue; }
+        if (t == 20) skipped_hop = 1;
+        for (k = 0; k < hop; ++k) if (t > 26 && !isfinite(out[k])) nonfinite_after = 1;
+    }
+    CHECK(handed_over_limit == 0, 5);               /* the model is never handed a frame beyond the limit */
+    CHECK(skipped_hop == 1 && failed_after == 0, 6);   /* the hop completes and so does every hop after it */
+    CHECK(nonfinite_after == 0, 7);
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
+    ainr_bridge_destroy(b);
+    return 0;
+}
+
 /* ---- reset_synthesis ------------------------------------------------------------------------ */
 #define RS_HOPS 100
 #define RS_AT 41   /* odd: the 48 kHz FIFO holds leftover samples at the start of this hop on every grid that has them */
@@ -637,6 +698,10 @@ int main(void) {
         }
     rc = run_contract();
     if (rc) { fprintf(stderr, "ainr_bridge: contract rows FAIL (%d)\n", rc); return 1; }
+    for (g = 0; g < N_GRIDS; ++g) {
+        rc = run_range_grid(&GRIDS[g]);
+        if (rc) { fprintf(stderr, "ainr_bridge: %d/%d range rows FAIL (%d)\n", GRIDS[g].sr, GRIDS[g].fft, rc); return 1; }
+    }
     for (g = 0; g < N_GRIDS; ++g) {
         rc = run_reset_synthesis(&GRIDS[g], 1);
         if (rc) { fprintf(stderr, "ainr_bridge: %d/%d reset_synthesis FAIL (%d)\n", GRIDS[g].sr, GRIDS[g].fft, rc); return 1; }

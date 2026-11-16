@@ -839,6 +839,45 @@ static int run_other_grid_refusal(const DFN2Grid *model) {
     return 0;
 }
 
+/* A host block with a non-finite or enormous bin is refused with the bridge idle; bins just under the bridge's bound,
+ * in phase over the grid, are taken and the frames they inflate on the model grid are not run. Neither wedges the
+ * bridge: every other hop returns 0 and the output is finite once the bad samples have left the filters. */
+static int run_range(const Grid *g) {
+    DfnRateBridgeConfig cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
+    Analyzer ae, ap;
+    static Complex se[MAX_FFT / 2 + 1], sa[MAX_FFT / 2 + 1];
+    static float sig[60 * (MAX_FFT / 2)], out[MAX_FFT / 2];
+    const int hop = g->fft / 2, n_freqs = g->fft / 2 + 1;
+    int t, k, refused = 0, failed = 0, nonfinite = 0;
+
+    if (!b || analyzer_init(&ae, g->fft) != 0 || analyzer_init(&ap, g->fft) != 0) return 1;
+    for (k = 0; k < 60 * hop; ++k) sig[k] = 0.3f * sinf(6.2831853f * 440.0f * (float)k / (float)g->sr);
+    for (t = 0; t < 60; ++t) {
+        analyzer_push(&ae, sig + t * hop, se);
+        analyzer_push(&ap, sig + t * hop, sa);
+        if (t == 20)
+            for (k = 0; k < n_freqs; ++k) {
+                se[k].r = sa[k].r = (k & 1) ? -2.9e20f : 2.9e20f;
+                se[k].i = sa[k].i = (k & 1) ? 2.9e20f : -2.9e20f;
+            }
+        if (t == 30) se[5].r = (float)NAN;
+        if (t == 40) sa[9].i = 1.0e30f;
+        if (dfn_rate_bridge_process(b, se, sa, out) != 0) {
+            if (t == 30 || t == 40) ++refused;
+            else ++failed;
+        } else if (t > 28 && t != 31) {
+            for (k = 0; k < hop; ++k) if (!isfinite(out[k])) nonfinite = 1;
+        }
+    }
+    fft_destroy(ae.fft);
+    fft_destroy(ap.fft);
+    dfn_rate_bridge_destroy(b);
+    if (refused != 2) return 2;
+    if (failed) return 3;
+    return nonfinite ? 4 : 0;
+}
+
 int main(void) {
     int rc, i;
     DFN2_REQUIRE_VARIANT_LINK();   /* does not link against an archive of the other DFN2 variant */
@@ -921,6 +960,10 @@ int main(void) {
                     GRIDS[i].sr, GRIDS[i].fft, rc);
             return 1;
         }
+    }
+    for (i = 0; i < N_GRIDS; ++i) {
+        rc = run_range(&GRIDS[i]);
+        if (rc) { fprintf(stderr, "rate bridge range row grid %d/%d failed: %d\n", GRIDS[i].sr, GRIDS[i].fft, rc); return 1; }
     }
     puts("dfn_rate_bridge: PASS");
     return 0;

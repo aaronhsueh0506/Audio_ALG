@@ -419,9 +419,22 @@ static int push_up(AinrBridge *b, AudioResampler *up, const float *hop, float *f
     return produced;
 }
 
+/* 1 when every part of the n bins is finite and at most 2^68 in magnitude. */
+static int bins_in_range(const Complex *x, int n) {
+    const float *f = (const float *)x;
+    int k;
+    for (k = 0; k < 2 * n; ++k) {
+        uint32_t bits;
+        memcpy(&bits, &f[k], sizeof bits);
+        if ((bits & 0x7FFFFFFFu) > AINR_BRIDGE_BIN_LIMIT_BITS) return 0;
+    }
+    return 1;
+}
+
 int ainr_bridge_begin(AinrBridge *b, const Complex *estimate_spec, const Complex *apply_spec) {
     int produced_e, produced_p;
     if (!b || !estimate_spec || !apply_spec || b->phase != 0) return -1;
+    if (!bins_in_range(estimate_spec, b->fft_n / 2 + 1) || !bins_in_range(apply_spec, b->fft_n / 2 + 1)) return -1;
     ac_istft_push(b->synth_e, estimate_spec, b->e_hop);
     ac_istft_push(b->synth_p, apply_spec, b->p_hop);
     produced_e = push_up(b, b->up_e, b->e_hop, b->fifo_e);
@@ -435,19 +448,24 @@ int ainr_bridge_begin(AinrBridge *b, const Complex *estimate_spec, const Complex
 
 int ainr_bridge_model_begin(AinrBridge *b, AinrBridgeFrame *frame) {
     if (!b || !frame || b->phase != 1) return -1;
-    if (b->fill < B48_HOP) return 0;
-    /* 48 kHz sqrt-Hann 1024/512 analysis; each STFT object keeps its lane's history. */
-    ac_stft_push(b->stft_e, b->fifo_e, b->spec_e48);
-    ac_stft_push(b->stft_p, b->fifo_p, b->spec_p48);
-    b->fill -= B48_HOP;
-    memmove(b->fifo_e, b->fifo_e + B48_HOP, (size_t)b->fill * sizeof(float));
-    memmove(b->fifo_p, b->fifo_p + B48_HOP, (size_t)b->fill * sizeof(float));
-    memset(b->out48, 0, (size_t)B48_BINS * sizeof(Complex));
-    frame->estimate_spec = b->spec_e48;
-    frame->apply_spec = b->spec_p48;
-    frame->out_spec = b->out48;
-    b->phase = 2;
-    return 1;
+    while (b->fill >= B48_HOP) {
+        /* 48 kHz sqrt-Hann 1024/512 analysis; each STFT object keeps its lane's history. */
+        ac_stft_push(b->stft_e, b->fifo_e, b->spec_e48);
+        ac_stft_push(b->stft_p, b->fifo_p, b->spec_p48);
+        b->fill -= B48_HOP;
+        memmove(b->fifo_e, b->fifo_e + B48_HOP, (size_t)b->fill * sizeof(float));
+        memmove(b->fifo_p, b->fifo_p + B48_HOP, (size_t)b->fill * sizeof(float));
+        memset(b->out48, 0, (size_t)B48_BINS * sizeof(Complex));
+        b->phase = 2;
+        if (bins_in_range(b->spec_e48, B48_BINS) && bins_in_range(b->spec_p48, B48_BINS)) {
+            frame->estimate_spec = b->spec_e48;
+            frame->apply_spec = b->spec_p48;
+            frame->out_spec = b->out48;
+            return 1;
+        }
+        if (ainr_bridge_model_end(b) != 0) return -1;   /* out_spec is zero: the model never sees this frame */
+    }
+    return 0;
 }
 
 /* The frame's out_spec -> 48 kHz WOLA -> resample down into the host FIFO. */

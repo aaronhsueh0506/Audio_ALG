@@ -62,6 +62,9 @@ extern "C" {
 #define AINR_BRIDGE_MODEL_FFT  1024
 #define AINR_BRIDGE_MODEL_HOP  512
 #define AINR_BRIDGE_MODEL_BINS 513
+/* Bit pattern of 2^68, the largest |bin| (audio scale) the bridge takes or hands out: the 2^63 bound of a model that
+ * scales its spectra by 1/32. A non-finite bin compares above it. */
+#define AINR_BRIDGE_BIN_LIMIT_BITS 0x61800000u
 /* Largest accepted lookahead_frames. */
 #define AINR_BRIDGE_MAX_LOOKAHEAD 16
 
@@ -111,13 +114,14 @@ void ainr_bridge_reset(AinrBridge *b);
  * while a hop is in progress (nothing is cleared). */
 int ainr_bridge_reset_synthesis(AinrBridge *b);
 
-/* Takes the host spectra (n_freqs bins each). 0, or -1 on NULL arguments or a hop already begun. */
+/* Takes the host spectra (n_freqs bins each). 0, or -1 on NULL arguments, a hop already begun or a bin that is
+ * non-finite or beyond AINR_BRIDGE_BIN_LIMIT_BITS (the bridge is left idle). */
 int ainr_bridge_begin(AinrBridge *b, const Complex *estimate_spec, const Complex *apply_spec);
 /* 1 with the open frame in *frame, 0 when the hop has no further frame, -1 when no hop is begun or a frame is
- * still open. */
+ * still open. A frame with a bin beyond AINR_BRIDGE_BIN_LIMIT_BITS (the resamplers and windows can add gain) is not
+ * handed out: it is closed with a zero out_spec and the next one is fetched. */
 int ainr_bridge_model_begin(AinrBridge *b, AinrBridgeFrame *frame);
-/* 0, or -1 when no frame is open. A frame must be answered with a full out_spec (zero until written): the bridge
- * does not skip or repeat frames. */
+/* 0, or -1 when no frame is open. A frame must be answered with a full out_spec (zero until written). */
 int ainr_bridge_model_end(AinrBridge *b);
 /* Writes hop_size floats; 0, or -1 (nothing changes) on NULL, no hop begun, a frame still open or a due frame not
  * fetched. After a -1 from a frame the caller cannot answer, ainr_bridge_reset() is the way out. */
