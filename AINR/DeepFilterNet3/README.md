@@ -36,7 +36,7 @@ when the existing noisy/clean corpus already satisfies the 48 kHz contract.
 | State layout version | 8 | 9 |
 
 The audio delay is the sample shift on the identity path, with zero-filled
-streaming warm-up, unit ERB mask and a unit current-frame DF tap. It excludes
+streaming start, unit ERB mask and a unit current-frame DF tap. It excludes
 accelerator execution, external queues and resampling. Whole-clip Python
 inference uses centered STFT at clip boundaries; its boundary framing is not
 the streaming C timing reference.
@@ -53,8 +53,8 @@ Specific to DFN3:
 - DFN3 is a parallel split: the deep filter reads the raw spectrum, so output
   frame `t` needs the heads of `t` (input up to `t+M`) and the spectrum up to
   `t+D`. The output is `max(M, D)` frames behind the input and the end-to-end
-  latency is `1 + max(M, D)` hops. The first M hops are warm-up frames (the
-  accelerator runs, its heads are discarded and the state restarts); with `D > M` the next `D - M` hops run the accelerator
+  latency is `1 + max(M, D)` hops. The first M hops after init or reset run no accelerator job (the
+  graph window is not complete yet); with `D > M` the next `D - M` hops run the accelerator
   and emit nothing, and the heads wait in the ring until their output frame.
 - In C the pair is two fields of `DFN3GridSpec` (`mask_lookahead`, `df_lookahead`); `dfn3_grid_make()` refuses a pair outside the
   ranges with `DFN3_GRID_ERR_MASK_LOOKAHEAD` / `DFN3_GRID_ERR_DF_LOOKAHEAD`. Nothing is selected at build time and there is no
@@ -124,7 +124,7 @@ and C descriptors use layout **9**, so the DFN2 layout-8 graph is refused.
 - `dfn3_process.c/.h`: `DFN3GridSpec` / `dfn3_grid_make()`, and the independent feature, enhancement and band-split reference
   on spectra.
 - `dfn3_model_io.c/.h`: feature windows (carved from the caller's block), accelerator bindings and state checks.
-- `dfn3_prepost.c/.h`: static-pool/host lifecycle, frequency domain only, delayed head handoff, warm-up frames and reset/bypass handling. The
+- `dfn3_prepost.c/.h`: static-pool/host lifecycle, frequency domain only, delayed head handoff, the hops without a graph window and reset/bypass handling. The
   application frames with audiolib (`AcStft` / `AcIstft`, sqrt-Hann, center 0, `AC_OLA_ACCUMULATE`, `spec_scale = grid.stft_scale`,
   `ispec_scale = grid.stft_unscale`).
 
@@ -156,12 +156,12 @@ The per-hop order is DFN2's (see [`../DeepFilterNet2/README.md`](../DeepFilterNe
 names: `ac_stft_push_planar()`, `dfn3_prepost_pre_process_freq()` (1 on every hop), `frame_open()`, the model, `frame_finish()`
 (`frame_bypass()` on a refusal), then `dfn3_prepost_post_process_freq()` and `ac_istft_push_planar()` on every hop (the zero
 spectrum before the first output yields zeros); `dfn3_model_run_frame()` wraps the middle three. DFN3 has no `frames_per_call`. The
-first `mask_lookahead` hops after init or reset are warm-up frames: the model runs on them, `frame_finish()` / `frame_bypass()`
-discard their heads, zero the registered state and advance the generation by one, so the first real frame starts from zero state and
-the audio is unchanged. The recurrent state (`h_gru`,
+first `mask_lookahead` hops after init or reset have no complete graph window: `dfn3_prepost_pre_process_freq()` returns 0, no
+accelerator job runs and no frame opens (do not call `frame_open()` / `frame_finish()`), the output spectrum is zero with `valid` 0, and the
+generation does not move; the first job starts from the zero state the registration holds, and the audio is unchanged. The recurrent state (`h_gru`,
 `df_convp_history`) is the application's under the same rules as DFN2: both pairs registered or none, zeroed at init and
 reset, finite-checked at every commit, state output at the address of its input; the state generation
-(`dfn3_prepost_state_generation()`, 1 after init) advances on every reset, warm-up frame and refused commit. `DFN3_PREPOST_CARVE_VERSION` is 9.
+(`dfn3_prepost_state_generation()`, 1 after init) advances on every reset and refused commit. `DFN3_PREPOST_CARVE_VERSION` is 9.
 
 Use `dfn3_enhance_spectrum_stream()` at the accelerator boundary; `dfn3_enhance_spectrum()` is
 the aligned arithmetic reference. The streaming API applies each head to the

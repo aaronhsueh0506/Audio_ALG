@@ -102,8 +102,7 @@ make -C AINR/RNNoise-ERB test   # ERB table, feature contract, features, framing
       checkpoint).
 - [ ] The recurrent state of the AINR classes (DeepFilterNet2, DeepFilterNet3, GTCRN, RNNoise-ERB) belongs to the application:
       registration is all-or-none (a pointer with a count of 0, or a count with a NULL pointer, is refused), the state
-      generation is 1 after init and advances on a reset, on every DeepFilterNet3 warm-up frame (the first
-      `mask_lookahead` hops, one flow on every hop, heads discarded, audio unchanged; DeepFilterNet2 opens no frame for them and moves nothing) and on a refused finish or validation, and a
+      generation is 1 after init and advances on a reset and on a refused finish or validation (the first `mask_lookahead` hops of DeepFilterNet2 and DeepFilterNet3 run no accelerator job and move nothing), and a
       refusal zeroes any registered state (`tests/test_c_prepost.c` for DeepFilterNet2 and GTCRN, `tests/test_dfn3_stream.c` for DeepFilterNet3,
       `RNNoise-ERB/test/test_rnnoise_features.c` for RNNoise-ERB, and `tests/test_dfn2_prepost_c.py::
       test_state_generation_counts_every_zeroing_and_nothing_else`) pass.

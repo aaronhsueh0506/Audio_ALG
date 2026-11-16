@@ -16,7 +16,7 @@
 <li><a href="#section-3">訊號泳道圖</a></li>
 <li><a href="#section-4">I/O 表</a></li>
 <li><a href="#section-5">State 表</a></li>
-<li><a href="#section-6">延遲與 warm-up</a></li>
+<li><a href="#section-6">延遲與起始 hop</a></li>
 <li><a href="#section-7">函式清單：公開 vs 內部</a></li>
 <li><a href="#section-8">參數表</a></li>
 </ul></details>
@@ -42,10 +42,10 @@
 <h2 id="section-3">訊號泳道圖</h2>
 <pre>current input frame     0             1                2
 host feature window     [0,0,F0]       [0,F0,F1]        [F0,F1,F2]
-graph invocation        warm-up       heads[0]          heads[1]
+graph invocation        none          heads[0]          heads[1]
 enhanced spectrum       invalid(0)    spectrum[0]       spectrum[1]
 AcIstft (application)   push zeros    first OLA hop     next OLA hop</pre>
-<p>出貨 1/1（M = 1）：hop 0 是暖機幀，模型照跑、heads 丟棄、登錄 state 歸零，generation 加 1；零頻譜進 <code>AC_OLA_ACCUMULATE</code> 的 <code>AcIstft</code> 得零 hop。</p>
+<p>出貨 1/1（M = 1）：hop 0 沒有完整的 graph window：<code>pre_process_freq</code> 回 0，不跑加速器、不開 frame，state generation 不動，首個 job 從登錄的零 state 開始；零頻譜進 <code>AC_OLA_ACCUMULATE</code> 的 <code>AcIstft</code> 得零 hop。</p>
 
 <h2 id="section-4">I/O 表</h2>
 <p>所有 graph tensors 為 float32，以下是單路 batch-1 部署 shape。每次 invocation 產生一個目標 frame（512 samples / 10.67 ms 的 hop）；三幀 feature window 由函式庫保存。</p>
@@ -53,10 +53,10 @@ AcIstft (application)   push zeros    first OLA hop     next OLA hop</pre>
 
 <h2 id="section-5">State 表</h2>
 <table><tr><th>跨 hop 狀態</th><th>Shape / 大小</th><th>保存者</th></tr><tr><td>GRU hidden</td><td>1280 floats = 5120 bytes</td><td>應用端：float host 在 config 註冊；板端由加速器持有；graph input/output 同位址</td></tr><tr><td>DF pathway window</td><td>30720 floats = 122880 bytes</td><td>同上；graph 內 Slice/Concat 更新</td></tr><tr><td>feature windows</td><td>ERB 96 floats、complex 576 floats</td><td>pool 內的 model_io block 滑動，runtime 唯讀</td></tr><tr><td>normalizers、raw noisy／DF rings、高頻延遲 ring、feature scratch</td><td>隨 grid 決定</td><td>pool 內的 state block；不進 graph</td></tr></table>
-<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>（DFN2 layout 8 不相容）、<code>DFN3_PREPOST_CARVE_VERSION = 9</code>。<code>get_mem_size</code> 實測（出貨 grid 48000/1024、1/1、64-bit 本機）：pool 90,384 bytes，其中 state block（<code>dfn3_state_mem_size()</code>）65,808、model_io block（<code>dfn3_model_io_mem_size()</code>）2,688；pool 不含 ERB 矩陣、註冊的 state 與應用端的 <code>AcStft</code>/<code>AcIstft</code>；<code>sizeof(DFN3State)</code> = 304 bytes（只有標頭）。ring 深度隨 pair 變，pool 也變：ring 6（1/0、2/1）102,416、ring 7（2/0）114,448。單路 C descriptor 不能拿 batch-N graph 代替。state generation 在 init 後為 1，reset、每個暖機幀與被拒的 <code>frame_finish</code> 各加 1（已註冊的 state 同時歸零）；板端 runtime 偵測到 generation 改變，須把自己的量化 state 重填成量化後的 0。</p>
+<p><code>DFN3_MODEL_IO_LAYOUT_VERSION = 9</code>（DFN2 layout 8 不相容）、<code>DFN3_PREPOST_CARVE_VERSION = 9</code>。<code>get_mem_size</code> 實測（出貨 grid 48000/1024、1/1、64-bit 本機）：pool 90,384 bytes，其中 state block（<code>dfn3_state_mem_size()</code>）65,808、model_io block（<code>dfn3_model_io_mem_size()</code>）2,688；pool 不含 ERB 矩陣、註冊的 state 與應用端的 <code>AcStft</code>/<code>AcIstft</code>；<code>sizeof(DFN3State)</code> = 304 bytes（只有標頭）。ring 深度隨 pair 變，pool 也變：ring 6（1/0、2/1）102,416、ring 7（2/0）114,448。單路 C descriptor 不能拿 batch-N graph 代替。state generation 在 init 後為 1，reset 與被拒的 <code>frame_finish</code> 各加 1（已註冊的 state 同時歸零）；板端 runtime 偵測到 generation 改變，須把自己的量化 state 重填成量化後的 0。</p>
 
-<h2 id="section-6">延遲與 warm-up</h2>
-<p>mask／DF lookahead 是 <code>DFN3GridSpec</code> 的兩個欄位 <code>mask_lookahead</code>（M，0..2）與 <code>df_lookahead</code>（D，0..<code>df_order</code>−1，order 5 時 0..4），15 個 pair（規則見 <a href="../../dfn2/reference/core.html#memory">DeepFilterNet2 頻域與模型契約</a>），出貨為 1/1；函式庫沒有 pair 常數，也不在建置時選 pair，<code>dfn3_grid_make()</code> 只拒絕範圍外的 pair；與 checkpoint 不符的 pair 由 <code>dfn3_model_io_descriptor_validate()</code>（<code>dfn3_model_run_frame()</code> 內部會呼叫）與 <code>dfn3_prepost_init_ex()</code> 對照呼叫端事先保存的 <code>DFN3PrepostMemReq</code>（<code>build_flags_hash</code>）拒絕。兩條路平行，模型延遲 <code>grid.output_delay</code> = max(M, D) hops（DFN2 是相加），ring 深度 <code>grid.ring</code> = <code>df_order</code> + max(M, D) − D。經應用端 <code>AcStft</code>/<code>AcIstft</code> 的 identity 路徑再加一個 hop，總延遲 1 + max(M, D) hops；出貨 1/1 為 1024 samples = 2 hops = 21.33 ms（不含推論時間或外部排隊）。<code>pre_process_freq</code> 每 hop 回 1；前 M 個 hop 是暖機幀（出貨：第一 hop；heads 丟棄、state 歸零，首個真幀從零 state 開始，音訊不變，串流開頭多 M 次加速器呼叫，板端每個暖機幀後重載量化零）；D &gt; M 時，其後幾次加速器照跑但還沒有輸出，heads 在 ring 裡等；<code>valid = 0</code> 的拍數是 max(M, D)，其間頻譜為零，合成端每 hop 無條件 push。<code>frame_bypass</code> 使用 unit 高頻 gain 和 unit current DF tap，維持相同時序。有限 clip 的精確尾端應補模型 feature 的零 padding；持續餵零音訊只是在延續 live stream。</p>
+<h2 id="section-6">延遲與起始 hop</h2>
+<p>mask／DF lookahead 是 <code>DFN3GridSpec</code> 的兩個欄位 <code>mask_lookahead</code>（M，0..2）與 <code>df_lookahead</code>（D，0..<code>df_order</code>−1，order 5 時 0..4），15 個 pair（規則見 <a href="../../dfn2/reference/core.html#memory">DeepFilterNet2 頻域與模型契約</a>），出貨為 1/1；函式庫沒有 pair 常數，也不在建置時選 pair，<code>dfn3_grid_make()</code> 只拒絕範圍外的 pair；與 checkpoint 不符的 pair 由 <code>dfn3_model_io_descriptor_validate()</code>（<code>dfn3_model_run_frame()</code> 內部會呼叫）與 <code>dfn3_prepost_init_ex()</code> 對照呼叫端事先保存的 <code>DFN3PrepostMemReq</code>（<code>build_flags_hash</code>）拒絕。兩條路平行，模型延遲 <code>grid.output_delay</code> = max(M, D) hops（DFN2 是相加），ring 深度 <code>grid.ring</code> = <code>df_order</code> + max(M, D) − D。經應用端 <code>AcStft</code>/<code>AcIstft</code> 的 identity 路徑再加一個 hop，總延遲 1 + max(M, D) hops；出貨 1/1 為 1024 samples = 2 hops = 21.33 ms（不含推論時間或外部排隊）。<code>pre_process_freq</code> 在 init 或 reset 後的前 M 個 hop 回 0（出貨：第一 hop）：graph window 未滿，不呼叫加速器、不開 frame，頻譜為零、<code>valid</code> = 0，首個 job 從零 state 開始，音訊不變；其後每 hop 回 1；D &gt; M 時，其後幾次加速器照跑但還沒有輸出，heads 在 ring 裡等；<code>valid = 0</code> 的拍數是 max(M, D)，其間頻譜為零，合成端每 hop 無條件 push。<code>frame_bypass</code> 使用 unit 高頻 gain 和 unit current DF tap，維持相同時序。有限 clip 的精確尾端應補模型 feature 的零 padding；持續餵零音訊只是在延續 live stream。</p>
 
 <h2 id="section-7">函式清單：公開 vs 內部</h2>
 <div class="tbl"><table>

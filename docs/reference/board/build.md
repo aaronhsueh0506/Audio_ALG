@@ -199,7 +199,7 @@ The DeepFilterNet2, Align-ULCNet and DeepVQE-S libraries are frequency domain on
 grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on a compile line. The grid is a run-time value: a sample
 passes `{sr, fft, hop_in}` (`AinrConfig` / `AiaecConfig`) to its model stream, which resolves the grid, `N = hop_in / (fft / 2)`, the graph path
 and (DFN2) ERB matrices from its catalog and reports the graph and the stream timing in the `AinrInfo` / `AiaecInfo` that `*_init()` fills
-(`AinrInfo`: `graph_path`, `queue_frames`; `AiaecInfo`: `graph_path`, `trim_samples`, `queue_frames`, `tail_zero_blocks`; no port list). The graph's wiring (signal, head and state shapes, one row per
+(`AinrInfo`: `graph_path`, `queue_frames`; `AiaecInfo`: `graph_path` only; no port list). The graph's wiring (signal, head and state shapes, one row per
 registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`,
 `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
 `stream/common/graph_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
