@@ -127,7 +127,7 @@ DFN2 board sample does not go through this folder: it picks the grid and the pai
   `stream/ainr/dfn2` (`dfn2_stream`, the model stream the hop drives) and `stream/ainr/bridge` (`ainr_bridge`).
   A unit that includes `dfn_hop.h` or `dfn_hop_pool.h` compiles with
   `-I stream/ainr/dfn2 -I stream/ainr/bridge -I stream/common` (`DFN_HOP_INC` in the two Makefiles);
-  `dfn2_stream.o` and `ainr_bridge.o` are members of `libaudio_pipeline_dfn.a` / `libdfn_res_stage.a`
+  `dfn2_stream.o` and `ainr_bridge.o` are members of `libaudio_pipeline_dfn.a` (the `pipelines/` and `pipelines/4ch/` builds)
   (built with `-DDFN2_STREAM_NO_STDIO` under `NO_STDIO=1`, so the archive holds no file loader).
 - The 4-channel example also needs the array instance of lib/aec (`aec.h`, `AecConfig.n_mics = 4`, in `libaec.a`) and the sample objects
   `array_sample_beam` and `array_sample_driver` in `4ch/`, which are linked into the program and are not part of

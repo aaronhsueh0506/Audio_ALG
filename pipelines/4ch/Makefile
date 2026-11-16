@@ -298,7 +298,7 @@ OBJ_ROOT ?= obj
 BIN_ROOT ?= bin
 OBJ_DIR := $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 BIN_DIR := $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
-DFN_PIPELINE_LIB := $(BIN_DIR)/libdfn_res_stage.a
+DFN_PIPELINE_LIB := $(BIN_DIR)/libaudio_pipeline_dfn.a
 
 SAMPLE_BEAM_OBJ := $(OBJ_DIR)/array_sample_beam.o
 DFN_PIPELINE_OBJS := $(OBJ_DIR)/ainr_bridge.o \
@@ -405,7 +405,7 @@ $(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c array_sample_beam.h te
 $(DFN_PIPELINE_LIB): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
 	  $(RANLIB) "$$t" && mv -f "$$t" $@
-	@echo "libdfn_res_stage.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
+	@echo "libaudio_pipeline_dfn.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
 ifneq ($(COMMON_LIB),)
 .PHONY: all test libs \

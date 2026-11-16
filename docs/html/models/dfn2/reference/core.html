@@ -521,7 +521,7 @@ make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
 <code>WERROR=1</code> 會傳到 compiler 並進組態簽章。對應的 AIAEC archive 是 <code>libaiaec_prepost.a</code>。</li>
 <li><b>grid、pair 與 N 都不是建置選項</b>:archive 與它們無關,應用端以 <code>dfn2_grid_make()</code> 在執行期給定。建置只決定 variant:<code>-DDFN2_MASK_ONLY</code> 要加在<b>每一個</b>編譯單元(<code>make -C AINR lib</code> 建完整版),不同 variant 的目標檔連結失敗(符號 <code>dfn2_variant_{full|mask_only}</code>)。完整規則、各 grid 的大小與限制見 <a href="grid.html">DFN2 grid 與 ERB</a>。</li>
 <li>兩支 DFN2 pipeline<b>不</b>連這個 archive:<code>pipelines/Makefile</code> 直接把三個 DFN2 TU 編進
-<code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 建置）或 <code>libdfn_res_stage.a</code>（<code>4ch/</code> 建置）。</li>
+<code>libaudio_pipeline_dfn.a</code>（<code>pipelines/</code> 與 <code>pipelines/4ch/</code> 的建置同名）。</li>
 </ul>
 
 <h2 id="section-14">bypass identity 的 partition of unity 檢查</h2>

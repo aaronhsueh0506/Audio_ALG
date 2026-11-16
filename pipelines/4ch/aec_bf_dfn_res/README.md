@@ -89,7 +89,7 @@ builds and runs `test_4ch_dfn`, then the skeleton (default, `--delay-num-filters
 `--sample-rate 48000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that `--sample-rate 16000Hz`, `--sample-rate 8000` and
 `--atten-lim 12dB` exit with 2, and that a 32 kHz model grid (not in the table: the AEC has no 32 kHz grid) is a rejected argument (exit 2).
 
-`libdfn_res_stage.a` holds the DFN2 model stream (`dfn2_stream.o`), the sample-rate bridge (`ainr_bridge.o`), the DFN2 host
+`libaudio_pipeline_dfn.a` holds the DFN2 model stream (`dfn2_stream.o`), the sample-rate bridge (`ainr_bridge.o`), the DFN2 host
 pre/post objects; link it ahead of the producer archives (the SRP/BF archives of audiolib, `libaec` (which holds the array),
 `libanr` and `libaudio_common`). The
 sample objects `array_sample_beam.o` and `array_sample_driver.o` are linked into

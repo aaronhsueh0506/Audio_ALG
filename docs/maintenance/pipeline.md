@@ -209,7 +209,7 @@ Pass conditions:
       cumulative frame count, the impulse-pinned added delay (shipped 1/1 pair: 672 / 629 native
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
-- [ ] The build produces `libdfn_res_stage.a` (carrying
+- [ ] The build produces `libaudio_pipeline_dfn.a` (carrying
       `ainr_bridge.o` and `dfn2_stream.o`); `AEC_LAYOUT_VERSION` is 5 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
