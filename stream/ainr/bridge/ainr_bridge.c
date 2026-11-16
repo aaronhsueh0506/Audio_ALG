@@ -275,7 +275,7 @@ AinrBridge *ainr_bridge_init_ex(void *mem, size_t bytes, const AinrBridgeConfig 
     Resolved r;
     AinrBridgeMemReq req;
     AinrBridge *b;
-    unsigned char *cursor;
+    unsigned char *cursor, *end;
     int lat_up, lat_down;
     long long sixths;
     if (!mem || (uintptr_t)mem % BRIDGE_ALIGN != 0u || resolve(cfg, &r) != 0)
@@ -288,23 +288,27 @@ AinrBridge *ainr_bridge_init_ex(void *mem, size_t bytes, const AinrBridgeConfig 
     b->fft_n = r.fft_n;
     b->hop_n = r.hop_n;
     cursor = (unsigned char *)mem + align_up(sizeof(*b));
+    end = (unsigned char *)mem + r.bytes;
+    /* The carve order is the ADD_REGION order of resolve(); a region missing from either list stops here. */
 #define TAKE(ptr_, type_, bytes_) do { \
+        size_t take_ = align_up((size_t)(bytes_)); \
+        if (!take_ || (size_t)(end - cursor) < take_) return NULL; \
         ptr_ = (type_)cursor; \
-        cursor += align_up((size_t)(bytes_)); \
+        cursor += take_; \
     } while (0)
-    b->fft_n_handle = fft_init(cursor, r.fft_n_bytes, r.fft_n);
-    cursor += align_up(r.fft_n_bytes);
-    b->fft48 = fft_init(cursor, r.fft48_bytes, B48_FFT);
-    cursor += align_up(r.fft48_bytes);
-    b->up_e = audio_resampler_init(cursor, r.up_bytes, cfg->sample_rate,
-                                   B48_RATE, 1);
-    cursor += align_up(r.up_bytes);
-    b->up_p = audio_resampler_init(cursor, r.up_bytes, cfg->sample_rate,
-                                   B48_RATE, 1);
-    cursor += align_up(r.up_bytes);
-    b->down = audio_resampler_init(cursor, r.down_bytes, B48_RATE,
-                                   cfg->sample_rate, 1);
-    cursor += align_up(r.down_bytes);
+    {
+        void *region;
+        TAKE(region, void *, r.fft_n_bytes);
+        b->fft_n_handle = fft_init(region, r.fft_n_bytes, r.fft_n);
+        TAKE(region, void *, r.fft48_bytes);
+        b->fft48 = fft_init(region, r.fft48_bytes, B48_FFT);
+        TAKE(region, void *, r.up_bytes);
+        b->up_e = audio_resampler_init(region, r.up_bytes, cfg->sample_rate, B48_RATE, 1);
+        TAKE(region, void *, r.up_bytes);
+        b->up_p = audio_resampler_init(region, r.up_bytes, cfg->sample_rate, B48_RATE, 1);
+        TAKE(region, void *, r.down_bytes);
+        b->down = audio_resampler_init(region, r.down_bytes, B48_RATE, cfg->sample_rate, 1);
+    }
     if (!b->fft_n_handle || !b->fft48 || !b->up_e || !b->up_p || !b->down)
         return NULL;
     TAKE(b->win_n, float *, (size_t)r.fft_n * sizeof(float));
@@ -343,6 +347,7 @@ AinrBridge *ainr_bridge_init_ex(void *mem, size_t bytes, const AinrBridgeConfig 
     TAKE(b->spec_p48, Complex *, (size_t)B48_BINS * sizeof(Complex));
     TAKE(b->out48, Complex *, (size_t)B48_BINS * sizeof(Complex));
 #undef TAKE
+    if (cursor != end) return NULL;
 
     b->prefill = calibrate_prefill(b);
     lat_up = audio_resampler_latency_input_frames(b->up_e);
