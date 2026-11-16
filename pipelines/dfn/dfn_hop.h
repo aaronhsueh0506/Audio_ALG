@@ -190,7 +190,9 @@ static inline int dfn_hop_close_frame(DfnHop* h, int model_rc, Complex* out) {
 }
 
 /* Starts a hop on the host-grid spectra E and P (borrowed for this call only). A non-finite bin, or one beyond the
- * model-scale bound the direct path enforces, is refused with the hop still idle (DFN_HOP_INVALID). */
+ * model-scale bound the direct path enforces (|bin| * scale > 2^63, i.e. 2^68 at the host grid), is refused with the hop
+ * still idle (DFN_HOP_INVALID). Bins just under the bound (in phase over the grid, from about 2^66) can still reach
+ * the model grid beyond it: nn_begin then refuses the frame and the recovery is the reset described above. */
 static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
     if (!h || !e || !p) return DFN_HOP_INVALID;
     if (h->phase != 0) return DFN_HOP_SEQUENCE_ERROR;
