@@ -113,15 +113,6 @@ CPPFLAGS ?=
 CXXFLAGS ?=
 LDFLAGS ?=
 
-define require_bool
-ifneq ($$(words $$($(1))),1)
-$$(error $(1) must be exactly 0 or 1, got '$$($(1))')
-endif
-ifneq ($$(filter-out 0 1,$$($(1))),)
-$$(error $(1) must be exactly 0 or 1, got '$$($(1))')
-endif
-endef
-
 ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
@@ -134,12 +125,12 @@ ifeq ($(filter print-%,$(MAKECMDGOALS)),)
 $(info Audio_ALG/4ch: FFT backend = $(BACKEND))
 endif
 
-$(eval $(call require_bool,SIMD))
-$(eval $(call require_bool,PROFILE))
-$(eval $(call require_bool,WERROR))
-$(eval $(call require_bool,NO_STDIO))
-$(eval $(call require_bool,DEBUG))
-$(eval $(call require_bool,TOOLCHAIN_CHECK))
+$(eval $(call CHECK_01,SIMD))
+$(eval $(call CHECK_01,PROFILE))
+$(eval $(call CHECK_01,WERROR))
+$(eval $(call CHECK_01,NO_STDIO))
+$(eval $(call CHECK_01,DEBUG))
+$(eval $(call CHECK_01,TOOLCHAIN_CHECK))
 
 # These values become shell command arguments in the two-phase producer
 # resolver.  Match the sibling Makefiles' supported surface and reject the

@@ -11,12 +11,8 @@ BACKEND ?= ne10
 ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
-ifneq ($(words $(SIMD)),1)
-$(error SIMD must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(SIMD)),)
-$(error SIMD must be exactly 0 or 1)
-endif
+include ../../../lib/deps.mk
+$(eval $(call CHECK_01,SIMD))
 PROFILE ?= 1
 TOOLCHAIN_CHECK ?= 1
 DEBUG ?= 0
@@ -28,7 +24,6 @@ endif
 
 # The AEC repo is a sibling dependency (lib/deps.mk resolves AEC_DIR / COMMON_DIR); this directory
 # is the only part of stream/aiaec that links it. libaiaec.a has no AEC dependency.
-include ../../../lib/deps.mk
 $(eval $(call RESOLVE_COMMON_LIB))
 
 override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I.. -I../../common \
