@@ -135,7 +135,11 @@ POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
+# The spectrum entries: latency matrix, stale-pool gate, refusals, warm-up and generation.
+FREQ_ROWS_BIN := $(OBJ_DIR)/freq_rows
+FREQ_ROWS_SOURCES := tests/freq_rows.c $(CORE_SOURCES) dfn2_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -220,6 +224,13 @@ $(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_
 freq-only: $(FREQ_ONLY_BIN)
 	"$(FREQ_ONLY_BIN)"
 
+$(FREQ_ROWS_BIN): $(FREQ_ROWS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(FREQ_ROWS_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+freq-rows: $(FREQ_ROWS_BIN)
+	"$(FREQ_ROWS_BIN)"
+
 $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
@@ -227,7 +238,7 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only erb-partition test-variant-guard check-header-cxx
+test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows erb-partition test-variant-guard check-header-cxx
 
 # check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
 # a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.

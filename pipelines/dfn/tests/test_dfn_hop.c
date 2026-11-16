@@ -1,5 +1,5 @@
 /* Tests of dfn/dfn_hop.h and dfn/dfn_hop_pool.h: the direct path (host on the model grid) and the
- * bridge path (16 kHz host, 48 kHz model) against twins built from the layers underneath, the four
+ * bridge path (16 kHz host, 48 kHz model) against a twin built from the layers underneath, the four
  * phased behaviours (run, fail, left open, never fetched), the sequence guards, the refusals of the
  * pool plan and reset.
  *
@@ -225,7 +225,7 @@ static const char* const SC_NAME[SC_COUNT] = { "plain", "attenuation limit 12 dB
 
 /* The hop under test against the twin over `hops` hops with the hash model (each context has its
  * own call counter) on one host grid and scenario. Returns the number of mismatching hops. */
-static int compare_with_twins(int host_rate, int fft, int scenario, int hops, int* energy_seen, int* first_nonzero) {
+static int compare_with_twin(int host_rate, int fft, int scenario, int hops, int* energy_seen, int* first_nonzero) {
     const int bridge_mode = host_rate != DFN2_SR;
     Rig a;
     Twin t;
@@ -339,10 +339,11 @@ static int phased(Rig* r, const Complex* e, const Complex* p, Behaviour b, float
 enum { N_BEH = 40 };
 static int run_behaviours(int bridge_mode, int (*infer)(void*, const DFN2PrepostInputs*, DFN2PrepostOutputs*),
                           float seq[4][N_BEH][MAXB], long long* run_frames, long long* run_calls,
-                          unsigned gens[4], int* max_frames, int* first_hop_frames) {
+                          unsigned gens[4], int* max_frames, int* first_hop_frames, long long* bridge_frames) {
     Complex e[MAXB], p[MAXB];
     int bi, h, bad = 0, frames;
     *max_frames = 0;
+    *bridge_frames = -1;
     for (bi = 0; bi < 4; ++bi) {
         Rig r;
         if (rig_init(&r, bridge_mode, model_of(infer, NULL)) != 0) return 1000;
@@ -359,7 +360,10 @@ static int run_behaviours(int bridge_mode, int (*infer)(void*, const DFN2Prepost
                 if (h == 0) *first_hop_frames = frames;
             }
         }
-        if (bi == B_RUN) *run_calls = g_model_calls;
+        if (bi == B_RUN) {
+            *run_calls = g_model_calls;
+            if (r.h.bridge) ainr_bridge_get_counters(r.h.bridge, bridge_frames, &frames);   /* 48 kHz frames the bridge opened */
+        }
         gens[bi] = dfn_hop_state_generation(&r.h);
         rig_free(&r);
     }
@@ -381,7 +385,7 @@ static void test_path(int bridge_mode) {
         int g, sc;
         for (g = bridge_mode ? 1 : 0; g < (bridge_mode ? 4 : 1); ++g)
             for (sc = 0; sc < SC_COUNT; ++sc) {
-                bad_process = compare_with_twins(grids[g][0], grids[g][1], sc, 60, &energy_seen, &first_nonzero);
+                bad_process = compare_with_twin(grids[g][0], grids[g][1], sc, 60, &energy_seen, &first_nonzero);
                 snprintf(msg, sizeof msg, "%s %d Hz, %s: dfn_hop_process equals the stream recipe bit for bit",
                          tag, grids[g][0], SC_NAME[sc]);
                 CHECK(bad_process == 0, msg);
@@ -400,8 +404,9 @@ static void test_path(int bridge_mode) {
         long long run_frames, run_calls, rf2, rc2;
         unsigned gens[4], gens2[4];
         int max_frames, first_hop_frames = -1, mf2, fh2, bad;
+        long long run_bridge_frames, bf2;
         bad = run_behaviours(bridge_mode, counting_identity_infer, seq, &run_frames, &run_calls, gens,
-                             &max_frames, &first_hop_frames);
+                             &max_frames, &first_hop_frames, &run_bridge_frames);
         CHECK(bad == 0, "phased calls succeed in every behaviour");
         CHECK(memcmp(seq[0], seq[1], sizeof seq[0]) == 0 && memcmp(seq[0], seq[2], sizeof seq[0]) == 0 &&
               memcmp(seq[0], seq[3], sizeof seq[0]) == 0,
@@ -413,6 +418,8 @@ static void test_path(int bridge_mode) {
               "direct path: one model frame per hop, from hop mask_lookahead");
         CHECK(run_calls == run_frames && run_frames > 0, "the model runs once per frame it is shown");
         CHECK(bridge_mode || run_frames == N_BEH - DFN2_MASK_LOOKAHEAD, "direct path: one model run per hop with a frame");
+        CHECK(!bridge_mode || (run_bridge_frames > DFN2_MASK_LOOKAHEAD && run_calls == run_bridge_frames - DFN2_MASK_LOOKAHEAD),
+              "bridge path: the model runs once per 48 kHz frame the bridge opened, less the mask lookahead");
         CHECK(gens[B_RUN] == 1u,
               "the state generation stays 1 (no reset, no refused commit, no run that failed)");
         /* the run status decides the generation: a failed run (STREAM_RUN_FAILED) and a frame left open move it
@@ -425,7 +432,7 @@ static void test_path(int bridge_mode) {
               "direct path: one step per model frame for a failure and for a frame left open");
 
         /* a model that changes the spectrum: only the run behaviour commits its heads */
-        bad = run_behaviours(bridge_mode, dfn_fixture_half_mask_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2);
+        bad = run_behaviours(bridge_mode, dfn_fixture_half_mask_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2, &bf2);
         CHECK(bad == 0, "phased calls succeed with the half-mask model");
         CHECK(memcmp(seq_half[B_RUN], seq[B_RUN], sizeof seq_half[0]) != 0,
               "the half-mask model changes the output of the run behaviour");
@@ -434,7 +441,7 @@ static void test_path(int bridge_mode) {
               memcmp(seq_half[B_UNFETCHED], seq[B_RUN], sizeof seq[0]) == 0,
               "fail / left open / never fetched stay the identity whatever the model would have written");
         /* the model's own result decides: written heads with a failure code are not committed */
-        bad = run_behaviours(bridge_mode, half_mask_then_fail_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2);
+        bad = run_behaviours(bridge_mode, half_mask_then_fail_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2, &bf2);
         CHECK(bad == 0, "phased calls succeed with a model that writes and then fails");
         CHECK(memcmp(seq_half[B_RUN], seq[B_RUN], sizeof seq_half[0]) == 0,
               "a model that writes its heads and reports failure is the identity, not the half mask");

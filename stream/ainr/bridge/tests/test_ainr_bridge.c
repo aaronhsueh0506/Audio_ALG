@@ -202,6 +202,12 @@ static int run_config(void) {
     CHECK(ainr_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad) == NULL, 35);
     bad = req; bad.bytes -= 16u;   /* a recorded size below what this build needs */
     CHECK(ainr_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad) == NULL, 36);
+    bad = req; bad.descriptor_version += 1u;
+    CHECK(ainr_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad) == NULL, 45);
+    bad = req; bad.reserved = 1u;
+    CHECK(ainr_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad) == NULL, 46);
+    bad = req; bad.alignment = 0u;
+    CHECK(ainr_bridge_init_ex(mem, (size_t)req.bytes, &cfg, &bad) == NULL, 47);
     CHECK(ainr_bridge_init(mem, (size_t)req.bytes - 16u, &cfg) == NULL, 37);
     CHECK(ainr_bridge_init((unsigned char *)mem + 8, (size_t)req.bytes, &cfg) == NULL, 38);   /* misaligned */
     CHECK(ainr_bridge_init(NULL, (size_t)req.bytes, &cfg) == NULL, 39);
@@ -300,6 +306,8 @@ static int run_grid(const Grid *g, int lookahead, int verbose) {
         printf("ainr_bridge: %d Hz / fft %d / L %d: added delay %d + %d/%d samples, round-trip max error %.2e\n",
                g->sr, g->fft, lookahead, delay, num - delay * den, den, (double)max_err);
     CHECK(max_err < 5e-3f, 13);
+    /* the shipped added delays at lookahead 2, in samples of the host rate: 16 kHz / 256 and 512, 8 kHz / 256 */
+    if (lookahead == 2) CHECK(delay == (g->sr == 8000 ? 330 : g->fft == 256 ? 672 : 629), 26);
 
     /* lanes: an apply-lane model never passes the estimate lane; an estimate-lane model passes it (and
      * not the apply lane); a model that answers nothing leaves silence */
