@@ -3,6 +3,13 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — Build guards on one helper, the DFN head check on the vector kernel, docs and tests follow the tree
+
+- **Build guards.** `lib/deps.mk` `TOOLCHAIN_FWD` refuses a `WERROR` that is not exactly one word, 0 or 1 (`WERROR=1 1`, `WERROR=0 1` and an empty `WERROR` used to pass and reach the sub-make command line as a goal); `pipelines/scripts/test_deps_env_safe.sh` has a row for each. `stream/aiaec/front/Makefile` takes its `SIMD` check from `CHECK_01` and `pipelines/4ch/Makefile` its six 0/1 knobs, in place of the local macro; build directory names, `config.manifest` bytes and recipes are unchanged for every valid setting, and the 4ch refusal text no longer repeats the value. The front's `_cfg_guard` and the bridge's `NO_STDIO` check stay as they were (the shared recipe prints a different collision message, and `CHECK_01` would refuse an empty `NO_STDIO`).
+- **DFN head check.** `dfn2_prepost.c` and `dfn3_prepost.c` call audiolib `skn_all_within_f32()` instead of a local scalar loop; verdicts are identical for every input, NaN and infinity included. No output moves.
+- **Tests.** `test_aiaec_nonfinite` runs the 48 kHz / 1024 N = 1 and N = 2 rows (`sr` comes from the grid row) and `test_aiaec_freq` pins their `_freq` pools. `docs/c_python_function_map.md` lists the new audiolib helpers.
+- **Docs.** `CLAUDE.md` and `docs/html/start/reference/integration.html` no longer describe the removed `dfn_res_stage` / `dfn_rate_bridge`, the per-hop DFN2 behaviour at N > 1 (one block per call, latency L + D, the per-hop entries return -1) or the AIAEC catalog without the 48 kHz rows. The `ainr.c` comment on the `_freq` range pre-check says what the check is for.
+
 ## [Unreleased] — 2026-11-16 — AEC stage timing is on by default (`PROFILE=1`)
 
 - `pipelines/Makefile`, `pipelines/4ch/Makefile` and `stream/aiaec/front/Makefile` default `PROFILE` to 1 and forward it to lib/aec, which builds with `-DAEC_STAGE_TIMING=$(PROFILE)`; `pipelines/Makefile` and the AIAEC front keep repeating that `-D` for their own translation units. `make PROFILE=0` builds the timing out (the AEC rows of `--timing` read 0 and the report says why). Outputs are unchanged; about 0.13 us per mono hop and about 0.6 us per four-microphone hop on the development host.
