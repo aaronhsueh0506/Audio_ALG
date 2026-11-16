@@ -4,9 +4,11 @@
  *
  * The lane is not copied here: pipelines/mono/alignulcnet/main.c is compiled into this
  * driver (its main() renamed), so parse_options() and derive_lane() are the deployed functions
- * themselves. Public AecConfig fields are read from the lane the example derives; the resolved
- * geometry (n_partitions, delay_period_hops) comes from aec_debug_status() of the initialized
- * instance and the level's floors from aec_level_*() (aec_internal.h). Grid: the example's own
+ * themselves. Public AecConfig fields are read from the lane the example derives; the tuning the
+ * AEC resolves for it (filter_length, shadow, high-pass, saturation, soft-clipped reference, live
+ * observer) comes from aec_resolve() (aec_tuning.h), the resolved geometry (n_partitions,
+ * delay_period_hops) from aec_debug_status() of the initialized instance and the level's floors
+ * from aec_level_*() (aec_internal.h). Grid: the example's own
  * option, `--sample-rate <rate>` (default 16000), passed to this driver.
  *
  * formed_hop_cng_invariant runs the deployed lane and the same lane with enable_cng = 0 on one
@@ -17,15 +19,12 @@
 #include "mono/alignulcnet/main.c"
 #undef main
 #include "aec_internal.h"
+#include "aec_tuning.h"
 
 #define LANE_DUMP_CONTEXT_LINEAR_ONLY 2   /* the gate's code for a lane that stops after the AecState (AEC_RESIDUAL_STATE) */
 #define DUMP_HOPS 400
 #define DUMP_ECHO_DELAY 37
 #define DUMP_HOP_MAX 512   /* the largest hop of the example's grid table */
-/* The deployed lane's internal tuning has no reader in the shipped library: filter_length is the rate's
- * (416 / 832 / 3072 samples at 8 / 16 / 48 kHz) and the four flags below are the lane's fixed values, printed
- * as the contract the gate compares. */
-#define LANE_DUMP_FILTER_LENGTH(rate) ((rate) == 8000 ? 416 : (rate) == 48000 ? 3072 : 832)
 
 static Aec* dump_init(const AecConfig* cfg, void** pool) {
     size_t bytes = aec_get_mem_size(cfg);
@@ -95,6 +94,7 @@ int main(int argc, char** argv) {
     AecConfig lane;
     const AecConfig* c;
     AecDebugStatus status;
+    AecResolved resolved;
     float floor_far_active_db = 0.0f, floor_dt_db = 0.0f;
     int split_floor_enabled = 0;
     void* pool = NULL;
@@ -118,6 +118,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     c = &lane;
+    if (!aec_resolve(c, &resolved)) {
+        aec_destroy(aec);
+        free(pool);
+        return 1;
+    }
     memset(&status, 0, sizeof status);
     aec_debug_status(aec, &status);
     if (aec_level_floor_db(c->level, &floor_far_active_db) != AEC_OK ||
@@ -135,14 +140,14 @@ int main(int argc, char** argv) {
     printf("sample_rate=%d\n", c->sample_rate);
     printf("fft_size=%d\n", c->fft_size);
     printf("hop_size=%d\n", aec_hop_size(aec));
-    printf("filter_length=%d\n", LANE_DUMP_FILTER_LENGTH(c->sample_rate));
+    printf("filter_length=%d\n", resolved.tun.filter_length);
     printf("n_partitions=%d\n", status.n_partitions);
     printf("enable_res=%d\n", 0);
     printf("enable_cng=%d\n", c->enable_cng);
-    printf("enable_shadow=%d\n", 1);
-    printf("enable_highpass=%d\n", 1);
-    printf("enable_saturation=%d\n", 1);
-    printf("saturation_softclip_ref=%d\n", 1);
+    printf("enable_shadow=%d\n", resolved.tun.enable_shadow);
+    printf("enable_highpass=%d\n", resolved.tun.enable_highpass);
+    printf("enable_saturation=%d\n", resolved.tun.enable_saturation);
+    printf("saturation_softclip_ref=%d\n", resolved.tun.saturation_softclip_ref);
     printf("enable_delay_est=%d\n", c->delay_mode == AEC_DELAY_MATCHED);
     printf("delay_mode=%d\n", (int)c->delay_mode);
     printf("delay_mode_matched=%d\n", (int)AEC_DELAY_MATCHED);
@@ -154,7 +159,7 @@ int main(int argc, char** argv) {
            c->residual == AEC_RESIDUAL_STATE ? LANE_DUMP_CONTEXT_LINEAR_ONLY :
            c->residual == AEC_RESIDUAL_ESTIMATE ? 1 : 0);
     printf("context_linear_only=%d\n", LANE_DUMP_CONTEXT_LINEAR_ONLY);
-    printf("live_observer_enabled=%d\n", 0);
+    printf("live_observer_enabled=%d\n", resolved.tun.live_observer_enabled);
     printf("min_gain_floor_far_active_db=%.9g\n", floor_far_active_db);
     printf("min_gain_floor_dt_db=%.9g\n", floor_dt_db);
     printf("min_gain_split_floor_enabled=%d\n", split_floor_enabled);
