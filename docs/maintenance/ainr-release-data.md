@@ -28,15 +28,18 @@
 | full | 16000／256 | 24 | 96 | 5 | 0 | 0 | 1、8 |
 | full | 48000／1024 | 32 | 96 | 5 | 1 | 1 | 1 |
 | lite | 48000／1024 | 32 | 96 | 0 | 1 | 0 | 1 |
+| full，mask_lookahead 0 的模型（`AINR_MODEL_ID_DFN2_FULL_L0`） | 16000／256 | 24 | 96 | 5 | 0 | 0 | 1、8 |
+| 同上 | 32000／512 | 28 | 96 | 5 | 0 | 0 | 1、4（graph 未交付，路徑 NULL） |
+| 同上 | 48000／1024 | 32 | 96 | 5 | 0 | 0 | 1、2（graph 未交付，路徑 NULL） |
 
-`mask lookahead` 大於 0 時 N 只能是 1（`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED`），所以 48 kHz 的 full 與 lite 沒有 N>1 的列。登錄表中 `atten_lim_db` 與 HPF 欄位在所有列都是 0／關閉。
+`mask lookahead` 大於 0 時 N 只能是 1（`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED`），所以 48 kHz 的 full 與 lite 沒有 N>1 的列。N>1 是 mask_lookahead 0 的模型：板端以 1024 樣本一塊錄音時 N = 1024／模型 hop（16 kHz 為 8、32 kHz 為 4、48 kHz 為 2），一包是一次 job、沒有額外延遲。這個模型是自己的 id，因為它的 48 kHz／1024／N=1 與 mask_lookahead 1 的模型的同一把鍵是兩張 shape 相同的不同 graph，而客戶組態沒有 lookahead 欄位；其 df lookahead 暫取 0（交付的 graph 才是準），沒有 ALT1／ALT2 量化替代。32 kHz／512 的 ERB 檔是 `fb_32000_28.bin`。登錄表中 `atten_lim_db` 與 HPF 欄位在所有列都是 0／關閉。
 
 ## Graph 與 ERB 檔
 
 - 登錄表的每個 N 帶一個 graph 路徑；路徑為 NULL 的 N 視為未交付，回 `AINR_ERR_FRAMES_PER_CALL`，不會改用別的 N 的圖。
 - graph 路徑由三段組成：基底目錄（`AINR_MODEL_DIR_BASE`）、量化子目錄、產品子目錄（full 與 lite 各一），檔名依取樣率與 N 命名，形如 `<前綴>_model_<16k|48k>_n<N>.bin`。前綴與各列的完整路徑見 `ainr.c` 內的 `AinrDfn2FramesVariant` 陣列。`ainr.c` 的註解標明檔名為暫定，待正式命名慣例確認。
 - ERB 矩陣檔依 `(sr, n_erb)` 命名，與量化無關，形如 `fb_<sr>_<n_erb>.bin`，放在 `AINR_ERB_MATRIX_DIR`（`ainr.c` 內有預設值，可在編譯時覆寫）。格式見 `docs/html/models/dfn2/reference/grid.html` 的 ERB 一節（`export_erb_matrix.py` 的 `erb_matrix.bin`）。
-- 登錄的 graph 是否已交付、量化版本是否與該列的 grid 與 N 相符，本庫沒有核對紀錄。full 16 kHz／256／N=8 的路徑存在於登錄表；交付與是否相符待交付端確認。
+- 登錄的 graph 是否已交付、量化版本是否與該列的 grid 與 N 相符，本庫沒有核對紀錄。full 16 kHz／256／N=8 的路徑存在於登錄表；交付與是否相符待交付端確認。mask_lookahead 0 的模型的 32 kHz 與 48 kHz graph 路徑為 NULL（正式登錄拒絕），交付時把路徑填進 `ainr.c` 的 `AINR_DFN2_FULL_L0_32K_512_N`、`AINR_DFN2_FULL_L0_48K_1024_N` 兩個陣列；測試建置（`AINR_TEST_CATALOG`）用 `test://` 佔位路徑。
 
 ## 8x8（ALT1）登錄列
 
@@ -77,7 +80,7 @@ static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_8X8[] = {
 ## 驗收入口
 
 ```sh
-make -C stream/ainr test                 # full：dfn2、freq、latency、freq-nonfinite、state-generation、pool-gates、atten-lim、product、graph-io、link-only
+make -C stream/ainr test                 # full：dfn2、freq、latency、blocks、freq-nonfinite、state-generation、pool-gates、atten-lim、product、graph-io、link-only
 make -C stream/ainr MASK_ONLY=1 test     # lite：同上，去掉 dfn2 與 freq
 ```
 

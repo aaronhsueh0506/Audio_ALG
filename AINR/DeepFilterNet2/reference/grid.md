@@ -58,12 +58,12 @@ they merged into the single `DFN2_GRID_ERR_NORM_ALPHA` = -12). Every library ent
 
 | grid (board table pair) | full | mask-only |
 |---|---|---|
-| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 47,744 | 10,912 |
-| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 62,784 | 16,736 |
-| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 92,608 | 32,224 |
+| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 47,616 | 10,784 |
+| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 62,656 | 16,608 |
+| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 92,480 | 32,096 |
 
-On the 48 kHz grid a deeper ring grows the full pool: 104,640 bytes at 2/3 (ring 6) and 116,672 at 2/4 (ring 7); `frames_per_call` 4
-gives 144,112. The recurrent state the shipped graph needs is 1,280 + 30,720 floats (`h_gru` and `df_convp_history`), the application's.
+On the 48 kHz grid a deeper ring grows the full pool: 104,512 bytes at 2/3 (ring 6) and 116,544 at 2/4 (ring 7); `frames_per_call` 4 (pair 0/0, the block staging
+holds the four frames) gives 131,680. The recurrent state the shipped graph needs is 1,280 + 30,720 floats (`h_gru` and `df_convp_history`), the application's.
 
 **What stays compile time**: `-DDFN2_MASK_ONLY` (every translation unit; the variant of the state and of the accelerator boundary
 structs) and `DFN2_FEATURE_VERSION`. The graph geometry (GRU rows and width, encoder channels, pathway window) is not in the
@@ -76,7 +76,7 @@ zero from `dfn2_model_io_descriptor_default()` and never read.
   `dfn2_variant_full` or `dfn2_variant_mask_only`. Objects built with a different variant (`-DDFN2_MASK_ONLY` on some units only)
   do not link; the grid and the pair are not in it. Under a `.c` -> `.o` rule objects of other flags share names: keep one object
   directory per flag set (`make -C AINR lib` does), or clean between builds.
-- `DFN2_PREPOST_CARVE_VERSION` is 12. The pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid: sample rate, n_fft, hop,
+- `DFN2_PREPOST_CARVE_VERSION` is 13. The pool hash (`build_flags_hash`, FNV-1a-32) folds the whole grid: sample rate, n_fft, hop,
   n_bins, n_erb, df_bins, `df_order`, both lookaheads, history, ring, `frames_per_call`, `input_frames`, plus the variant, the
   layout and carve versions, the feature version, the two alphas and `dfn2_stft_scale(n_fft)` / `dfn2_stft_unscale(n_fft)`. The
   seven normaliser settings are no longer in the hash at all (they are fixed constants, identical for every grid). A

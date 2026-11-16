@@ -2,7 +2,7 @@
 
 `export_onnx.py --frames-per-call N` (default 1, at most 64 as in the C host) writes a graph that runs N
 frames per invocation, for an accelerator where one call per hop costs more
-than the extra latency. `--frames-per-call 1`, or no option, writes the same
+than one call per block of N hops. N > 1 needs `mask_lookahead` 0 and adds no latency. `--frames-per-call 1`, or no option, writes the same
 ONNX and JSON bytes as before the option existed.
 
 | | one frame per call | N frames per call |
@@ -33,24 +33,23 @@ its invocations (`--frames` counts invocations, the report records
 The C host takes N as `DFN2GridSpec.frames_per_call` (1..64, a run-time field; `DFN2_GRID_ERR_FRAMES_PER_CALL` otherwise),
 with the lookahead pair:
 
-- the window holds `N + 2` frames; the first call is ready after `M + N`
-  pushed frames, every later one after N more (`pre_process_freq` returns 1 on hops
-  `M+N-1`, `M+2N-1`, ...); `dfn2_model_io_frame_slot()` names the slot of the
-  last pushed frame. With N > 1 the earlier hops return 0 (as the first M hops do for N == 1) and
-  `frame_open()` is called only after a 1 (as are the model and `frame_finish()`);
+- the window holds `N + 2` frames: the call's N frames and the two before them. With N > 1
+  (and `M` = 0, a grid with `M` > 0 is refused by `get_mem_size` and init) `pre_process_freq` and
+  `post_process_freq` return -1 and a call goes through the block entry:
+  `pre_process_block_dual` takes the N frames at once (N * `n_bins` per plane) and returns 1, so every block has a job;
+  `dfn2_model_io_frame_slot()` still names the slot of the last pushed frame;
 - `frame_open()` publishes N heads per tensor, `frame_finish()` builds the N enhanced frames
-  in one burst, and `post_process_freq` returns one hop per call from that burst,
-  so the output trails by N - 1 more hops: latency `1 + M + D + N - 1` hops
-  (`dfn2_prepost_latency_frames(grid)` + 1; 10 hops, 106.7 ms, at the shipped pair
-  with N = 8). A refused commit zeroes the registered state and advances the
-  generation, and `frame_bypass()` passes all N frames as the noisy spectrum;
+  in one burst, and `post_process_block` hands all N out, so the output is the N == 1 stream with no shift:
+  latency `1 + M + D` hops (`dfn2_prepost_latency_frames(grid)` + 1; 2 hops at 16 kHz / 256, 128 samples, also at N = 8).
+  The first `D` frames of a stream carry no spectrum (`valid_frames` counts the rest, the last ones of the block). A refused commit
+  zeroes the registered state and advances the generation, and `frame_bypass()` passes all N frames as the noisy spectrum;
 - `DFN2ModelIoDescriptor` keeps its 18 fields and 72 bytes: N is
   `input_frames - 2` (`input_frames` = N + 2, metadata `input_feature_frames`),
   so `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
   another N, and a descriptor made for the one-frame graph (`input_frames` = 3)
   is refused by a grid of N > 1;
 - N is folded into the pool hash (a pool of another N is refused) and into the pool
-  size (144,112 bytes at N = 4 on the shipped grid against 92,608 at N = 1; 64-bit host). The pipelines' `dfn_hop` and the Python twin are
+  size (the block staging holds N frames; 64-bit host). The pipelines' `dfn_hop` and the Python twin are
   one-frame units, and they refuse N > 1.
 
 `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8: it names the state tensors, which N
@@ -60,9 +59,9 @@ the descriptor and `frames_per_call` in the metadata.
 Tests: `../tests/test_dfn2_frames_per_call.py` (wrapper and exported graph
 streamed in chunks against the one-frame graph, all pairs; a wrong state carry
 fails; metadata and validator; calibration) and
-`../tests/test_dfn2_frames_per_call_c.py` (the N-frame host against the
-one-frame host, byte for byte, with a stand-in accelerator; reset, refusal, contract;
-the 72-byte descriptor through a grid of either N).
+`../tests/test_dfn2_frames_per_call_c.py` (the block host against the
+one-frame host, byte for byte and with no shift, with a stand-in accelerator; reset, refusal, contract;
+the 72-byte descriptor through a grid of either N; `mask_lookahead` > 0 with N > 1 refused).
 
 ## Mask-only (stage 1)
 

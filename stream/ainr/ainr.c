@@ -1,6 +1,6 @@
 /* ainr.h implementation: a block-level (hop_in samples per call) wrapper over dfn2_stream's
- * hop-level API. The catalog below is the only place that knows the DFN2 grid fields and which
- * (sample_rate, n_fft, frames_per_call) combinations have a shipped graph. */
+ * hop entries (N == 1) and packet entries (N > 1). The catalog below is the only place that knows the DFN2 grid
+ * fields and which (sample_rate, n_fft, frames_per_call) combinations have a shipped graph. */
 
 #include "ainr.h"
 #include "ainr_test.h"

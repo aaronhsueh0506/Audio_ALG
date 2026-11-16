@@ -14,22 +14,25 @@
 
 <h2 id="pool">Pool</h2>
 <p><code>ainr_get_mem_size()</code> 回 <code>StreamMemReq</code>（<code>bytes</code> 與 <code>alignment</code> 兩欄，定義在 <code>stream/common/stream_mem.h</code>，與接線型別無關；<code>ainr.h</code> 只引用它）。呼叫端配 <code>bytes</code> 個位元組、對齊 <code>alignment</code>（<code>AINR_ALIGNMENT</code> = 16），交給 <code>ainr_init()</code>。init 自己重算所需大小：pool 小於它或沒有對齊就回 <code>AINR_ERR_POOL</code>（pool 不會被寫入）；較大的 pool 可以。</p>
-<p>PCM 家族的 pool 含完整的內層 stream：FFT、STFT、ISTFT、PCM 緩衝與兩份 ERB 表；ERB 檔分塊讀進表裡，不另佔一份表大小的暫存。<code>_freq</code> 家族的分析與合成在呼叫端，內層 stream 是 <code>freq_only</code>（<code>DFN2StreamConfig.freq_only</code>）：pool 只有前後處理、兩份 ERB 表，加上一幀換算暫存與 N &gt; 1 時跨 hop 的頻譜暫存，所以比 PCM 家族小。</p>
+<p>PCM 家族的 pool 含完整的內層 stream：FFT、STFT、ISTFT、PCM 緩衝與兩份 ERB 表；ERB 檔分塊讀進表裡，不另佔一份表大小的暫存。<code>_freq</code> 家族的分析與合成在呼叫端，內層 stream 是 <code>freq_only</code>（<code>DFN2StreamConfig.freq_only</code>）：pool 只有前後處理、兩份 ERB 表，加上這一包 N 個 frame 的音訊尺度換算暫存（est 與 app 各 N × n_bins），所以比 PCM 家族小。N &gt; 1 的一包由 <code>DFN2Prepost</code> 的區塊暫存直接收 STFT 與交出 ISTFT 的輸入，沒有跨包的預滾暫存。</p>
 <p>下表是在本庫 host 建置（arm64 macOS、<code>SIMD=1</code>、<code>BACKEND=ne10</code>）以 <code>ainr_get_mem_size()</code>、<code>ainr_get_mem_size_freq()</code> 實際讀出的值，單位 bytes。目標板的值隨指標寬度與編譯設定而異，請在板上呼叫同一組函式取得。</p>
 <table>
 <thead><tr><th>組態</th><th>PCM</th><th>頻譜 → 頻譜（<code>_freq</code>）</th></tr></thead>
 <tbody>
-<tr><th>full 16 kHz／256／N=1</th><td>91312</td><td>74752</td></tr>
-<tr><th>full 16 kHz／256／N=8</th><td>148480</td><td>137360</td></tr>
-<tr><th>full 48 kHz／1024／N=1</th><td>295728</td><td>232320</td></tr>
-<tr><th>lite 48 kHz／1024／N=1</th><td>235360</td><td>171952</td></tr>
+<tr><th>full 16 kHz／256／N=1</th><td>91264</td><td>74704</td></tr>
+<tr><th>full 16 kHz／256／N=8</th><td>139376</td><td>137264</td></tr>
+<tr><th>full 48 kHz／1024／N=1</th><td>295680</td><td>232272</td></tr>
+<tr><th>lite 48 kHz／1024／N=1</th><td>235296</td><td>171888</td></tr>
+<tr><th>mask_lookahead 0 的模型 32 kHz／512／N=1</th><td>156768</td><td>124592</td></tr>
+<tr><th>mask_lookahead 0 的模型 32 kHz／512／N=4</th><td>183584</td><td>163744</td></tr>
+<tr><th>mask_lookahead 0 的模型 48 kHz／1024／N=2</th><td>308736</td><td>253536</td></tr>
 </tbody></table>
 
 <h2 id="info">AinrInfo 與 sample 模型設定</h2>
 <p><code>ainr_init()</code>（<code>_freq</code> 同）填 <code>AinrInfo</code>，只有兩欄：</p>
 <ul>
 <li><code>graph_path</code>：這個組態要開的圖，由產品的發布資料決定，客戶不必也不應自己拼檔名。</li>
-<li><code>queue_frames</code>：輸出落後輸入 <code>queue_frames + 1</code> 個模型 hop。</li>
+<li><code>queue_frames</code>：輸出落後輸入 <code>queue_frames + 1</code> 個模型 hop（<code>mask_lookahead + df_lookahead</code>，與 N 無關）。</li>
 </ul>
 <p>N 與 <code>hop_in</code> 不在 <code>AinrInfo</code>：客戶的三欄設定已經帶有它們，sample 自己算 N = <code>cfg.hop_in / (cfg.fft / 2)</code>。state 的起始 generation 也不在其中：sample 在 init 之後、第一次 <code>ainr_preprocess()</code> 之前呼叫 <code>ainr_state_generation(ctx)</code> 取得（reset 之後同樣用它）。函式庫不描述圖的埠，也不保存 state 的尺寸。</p>
 <p>圖的接線在兩個無 SDK 標頭：<code>stream/ainr/graph_io_dfn2.h</code> 是 DFN2 的固定表（只有標頭，<code>ainr.h</code> 不引用），每個登錄的 (產品, sr, fft, N) 一列，列出每個訊號輸入、每個 head 與每個 state 的 [b,c,h,w]，註明所對應的匯出器；<code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）是四支 sample（與另兩款模型）共用的程式：把一列展開成 <code>StreamWiring</code>、用數量迴圈算 state 配對、依 shape 算 input buffer 大小、呼叫埠檢查，以及送件前核對 <code>StreamWork</code> 的數量與 shape（<code>GRAPH_IO_CHECK_WORK</code>）。sample 加 <code>-I stream/common -I stream/ainr</code> 並編譯 <code>stream/common/stream_bind.c</code>。查不到列（<code>GRAPH_IO_ERR_NO_ROW</code>）的組態在開圖前拒絕。</p>

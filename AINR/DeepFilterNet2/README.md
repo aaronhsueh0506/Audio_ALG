@@ -80,7 +80,7 @@ Specific to this one:
   `frame_fail()` are refused), the framing and compose clocks advance with no heads, nothing is emitted, and the registered state and
   the state generation stay as they were, so the first frame with a job starts from the state the stream began with and the accelerator
   is not called for the first M hops. `dfn2_model_run_frame()` refuses them like any call without an open frame. For N > 1 frames per
-  call it keeps the older flow, see [Multi-frame export](reference/multiframe.md); with M = 0 every hop has a job;
+  call (M = 0 only) the block entry takes the N frames at once and every block has a job, see [Multi-frame export](reference/multiframe.md);
 - the spectra are `torch.stft(normalized=True)` on the instance's grid (`dfn2_stft_scale(grid.n_fft)` = 1/sqrt(n_fft); 1024 points on
   the shipped 48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`dfn2_stft_unscale(grid.n_fft)`, 32x on
   the shipped grid; see `dfn2_prepost.h`);
@@ -143,7 +143,7 @@ Specific to DFN2:
   (the accelerator does not run for them); the first M + D hops emit nothing (`valid` 0).
 - The rings hold `grid.ring = max(df_order, M + D + 1)` frames: five up to
   `M + D = 4`, six for `M + D = 5` (1/4, 2/3), seven for `M + D = 6` (2/4). The state is carved to that ring at init, so a
-  deeper pair only makes the pool larger (92,608 bytes at 1/1, 104,640 at 2/3, 116,672 at 2/4 on the 48 kHz grid; 64-bit host).
+  deeper pair only makes the pool larger (92,480 bytes at 1/1, 104,512 at 2/3, 116,544 at 2/4 on the 48 kHz grid; 64-bit host).
   Mask-only keeps only the noisy ring, `M + 1` frames.
 
 ## Integration reference

@@ -44,7 +44,7 @@ DFN2PrepostConfig cfg;
 dfn2_prepost_config_defaults(&amp;cfg, &amp;grid);       /* 按值複製 grid */
 cfg.erb_fwd = erb_fwd;  cfg.erb_inv = erb_inv;   /* 應用端載入的 ERB 矩陣 */
 DFN2PrepostMemReq req;
-dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);           /* 48 kHz 1/1：92,608 bytes */</pre>
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);           /* 48 kHz 1/1：92,480 bytes */</pre>
 
 <h2 id="section-3">Block diagram</h2>
 <pre>
@@ -112,19 +112,19 @@ DFN2Grid grid
 <p>各 tensor 的 I/O 表見 <a href="core.html">DeepFilterNet2 頻域與模型契約</a>。pool 的陣列依 grid 精確配置。遞迴 state（出貨模型 1,280 + 30,720 float）、ERB 矩陣與應用端的 <code>AcStft</code>／<code>AcIstft</code> 都不在 pool 內。</p>
 <div class="tbl"><table>
 <tr><th>grid（板端表的 pair）</th><th>pool</th><th>其中 state 區塊</th><th>io 區塊</th><th>mask-only pool</th><th>full／mask-only hash</th></tr>
-<tr><td>16 kHz、256、erb 24、0／0</td><td>47,744</td><td>32,448</td><td>2,592</td><td>10,912</td><td><code>10bf4368</code>／<code>fedef9c5</code></td></tr>
-<tr><td>32 kHz、512、erb 28、0／0</td><td>62,784</td><td>44,320</td><td>2,640</td><td>16,736</td><td><code>109d5254</code>／<code>323ace59</code></td></tr>
-<tr><td>48 kHz、1024、erb 32、1／1（mask-only 1／0）</td><td>92,608</td><td>67,904</td><td>2,688</td><td>32,224</td><td><code>cf8e7b8e</code>／<code>4412e82e</code></td></tr>
-<tr><td>48 kHz、2／3（ring 6）；2／4（ring 7）</td><td>104,640；116,672</td><td>79,936；91,968</td><td>2,688</td><td>—</td><td><code>d8e8785e</code>；<code>12e38841</code></td></tr>
-<tr><td>48 kHz、1／1、frames_per_call 4</td><td>144,112</td><td>67,904</td><td>5,376</td><td>—</td><td><code>cf6f659e</code></td></tr>
+<tr><td>16 kHz、256、erb 24、0／0</td><td>47,616</td><td>32,448</td><td>2,592</td><td>10,784</td><td><code>26272c63</code>／<code>b119811a</code></td></tr>
+<tr><td>32 kHz、512、erb 28、0／0</td><td>62,656</td><td>44,320</td><td>2,640</td><td>16,608</td><td><code>313674cf</code>／<code>5ffed5fe</code></td></tr>
+<tr><td>48 kHz、1024、erb 32、1／1（mask-only 1／0）</td><td>92,480</td><td>67,904</td><td>2,688</td><td>32,096</td><td><code>186d6df5</code>／<code>4b322655</code></td></tr>
+<tr><td>48 kHz、2／3（ring 6）；2／4（ring 7）</td><td>104,512；116,544</td><td>79,936；91,968</td><td>2,688</td><td>—</td><td><code>0686dd05</code>；<code>05204f8a</code></td></tr>
+<tr><td>48 kHz、0／0、frames_per_call 4（N&gt;1 要求 mask_lookahead 0）</td><td>131,680</td><td>67,904</td><td>5,376</td><td>—</td><td><code>93bb495a</code></td></tr>
 </table></div>
-<p class="note">單位 bytes，本機量測（<code>dfn2_prepost_get_mem_size</code>、<code>dfn2_state_mem_size</code>、<code>dfn2_model_io_mem_size</code>）；同一個 grid 換 pair（例如 16 kHz 用 1／1）pool 大小相同、hash 不同（<code>8086c1fb</code>）。應用端自己的物件（audiolib，本機量測）：FFT handle 7,152／13,552／26,352（16／32／48 kHz）；<code>AcStft</code> 或 <code>AcIstft</code> 借用 FFT handle 與窗表時各 3,168／6,240／12,384，用預設 config（各自帶一份 FFT 與窗表）時各 11,344／21,840／42,832；每個 ERB 矩陣（<code>n_bins × n_erb</code> 個 float32）12,384／28,784／65,664。mask-only 的 16 kHz 列是 0／0；1／0 為 11,936。</p>
+<p class="note">單位 bytes，本機量測（<code>dfn2_prepost_get_mem_size</code>、<code>dfn2_state_mem_size</code>、<code>dfn2_model_io_mem_size</code>）；同一個 grid 換 pair（例如 16 kHz 用 1／1）pool 大小相同、hash 不同（<code>d3ae39c0</code>）。應用端自己的物件（audiolib，本機量測）：FFT handle 7,152／13,552／26,352（16／32／48 kHz）；<code>AcStft</code> 或 <code>AcIstft</code> 借用 FFT handle 與窗表時各 3,168／6,240／12,384，用預設 config（各自帶一份 FFT 與窗表）時各 11,344／21,840／42,832；每個 ERB 矩陣（<code>n_bins × n_erb</code> 個 float32）12,384／28,784／65,664。mask-only 的 16 kHz 列是 0／0；1／0 為 11,808。</p>
 
 <h2 id="section-7">連結符號與 pool 身分</h2>
 <ul>
 <li><b>連結符號只有 variant</b>：<code>dfn2_process.c</code> 定義 <code>dfn2_variant_full</code> 或 <code>dfn2_variant_mask_only</code>，<code>dfn2_model_io.c</code>、<code>dfn2_prepost.c</code> 與任何執行 <code>DFN2_REQUIRE_VARIANT_LINK()</code> 的應用單元引用它。一部分單元帶 <code>-DDFN2_MASK_ONLY</code> 的物件連結失敗；<b>grid、pair 與 frames_per_call 都不在符號裡</b>——一個 build 服務所有 grid，grid 或 pair 不符由執行期的 descriptor、pool hash 與 grid 檢查拒絕。</li>
 <li>在 <code>.c</code> → <code>.o</code> 規則下，不同旗標（mask-only）編出的物件同名：每組旗標用自己的物件資料夾，或在切換之間清除；殘留的舊物件會以 <code>dfn2_variant_*</code> 未定義而連結失敗。<code>make -C AINR lib</code> 本來就一組旗標一個資料夾。dfn 與 dfn-lite 兩個板端 sample 也是如此。</li>
-<li><b>pool 身分</b>：<code>DFN2_PREPOST_CARVE_VERSION = 12</code>；<code>build_flags_hash</code>（FNV-1a-32）對<b>每一個</b> grid 都折入整個 grid：sr、n_fft、hop、n_bins、n_erb、df_bins、<code>df_order</code>、兩個 lookahead、df_history、ring、<code>frames_per_call</code>、<code>input_frames</code>、mask-only 旗標（variant）、model_io layout 與 carve 版號、graph 的輸入 frame 數、feature 版本，加上兩個正規化 alpha（<code>erb_norm_alpha</code>、<code>spec_norm_alpha</code>，由取樣率與 hop 推算；固定的 tau／初始值／scale 常數在 <code>dfn2_grid.h</code>，不是 grid 欄位）與兩個 STFT scale（<code>dfn2_stft_scale()</code>／<code>dfn2_stft_unscale()</code>，由 <code>n_fft</code> 推算，同樣不是 grid 欄位）。<b>別的 build 或別的 grid 查到的 pool 大小與 <code>DFN2PrepostMemReq</code> 會被 <code>dfn2_prepost_init_ex()</code> 拒絕</b>，請重新查詢。state 登錄不在 hash 裡，它不改變 pool 的任何位元組。</li>
+<li><b>pool 身分</b>：<code>DFN2_PREPOST_CARVE_VERSION = 13</code>；<code>build_flags_hash</code>（FNV-1a-32）對<b>每一個</b> grid 都折入整個 grid：sr、n_fft、hop、n_bins、n_erb、df_bins、<code>df_order</code>、兩個 lookahead、df_history、ring、<code>frames_per_call</code>、<code>input_frames</code>、mask-only 旗標（variant）、model_io layout 與 carve 版號、graph 的輸入 frame 數、feature 版本，加上兩個正規化 alpha（<code>erb_norm_alpha</code>、<code>spec_norm_alpha</code>，由取樣率與 hop 推算；固定的 tau／初始值／scale 常數在 <code>dfn2_grid.h</code>，不是 grid 欄位）與兩個 STFT scale（<code>dfn2_stft_scale()</code>／<code>dfn2_stft_unscale()</code>，由 <code>n_fft</code> 推算，同樣不是 grid 欄位）。<b>別的 build 或別的 grid 查到的 pool 大小與 <code>DFN2PrepostMemReq</code> 會被 <code>dfn2_prepost_init_ex()</code> 拒絕</b>，請重新查詢。state 登錄不在 hash 裡，它不改變 pool 的任何位元組。</li>
 </ul>
 
 <h2 id="section-8">延遲與 warm-up（每個 grid）</h2>
