@@ -1,12 +1,14 @@
-/* The spectrum-only stream of deepvqe_stream (cfg.freq_only), per grid row (N = 1 and a batched N):
+/* The spectrum-only stream of deepvqe_stream (cfg.freq_only), per grid row (N = 1 and a batched N), through the packet
+ * entries (N frames per call):
  *   - a pool of exactly get_mem_size() bytes between two canary zones initialises, 16 bytes less is refused; its size
  *     is the pinned one and the full stream's less the FFT, two STFT, one ISTFT and the scratch slab, as audiolib's own
  *     size queries give them;
  *   - a run through the _freq entries (model failure, NaN / Inf / 3e30 / unwritten taps, a NaN input bin, resets between
- *     hops and inside one, calls out of order, the N - 1 pre-roll hops) returns, hop for hop, the codes, job tensors,
- *     generation and spectra of a full stream fed the same;
+ *     packets and inside one, calls out of order) returns, packet for packet, the codes, job tensors, generation and
+ *     spectra of a full stream fed the same;
  *   - the canary zones are intact afterwards;
- *   - both PCM entries return -1 and change nothing (pool bytes, generation, io, PCM); a due _freq hop survives them;
+ *   - the PCM entries (packet and one-hop) return -1 and change nothing (pool bytes, generation, io, PCM); a due _freq
+ *     packet survives them;
  *   - a descriptor of the other kind of stream is refused in both directions; any non-zero freq_only is the same build. */
 #include <math.h>
 #include <stdint.h>
@@ -23,10 +25,10 @@ typedef struct Row { int sr, fft, depth, n; size_t slim_bytes; } Row;
 
 /* The pinned bytes are host (LP64) numbers. */
 static const Row ROWS[] = {
-    { 16000, 256, 63, 1, 18272 },
-    { 16000, 256, 63, 8, 119312 },
-    { 16000, 512, 32, 1, 35680 },
-    { 16000, 512, 32, 8, 237072 },
+    { 16000, 256, 63, 1, 18256 },
+    { 16000, 256, 63, 8, 119296 },
+    { 16000, 512, 32, 1, 35664 },
+    { 16000, 512, 32, 8, 237056 },
 };
 
 #define GUARD 4096u
@@ -97,74 +99,74 @@ static void fill_spectra(uint32_t *seed, int h, float *mr, float *mi, float *fr,
     if (h % 97 == 40) mr[3] = (float)NAN;
 }
 
-/* `slim` (freq_only) against `full`, hop for hop. Returns the number of differing calls. */
+/* `slim` (freq_only) against `full`, packet for packet. Returns the number of differing calls. */
 static int run_pair(DeepVqeStream *slim, DeepVqeStream *full, const DeepVqeGrid *g, const char *label) {
-    const size_t nb = (size_t)g->n_bins;
-    float *x = (float *)malloc(nb * 8u * sizeof(float));
+    const size_t nb = (size_t)g->n_bins, np = nb * (size_t)g->frames_per_call;
+    float *x = (float *)malloc(np * 8u * sizeof(float));
     float *mr, *mi, *fr, *fi, *sre, *sim, *fre, *fim;
     uint32_t seed = 2463534242u + (uint32_t)g->n_fft + (uint32_t)g->frames_per_call;
-    int t, bad = 0, jobs = 0, real = 0;
+    int t, k, bad = 0, jobs = 0, real = 0;
 
     if (!x) exit(2);
-    mr = x; mi = x + nb; fr = x + 2 * nb; fi = x + 3 * nb;
-    sre = x + 4 * nb; sim = x + 5 * nb; fre = x + 6 * nb; fim = x + 7 * nb;
+    mr = x; mi = x + np; fr = x + 2 * np; fi = x + 3 * np;
+    sre = x + 4 * np; sim = x + 5 * np; fre = x + 6 * np; fim = x + 7 * np;
     for (t = 0; t < HOPS; ++t) {
         DeepVqeHopIO sio, fio;
-        int src, frc, srm = -1, frm = -1;
+        int src, frc, srm, frm;
 
-        fill_spectra(&seed, t, mr, mi, fr, fi, nb);
+        for (k = 0; k < g->frames_per_call; ++k) {
+            const size_t o = (size_t)k * nb;
+            fill_spectra(&seed, t * g->frames_per_call + k, mr + o, mi + o, fr + o, fi + o, nb);
+        }
         if (t == HOPS / 4) { deepvqe_stream_reset(slim); deepvqe_stream_reset(full); }
         if (t == HOPS / 2 &&
-            (deepvqe_stream_post_process_freq(slim, 0, sre, sim) != -1 ||
-             deepvqe_stream_post_process_freq(full, 0, fre, fim) != -1))
+            (deepvqe_stream_post_process_packet_freq(slim, 0, sre, sim) != -1 ||
+             deepvqe_stream_post_process_packet_freq(full, 0, fre, fim) != -1))
             ++bad;   /* a post with nothing due */
         memset(&sio, 0x5A, sizeof sio);
         memset(&fio, 0x5A, sizeof fio);
-        src = deepvqe_stream_pre_process_freq(slim, mr, mi, fr, fi, &sio);
-        frc = deepvqe_stream_pre_process_freq(full, mr, mi, fr, fi, &fio);
-        if (src < 0 || src != frc || (src == 1 && !same_job(&sio, &fio)) ||
-            (src == 0 && memcmp(&sio, &fio, sizeof sio) != 0)) {
+        src = deepvqe_stream_pre_process_packet_freq(slim, mr, mi, fr, fi, &sio);
+        frc = deepvqe_stream_pre_process_packet_freq(full, mr, mi, fr, fi, &fio);
+        if (src != 1 || frc != 1 || !same_job(&sio, &fio)) {
             ++bad;
             break;
         }
         if (t == HOPS / 2) {
             DeepVqeHopIO again;
-            if (deepvqe_stream_pre_process_freq(slim, mr, mi, fr, fi, &again) != -1) ++bad;
+            if (deepvqe_stream_pre_process_packet_freq(slim, mr, mi, fr, fi, &again) != -1) ++bad;
         }
-        if (src == 1) {
-            ++jobs;
-            srm = fill_taps(sio.outputs.taps, sio.outputs.taps_elements, jobs, job_kind(jobs));
-            frm = fill_taps(fio.outputs.taps, fio.outputs.taps_elements, jobs, job_kind(jobs));
-        }
-        if (t == HOPS / 3 || t == (2 * HOPS) / 3) {   /* reset with the hop due: it is dropped */
+        ++jobs;
+        srm = fill_taps(sio.outputs.taps, sio.outputs.taps_elements, jobs, job_kind(jobs));
+        frm = fill_taps(fio.outputs.taps, fio.outputs.taps_elements, jobs, job_kind(jobs));
+        if (t == HOPS / 3 || t == (2 * HOPS) / 3) {   /* reset with the packet due: it is dropped */
             deepvqe_stream_reset(slim);
             deepvqe_stream_reset(full);
-            if (deepvqe_stream_post_process_freq(slim, srm, sre, sim) != -1 ||
-                deepvqe_stream_post_process_freq(full, frm, fre, fim) != -1) ++bad;
+            if (deepvqe_stream_post_process_packet_freq(slim, srm, sre, sim) != -1 ||
+                deepvqe_stream_post_process_packet_freq(full, frm, fre, fim) != -1) ++bad;
             continue;
         }
-        src = deepvqe_stream_post_process_freq(slim, srm, sre, sim);
-        frc = deepvqe_stream_post_process_freq(full, frm, fre, fim);
-        if (src < 0 || src != frc ||
+        src = deepvqe_stream_post_process_packet_freq(slim, srm, sre, sim);
+        frc = deepvqe_stream_post_process_packet_freq(full, frm, fre, fim);
+        if (src != 1 || frc != 1 ||
             deepvqe_stream_state_generation(slim) != deepvqe_stream_state_generation(full) ||
-            memcmp(sre, fre, nb * sizeof(float)) != 0 || memcmp(sim, fim, nb * sizeof(float)) != 0)
+            memcmp(sre, fre, np * sizeof(float)) != 0 || memcmp(sim, fim, np * sizeof(float)) != 0)
             ++bad;
-        real += src == 1 && memcmp(sre, mr, nb * sizeof(float)) != 0;
+        real += memcmp(sre, mr, np * sizeof(float)) != 0;
     }
-    /* not vacuous: jobs ran, most hops carry a real spectrum, the run restarted the state */
-    if (jobs < HOPS / (2 * g->frames_per_call) || real < HOPS / 2 || deepvqe_stream_state_generation(slim) < 4u) ++bad;
-    if (bad) fprintf(stderr, "%s: %d differing call(s), the last at hop %d\n", label, bad, t);
+    /* not vacuous: jobs ran, most packets carry a real spectrum, the run restarted the state */
+    if (jobs < HOPS / 2 || real < HOPS / 2 || deepvqe_stream_state_generation(slim) < 4u) ++bad;
+    if (bad) fprintf(stderr, "%s: %d differing call(s), the last at packet %d\n", label, bad, t);
     free(x);
     return bad;
 }
 
 /* The PCM entries on a freq_only stream, from a reset: -1, the pool bytes, generation, io and PCM unchanged, and a due
- * _freq hop is left as it was. */
+ * _freq packet is left as it was. */
 static void check_pcm_refused(DeepVqeStream *slim, const unsigned char *pool, size_t bytes, const DeepVqeGrid *g,
                               const char *label) {
-    const size_t hop = (size_t)g->hop, nb = (size_t)g->n_bins;
-    int16_t *pcm = (int16_t *)malloc(hop * sizeof(int16_t));
-    float *z = (float *)calloc(nb * 2u, sizeof(float));
+    const size_t n = (size_t)g->frames_per_call, hop = (size_t)g->hop, nb = (size_t)g->n_bins;
+    int16_t *pcm = (int16_t *)malloc(n * hop * sizeof(int16_t));
+    float *z = (float *)calloc(n * nb * 2u, sizeof(float));
     unsigned char *snap = (unsigned char *)malloc(bytes);
     DeepVqeHopIO io, before;
     uint32_t gen;
@@ -172,24 +174,26 @@ static void check_pcm_refused(DeepVqeStream *slim, const unsigned char *pool, si
     int untouched = 1, pre;
 
     if (!pcm || !z || !snap) exit(2);
-    for (k = 0; k < hop; ++k) pcm[k] = (int16_t)(1234 + (int)k);
+    for (k = 0; k < n * hop; ++k) pcm[k] = (int16_t)(1234 + (int)k);
     deepvqe_stream_reset(slim);
     gen = deepvqe_stream_state_generation(slim);
     memset(&io, 0x5A, sizeof io);
     before = io;
     memcpy(snap, pool, bytes);
-    CHECK(deepvqe_stream_pre_process(slim, pcm, pcm, &io) == -1, "%s: PCM pre_process accepted", label);
+    CHECK(deepvqe_stream_pre_process_packet(slim, pcm, pcm, &io) == -1 &&
+          deepvqe_stream_pre_process(slim, pcm, pcm, &io) == -1, "%s: PCM pre_process accepted", label);
     CHECK(memcmp(snap, pool, bytes) == 0 && memcmp(&io, &before, sizeof io) == 0 &&
           deepvqe_stream_state_generation(slim) == gen, "%s: a refused PCM pre_process changed the stream", label);
-    pre = deepvqe_stream_pre_process_freq(slim, z, z + nb, z, z + nb, &io);
-    CHECK(pre == (g->frames_per_call == 1 ? 1 : 0), "%s: _freq pre after the refusal", label);
+    pre = deepvqe_stream_pre_process_packet_freq(slim, z, z + n * nb, z, z + n * nb, &io);
+    CHECK(pre == 1, "%s: _freq pre after the refusal", label);
     memcpy(snap, pool, bytes);
-    CHECK(deepvqe_stream_post_process(slim, 0, pcm) == -1, "%s: PCM post_process accepted", label);
-    for (k = 0; k < hop; ++k) untouched &= pcm[k] == (int16_t)(1234 + (int)k);
+    CHECK(deepvqe_stream_post_process_packet(slim, 0, pcm) == -1 && deepvqe_stream_post_process(slim, 0, pcm) == -1,
+          "%s: PCM post_process accepted", label);
+    for (k = 0; k < n * hop; ++k) untouched &= pcm[k] == (int16_t)(1234 + (int)k);
     CHECK(untouched && memcmp(snap, pool, bytes) == 0, "%s: a refused PCM post_process wrote PCM or the pool", label);
     if (pre == 1) fill_taps(io.outputs.taps, io.outputs.taps_elements, 1, 0);
-    CHECK(deepvqe_stream_post_process_freq(slim, 0, z, z + nb) == (g->frames_per_call == 1 ? 1 : 0),
-          "%s: the due _freq hop was lost", label);
+    CHECK(deepvqe_stream_post_process_packet_freq(slim, 0, z, z + n * nb) == 1, "%s: the due _freq packet was lost",
+          label);
     CHECK(deepvqe_stream_hop_size(slim) == g->hop, "%s: hop size", label);
     free(pcm);
     free(z);

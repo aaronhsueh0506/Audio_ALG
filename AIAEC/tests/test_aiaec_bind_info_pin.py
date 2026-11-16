@@ -70,9 +70,8 @@ def signal_names(model_name, n):
 
 
 def expected_trim_queue(model_name, n, hop):
-    """(trim_samples, queue_frames), the same for both families: DeepVQE-S N * hop and N - 1 frames;
-    Align-ULCNet hop and no queue."""
-    return (hop, 0) if model_name == 'align_ulcnet' else (n * hop, n - 1)
+    """(trim_samples, queue_frames), the same for both families and both models: one hop and no queue."""
+    return (hop, 0)
 
 
 def _case_id(case):

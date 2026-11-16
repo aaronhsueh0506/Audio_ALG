@@ -1,8 +1,8 @@
 /* Smoke build only: does deepvqe_stream link and run several hops without crashing. Not a
  * correctness test -- it does not check PCM against a reference; that's the separate
- * verification harness. Also asserts the one documented return value: with AC_OLA_ACCUMULATE
- * (no first-push suppression) post_process returns 1 (a real, full-hop synthesis result) at every
- * hop from hop 0 onward, N == 1 here. */
+ * verification harness. Also asserts the documented returns: post_process returns 1 at every hop
+ * from hop 0 onward (N == 1 here), the one-hop entries refuse a stream with N > 1, and at N == 1
+ * they equal the packet entries. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -25,92 +25,136 @@ static int fake_accelerator(DeepVqePrepostOutputs *out) {
     return 0;
 }
 
-/* Pairing probe at frames_per_call == 8: pre_process's first call to a fresh/reset stream
- * returns 0 (batch still gathering, no job this hop) -- `s->open` is NEVER set in that case, so
- * a check gated on `open` alone cannot catch a second pre_process before the matching
- * post_process here; only `pending` (set on every successful pre_process, job-ready or not) can.
- * Returns 0 on success, 1 on failure (same convention as main()'s own body). */
-static int pairing_probe_n8(void) {
+static void make_stream(int fft, int depth, int n, void **pool_out, DeepVqeStream **s_out, size_t *bytes_out) {
     DeepVqeGridSpec spec;
     DeepVqeGrid grid;
     DeepVqeStreamConfig cfg;
     DeepVqeStreamMemReq req;
-    DeepVqeStream *s;
-    void *pool = NULL;
-    int16_t *mic_in, *far_in, *pcm_out;
-    int hop, k, pre_rc, misuse_rc;
-    DeepVqeHopIO io;
 
     memset(&spec, 0, sizeof(spec));
     spec.sample_rate = 16000;
-    spec.n_fft = 256;
-    spec.delay_depth = 63;
-    spec.frames_per_call = 8;
-    if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) {
-        fprintf(stderr, "pairing probe (N=8): deepvqe_grid_make failed\n");
-        return 1;
-    }
-
+    spec.n_fft = fft;
+    spec.delay_depth = depth;
+    spec.frames_per_call = n;
     memset(&cfg, 0, sizeof(cfg));
+    if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) { fprintf(stderr, "deepvqe_grid_make failed\n"); exit(2); }
     cfg.grid = grid;
-    if (deepvqe_stream_get_mem_size(&cfg, &req) != 0) {
-        fprintf(stderr, "pairing probe (N=8): deepvqe_stream_get_mem_size failed\n");
-        return 1;
-    }
-    if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
-        fprintf(stderr, "pairing probe (N=8): pool allocation failed\n");
-        return 1;
-    }
-    s = deepvqe_stream_init_ex(&cfg, pool, (size_t)req.bytes, &req);
-    if (!s) {
-        fprintf(stderr, "pairing probe (N=8): deepvqe_stream_init_ex failed\n");
-        free(pool);
-        return 1;
-    }
+    if (deepvqe_stream_get_mem_size(&cfg, &req) != 0) { fprintf(stderr, "get_mem_size failed\n"); exit(2); }
+    *pool_out = NULL;
+    if (posix_memalign(pool_out, (size_t)req.alignment, (size_t)req.bytes) != 0 || !*pool_out) exit(2);
+    *s_out = deepvqe_stream_init_ex(&cfg, *pool_out, (size_t)req.bytes, &req);
+    if (!*s_out) { fprintf(stderr, "deepvqe_stream_init_ex failed\n"); exit(2); }
+    *bytes_out = (size_t)req.bytes;
+}
 
+/* frames_per_call == 8: the one-hop entries refuse and touch nothing; the packet entries pair (a second pre or post out
+ * of turn is -1) and one packet writes N * hop samples. Returns 0 on success, 1 on failure. */
+static int packet_probe_n8(void) {
+    const int n = 8;
+    DeepVqeStream *s;
+    void *pool;
+    size_t bytes, k;
+    unsigned char *snap;
+    int16_t *mic_in, *far_in, *pcm_out;
+    int hop;
+    DeepVqeHopIO io, before;
+    float *spec;
+    int fail = 0;
+
+    make_stream(256, 63, n, &pool, &s, &bytes);
     hop = deepvqe_stream_hop_size(s);
-    mic_in = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
-    far_in = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
-    pcm_out = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
-    if (!mic_in || !far_in || !pcm_out) {
-        fprintf(stderr, "pairing probe (N=8): pcm buffer allocation failed\n");
-        free(pool);
-        return 1;
-    }
-    for (k = 0; k < hop; ++k) { mic_in[k] = (int16_t)k; far_in[k] = (int16_t)(k * 2); }
+    mic_in = (int16_t *)calloc((size_t)n * (size_t)hop, sizeof(int16_t));
+    far_in = (int16_t *)calloc((size_t)n * (size_t)hop, sizeof(int16_t));
+    pcm_out = (int16_t *)calloc((size_t)n * (size_t)hop, sizeof(int16_t));
+    snap = (unsigned char *)malloc(bytes);
+    spec = (float *)calloc((size_t)n * (size_t)(hop + 1) * 2u, sizeof(float));
+    if (!mic_in || !far_in || !pcm_out || !snap || !spec) exit(2);
+    for (k = 0; k < (size_t)n * (size_t)hop; ++k) { mic_in[k] = (int16_t)(k % 211); far_in[k] = (int16_t)(k * 2 % 199); pcm_out[k] = 777; }
 
-    /* Fresh/reset stream, first hop of an N=8 batch: must return 0 (gathering), not 1 -- this is
-     * the case `open` never sets, so the misuse probe below is only meaningful because of it. */
-    pre_rc = deepvqe_stream_pre_process(s, mic_in, far_in, &io);
-    if (pre_rc != 0) {
-        fprintf(stderr, "pairing probe (N=8): setup pre_process rc=%d, expected 0 (batch "
-                        "gathering, hop 1 of 8)\n", pre_rc);
-        free(mic_in); free(far_in); free(pcm_out); free(pool);
-        return 1;
-    }
+    memset(&io, 0x5A, sizeof io);
+    before = io;
+    memcpy(snap, pool, bytes);
+    if (deepvqe_stream_pre_process(s, mic_in, far_in, &io) != -1) { fprintf(stderr, "N=8: one-hop pre_process accepted\n"); fail = 1; }
+    if (deepvqe_stream_pre_process_freq(s, spec, spec, spec, spec, &io) != -1) { fprintf(stderr, "N=8: one-hop pre_process_freq accepted\n"); fail = 1; }
+    if (memcmp(snap, pool, bytes) != 0 || memcmp(&io, &before, sizeof io) != 0) { fprintf(stderr, "N=8: a refused one-hop pre_process changed the stream\n"); fail = 1; }
 
-    /* A second pre_process with no intervening post_process must be rejected even though no
-     * model frame is open (rc == 0 above never sets `open`). */
-    misuse_rc = deepvqe_stream_pre_process(s, mic_in, far_in, &io);
-    if (misuse_rc != -1) {
-        fprintf(stderr, "pairing probe (N=8): pre_process called twice in a row during the "
-                        "gather phase returned %d, expected -1\n", misuse_rc);
-        free(mic_in); free(far_in); free(pcm_out); free(pool);
-        return 1;
-    }
+    if (deepvqe_stream_pre_process_packet(s, mic_in, far_in, &io) != 1) { fprintf(stderr, "N=8: packet pre_process did not return 1\n"); fail = 1; }
+    if (deepvqe_stream_pre_process_packet(s, mic_in, far_in, &io) != -1) { fprintf(stderr, "N=8: packet pre_process twice in a row did not return -1\n"); fail = 1; }
+    memcpy(snap, pool, bytes);
+    if (deepvqe_stream_post_process(s, 0, pcm_out) != -1) { fprintf(stderr, "N=8: one-hop post_process accepted\n"); fail = 1; }
+    for (k = 0; k < (size_t)n * (size_t)hop; ++k) if (pcm_out[k] != 777) { fprintf(stderr, "N=8: a refused one-hop post_process wrote pcm_out\n"); fail = 1; break; }
+    if (deepvqe_stream_post_process_freq(s, 0, spec, spec + (size_t)n * (size_t)(hop + 1)) != -1) { fprintf(stderr, "N=8: one-hop post_process_freq accepted\n"); fail = 1; }
+    if (memcmp(snap, pool, bytes) != 0) { fprintf(stderr, "N=8: a refused one-hop post_process changed the stream\n"); fail = 1; }
 
-    /* Resynchronize with the documented contract (post_process is still due for the first call)
-     * before tearing down, confirming the stream is left usable, not permanently wedged. */
-    if (deepvqe_stream_post_process(s, 0, pcm_out) != 0) {
-        fprintf(stderr, "pairing probe (N=8): cleanup post_process did not return the expected "
-                        "pre-roll 0\n");
-        free(mic_in); free(far_in); free(pcm_out); free(pool);
-        return 1;
-    }
+    (void)fake_accelerator(&io.outputs);
+    if (deepvqe_stream_post_process_packet(s, 0, pcm_out) != 1) { fprintf(stderr, "N=8: packet post_process did not return 1\n"); fail = 1; }
+    if (deepvqe_stream_post_process_packet(s, 0, pcm_out) != -1) { fprintf(stderr, "N=8: packet post_process twice in a row did not return -1\n"); fail = 1; }
+    if (deepvqe_stream_pre_process_packet(s, mic_in, far_in, &io) != 1) { fprintf(stderr, "N=8: the stream is wedged after a packet\n"); fail = 1; }
 
-    printf("smoke_deepvqe_stream: pairing probe (N=8, repeated pre during gather) -- PASS\n");
-    free(mic_in); free(far_in); free(pcm_out); free(pool);
-    return 0;
+    if (!fail) printf("smoke_deepvqe_stream: packet probe (N=8, one-hop entries refuse, packet pairing) -- PASS\n");
+    free(mic_in); free(far_in); free(pcm_out); free(snap); free(spec); free(pool);
+    return fail;
+}
+
+/* N == 1: the one-hop entries return what the packet entries return, PCM and spectrum, over a run with an input-dependent
+ * accelerator stand-in (a failed hop included). Returns 0 on success, 1 on failure. */
+static int one_hop_equals_packet_n1(void) {
+    DeepVqeStream *a, *b;
+    void *pa, *pb;
+    size_t bytes;
+    int hop, nb, i, k, fail = 0;
+    int16_t *mic, *far, *oa, *ob;
+    float *spec, *ra, *rb, *ia, *ib;
+
+    make_stream(256, 63, 1, &pa, &a, &bytes);
+    make_stream(256, 63, 1, &pb, &b, &bytes);
+    hop = deepvqe_stream_hop_size(a);
+    nb = hop + 1;
+    mic = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
+    far = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
+    oa = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
+    ob = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
+    spec = (float *)calloc((size_t)nb * 4u, sizeof(float));
+    ra = (float *)calloc((size_t)nb * 4u, sizeof(float));
+    rb = ra + nb; ia = rb + nb; ib = ia + nb;
+    if (!mic || !far || !oa || !ob || !spec || !ra) exit(2);
+    for (i = 0; i < 40; ++i) {
+        DeepVqeHopIO ioa, iob;
+        int status = i == 17 ? -1 : 0;
+
+        for (k = 0; k < hop; ++k) { mic[k] = (int16_t)((k * 13 + i * 7) % 2001 - 1000); far[k] = (int16_t)((k * 5 + i * 11) % 1601 - 800); }
+        if (deepvqe_stream_pre_process(a, mic, far, &ioa) != 1 || deepvqe_stream_pre_process_packet(b, mic, far, &iob) != 1 ||
+            ioa.state_generation != iob.state_generation ||
+            memcmp(ioa.inputs.mic, iob.inputs.mic, ioa.inputs.spectrum_ri_elements * sizeof(float)) != 0 ||
+            memcmp(ioa.inputs.far, iob.inputs.far, ioa.inputs.spectrum_ri_elements * sizeof(float)) != 0) { fprintf(stderr, "N=1 PCM hop %d: pre differs\n", i); fail = 1; break; }
+        for (k = 0; k < (int)ioa.outputs.taps_elements; ++k)
+            ioa.outputs.taps[k] = iob.outputs.taps[k] = 0.05f * (float)((k * 31 + i * 17) % 23 - 11) / 11.0f + (k % 18 == 8 ? 0.5f : 0.0f);
+        if (deepvqe_stream_post_process(a, status, oa) != 1 || deepvqe_stream_post_process_packet(b, status, ob) != 1 ||
+            memcmp(oa, ob, (size_t)hop * sizeof(int16_t)) != 0 ||
+            deepvqe_stream_state_generation(a) != deepvqe_stream_state_generation(b)) { fprintf(stderr, "N=1 PCM hop %d: post differs\n", i); fail = 1; break; }
+    }
+    deepvqe_stream_reset(a);
+    deepvqe_stream_reset(b);
+    for (i = 0; i < 40 && !fail; ++i) {
+        DeepVqeHopIO ioa, iob;
+        float *mr = spec, *mi = spec + nb, *fr = spec + 2 * nb, *fi = spec + 3 * nb;
+        int status = i == 17 ? -1 : 0;
+
+        for (k = 0; k < nb; ++k) {
+            mr[k] = (float)((k * 13 + i * 7) % 2001 - 1000) / 5000.0f; mi[k] = (float)((k * 3 + i * 19) % 1001 - 500) / 5000.0f;
+            fr[k] = (float)((k * 5 + i * 11) % 1601 - 800) / 5000.0f; fi[k] = (float)((k * 17 + i) % 701 - 350) / 5000.0f;
+        }
+        if (deepvqe_stream_pre_process_freq(a, mr, mi, fr, fi, &ioa) != 1 ||
+            deepvqe_stream_pre_process_packet_freq(b, mr, mi, fr, fi, &iob) != 1) { fprintf(stderr, "N=1 freq hop %d: pre differs\n", i); fail = 1; break; }
+        for (k = 0; k < (int)ioa.outputs.taps_elements; ++k)
+            ioa.outputs.taps[k] = iob.outputs.taps[k] = 0.05f * (float)((k * 29 + i * 13) % 23 - 11) / 11.0f + (k % 18 == 8 ? 0.5f : 0.0f);
+        if (deepvqe_stream_post_process_freq(a, status, ra, ia) != 1 || deepvqe_stream_post_process_packet_freq(b, status, rb, ib) != 1 ||
+            memcmp(ra, rb, (size_t)nb * sizeof(float)) != 0 || memcmp(ia, ib, (size_t)nb * sizeof(float)) != 0 ||
+            deepvqe_stream_state_generation(a) != deepvqe_stream_state_generation(b)) { fprintf(stderr, "N=1 freq hop %d: post differs\n", i); fail = 1; break; }
+    }
+    if (!fail) printf("smoke_deepvqe_stream: N=1 one-hop entries equal the packet entries (PCM and spectrum) -- PASS\n");
+    free(mic); free(far); free(oa); free(ob); free(spec); free(ra); free(pa); free(pb);
+    return fail;
 }
 
 int main(void) {
@@ -254,7 +298,8 @@ int main(void) {
     free(pcm_out);
     free(pool);
 
-    if (pairing_probe_n8() != 0) return 1;
+    if (packet_probe_n8() != 0) return 1;
+    if (one_hop_equals_packet_n1() != 0) return 1;
 
     return 0;
 }

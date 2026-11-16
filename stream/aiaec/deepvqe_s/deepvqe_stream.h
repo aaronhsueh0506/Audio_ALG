@@ -1,19 +1,22 @@
 /* DeepVQE-S PCM stream: two analysis AcStft (mic, far) and one AcIstft (AC_OLA_ACCUMULATE) around lib/aiaec/deepvqe_s's
- * DeepVqePrepost lifecycle; one hop of int16 PCM per call, grid.frames_per_call N in [1, 64]. N > 1: the accelerator runs
- * once every N hops and pre_process's return value says which (1 job, 0 none); pre/post_process run every hop.
+ * DeepVqePrepost lifecycle. One call carries grid.frames_per_call = N frames, N in [1, 64], and one accelerator job:
  *
- *     per hop: rc = deepvqe_stream_pre_process(ctx, mic_in, far_in, &io);             // -1: contract error
- *              if (rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs); }
- *              deepvqe_stream_post_process(ctx, ai_rc, pcm_out);
+ *     rc = deepvqe_stream_pre_process_packet(ctx, mic_in, far_in, &io);   // N * hop int16 each; -1: contract error
+ *     device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs);
+ *     deepvqe_stream_post_process_packet(ctx, ai_rc, pcm_out);              // N * hop samples
+ *
+ * pre analyses the N hops and opens the batch; post closes it (ai_rc 0 commits, otherwise the batch fails closed) and
+ * synthesises its N frames: a call's output is its own N frames, nothing is queued across calls, and there is no start-up
+ * case. The PCM delay is one hop of framing whatever N. The one-hop entries (pre_process, post_process, _freq) are the N == 1
+ * form of the same sequence and return -1 on a stream with N > 1.
  *
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any other
  * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
  * continue from (reset, refused commit, a dirty status); each advance also empties the CCM ring. Before a run, zero the
- * accelerator's state when io.state_generation differs from the value at the last zeroing; it is written every hop, also with
- * the optional registered state.
- * A status other than 0 fails CLOSED: the batch's spectrum is zero, but the overlap-add still carries the previous hop, so
- * pcm_out is not fully zero except on the first bypass. No warm-up: a frame is ready from hop 0 (N == 1) or hop N - 1, over a
- * zero-filled CCM ring. The zero hops are the N - 1 pre-roll hops of the first batch. PCM delay is N * grid.hop samples. */
+ * accelerator's state when io.state_generation differs from the value at the last zeroing; it is written every call, also
+ * with the optional registered state.
+ * A status other than 0 fails CLOSED: the batch's spectra are zero, but the overlap-add still carries the previous hop, so
+ * pcm_out is not fully zero except on the first bypass. */
 
 #ifndef DEEPVQE_STREAM_H
 #define DEEPVQE_STREAM_H
@@ -28,7 +31,7 @@ extern "C" {
 #endif
 
 #define DEEPVQE_STREAM_DESCRIPTOR_VERSION 1u
-#define DEEPVQE_STREAM_LAYOUT_VERSION     4u   /* bump with build_flags_hash on any pool / carve / descriptor change */
+#define DEEPVQE_STREAM_LAYOUT_VERSION     5u   /* bump with build_flags_hash on any pool / carve / descriptor change */
 #define DEEPVQE_STREAM_ALIGNMENT          16u
 
 typedef struct DeepVqeStreamConfig {
@@ -76,36 +79,37 @@ uint32_t deepvqe_stream_state_generation(const DeepVqeStream *s);
 
 int deepvqe_stream_hop_size(const DeepVqeStream *s);              /* samples per PCM hop; -1 on NULL */
 
-/* The tensor views of one open hop and the generation the accelerator's state must match; valid until post_process. */
+/* The tensor views of one open batch and the generation the accelerator's state must match; valid until post_process. */
 typedef struct DeepVqeHopIO {
-    DeepVqePrepostInputs  inputs;      /* valid only when pre_process returned 1 */
-    DeepVqePrepostOutputs outputs;     /* valid only when pre_process returned 1 */
-    uint32_t              state_generation;   /* sampled every hop, job or not */
+    DeepVqePrepostInputs  inputs;
+    DeepVqePrepostOutputs outputs;
+    uint32_t              state_generation;
 } DeepVqeHopIO;
 
-/* One PCM hop in (mic_in, far_in: hop_size samples each, no HPF): analysis, pre_process_freq, frame_open if a job is due.
- * Returns 1 with io filled, 0 with io zeroed (N > 1, no job this hop; state_generation still written), -1 on a contract
- * error (NULL args, a freq_only stream, or a call before the matching post_process). */
-int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
-                               DeepVqeHopIO *io);
+/* N hops in (mic_in, far_in: N * hop_size samples each, oldest first, no HPF): analysis, pre_process_freq, frame_open.
+ * Returns 1 with io filled, -1 on a contract error (NULL args, a freq_only stream, or a call before the matching post_process). */
+int deepvqe_stream_pre_process_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in, DeepVqeHopIO *io);
 
-/* Closes the hop: ai_rc is read only if pre_process returned 1 (0 commits; otherwise the batch fails CLOSED, see above). pcm_out is a
- * full hop: return 1; 0 with zeros during the N - 1 pre-roll hops (N > 1); -1 with zeros on a post_process_freq() error, or
- * -1 untouched if no pre_process is pending or the stream is freq_only (the hop stays due: post_process_freq() closes it).
- * Once per pre_process, every hop. */
+/* Closes the batch (ai_rc 0 commits, else it fails closed), writes its N frames, oldest first, to pcm_out (N * hop_size
+ * samples). Returns 1; -1 with zeros on a synthesis error, -1 untouched with no pre_process pending or on a freq_only stream. */
+int deepvqe_stream_post_process_packet(DeepVqeStream *s, int ai_rc, int16_t *pcm_out);
+
+/* Spectrum-domain entries, for a caller that keeps analysis and / or synthesis outside: the stream's own scale (unnormalised
+ * rfft of a sqrt-Hann n_fft block of full-scale float audio), N frames of n_bins floats per plane, oldest first; the same
+ * conventions as the PCM pair, which may be paired with them. cfg.freq_only keeps the FFT, STFT / ISTFT and PCM scratch out. */
+
+/* As deepvqe_stream_pre_process_packet(), with the N frames' mic and far spectra supplied (the analysis STFTs are not touched). */
+int deepvqe_stream_pre_process_packet_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,
+                                           const float *far_re, const float *far_im, DeepVqeHopIO *io);
+
+/* As deepvqe_stream_post_process_packet(), but re / im (N * n_bins floats each) receive the enhanced spectra and no ISTFT runs. */
+int deepvqe_stream_post_process_packet_freq(DeepVqeStream *s, int ai_rc, float *re, float *im);
+
+/* The packet entries of a one-frame stream (N == 1); -1, nothing touched, when N > 1. */
+int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in, DeepVqeHopIO *io);
 int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out);
-
-/* Spectrum-domain entries, for a caller that keeps analysis and / or synthesis outside: the stream's own scale
- * (unnormalised rfft of a sqrt-Hann n_fft block of full-scale float audio, n_bins floats per plane); same pending / job /
- * return conventions as the PCM pair, which may be paired with the _freq entries across. They run on either kind of
- * stream; cfg.freq_only keeps the FFT, STFT / ISTFT and PCM scratch out of the pool. */
-
-/* As deepvqe_stream_pre_process(), with this hop's mic and far spectra supplied (the analysis STFTs are not touched). */
 int deepvqe_stream_pre_process_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,
                                     const float *far_re, const float *far_im, DeepVqeHopIO *io);
-
-/* As deepvqe_stream_post_process(), but re / im (n_bins floats each) receive the enhanced spectrum and no ISTFT runs.
- * Returns 1 real spectrum, 0 zero spectrum (pre-roll), -1 contract error (nothing written without a matching pre_process). */
 int deepvqe_stream_post_process_freq(DeepVqeStream *s, int ai_rc, float *re, float *im);
 
 #ifdef __cplusplus

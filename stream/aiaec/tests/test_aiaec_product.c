@@ -84,7 +84,7 @@ int main(void) {
     CHECK(aiaec_init(&odd, small, sizeof(small), &ctx, &info) == AIAEC_ERR_IN_HOP && ctx == NULL, "hop_in 129: init");
 #if AIAEC_TEST_PRODUCT == 1
     rc = init_cfg(&n8, &info, &pool, &ctx);
-    CHECK(rc == AIAEC_OK && info.trim_samples == 1024 && info.queue_frames == 7 && info.tail_zero_blocks == 1 &&
+    CHECK(rc == AIAEC_OK && info.trim_samples == 128 && info.queue_frames == 0 && info.tail_zero_blocks == 1 &&
           pre_zero_n8(ctx, &work) == AIAEC_OK && work.input_count == 2 && work.inputs[0].h == 8u && work.inputs[1].h == 8u &&
           work.outputs[0].c == 8u, "deepvqe_s: hop_in 1024 is N=8 (2 signals over 8 frames)");
     CHECK(strstr(info.graph_path, "n8") != NULL, "deepvqe_s: N=8 picks its graph");

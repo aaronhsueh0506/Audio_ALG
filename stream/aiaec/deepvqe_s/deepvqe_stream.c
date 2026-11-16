@@ -34,10 +34,7 @@ struct DeepVqeStream {
     float *enh_re;
     float *enh_im;
 
-    int open;    /* 1: a DeepVqePrepost frame is open, post_process must finish / bypass it */
-    int pending; /* 1: pre_process succeeded and post_process is due (every hop, job or not) */
-    /* 0 until the first batch has finished or bypassed (N > 1 pre-roll hops synthesize silence); reset by deepvqe_stream_reset(). */
-    int result_ready;
+    int pending; /* 1: a pre_process succeeded, its batch is open and the post_process is due */
 };
 
 typedef struct DeepVqeStreamLayout {
@@ -205,7 +202,6 @@ static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg,
     s = layout->self;
 
     s->grid = cfg->grid;
-    s->open = 0;
     s->pending = 0;
 
     s->fft = NULL;
@@ -288,9 +284,7 @@ void deepvqe_stream_reset(DeepVqeStream *s) {
         ac_istft_reset(s->istft);
     }
     deepvqe_prepost_reset(s->prepost);
-    s->open = 0;
     s->pending = 0;
-    s->result_ready = 0;
 }
 
 uint32_t deepvqe_stream_state_generation(const DeepVqeStream *s) {
@@ -301,116 +295,116 @@ int deepvqe_stream_hop_size(const DeepVqeStream *s) {
     return s ? s->grid.hop : -1;
 }
 
-/* Shared tail of every pre_process entry: batch accumulation, state_generation sample, frame_open. */
-static int open_hop(DeepVqeStream *s, const float *mic_re, const float *mic_im,
-                    const float *far_re, const float *far_im, DeepVqeHopIO *io) {
-    int rc = deepvqe_prepost_pre_process_freq(s->prepost, mic_re, mic_im, far_re, far_im);
+/* N frames in, one frame_open. The PCM entries (mic_in non-NULL) analyse hop by hop into the one-frame scratch and hand each
+ * frame over at once; the spectrum entries take the N * n_bins planes. */
+static int open_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
+                       const float *mic_re, const float *mic_im, const float *far_re, const float *far_im,
+                       DeepVqeHopIO *io) {
+    const int n = s->grid.frames_per_call, hop = s->grid.hop;
+    const size_t nb = (size_t)s->grid.n_bins;
+    int i, k;
 
-    /* frames_per_call == 1: pre_process_freq() always returns 1 ("one frame per hop from the
-     * first hop, no latency beyond it"); > 1: 0 on the N - 1 hops still gathering the batch, 1
-     * once it is full. Either way state_generation is sampled every hop. */
-    if (rc < 0) return -1;
-    io->state_generation = deepvqe_prepost_state_generation(s->prepost);
-    if (rc == 0) {
-        memset(&io->inputs, 0, sizeof(io->inputs));
-        memset(&io->outputs, 0, sizeof(io->outputs));
-        s->pending = 1;
-        return 0;
+    for (k = 0; k < n; ++k) {
+        const float *mr, *mi, *fr, *fi;
+        int rc;
+
+        if (mic_in) {
+            const size_t off = (size_t)k * (size_t)hop;
+            for (i = 0; i < hop; ++i) {
+                s->mic_f[i] = (float)mic_in[off + (size_t)i] / 32768.0f;
+                s->far_f[i] = (float)far_in[off + (size_t)i] / 32768.0f;
+            }
+            ac_stft_push_planar(s->stft_mic, s->mic_f, s->mic_re, s->mic_im);
+            ac_stft_push_planar(s->stft_far, s->far_f, s->far_re, s->far_im);
+            mr = s->mic_re; mi = s->mic_im; fr = s->far_re; fi = s->far_im;
+        } else {
+            mr = mic_re + (size_t)k * nb; mi = mic_im + (size_t)k * nb;
+            fr = far_re + (size_t)k * nb; fi = far_im + (size_t)k * nb;
+        }
+        rc = deepvqe_prepost_pre_process_freq(s->prepost, mr, mi, fr, fi);
+        if (rc < 0 || (rc == 1) != (k == n - 1)) return -1;   /* unreachable behind the pending gate */
     }
+    io->state_generation = deepvqe_prepost_state_generation(s->prepost);
     if (deepvqe_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
-
-    s->open = 1;
     s->pending = 1;
     return 1;
 }
 
-int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
-                               DeepVqeHopIO *io) {
-    int hop, i;
-
-    /* Gated on `pending`, not `open`: a no-job hop (frames_per_call > 1) leaves `open` at 0, but
-     * pre_process has still run and post_process is still due -- a second pre_process before
-     * that post_process must be rejected either way. */
+int deepvqe_stream_pre_process_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
+                                      DeepVqeHopIO *io) {
     if (!s || !mic_in || !far_in || !io || !s->stft_mic || s->pending) return -1;
-    hop = s->grid.hop;
+    return open_packet(s, mic_in, far_in, NULL, NULL, NULL, NULL, io);
+}
 
-    for (i = 0; i < hop; ++i) {
-        s->mic_f[i] = (float)mic_in[i] / 32768.0f;
-        s->far_f[i] = (float)far_in[i] / 32768.0f;
+int deepvqe_stream_pre_process_packet_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,
+                                           const float *far_re, const float *far_im, DeepVqeHopIO *io) {
+    if (!s || !mic_re || !mic_im || !far_re || !far_im || !io || s->pending) return -1;
+    return open_packet(s, NULL, NULL, mic_re, mic_im, far_re, far_im, io);
+}
+
+/* Closes the open batch: commit on a clean run, else the library's fail-closed close. A finish that refuses (non-finite tap or
+ * state) leaves the batch open: the bypass closes it. */
+static void close_packet(DeepVqeStream *s, int ai_rc) {
+    if (ai_rc == STREAM_RUN_OK) {
+        if (deepvqe_prepost_frame_finish(s->prepost) != 0) deepvqe_prepost_frame_bypass(s->prepost);
+    } else {
+        deepvqe_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
     }
+    s->pending = 0;
+}
 
-    ac_stft_push_planar(s->stft_mic, s->mic_f, s->mic_re, s->mic_im);
-    ac_stft_push_planar(s->stft_far, s->far_f, s->far_re, s->far_im);
+int deepvqe_stream_post_process_packet_freq(DeepVqeStream *s, int ai_rc, float *re, float *im) {
+    const size_t nb = s ? (size_t)s->grid.n_bins : 0u;
+    int k;
 
-    return open_hop(s, s->mic_re, s->mic_im, s->far_re, s->far_im, io);
+    if (!s || !re || !im || !s->pending) return -1;
+    close_packet(s, ai_rc);
+    for (k = 0; k < s->grid.frames_per_call; ++k) {
+        if (deepvqe_prepost_post_process_freq(s->prepost, re + (size_t)k * nb, im + (size_t)k * nb) != 0) {
+            /* Defensive only: the batch was just closed. */
+            memset(re, 0, (size_t)s->grid.frames_per_call * nb * sizeof(float));
+            memset(im, 0, (size_t)s->grid.frames_per_call * nb * sizeof(float));
+            return -1;
+        }
+    }
+    return 1;
+}
+
+int deepvqe_stream_post_process_packet(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
+    const int n = s ? s->grid.frames_per_call : 0, hop = s ? s->grid.hop : 0;
+    int i, k;
+
+    if (!s || !pcm_out || !s->istft || !s->pending) return -1;
+    close_packet(s, ai_rc);
+    for (k = 0; k < n; ++k) {
+        int written = -1;
+
+        if (deepvqe_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im) == 0)
+            written = ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
+        if (written != hop) {
+            /* Defensive only: the batch was just closed and AC_OLA_ACCUMULATE always returns hop. */
+            memset(pcm_out, 0, (size_t)n * (size_t)hop * sizeof(int16_t));
+            return -1;
+        }
+        for (i = 0; i < hop; ++i) pcm_out[(size_t)k * (size_t)hop + (size_t)i] = stream_saturate_s16(s->hop_out[i]);
+    }
+    return 1;
+}
+
+int deepvqe_stream_pre_process(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in, DeepVqeHopIO *io) {
+    return s && s->grid.frames_per_call == 1 ? deepvqe_stream_pre_process_packet(s, mic_in, far_in, io) : -1;
+}
+
+int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
+    return s && s->grid.frames_per_call == 1 ? deepvqe_stream_post_process_packet(s, ai_rc, pcm_out) : -1;
 }
 
 int deepvqe_stream_pre_process_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,
                                     const float *far_re, const float *far_im, DeepVqeHopIO *io) {
-    if (!s || !mic_re || !mic_im || !far_re || !far_im || !io || s->pending) return -1;
-    return open_hop(s, mic_re, mic_im, far_re, far_im, io);
+    return s && s->grid.frames_per_call == 1
+        ? deepvqe_stream_pre_process_packet_freq(s, mic_re, mic_im, far_re, far_im, io) : -1;
 }
 
 int deepvqe_stream_post_process_freq(DeepVqeStream *s, int ai_rc, float *re, float *im) {
-    /* `pending` rejects a post_process with no matching pre_process this hop -- without it, a
-     * second call in a row (or a call with no pre_process ever) would fall through to the
-     * `!s->result_ready` test below exactly as if this were a legitimate no-job pre-roll hop,
-     * silently re-delivering (or delivering nothing new) instead of returning -1. */
-    if (!s || !re || !im || !s->pending) return -1;
-    s->pending = 0;
-
-    /* A refused finish (non-finite tap or state) already advanced the generation but leaves the batch open: the bypass
-     * closes it. Skipped on a no-job hop (frames_per_call > 1, still gathering): nothing is open, drain what the last
-     * closed batch left. */
-    if (s->open) {
-        if (ai_rc == STREAM_RUN_OK) {
-            if (deepvqe_prepost_frame_finish(s->prepost) != 0) deepvqe_prepost_frame_bypass(s->prepost);
-        } else {
-            deepvqe_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
-        }
-        s->open = 0;
-        s->result_ready = 1;
-    }
-
-    /* frames_per_call > 1's pre-roll hops, before the stream's first batch has ever finished or
-     * bypassed: nothing real exists yet to drain. Output-side convention (the spec defines these
-     * N - 1 hops as zero-fill), not an OLA workaround: AC_OLA_ACCUMULATE has no first-push
-     * special case (a pushed zero spectrum is just acc += 0); real synthesis starts at hop N - 1. */
-    if (!s->result_ready) {
-        memset(re, 0, (size_t)s->grid.n_bins * sizeof(float));
-        memset(im, 0, (size_t)s->grid.n_bins * sizeof(float));
-        return 0;
-    }
-
-    if (deepvqe_prepost_post_process_freq(s->prepost, re, im) != 0) {
-        /* Defensive only, unreached in correct use (the batch was just closed above, or there
-         * never was one open this hop). */
-        memset(re, 0, (size_t)s->grid.n_bins * sizeof(float));
-        memset(im, 0, (size_t)s->grid.n_bins * sizeof(float));
-        return -1;
-    }
-    return 1;
-}
-
-int deepvqe_stream_post_process(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
-    int hop, i, rc, written;
-
-    if (!s || !pcm_out || !s->istft || !s->pending) return -1;
-    hop = s->grid.hop;
-
-    rc = deepvqe_stream_post_process_freq(s, ai_rc, s->enh_re, s->enh_im);
-    if (rc <= 0) {
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
-        return rc;
-    }
-
-    written = ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
-    if (written != hop) {
-        /* Defensive only: AC_OLA_ACCUMULATE always returns hop; unreachable in correct use. */
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
-        return 0;
-    }
-
-    for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
-    return 1;
+    return s && s->grid.frames_per_call == 1 ? deepvqe_stream_post_process_packet_freq(s, ai_rc, re, im) : -1;
 }

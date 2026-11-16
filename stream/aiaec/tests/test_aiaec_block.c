@@ -4,9 +4,9 @@
  * graph paths for the rows below so the gated API constructs; the production catalog (no delivered
  * graph for most rows) is covered by test_aiaec_catalog.c.
  *
- *   DeepVQE-S (N=1 and N=8 at 16k/256, N=1 at 16k/512): the block path against deepvqe_stream_*
- *     driven directly with the same stash/drain loop, bit-exact PCM and identical accelerator-side
- *     tensors; batching against an independent N=1 stream; fail-closed; identity-accelerator delay.
+ *   DeepVQE-S (N=1 and N=8 at 16k/256, N=1 at 16k/512): the block path against the deepvqe_stream
+ *     packet entries driven directly, bit-exact PCM and identical accelerator-side tensors;
+ *     batching against an independent N=1 stream; fail-closed; identity-accelerator delay.
  *   Align-ULCNet (N=1): normal, realignment-bypass and forced-failure hops against ulcnet_stream_*
  *     driven directly; run status ignored on a bypass hop; identity delay.
  *   Both: live work-view shapes, kind/size rejection before any state write, reset, and the pool
@@ -136,8 +136,8 @@ static DeepVqeStream *dv_stream(const DeepVqeGrid *grid) {
     return deepvqe_stream_init_ex(&scfg, pool, (size_t)sreq.bytes, &sreq);
 }
 
-/* The block path against deepvqe_stream_* driven directly with the same stash/drain loop: PCM bit
- * for bit, and the tensors the accelerator sees (element counts, input spectra) identical. The 8x
+/* The block path against the deepvqe_stream packet entries driven directly: PCM bit for bit, and
+ * the tensors the accelerator sees (element counts, input spectra) identical. The 8x
  * amplitude keeps the compare above the int16 rounding threshold, where an earlier cold-start bug
  * passed with zero mismatches. */
 static int section_deepvqe_block_vs_stream(int n, int fft) {
@@ -147,9 +147,9 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
     DeepVqeGrid grid;
     DeepVqeStream *ref;
     const int hop = fft / 2, blocks = 6;
-    int16_t *mic_in, *far_in, *pcm_blk, *pcm_ref, *stash;
+    int16_t *mic_in, *far_in, *pcm_blk, *pcm_ref;
     long long ghop = 0;
-    int b, k, i, bad = 0;
+    int b, k, bad = 0;
 
     if (!ctx) return 1;
     if (dv_grid(fft, n, &grid) != 0 || !(ref = dv_stream(&grid))) { FAIL("block_vs_stream: reference stream"); return 1; }
@@ -157,7 +157,6 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
     far_in = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     pcm_blk = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
     pcm_ref = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
-    stash = calloc((size_t)hop * (size_t)n, sizeof(int16_t));
 
     for (b = 0; b < blocks; ++b) {
         AiaecInput input;
@@ -175,11 +174,7 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
         CHECK(rc == AIAEC_OK && work.action == STREAM_WORK_SUBMIT, "N=%d fft=%d block %d: preprocess rc=%d action=%d", n, fft, b, rc, (int)work.action);
         CHECK(work.input_count == 2 && work.output_count == 1, "N=%d block %d: counts %d/%d", n, b, work.input_count, work.output_count);
 
-        for (i = 0; i < n - 1; ++i) {
-            CHECK(deepvqe_stream_pre_process(ref, mic_in + (size_t)i * hop, far_in + (size_t)i * hop, &hio) == 0, "ref pre %d", i);
-            CHECK(deepvqe_stream_post_process(ref, 0, stash + (size_t)i * hop) >= 0, "ref post %d", i);
-        }
-        CHECK(deepvqe_stream_pre_process(ref, mic_in + (size_t)(n - 1) * hop, far_in + (size_t)(n - 1) * hop, &hio) == 1, "ref last pre");
+        CHECK(deepvqe_stream_pre_process_packet(ref, mic_in, far_in, &hio) == 1, "ref pre");
         CHECK(work.inputs[0].elements == hio.inputs.spectrum_ri_elements && work.inputs[1].elements == hio.inputs.spectrum_ri_elements &&
               work.outputs[0].elements == hio.outputs.taps_elements, "N=%d block %d: tensor element counts differ from deepvqe_stream", n, b);
         CHECK(memcmp(work.inputs[0].data, hio.inputs.mic, work.inputs[0].elements * sizeof(float)) == 0 &&
@@ -190,24 +185,23 @@ static int section_deepvqe_block_vs_stream(int n, int fft) {
         fake_taps(ghop, work.outputs[0].data, work.outputs[0].elements);
         fake_taps(ghop, hio.outputs.taps, hio.outputs.taps_elements);
         CHECK(aiaec_postprocess(ctx, 0, pcm_blk) == AIAEC_OK, "N=%d block %d: postprocess", n, b);
-        CHECK(deepvqe_stream_post_process(ref, 0, pcm_ref + (size_t)(n - 1) * hop) >= 0, "ref last post");
-        memcpy(pcm_ref, stash, (size_t)(n - 1) * (size_t)hop * sizeof(int16_t));
+        CHECK(deepvqe_stream_post_process_packet(ref, 0, pcm_ref) == 1, "ref post");
 
         if (memcmp(pcm_ref, pcm_blk, (size_t)hop * (size_t)n * sizeof(int16_t)) != 0) {
-            FAIL("N=%d fft=%d block %d: block pcm_out differs from deepvqe_stream_* driven directly", n, fft, b);
+            FAIL("N=%d fft=%d block %d: block pcm_out differs from the deepvqe_stream packet entries driven directly", n, fft, b);
             bad = 1;
         }
         ghop += n;
     }
     printf("section_deepvqe_block_vs_stream(fft=%d N=%d): %d blocks bit-exact vs deepvqe_stream_*\n", fft, n, blocks);
-    free(mic_in); free(far_in); free(pcm_blk); free(pcm_ref); free(stash); free(pool);
+    free(mic_in); free(far_in); free(pcm_blk); free(pcm_ref); free(pool);
     return bad;
 }
 
-/* N=8 batching against an independent N=1 stream fed the same per-hop PCM. The batched side is
- * (N-1)*hop samples later than the reference (both carry the same base hop of STFT/ISTFT framing,
- * which cancels), and block boundaries of the two do not line up, so one global concatenated buffer
- * per side is compared with that shift applied. */
+/* N=8 batching against an independent N=1 stream fed the same per-hop PCM: the batched side carries
+ * the same delay (one hop of STFT/ISTFT framing), so the two PCM streams are equal sample for
+ * sample. Block boundaries of the two do not line up, so one global concatenated buffer per side
+ * is compared. */
 static int section_batching_vs_n1(int n) {
     AiaecConfig cfg = make_cfg(256, n);
     void *pool = NULL;
@@ -215,7 +209,7 @@ static int section_batching_vs_n1(int n) {
     DeepVqeGrid rgrid;
     DeepVqeStream *ref;
     const int hop = 128, blocks = 6;
-    const size_t total = (size_t)blocks * (size_t)n * (size_t)hop, shift = (size_t)(n - 1) * hop;
+    const size_t total = (size_t)blocks * (size_t)n * (size_t)hop;
     int16_t *mic_in, *far_in, *full_blk, *full_ref;
     float *taps_ref;
     long long ghop = 0;
@@ -254,13 +248,13 @@ static int section_batching_vs_n1(int n) {
         }
         ghop += n;
     }
-    if (memcmp(full_blk + shift, full_ref, (total - shift) * sizeof(int16_t)) != 0) {
+    if (memcmp(full_blk, full_ref, total * sizeof(int16_t)) != 0) {
         size_t s;
-        for (s = 0; s < total - shift; ++s)
-            if (full_blk[shift + s] != full_ref[s]) { FAIL("N=%d: batched PCM diverges from the N=1 stream at sample %zu", n, s); break; }
+        for (s = 0; s < total; ++s)
+            if (full_blk[s] != full_ref[s]) { FAIL("N=%d: batched PCM diverges from the N=1 stream at sample %zu", n, s); break; }
         bad = 1;
     }
-    printf("section_batching_vs_n1(N=%d): %zu samples compared at shift %zu, %s\n", n, total - shift, shift, bad ? "DIVERGED" : "bit-exact");
+    printf("section_batching_vs_n1(N=%d): %zu samples compared, %s\n", n, total, bad ? "DIVERGED" : "bit-exact");
     free(mic_in); free(far_in); free(full_blk); free(full_ref); free(taps_ref); free(pool);
     return bad;
 }
@@ -300,11 +294,11 @@ static long long energy16(const int16_t *x, size_t n) {
     return e;
 }
 
-/* A failed block contributes silence, never the mic: with an identity accelerator every block returns the previous
- * block's input (delay-aligned), except the samples the failed job owns. The failed job's N frames are zero spectra; in
- * the PCM family that is the last hop of the failing block (half of it still the previous frame's overlap) and the
- * first N - 1 hops of the next block, which are exactly zero; the next block's last hop is again half. Everything else
- * is the delayed mic. The failure is made unmistakable: valid finite taps with a dirty status (the library must act on
+/* A failed block contributes silence, never the mic: with an identity accelerator every hop returns the input of the hop
+ * before it (the one hop of framing delay), except the samples the failed job owns. The failed job's N frames are zero
+ * spectra; in the PCM family that is the failing block itself: its first hop (half of it still the previous frame's
+ * overlap) and then N - 1 hops that are exactly zero; the next block's first hop is again half. Everything else is the
+ * delayed mic. The failure is made unmistakable: valid finite taps with a dirty status (the library must act on
  * the status), non-finite taps with status OK (the library must refuse them), both, and a run that never started
  * (the same silent batch, but the state generation must not move). */
 static int section_fail_closed_one(FailKind kind) {
@@ -342,15 +336,15 @@ static int section_fail_closed_one(FailKind kind) {
         }
     }
     for (b = 1; b < BLOCKS; ++b) {
-        const int16_t *out = pcm_out + (size_t)b * BS, *want = mic_in + (size_t)(b - 1) * BS;
+        const int16_t *out = pcm_out + (size_t)b * BS, *want = mic_in + (size_t)b * BS - HOP;
         for (h = 0; h < N; ++h) {
             const int16_t *o = out + (size_t)h * HOP, *w = want + (size_t)h * HOP;
-            if (b == FAILED && h == N - 1) {
+            if (b == FAILED && h == 0) {
                 CHECK(!pcm16_close(o, w, HOP) && energy16(o, HOP) > 0, "fail_closed(%d) block %d hop %d: the failing hop is %s", (int)kind, b, h,
                       energy16(o, HOP) > 0 ? "the delayed mic" : "silent (it keeps the previous frame's overlap)");
-            } else if (b == FAILED + 1 && h < N - 1) {
+            } else if (b == FAILED && h > 0) {
                 CHECK(all_zero16(o, HOP), "fail_closed(%d) block %d hop %d: not exactly zero (a failed batch must be silent, not the mic)", (int)kind, b, h);
-            } else if (b == FAILED + 1 && h == N - 1) {
+            } else if (b == FAILED + 1 && h == 0) {
                 CHECK(!pcm16_close(o, w, HOP) && energy16(o, HOP) > 0, "fail_closed(%d) block %d hop %d: the recovery hop is %s", (int)kind, b, h,
                       energy16(o, HOP) > 0 ? "the delayed mic" : "silent");
             } else {
@@ -375,7 +369,7 @@ static int section_fail_closed_one(FailKind kind) {
         fill_identity_taps((float *)work.outputs[0].data, work.outputs[0].elements, N);
         CHECK(aiaec_postprocess(ctx, 0, pcm_out) == AIAEC_OK, "fail_closed: postprocess after reset");
     }
-    printf("section_fail_closed(%s): failed batch exactly silent (N-1 hops), neighbours are the delayed mic, generation tracked\n",
+    printf("section_fail_closed(%s): failed batch silent after its first hop, neighbours are the delayed mic, generation tracked\n",
            kind == FAIL_STATUS ? "dirty status" : kind == FAIL_NONFINITE ? "non-finite taps" : kind == FAIL_BOTH ? "both"
                                                                                                : "not started");
     free(mic_in); free(far_zero); free(pcm_out); free(pool);
@@ -393,10 +387,10 @@ static int section_fail_closed(void) {
     return rc;
 }
 
-/* AiaecInfo.trim_samples (frames_per_call * hop) against an IDENTITY accelerator: CCM taps
+/* AiaecInfo.trim_samples (one hop, whatever N) against an IDENTITY accelerator: CCM taps
  * forced to the (delay 0, centre frequency tap) coefficient 1+0j, so the only reason input and
  * output can differ is the pure sample shift being measured. Every block's output must equal the
- * previous block's input. */
+ * input delayed by trim_samples. */
 static int section_trim(int n, int fft) {
     AiaecConfig cfg = make_cfg(fft, n);
     void *pool = NULL;
@@ -407,8 +401,8 @@ static int section_trim(int n, int fft) {
     int k, bidx;
 
     if (!ctx) return 1;
-    CHECK(bi.trim_samples == n * hop && bi.queue_frames == n - 1,
-          "delay N=%d: trim %d queue %d, want %d / %d", n, bi.trim_samples, bi.queue_frames, n * hop, n - 1);
+    CHECK(bi.trim_samples == hop && bi.queue_frames == 0,
+          "delay N=%d: trim %d queue %d, want %d / 0", n, bi.trim_samples, bi.queue_frames, hop);
     mic_in = calloc((size_t)bs * blocks, sizeof(int16_t));
     far_zero = calloc((size_t)bs, sizeof(int16_t));
     pcm_out = calloc((size_t)bs, sizeof(int16_t));
@@ -421,11 +415,11 @@ static int section_trim(int n, int fft) {
         fill_identity_taps((float *)work.outputs[0].data, work.outputs[0].elements, n);
         CHECK(aiaec_postprocess(ctx, 0, pcm_out) == AIAEC_OK, "delay N=%d block %d: postprocess", n, bidx);
         if (bidx == 0) continue;
-        CHECK(pcm16_close(pcm_out, mic_in + (size_t)(bidx - 1) * bs, (size_t)bs) &&
+        CHECK(pcm16_close(pcm_out, mic_in + (size_t)bidx * bs - hop, (size_t)bs) &&
               !pcm16_close(pcm_out, mic_in + (size_t)bidx * bs, (size_t)bs),
-              "delay N=%d fft=%d block %d: output is not exactly the previous block's input", n, fft, bidx);
+              "delay N=%d fft=%d block %d: output is not exactly the input delayed by one hop", n, fft, bidx);
     }
-    printf("section_trim(N=%d fft=%d): identity accelerator confirms %d samples\n", n, fft, n * hop);
+    printf("section_trim(N=%d fft=%d): identity accelerator confirms %d samples\n", n, fft, hop);
     free(mic_in); free(far_zero); free(pcm_out); free(pool);
     return 0;
 }

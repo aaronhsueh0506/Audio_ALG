@@ -169,7 +169,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
     int16_t *p_blk = calloc((size_t)hop_in, sizeof(int16_t));
     int16_t *p_freq = calloc((size_t)hop_in, sizeof(int16_t));
     AiaecAlignEvent ev[8];
-    int b, k, i, bad = 0, had_hop = 0, prev_solid = 0, edges = 0, fails = 0;
+    int b, k, bad = 0, had_hop = 0, prev_solid = 0, edges = 0, fails = 0;
     long long ghop = 0;
 
     (void)ev; (void)had_hop; (void)prev_solid;
@@ -215,6 +215,7 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         in.kind = AIAEC_INPUT_DEEPVQE_S;
         in.u.deepvqe_s.mic_in = mic; in.u.deepvqe_s.far_in = far16;
         for (k = 0; k < n; ++k) {
+            int i;
             for (i = 0; i < hop; ++i) {
                 hopf[i] = (float)mic[(size_t)k * hop + (size_t)i] / 32768.0f;
                 hopg[i] = (float)far16[(size_t)k * hop + (size_t)i] / 32768.0f;
@@ -251,11 +252,6 @@ static int section_equivalence(int fft, int n, const Ev *sched, int blocks) {
         }
         if (memcmp(p_blk, p_freq, (size_t)hop_in * sizeof(int16_t)) != 0) {
             FAIL("fft=%d N=%d block %d: block PCM != _freq + external ISTFT", fft, n, b); bad = 1;
-        }
-        if (PRODUCT_DV && n > 1 && b == 0) {
-            int zero = 1;
-            for (i = 0; i < (n - 1) * nb; ++i) if (f_re[i] != 0.0f || f_im[i] != 0.0f) zero = 0;
-            CHECK(zero, "N=%d: the first block's leading %d spectrum frames are not zero", n, n - 1);
         }
         ghop += n;
     }
@@ -506,14 +502,13 @@ static int family_info(const AiaecConfig *cfg, int family, AiaecInfo *info) {
     return rc;
 }
 
-/* The round trip on the final PCM and the model queue, from the grid alone: DeepVQE-S N * hop and N - 1
- * frames, Align-ULCNet one hop and no queue. */
-static int expected_trim(int hop, int n) { return PRODUCT_DV ? n * hop : hop; }
-static int expected_queue(int n) { return PRODUCT_DV ? n - 1 : 0; }
+/* The round trip on the final PCM and the model queue, from the grid alone: one hop and no queue, both models. */
+static int expected_trim(int hop) { return hop; }
+static int expected_queue(void) { return 0; }
 
 static int section_tail(int fft, int n) {
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n;
-    const int want_trim = expected_trim(hop, n), want_queue = expected_queue(n);
+    const int want_trim = expected_trim(hop), want_queue = expected_queue();
     AiaecConfig cfg = make_cfg(fft, n);
     AiaecInfo bi_pcm, bi_freq;
     Pair t;
@@ -625,7 +620,7 @@ static int section_tail(int fft, int n) {
  * info, delays, pools, gates
  * ------------------------------------------------------------------------------------------- */
 static int section_bind_and_pool(int fft, int n) {
-    const int hop = fft / 2, want_trim = expected_trim(hop, n), want_queue = expected_queue(n);
+    const int hop = fft / 2, want_trim = expected_trim(hop), want_queue = expected_queue();
     AiaecConfig cfg = make_cfg(fft, n);
     AiaecInfo pb, pf;
     StreamMemReq rb, rf;
@@ -676,7 +671,7 @@ static int section_bind_and_pool(int fft, int n) {
         CHECK(aiaec_init(&cfg, pool, (size_t)rb.bytes, &cb, &info) == AIAEC_OK && cb != NULL, "pool: the exact block size must construct");
         CHECK(aiaec_init_freq(&cfg, pool, (size_t)rf.bytes + 64u, &cf, &info) == AIAEC_OK && cf != NULL, "pool: a larger freq pool must construct");
     }
-    {   /* the _freq pool carries no framing: pinned (host, both models compiled); the PCM pool adds it where the stash is equal */
+    {   /* the _freq pool carries no framing: pinned (host, both models compiled); the PCM pool adds it */
         AcStftConfig sc;
         const size_t plane = (size_t)(PRODUCT_AL ? n : 1) * (size_t)(fft / 2 + 1);
         size_t framing, pinned;
@@ -685,9 +680,8 @@ static int section_bind_and_pool(int fft, int n) {
         framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +
                   ck_align16_size((3u * (size_t)hop + 6u * plane) * sizeof(float));
-        pinned = PRODUCT_DV ? (fft == 512 ? 35776u : n == 8 ? 126640u : 18368u) : (fft == 512 ? 15088u : 7920u);
-        if (PRODUCT_AL || n == 1)
-            CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
+        pinned = PRODUCT_DV ? (fft == 512 ? 35744u : n == 8 ? 119376u : 18336u) : (fft == 512 ? 15072u : 7904u);
+        CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
                   (unsigned long long)rb.bytes, (unsigned long long)rf.bytes, framing);
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
               (unsigned long long)rf.bytes, pinned);
@@ -779,9 +773,8 @@ static float frame_max_diff(const float *a_re, const float *a_im, const float *b
     return d;
 }
 
-/* The _freq entry fails closed too. An identity accelerator returns the mic spectrum, delayed by N - 1 frames; the
- * failed job's N frames are zero spectra: the failed block's last frame and the next block's first N - 1 frames, which
- * must be exactly zero, with a normal frame on either side. The failure is a dirty run status with valid taps,
+/* The _freq entry fails closed too. An identity accelerator returns the mic spectrum; the failed job's N frames are
+ * zero spectra: the failed block's own N frames, which must be exactly zero, with a normal frame on either side. The failure is a dirty run status with valid taps,
  * non-finite taps with status OK, both, and STREAM_RUN_NOT_STARTED with valid taps. The state generation each SUBMIT
  * block carries must be the live one, across the failure and a reset: it moves by one for a dirty status or a refused
  * commit (both together count once) and stays for a run that never started. */
@@ -796,7 +789,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
     float *o_re = calloc((size_t)frames * nb, sizeof(float)), *o_im = calloc((size_t)frames * nb, sizeof(float));
     float *z = calloc((size_t)n * (size_t)nb, sizeof(float)), *hopf = calloc((size_t)hop, sizeof(float));
     unsigned int gen_seen[BLOCKS];
-    const int fail_lo = FAILED * n + n - 1, fail_hi = (FAILED + 1) * n + n - 2;   /* output frame positions of the failed job */
+    const int fail_lo = FAILED * n, fail_hi = FAILED * n + n - 1;   /* output frame positions of the failed job */
     int b, i, p, bad = g_fail;
 
     if (pair_make(&t, &cfg) != 0) return 1;
@@ -830,15 +823,15 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
         }
         CHECK(rc == AIAEC_OK, "fail_closed block %d: postprocess rc=%d", b, rc);
     }
-    /* output frame p is the identity on input frame p - (N - 1), except what the failed job owns and the lead-in */
+    /* output frame p is the identity on input frame p, except what the failed job owns */
     for (p = 0; p < frames; ++p) {
         const float *ore = o_re + (size_t)p * nb, *oim = o_im + (size_t)p * nb;
-        if (p < n - 1 || p == fail_lo || (p > fail_lo && p <= fail_hi)) {
+        if (p >= fail_lo && p <= fail_hi) {
             CHECK(frame_is_zero(ore, oim, nb), "fail_closed(fft=%d N=%d kind=%d): frame %d not exactly zero (a failed batch must be silent, not the mic)",
                   fft, n, (int)kind, p);
         } else {
-            float peak, d = frame_max_diff(ore, oim, e_re + (size_t)(p - (n - 1)) * nb, e_im + (size_t)(p - (n - 1)) * nb, nb, &peak);
-            CHECK(peak > 0.0f && d <= 2e-3f * peak, "fail_closed(fft=%d N=%d kind=%d): frame %d is not the delayed mic spectrum (diff %g, peak %g)",
+            float peak, d = frame_max_diff(ore, oim, e_re + (size_t)p * nb, e_im + (size_t)p * nb, nb, &peak);
+            CHECK(peak > 0.0f && d <= 2e-3f * peak, "fail_closed(fft=%d N=%d kind=%d): frame %d is not the mic spectrum (diff %g, peak %g)",
                   fft, n, (int)kind, p, (double)d, (double)peak);
         }
     }
@@ -864,7 +857,7 @@ static int section_fail_closed_freq(int fft, int n, FailKind kind) {
         rc = aiaec_postprocess_freq(t.freq, 0, o_re, o_im);
         CHECK(rc == AIAEC_OK, "fail_closed: postprocess after reset");
     }
-    printf("section_fail_closed_freq(fft=%d N=%d kind=%d): failed job's frames exactly zero, others the delayed mic spectrum, generation tracked\n",
+    printf("section_fail_closed_freq(fft=%d N=%d kind=%d): failed job's frames exactly zero, others the mic spectrum, generation tracked\n",
            fft, n, (int)kind);
     frame_free(&an);
     pair_free(&t);

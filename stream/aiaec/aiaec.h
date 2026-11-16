@@ -119,9 +119,8 @@ typedef struct AiaecInput {
 typedef struct AiaecInfo {
     const char  *graph_path;           /* model.bin for this configuration; a static string, never NULL here */
     int          trim_samples;         /* samples to drop from the start of the final PCM (after the caller's ISTFT for
-                                        * _freq), both families: DeepVQE-S N * model_hop, Align-ULCNet model_hop */
-    int          queue_frames;         /* model-queue frames between a frame in and its enhanced frame out:
-                                        * DeepVQE-S N - 1, Align-ULCNet 0 */
+                                        * _freq), both models and families: model_hop */
+    int          queue_frames;         /* model-queue frames between a frame in and its enhanced frame out: 0 */
     int          tail_zero_blocks;     /* all-zero hop_in blocks after the last real block: ceil(trim_samples / hop_in); no
                                         * family flushes: _freq's analyser must first deliver the final frames;
                                         * queue_frames zero hops alone lose the last hop */
@@ -201,7 +200,7 @@ int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, Stream
 
 /* As aiaec_postprocess(), writing the block's N enhanced frames to out_re / out_im (N * n_bins floats each), for the
  * block opened by aiaec_preprocess_freq(). Through an AcIstft(AC_OLA_ACCUMULATE, ispec_scale 1) they equal the PCM family's
- * pcm_out (DeepVQE-S's first block starts with N - 1 zero frames). */
+ * pcm_out. */
 int aiaec_postprocess_freq(AiaecFreqCtx *ctx, int run_status, float *out_re, float *out_im);
 
 #ifdef __cplusplus

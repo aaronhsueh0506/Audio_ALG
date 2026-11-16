@@ -29,9 +29,9 @@
 #define IS_ALIGN 0
 #endif
 
-/* Trim, queue and tail of the 16 kHz rows, as literals (the pre-batching delay of DeepVQE-S is N hops, Align-ULCNet's is one). */
-static const struct { int fft, n, trim_dv, queue_dv, trim_align; } INFO_ROWS[] = {
-    { 256, 1, 128, 0, 128 }, { 256, 8, 1024, 7, 128 }, { 512, 1, 256, 0, 256 },
+/* Trim of the 16 kHz rows, as literals (one model hop for both models, queue 0, tail 1). */
+static const struct { int fft, n, trim; } INFO_ROWS[] = {
+    { 256, 1, 128 }, { 256, 8, 128 }, { 512, 1, 256 },
 };
 
 static int g_fail, g_patterns;
@@ -212,8 +212,7 @@ int main(void)
               "sr %d fft %d N %d: the two families report one and the same info", cfg.sr, cfg.fft, n);
         for (row = 0; row < (int)(sizeof INFO_ROWS / sizeof INFO_ROWS[0]); ++row) {
             if (cfg.sr != 16000 || cfg.fft != INFO_ROWS[row].fft || n != INFO_ROWS[row].n) continue;
-            CHECK(infos[0].trim_samples == (IS_ALIGN ? INFO_ROWS[row].trim_align : INFO_ROWS[row].trim_dv) &&
-                  infos[0].queue_frames == (IS_ALIGN ? 0 : INFO_ROWS[row].queue_dv) && infos[0].tail_zero_blocks == 1,
+            CHECK(infos[0].trim_samples == INFO_ROWS[row].trim && infos[0].queue_frames == 0 && infos[0].tail_zero_blocks == 1,
                   "sr %d fft %d N %d: trim %d queue %d tail %d", cfg.sr, cfg.fft, n, infos[0].trim_samples,
                   infos[0].queue_frames, infos[0].tail_zero_blocks);
         }

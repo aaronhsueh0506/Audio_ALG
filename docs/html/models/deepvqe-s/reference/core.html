@@ -309,16 +309,16 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
 <h3>流程圖（block diagram）</h3>
 <pre>
-PCM in (int16 mic_in, far_in)
+PCM in (int16 mic_in, far_in; 一包 N 個 hop，N = frames_per_call)
   |
   v
 int16 -> float (/32768)  x2（無 HPF）
   |
   v
-ac_stft_push_planar x2 (stft_mic, stft_far) -----> mic_re/im, far_re/im
+ac_stft_push_planar x2 (stft_mic, stft_far) -----> mic_re/im, far_re/im   （N 個 hop 各一次）
   |
   v
-deepvqe_prepost_pre_process_freq
+deepvqe_prepost_pre_process_freq（每個 frame 一次，共 N 次，第 N 次回 1）
   |
   v
 deepvqe_prepost_frame_open ---> DeepVqeHopIO{inputs, outputs, state_generation}
@@ -327,47 +327,47 @@ deepvqe_prepost_frame_open ---> DeepVqeHopIO{inputs, outputs, state_generation}
   |                              (呼叫端:NPU / 替身跑 io.inputs -> io.outputs)
   |                                        |
   v                                        v
-deepvqe_stream_post_process(ai_rc) <-------
+deepvqe_stream_post_process_packet(ai_rc) <-------
   |  ai_rc==0: frame_finish          ai_rc!=0: frame_fail(當拍頻譜歸零; 非 NOT_STARTED 則 state 清零, generation +1)
   v
-deepvqe_prepost_post_process_freq
+deepvqe_prepost_post_process_freq（N 次，由舊到新）
   |
   v
-ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE；每拍回滿一個 hop，含首拍)
+ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE；每個 frame 回滿一個 hop，含首拍)
   |
   v
 float -> int16 飽和轉換（×32768，四捨五入、半值遠離零）（push 回 0 時填零；N=1 不會發生）
   |
   v
-PCM out (int16, 永遠完整一個 hop)
+PCM out (int16, 永遠完整 N 個 hop；N=1 時一個 hop)
 </pre>
 
 <h2 id="section-9">訊號泳道圖</h2>
-<p>lifeline：<code>caller</code>（含 <code>AcStft</code>／<code>AcIstft</code>）、<code>deepvqe_stream</code>（本層）、<code>NPU</code>（替身或目標平台 runtime）。沒有模型延遲；PCM 總延遲為 N × hop（N=1 時 1 hop），首拍已是真實輸出。</p>
+<p>lifeline：<code>caller</code>（含 <code>AcStft</code>／<code>AcIstft</code>）、<code>deepvqe_stream</code>（本層）、<code>NPU</code>（替身或目標平台 runtime）。沒有模型延遲；PCM 總延遲為一個 hop（stream 自己的框化），與 N 無關，首拍已是真實輸出。圖以 N=1 為例：一包就是一個 hop；N&gt;1 時 pre 一次收 N 個 hop、跑一次加速器、post 一次交出 N 個 hop，單 hop 的 <code>pre_process</code>／<code>post_process</code> 只用於 N=1，N&gt;1 的 stream 回 −1 且不動任何狀態。</p>
 <pre>
-hop   caller                       deepvqe_stream                       NPU
-0     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次 (CCM ring 全零歷史)
+包    caller                       deepvqe_stream                       NPU
+0     mic_in,far_in -> pre_process_packet -> STFT x2, pre_process_freq, open -> 跑一次 (CCM ring 全零歷史)
       &lt;-- 1 (job開啟) --------------------------------------------
       ai_rc=run_accelerator ---------------------------------->  寫 taps + state
-      post_process(ai_rc) --------> frame_finish -------------->
+      post_process_packet(ai_rc) --> frame_finish -------------->
       &lt;-- 1 (首拍即真實合成輸出, 前半窗來自零歷史) ---- ISTFT push=hop ----
-1     mic_in,far_in -> pre_process -> STFT x2, pre_process_freq, open -> 跑一次
+1     mic_in,far_in -> pre_process_packet -> STFT x2, pre_process_freq, open -> 跑一次
       ai_rc=run_accelerator ---------------------------------->  寫 taps + state
-      post_process(ai_rc) --------> frame_finish -------------->
+      post_process_packet(ai_rc) --> frame_finish -------------->
       &lt;-- 1 (真實輸出) --------------------- ISTFT push=hop ----
   ... (fail-closed 範例) ...
-k     pre_process -> open --------------------------------------> 替身回 -1, 不寫 taps
-      post_process(ai_rc=-1) -----> frame_fail (本拍頻譜貢獻歸零, state 清零, 非直通 mic_in) ->
+k     pre_process_packet -> open -------------------------------> 替身回 -1, 不寫 taps
+      post_process_packet(ai_rc=-1) -> frame_fail (本拍頻譜貢獻歸零, state 清零, 非直通 mic_in) ->
       &lt;-- 1 (PCM 仍疊加上一拍 OLA 尾段, 單拍不保證全零; 連續兩拍才靜音) --
 </pre>
 
 <h2 id="section-10">I/O 表</h2>
 <div class="tbl"><table>
 <tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
-<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 <code>deepvqe_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
-<tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>DeepVqePrepostInputs</code>）</td><td><code>mic</code>／<code>far</code> 各 <code>[1,2,1,BINS]</code>（壓縮後平面複數），16 組 state 視圖（<code>DeepVqeStateId</code>）</td><td>僅 <code>pre_process</code> 回 1 時有效</td><td>—</td></tr>
-<tr><td>輸出</td><td><code>io.outputs</code>（<code>DeepVqePrepostOutputs</code>）</td><td><code>taps</code> <code>[1,1,BINS,TIME_ORDER*FREQ_TAPS*2]</code>（NaN 預填），16 組 <code>state_out</code></td><td>加速器寫一次</td><td>—</td></tr>
-<tr><td>輸出</td><td><code>pcm_out</code></td><td><code>int16_t*</code>，長度同 <code>mic_in</code></td><td>每 hop 1 次，永遠寫滿</td><td>1 hop</td></tr>
+<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 N × <code>deepvqe_stream_hop_size(s)</code></td><td>每包 1 次</td><td>N hop（16 kHz／512、N=1 時為 256 samples）</td></tr>
+<tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>DeepVqePrepostInputs</code>）</td><td><code>mic</code>／<code>far</code> 各 <code>[1,2,N,BINS]</code>（壓縮後平面複數），16 組 state 視圖（<code>DeepVqeStateId</code>）</td><td><code>pre_process_packet</code> 回 1 時有效</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>io.outputs</code>（<code>DeepVqePrepostOutputs</code>）</td><td><code>taps</code> <code>[1,N,BINS,TIME_ORDER*FREQ_TAPS*2]</code>（NaN 預填），16 組 <code>state_out</code></td><td>加速器寫一次</td><td>—</td></tr>
+<tr><td>輸出</td><td><code>pcm_out</code></td><td><code>int16_t*</code>，長度同 <code>mic_in</code></td><td>每包 1 次，永遠寫滿</td><td>N hop</td></tr>
 </table></div>
 <p class="note"><code>DEEPVQE_TIME_ORDER = 3</code>、<code>DEEPVQE_FREQ_TAPS = 3</code>、<code>DEEPVQE_STATE_COUNT = 16</code>（<code>lib/aiaec/deepvqe_s/deepvqe_process.h</code>／<code>deepvqe_prepost.h</code>）。</p>
 
@@ -385,7 +385,7 @@ k     pre_process -> open --------------------------------------> 替身回 -1, 
 <tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
 <tr><td>模型延遲</td><td>0（每 hop 一幀，<code>deepvqe_prepost.h</code>：「no latency beyond it」）</td><td><code>deepvqe_prepost.h</code></td></tr>
-<tr><td>合成啟動</td><td>無首拍特例：N=1 時 hop 0 即為真實合成輸出（前半窗疊加的歷史為零，可能有聲）；N&gt;1 的第一批前 N-1 拍為規格內零填</td><td><code>deepvqe_stream.h</code> 檔頭</td></tr>
+<tr><td>合成啟動</td><td>無首拍特例：每一包的輸出就是該包 N 個 frame 的合成，hop 0 即為真實合成輸出（前半窗疊加的歷史為零，可能有聲）；沒有 N−1 拍的零填，也沒有跨包的佇列</td><td><code>deepvqe_stream.h</code> 檔頭</td></tr>
 <tr><td>CCM ring 部分零歷史</td><td>前 <code>TIME_ORDER-1</code> = 2 個 hop</td><td>模型自身啟動行為，非延遲</td></tr>
 </table></div>
 </main>

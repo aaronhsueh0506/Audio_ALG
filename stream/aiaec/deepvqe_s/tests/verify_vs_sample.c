@@ -290,11 +290,9 @@ static int run_matrix(int inject_shift) {
 
             post_rc_a = board_post(&A, ai_rc, pcm_out_a, &written_a);
             post_rc_b = deepvqe_stream_post_process(B, ai_rc, pcm_out_b);
-            /* B doesn't expose `written` directly; infer it from post_rc_b per deepvqe_stream.h's
-             * documented 3-way split (1 => written==hop; 0 => written==0, the frames_per_call > 1
-             * pre-roll case, never reached here since frames_per_call == 1; -1 => post_process_freq
-             * contract error, written undefined/not applicable). */
-            written_b = (post_rc_b == 1) ? hop : (post_rc_b == 0 ? 0 : -1);
+            /* B doesn't expose `written` directly; infer it from post_rc_b (1 => written==hop; -1 => contract
+             * error, written undefined/not applicable). */
+            written_b = (post_rc_b == 1) ? hop : -1;
 
             if (post_rc_a != post_rc_b) {
                 fprintf(stderr, "hop %lld: post_rc mismatch A=%d B=%d\n", ghop, post_rc_a, post_rc_b);

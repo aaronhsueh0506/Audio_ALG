@@ -270,8 +270,6 @@ typedef struct AiaecCore {
         struct {
             DeepVqeStream *inner;
             DeepVqeGrid    grid;
-            int16_t       *stash;     /* PCM family: (N - 1) * hop; NULL when N == 1 */
-            float         *stash_f;   /* _freq: (N - 1) * n_bins real, then as many imaginary */
         } deepvqe;
 #endif
 #if AIAEC_ENABLE_ALIGN_ULCNET
@@ -308,12 +306,11 @@ static void aiaec_ulcnet_stream_cfg(AiaecFamily family, const UlcnetGrid *grid, 
 }
 #endif
 
-/* Carves (base != NULL) or just sizes (base == NULL) the core header, the DeepVQE-S stash (if
- * applicable) and the bound inner stream's own pool region, in that order. dgrid/ugrid are
- * `const void *` (cast back inside each #if branch) so the signature compiles in every build
+/* Carves (base != NULL) or just sizes (base == NULL) the core header and the bound inner stream's own pool region, in that
+ * order. dgrid/ugrid are `const void *` (cast back inside each #if branch) so the signature compiles in every build
  * variant, even one where only one of DeepVqeGrid/UlcnetGrid exists. */
 static int aiaec_pool_layout(AiaecFamily family, int n, const void *dgrid, const void *ugrid,
-                             unsigned char *base, AiaecCore **core_out, void **stash_out,
+                             unsigned char *base, AiaecCore **core_out,
                              void **inner_pool_out, size_t *inner_bytes_out, size_t *total_out)
 {
     size_t cursor = 0;
@@ -327,19 +324,8 @@ static int aiaec_pool_layout(AiaecFamily family, int n, const void *dgrid, const
         const DeepVqeGrid *grid = (const DeepVqeGrid *)dgrid;
         DeepVqeStreamConfig scfg;
         DeepVqeStreamMemReq sreq;
-        size_t stash_bytes = 0;
 
         (void)ugrid;
-        if (n > 1) {
-            stash_bytes = family == AIAEC_FAMILY_PCM
-                ? (size_t)(n - 1) * (size_t)grid->hop * sizeof(int16_t)
-                : (size_t)2u * (size_t)(n - 1) * (size_t)grid->n_bins * sizeof(float);
-            if (stream_carve(base, &cursor, stash_bytes, &p) != 0) return -1;
-        } else {
-            p = (void *)0;
-        }
-        if (stash_out) *stash_out = p;
-
         aiaec_deepvqe_stream_cfg(family, grid, &scfg);
         if (deepvqe_stream_get_mem_size(&scfg, &sreq) != 0) return -1;
         if (stream_carve(base, &cursor, (size_t)sreq.bytes, &p) != 0) return -1;
@@ -349,15 +335,13 @@ static int aiaec_pool_layout(AiaecFamily family, int n, const void *dgrid, const
         (void)family; (void)dgrid; (void)ugrid; (void)n;
         return -1;
 #endif
-    } else {   /* AIAEC_MODEL_ID_ALIGN_ULCNET: the inner stream batches N hops itself, no stash */
+    } else {   /* AIAEC_MODEL_ID_ALIGN_ULCNET */
 #if AIAEC_ENABLE_ALIGN_ULCNET
         const UlcnetGrid *grid = (const UlcnetGrid *)ugrid;
         UlcnetStreamConfig ucfg;
         UlcnetStreamMemReq ureq;
 
         (void)dgrid;
-        if (stash_out) *stash_out = (void *)0;
-
         aiaec_ulcnet_stream_cfg(family, grid, n, &ucfg);
         if (ulcnet_stream_get_mem_size(&ucfg, &ureq) != 0) return -1;
         if (stream_carve(base, &cursor, (size_t)ureq.bytes, &p) != 0) return -1;
@@ -389,7 +373,7 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
         status = aiaec_build_grid(entry, n, delay_depth, &dgrid);
         if (status != AIAEC_OK) return status;
         if (aiaec_pool_layout(family, n, &dgrid, (const void *)0, (unsigned char *)0,
-                              (AiaecCore **)0, (void **)0, (void **)0, (size_t *)0, &total) != 0)
+                              (AiaecCore **)0, (void **)0, (size_t *)0, &total) != 0)
             return AIAEC_ERR_POOL;
 #else
         return AIAEC_ERR_MODEL_ID;
@@ -400,7 +384,7 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
         status = aiaec_build_grid_ulcnet(entry, delay_depth, &ugrid);
         if (status != AIAEC_OK) return status;
         if (aiaec_pool_layout(family, n, (const void *)0, &ugrid, (unsigned char *)0,
-                              (AiaecCore **)0, (void **)0, (void **)0, (size_t *)0, &total) != 0)
+                              (AiaecCore **)0, (void **)0, (size_t *)0, &total) != 0)
             return AIAEC_ERR_POOL;
 #else
         return AIAEC_ERR_MODEL_ID;
@@ -412,29 +396,14 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
     return AIAEC_OK;
 }
 
-/* Round trip on the final PCM, measured with an identity accelerator; the same for both families
- * (the _freq caller's own ISTFT supplies the framing hop the PCM family has inside).
- * DeepVQE-S: N * hop -- one hop of STFT/ISTFT framing latency, present even at N == 1, plus (N - 1)
- * hops of model queue. Align-ULCNet: the packet graph returns the N enhanced frames of the N frames it
- * was given, so there is no queue: one hop of framing latency whatever N. */
-static int aiaec_trim_samples(int model_id, int n, int hop)
-{
-    return model_id == AIAEC_MODEL_ID_ALIGN_ULCNET ? hop : n * hop;
-}
-
-static int aiaec_queue_frames(int model_id, int n)
-{
-    return model_id == AIAEC_MODEL_ID_ALIGN_ULCNET ? 0 : n - 1;
-}
-
+/* Round trip on the final PCM, for both models and both families (the _freq caller's own ISTFT supplies the framing hop
+ * the PCM family has inside): one hop of framing latency whatever N, and no model queue. */
 static void aiaec_core_info(const AiaecCore *core, const char *graph_path, AiaecInfo *info)
 {
-    const int model_hop = core->cfg.fft / 2;
-
     memset(info, 0, sizeof(*info));
     info->graph_path = graph_path;
-    info->trim_samples = aiaec_trim_samples(core->model_id, core->frames_per_call, model_hop);
-    info->queue_frames = aiaec_queue_frames(core->model_id, core->frames_per_call);
+    info->trim_samples = core->cfg.fft / 2;
+    info->queue_frames = 0;
     info->tail_zero_blocks = (info->trim_samples + core->cfg.hop_in - 1) / core->cfg.hop_in;
 }
 
@@ -448,7 +417,6 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
     const AiaecModelEntry *entry;
     const char *graph_path = (const char *)0;
     AiaecCore *core = (AiaecCore *)0;
-    void *stash = (void *)0;
     void *inner_pool = (void *)0;
     size_t inner_bytes = 0;
     size_t total = 0;
@@ -472,7 +440,7 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
         status = aiaec_build_grid(entry, n, delay_depth, &dgrid);
         if (status != AIAEC_OK) return status;
         if (aiaec_pool_layout(family, n, &dgrid, (const void *)0, (unsigned char *)pool,
-                              &core, &stash, &inner_pool, &inner_bytes, &total) != 0)
+                              &core, &inner_pool, &inner_bytes, &total) != 0)
             return AIAEC_ERR_POOL;
         if (total != (size_t)req.bytes) return AIAEC_ERR_POOL;
 
@@ -480,8 +448,6 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
         core->u.deepvqe.inner = deepvqe_stream_init(&scfg, inner_pool, inner_bytes);
         if (!core->u.deepvqe.inner) return AIAEC_ERR_POOL;
         core->u.deepvqe.grid = dgrid;
-        if (family == AIAEC_FAMILY_PCM) core->u.deepvqe.stash = (int16_t *)stash;
-        else core->u.deepvqe.stash_f = (float *)stash;
         core->hop = dgrid.hop;
         core->n_bins = dgrid.n_bins;
 #else
@@ -495,7 +461,7 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
         status = aiaec_build_grid_ulcnet(entry, delay_depth, &ugrid);
         if (status != AIAEC_OK) return status;
         if (aiaec_pool_layout(family, n, (const void *)0, &ugrid, (unsigned char *)pool,
-                              &core, &stash, &inner_pool, &inner_bytes, &total) != 0)
+                              &core, &inner_pool, &inner_bytes, &total) != 0)
             return AIAEC_ERR_POOL;
         if (total != (size_t)req.bytes) return AIAEC_ERR_POOL;
 
@@ -596,72 +562,6 @@ unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx) { return ctx ?
  * Block entries
  * ------------------------------------------------------------------------------------------- */
 
-#if AIAEC_ENABLE_DEEPVQE_S
-/* DeepVQE-S's N-hop stash/drain loop: the first N - 1 hops of a block never carry a real job (each
- * drains what the previous block's job left owed and stashes it); the last one does. The two
- * families differ only in what is analysed (PCM or supplied spectra) and what is drained (PCM, or a
- * spectrum into the float stash). */
-static int aiaec_deepvqe_pre(AiaecCore *c, const int16_t *mic_in, const int16_t *far_in,
-                             const AiaecFreqInput *fin, DeepVqeHopIO *hio)
-{
-    DeepVqeStream *inner = c->u.deepvqe.inner;
-    const int n = c->frames_per_call, hop = c->hop, nb = c->n_bins;
-    int i, rc;
-
-    for (i = 0; i <= n - 1; ++i) {
-        const size_t fo = (size_t)i * (size_t)nb;
-        if (fin)
-            rc = deepvqe_stream_pre_process_freq(inner, fin->u.deepvqe_s.mic_re + fo, fin->u.deepvqe_s.mic_im + fo,
-                                                 fin->u.deepvqe_s.far_re + fo, fin->u.deepvqe_s.far_im + fo, hio);
-        else
-            rc = deepvqe_stream_pre_process(inner, mic_in + (size_t)i * (size_t)hop,
-                                            far_in + (size_t)i * (size_t)hop, hio);
-        if (i == n - 1) return rc == 1 ? AIAEC_OK : AIAEC_ERR_SEQUENCE;
-        if (rc != 0) return AIAEC_ERR_SEQUENCE;
-        if (c->family == AIAEC_FAMILY_PCM) {
-            if (deepvqe_stream_post_process(inner, STREAM_RUN_OK, c->u.deepvqe.stash + (size_t)i * (size_t)hop) < 0)
-                return AIAEC_ERR_SEQUENCE;
-        } else {
-            float *stash_re = c->u.deepvqe.stash_f, *stash_im = stash_re + (size_t)(n - 1) * (size_t)nb;
-            if (deepvqe_stream_post_process_freq(inner, STREAM_RUN_OK, stash_re + fo, stash_im + fo) < 0)
-                return AIAEC_ERR_SEQUENCE;
-        }
-    }
-    return AIAEC_ERR_SEQUENCE;
-}
-
-static int aiaec_deepvqe_post_pcm(AiaecCore *c, int run_status, int16_t *pcm_out)
-{
-    const int n = c->frames_per_call, hop = c->hop;
-    int i;
-
-    if (deepvqe_stream_post_process(c->u.deepvqe.inner, run_status,
-                                    pcm_out + (size_t)(n - 1) * (size_t)hop) < 0)
-        return AIAEC_ERR_SEQUENCE;
-    for (i = 0; i < n - 1; ++i) {
-        memcpy(pcm_out + (size_t)i * (size_t)hop, c->u.deepvqe.stash + (size_t)i * (size_t)hop,
-               (size_t)hop * sizeof(int16_t));
-    }
-    return AIAEC_OK;
-}
-
-static int aiaec_deepvqe_post_freq(AiaecCore *c, int run_status, float *out_re, float *out_im)
-{
-    const int n = c->frames_per_call, nb = c->n_bins;
-    const size_t last = (size_t)(n - 1) * (size_t)nb;
-    int i;
-
-    if (deepvqe_stream_post_process_freq(c->u.deepvqe.inner, run_status, out_re + last, out_im + last) < 0)
-        return AIAEC_ERR_SEQUENCE;
-    for (i = 0; i < n - 1; ++i) {
-        const size_t fo = (size_t)i * (size_t)nb;
-        memcpy(out_re + fo, c->u.deepvqe.stash_f + fo, (size_t)nb * sizeof(float));
-        memcpy(out_im + fo, c->u.deepvqe.stash_f + last + fo, (size_t)nb * sizeof(float));
-    }
-    return AIAEC_OK;
-}
-#endif /* AIAEC_ENABLE_DEEPVQE_S */
-
 /* 1 when every |x[k]| is at most the float whose IEEE bits are limit_bits (a NaN or Inf is above any finite limit). */
 static int aiaec_plane_within(const float *x, size_t n, uint32_t limit_bits)
 {
@@ -705,9 +605,14 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 return AIAEC_ERR_NONFINITE_INPUT;
         }
 
-        rc = aiaec_deepvqe_pre(c, pin ? pin->u.deepvqe_s.mic_in : (const int16_t *)0,
-                               pin ? pin->u.deepvqe_s.far_in : (const int16_t *)0, fin, &hio);
-        if (rc != AIAEC_OK) return rc;
+        if (pin)
+            rc = deepvqe_stream_pre_process_packet(c->u.deepvqe.inner, pin->u.deepvqe_s.mic_in,
+                                                   pin->u.deepvqe_s.far_in, &hio);
+        else
+            rc = deepvqe_stream_pre_process_packet_freq(c->u.deepvqe.inner, fin->u.deepvqe_s.mic_re,
+                                                        fin->u.deepvqe_s.mic_im, fin->u.deepvqe_s.far_re,
+                                                        fin->u.deepvqe_s.far_im, &hio);
+        if (rc != 1) return AIAEC_ERR_SEQUENCE;
 
         aiaec_block_fill_deepvqe(&c->u.deepvqe.grid, &hio.inputs, &hio.outputs, hio.state_generation, work);
         c->block_open = 1;
@@ -837,8 +742,9 @@ static int aiaec_core_postprocess(AiaecCore *c, int run_status, int16_t *pcm_out
 
     if (c->model_id == AIAEC_MODEL_ID_DEEPVQE_S) {
 #if AIAEC_ENABLE_DEEPVQE_S
-        return pcm_out ? aiaec_deepvqe_post_pcm(c, run_status, pcm_out)
-                       : aiaec_deepvqe_post_freq(c, run_status, out_re, out_im);
+        rc = pcm_out ? deepvqe_stream_post_process_packet(c->u.deepvqe.inner, run_status, pcm_out)
+                     : deepvqe_stream_post_process_packet_freq(c->u.deepvqe.inner, run_status, out_re, out_im);
+        return rc == 1 ? AIAEC_OK : AIAEC_ERR_SEQUENCE;
 #else
         return AIAEC_ERR_MODEL_ID;
 #endif

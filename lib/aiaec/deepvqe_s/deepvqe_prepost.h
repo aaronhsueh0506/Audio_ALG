@@ -1,29 +1,23 @@
 /* DeepVQE-S pre/post class: everything between the caller's spectra and the accelerator's
  * tensors, frequency domain only; one frame in, one inference, one frame out with
- * grid.frames_per_call == 1; with frames_per_call == N > 1, N frames in per accelerator call,
- * one frame out per pre/post_process_freq pair still -- the accelerator runs once every N calls:
+ * grid.frames_per_call == 1; with frames_per_call == N > 1, N frames in per accelerator call and
+ * N frames out of it:
  *
- *     deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re, far_im);   // ready after N calls
- *     if (ready) {
- *         deepvqe_prepost_frame_open(p, &in, &out);   // N-frame views into the pool
- *         my_npu_run(&in, &out);                        // NPU fills `out` (N taps)
- *         deepvqe_prepost_frame_finish(p);              // after a run; _frame_fail() if it failed
- *     }
- *     deepvqe_prepost_post_process_freq(p, re, im);   // drains one of the N frames
+ *     deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re, far_im);   // N calls; the Nth returns 1
+ *     deepvqe_prepost_frame_open(p, &in, &out);   // N-frame views into the pool
+ *     my_npu_run(&in, &out);                        // NPU fills `out` (N taps)
+ *     deepvqe_prepost_frame_finish(p);              // after a run; _frame_fail() if it failed
+ *     deepvqe_prepost_post_process_freq(p, re, im);   // N calls: the batch's frames, oldest first
  *
- * pre_process_freq returns 1 once every N calls (the one to follow with frame_open/finish or
- * _bypass), 0 the other N - 1 (no job this call); post_process_freq is called every time either
- * way and always drains exactly one frame, continuing to drain the previous batch's N frames
- * while the next batch's N inputs are still being gathered -- latency grows by N - 1 calls, there
- * is otherwise still exactly one frame out per call. N == 1 is unchanged: pre_process_freq always
- * returns 1. Before the very first batch ever finishes or is bypassed, post_process_freq drains
- * the pool's zero-initialized enh buffer (silence), same as N == 1 always did before any frame.
+ * pre_process_freq returns 0 for the first N - 1 calls of a batch (gathering) and 1 for the Nth
+ * (the one to follow with frame_open, then finish | fail | bypass); post_process_freq is called
+ * after the batch is closed and drains one frame per call, in order. N == 1: pre_process_freq
+ * always returns 1.
  *
  * Framing: one AcStft per stream and one AcIstft for the output, all from
  * ac_stft_config_default(&sc, n_fft) (sqrt-Hann, center 0, hop n_fft / 2, spec_scale =
  * ispec_scale = 1) with sc.ola = AC_OLA_ACCUMULATE (analysis ignores ola); one frame per hop from
- * the first hop, no latency beyond it (N == 1) or N - 1 hops (N > 1, see above). The class holds
- * no window and no FFT handle. */
+ * the first hop, no latency beyond it. The class holds no window and no FFT handle. */
 
 #ifndef DEEPVQE_PREPOST_H
 #define DEEPVQE_PREPOST_H
@@ -286,11 +280,9 @@ int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
  * Returns 0, or -1 (nothing changed) if no batch is open. */
 int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started);
 
-/* The enhanced spectrum (n_bins bins) of the next frame still owed from the last finished or
- * bypassed batch -- one drained per call, in order, over the N calls following that batch (N ==
- * 1: every call; before the first batch ever finishes, the pool's zero init makes this silence,
- * same as N == 1 always did). Returns 0, or -1 on NULL re/im or a call made while a batch is
- * open. */
+/* The enhanced spectrum (n_bins bins) of the next frame of the last closed batch -- one drained
+ * per call, in order, over the N calls following that batch. Returns 0, or -1 on NULL re/im or a
+ * call made while a batch is open. */
 int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im);
 
 #ifdef __cplusplus
