@@ -107,23 +107,30 @@ static inline int dfn_hop_infer(const DfnHop* h, DfnHopJob* job) {
     return h->model.infer(h->model.user, &job->inputs, &job->outputs);
 }
 
-/* Host on the model's grid. `planar` holds 6 * n_bins floats, `out_spec` n_bins bins; both are
- * zeroed here. 0, or -1 (h untouched) for NULL h / grid / model or frames_per_call != 1. */
-static inline int dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
-                                      const DFN2Model* model, AcIstft* istft, Complex* out_spec,
+/* The fields both paths share; 0, or -1 (h untouched) for NULL h / grid / model or frames_per_call != 1. */
+static inline int dfn_hop_init_common(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid, const DFN2Model* model,
                                       float* planar) {
     if (!h || !grid || !model || grid->frames_per_call != 1) return -1;
     memset(h, 0, sizeof(*h));
     h->stream = stream;
     h->model = *model;
-    h->istft = istft;
-    h->out_spec = out_spec;
     h->planar = planar;
     h->n_bins = grid->n_bins;
-    h->hop_size = grid->hop;
     h->scale = dfn2_stft_scale(grid->n_fft);
     h->unscale = dfn2_stft_unscale(grid->n_fft);
     memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
+    return 0;
+}
+
+/* Host on the model's grid. `planar` holds 6 * n_bins floats, `out_spec` n_bins bins; both are
+ * zeroed here. 0, or -1 (h untouched) for NULL h / grid / model or frames_per_call != 1. */
+static inline int dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
+                                      const DFN2Model* model, AcIstft* istft, Complex* out_spec,
+                                      float* planar) {
+    if (dfn_hop_init_common(h, stream, grid, model, planar) != 0) return -1;
+    h->istft = istft;
+    h->out_spec = out_spec;
+    h->hop_size = grid->hop;
     memset(out_spec, 0, (size_t)grid->n_bins * sizeof(Complex));
     return 0;
 }
@@ -131,16 +138,8 @@ static inline int dfn_hop_init_direct(DfnHop* h, DFN2Stream* stream, const DFN2G
 /* Host rate differs from the model grid (bridge path). 0, or -1 as dfn_hop_init_direct(). */
 static inline int dfn_hop_init_bridge(DfnHop* h, DFN2Stream* stream, const DFN2Grid* grid,
                                       const DFN2Model* model, AinrBridge* bridge, float* planar) {
-    if (!h || !grid || !model || grid->frames_per_call != 1) return -1;
-    memset(h, 0, sizeof(*h));
-    h->stream = stream;
+    if (dfn_hop_init_common(h, stream, grid, model, planar) != 0) return -1;
     h->bridge = bridge;
-    h->model = *model;
-    h->planar = planar;
-    h->n_bins = grid->n_bins;
-    h->scale = dfn2_stft_scale(grid->n_fft);
-    h->unscale = dfn2_stft_unscale(grid->n_fft);
-    memset(planar, 0, (size_t)6 * (size_t)grid->n_bins * sizeof(float));
     return 0;
 }
 
@@ -223,7 +222,6 @@ static inline int dfn_hop_bridge_frame(DfnHop* h) {
 }
 
 static inline int dfn_hop_bridge_frame_end(DfnHop* h, int model_rc) {
-    if (!h->frame_open) return -1;
     h->frame_open = 0;
     if (dfn_hop_close_frame(h, model_rc, h->frame_out) != 0) return -1;
     return ainr_bridge_model_end(h->bridge);
