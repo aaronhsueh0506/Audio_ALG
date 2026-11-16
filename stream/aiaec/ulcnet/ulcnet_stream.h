@@ -117,7 +117,7 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 
 /* Once per pre_process. ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail
  * OPEN). pcm_out is a full hop (return 1), a reprime or alignment-event hop included (its frame is the error spectrum).
- * -1 with zeros on a post_process_freq() error; a freq_only stream: -1, pcm_out untouched, hop still open. */
+ * -1 with nothing open or NULL arguments; a freq_only stream: -1, pcm_out untouched, hop still open. */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
 /* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then one job; the PCM equals N
