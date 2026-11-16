@@ -18,10 +18,9 @@
 
 struct DFN2Stream {
     DFN2Grid grid;
-    int      hpf_enable;
 
     /* hpf, fft, stft, istft: the PCM half, NULL in a freq_only context (the entries test stft / istft). */
-    Hpf        *hpf;     /* NULL when !hpf_enable */
+    Hpf        *hpf;     /* NULL unless the config enables the input high-pass */
     FftHandle  *fft;     /* carved once, shared by stft and istft */
     AcStft     *stft;
     AcIstft    *istft;
@@ -273,7 +272,6 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     s = layout->self;
 
     s->grid = cfg->grid;
-    s->hpf_enable = cfg->hpf_enable;
     s->open = 0;
     s->pending = 0;
     s->hpf = NULL;
@@ -411,7 +409,7 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
     hop = s->grid.hop;
 
     for (i = 0; i < hop; ++i) s->hop_in[i] = (float)pcm_in[i] / 32768.0f;
-    if (s->hpf_enable) hpf_process(s->hpf, s->hop_in, hop);
+    if (s->hpf) hpf_process(s->hpf, s->hop_in, hop);
 
     ac_stft_push_planar(s->stft, s->hop_in, s->spec_re, s->spec_im);
 
@@ -437,7 +435,7 @@ static void dfn2_stream_close_frame(DFN2Stream *s, int ai_rc) {
 }
 
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
-    int hop, i, valid, prc;
+    int hop, i, valid;
 
     if (!s || !pcm_out || !s->pending || !s->istft) return -1;
     hop = s->grid.hop;
@@ -445,14 +443,8 @@ int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
     dfn2_stream_close_frame(s, ai_rc);
 
     valid = 0;
-    prc = dfn2_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im, &valid);
-    if (prc == 0) {
-        ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
-    } else {
-        /* Defensive only, unreached in correct use (the hop was just closed above). */
-        memset(s->hop_out, 0, (size_t)hop * sizeof(float));
-        valid = 0;
-    }
+    if (dfn2_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im, &valid) != 0) return -1;
+    ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
 
     for (i = 0; i < hop; ++i) pcm_out[i] = stream_saturate_s16(s->hop_out[i]);
 
