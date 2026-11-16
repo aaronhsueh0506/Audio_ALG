@@ -371,7 +371,7 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 
 # aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with
 # ../dfn/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
@@ -586,8 +586,8 @@ test: $(BIN_DIR)/4ch_alignulcnet_d1
 $(BIN_DIR)/4ch_aec_bf_dfn_res: $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 
-$(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
+$(BIN_DIR)/test_4ch_dfn: $(OBJ_DIR)/test_4ch_dfn.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4ch_dfn.o $(OBJ_DIR)/array_sample_driver.o $(DFN_PIPELINE_LIB) $(UNIT_LIBS) $(LDLIBS)
 
 # 4ch_external_static spells the application-side init out and needs lib/aec only.
 $(BIN_DIR)/4ch_external_static: $(OBJ_DIR)/4ch_external_static.o $(CORE_LIBS) | _cfg_guard

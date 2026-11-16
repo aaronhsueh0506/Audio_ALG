@@ -33,11 +33,8 @@
 array_sample_beam_process(unit, mics_interleaved /* [hop][4] */, ref, &amp;beam, NULL);   /* delay、4 lane、SRP-PHAT、BF */
 array_sample_beam_fuse(unit, &amp;v);                          /* = aec_process_residual(aec, &amp;{beam.weights, beam.spectrum}) + aec_get_residual */
 moved = array_sample_post_reset_due(&amp;handled, &amp;v);        /* v.post_reset_serial 變動:某條 lane 本 hop 硬重置 */
-if (hop.bridge) { if (moved) ainr_bridge_reset_synthesis(hop.bridge); } /* 16 kHz:只清橋內原生合成的 OLA 尾巴 */
-else {                                                      /* 48 kHz:每 hop 位移一格的 shift register(從 0 起) */
-    reset_pending = (reset_pending &lt;&lt; 1) | moved;
-    if ((reset_pending &gt;&gt; dfn_hop_lookahead_frames(&amp;grid)) &amp; 1u) ac_istft_reset(hop.istft);   /* 只清呼叫端的合成 */
-}                                                           /* comfort-noise 種子由 array 自己重設 */
+dfn_reset_follow(&amp;follow, &amp;hop, moved);                    /* 16 kHz:這個 hop 只清橋內原生合成的 OLA 尾巴;48 kHz:每 hop 位移一格的 shift register(從 0 起),
+                                                              延後 dfn_hop_lookahead_frames() 個 hop 清呼叫端的合成;comfort-noise 種子由 array 自己重設 */
 aec_apply_gain(aec, NULL, post);                          /* P 必須在 dfn_hop_begin 之前形成:P = B * G_res，B = v.base_spec */
 if (cng_on)                                                /* 預設關: B 與 P 要同相位 */
     aec_apply_cng(aec, NULL, post);

@@ -32,15 +32,15 @@
  * on the model's own grid (2 for the shipped 1/1 pair at 48 kHz) and
  * ainr_bridge_added_delay_samples() through the bridge; the first output hops are zero. An AEC
  * post-chain reset event (aec_post_reset_serial() moved) is followed by the caller before the
- * hop: through the bridge ainr_bridge_reset_synthesis(h.bridge) (the host-grid synthesis is inside
- * the bridge and runs at the top of dfn_hop_begin(): no delay line); with the model grid driven
- * directly the caller clears its own AcIstft dfn_hop_lookahead_frames() hops later (see
- * mono/aec_dfn_res/main.c). A negative return leaves recovery to the caller: reset the AEC front
+ * hop with dfn_reset_follow(): through the bridge it clears the host-grid synthesis on the hop of the
+ * event (that synthesis is inside the bridge and runs at the top of dfn_hop_begin()); with the model
+ * grid driven directly it clears the hop's AcIstft dfn_hop_lookahead_frames() hops later. A negative return leaves recovery to the caller: reset the AEC front
  * end, the comfort-noise generator and DfnHop together. */
 #ifndef PIPELINES_DFN_DFN_HOP_H
 #define PIPELINES_DFN_DFN_HOP_H
 
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "ainr_bridge.h"
@@ -316,6 +316,35 @@ static inline int dfn_hop_process(DfnHop* h, const Complex* e, const Complex* p,
     }
     if (r < 0) return r;
     return dfn_hop_end(h, out);
+}
+
+/* Follows an upstream hard post-chain reset event. Direct path: the frame built on the hop of the event reaches the
+ * synthesis dfn_hop_lookahead_frames() hops later, so the hop's AcIstft is cleared just before that push and DFN2 keeps
+ * running. Bridge path: its host-grid synthesis is cleared on the hop of the event. */
+typedef struct DfnResetFollow {
+    uint32_t pending;             /* bit k: an event was seen k hops ago */
+    int delay;                    /* hops from the event to the clear: the model's lookahead, below 32 */
+} DfnResetFollow;
+
+static inline void dfn_reset_follow_init(DfnResetFollow* f, const DFN2Grid* grid) {
+    f->pending = 0u;
+    f->delay = dfn_hop_lookahead_frames(grid);
+}
+
+/* After dfn_hop_reset(): no event is pending. */
+static inline void dfn_reset_follow_clear(DfnResetFollow* f) {
+    f->pending = 0u;
+}
+
+/* Once per hop before dfn_hop_begin(); `moved` is 1 when the event is on this hop. Returns 1 when it cleared a
+ * synthesis, 0 when not, or the bridge's refusal (negative; it cannot refuse between hops). */
+static inline int dfn_reset_follow(DfnResetFollow* f, DfnHop* h, int moved) {
+    if (h->bridge) return moved ? (ainr_bridge_reset_synthesis(h->bridge) == 0 ? 1 : DFN_HOP_INVALID) : 0;
+    if (!h->istft) return 0;
+    f->pending = (f->pending << 1) | (uint32_t)(moved != 0);
+    if (!((f->pending >> f->delay) & 1u)) return 0;
+    ac_istft_reset(h->istft);
+    return 1;
 }
 
 #ifdef __cplusplus

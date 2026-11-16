@@ -147,10 +147,11 @@ estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and c
 `ainr_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
 its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the model
 by its lookahead: the frame built on the hop of the event is pushed `dfn_hop_lookahead_frames()` hops later, so the example
-clears only its own synthesis (`ac_istft_reset()` on `hop.istft`) just before that push, through a per-hop shift register
-that starts at 0 (the same rule as `mono_aec_dfn_res`: the synthesis that receives the first post-reset frame is cleared just before
-it enters). DFN2 keeps running and the hop is not reset. In this flow the serial moves only with an array reset (the lanes
-take an aligned far), which the refused-call path pairs with a hop reset and a cleared shift register.
+clears only its own synthesis (`ac_istft_reset()` on `hop.istft`) just before that push, through the per-hop shift register
+of `dfn_reset_follow()` (`dfn/dfn_hop.h`; it starts at 0, and `main.c` and `tests/test_4ch_dfn.c` run the same function; the same
+rule as `mono_aec_dfn_res`: the synthesis that receives the first post-reset frame is cleared just before it enters). DFN2 keeps
+running and the hop is not reset. In this flow the serial moves only with an array reset (the lanes take an aligned far), which the
+refused-call path pairs with a hop reset and a cleared shift register (`dfn_reset_follow_clear()`).
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
 48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the array's `AecConfig`

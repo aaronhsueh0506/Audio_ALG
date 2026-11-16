@@ -14,11 +14,24 @@
  * bridge's added delay within the resamplers' pass-band error, a near-end impulse pins the delay
  * and the per-hop stage schedule is the documented one.
  * The phased hop (begin / nn_begin / nn_end / end) against the callback-driven one, in the four
- * behaviours run / fail / left open / never fetched, on every grid and both error entries. */
+ * behaviours run / fail / left open / never fetched, on every grid and both error entries.
+ * main.c is compiled into this file: the rows named "main.c" drive its own DfnSample (its build, reset and form
+ * functions) and count the synthesis clears. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "audio_stft.h"
+
+/* Every synthesis clear and the hop it happened on, for the rows that drive main.c. */
+static long g_istft_resets, g_istft_reset_frame, g_frame;
+static void counted_istft_reset(AcIstft *s) {
+    ++g_istft_resets;
+    g_istft_reset_frame = g_frame;
+    (ac_istft_reset)(s);
+}
+#define ac_istft_reset counted_istft_reset
 
 #define ARRAY_TEST_RIG_WITH_BEAM 1
 #include "4ch/tests/array_test_rig.h"
@@ -28,6 +41,10 @@
 #include "dfn/tests/dfn_test_fixture.h"
 #include "4ch/tests/conv_chain_4ch.h"
 #include "4ch/array_sample_post.h"
+
+#define main four_dfn_example_main
+#include "../main.c"
+#undef main
 
 #define TEST_FRAMES 64
 #define ECHO_DELAY 384
@@ -113,8 +130,7 @@ typedef struct FourDfn {
     Complex *post;
     void *post_mem;
     uint32_t reset_handled;   /* AecResidualView.post_reset_serial last followed */
-    uint32_t reset_pending;   /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
-    int reset_delay;          /* hops the direct path delays a frame by (the model's lookahead) */
+    DfnResetFollow follow;    /* the synthesis clear that follows a hard reset: the code main.c runs */
     long hops_begun;          /* fdfn_begin() calls so far */
     long clears, last_clear;  /* direct path: ac_istft_reset() calls, and the hop index of the last one */
     long reset_hops;          /* hops on which the serial had moved */
@@ -153,7 +169,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
 
     m->n_freqs = n_freqs;
     m->enable_cng = enable_cng;
-    m->reset_delay = dfn_hop_lookahead_frames(dfn_test_grid());
+    dfn_reset_follow_init(&m->follow, dfn_test_grid());
     if (posix_memalign(&m->post_mem, 16, ALIGN16((size_t)n_freqs * sizeof(Complex))) != 0) {
         m->post_mem = NULL;
         goto fail;
@@ -181,7 +197,7 @@ fail:
 static void fdfn_reset(FourDfn *m) {
     array_sample_beam_reset(m->unit);
     m->reset_handled = aec_post_reset_serial(m->aec);
-    m->reset_pending = 0u;
+    dfn_reset_follow_clear(&m->follow);
     dfn_hop_reset(&m->hop);
 }
 
@@ -198,22 +214,17 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     m->estimate = f.error_spec;
     due = array_sample_post_reset_due(&m->reset_handled, &f);
     if (due) ++m->reset_hops;
-    if (m->hop.bridge) {
-        /* the bridge synthesises the host-grid spectra at the top of its begin(): the clear goes in on the hop
-         * of the event, with no delay line, and DFN2 keeps running */
-        int clear = due;
-        if (m->sabotage & FDFN_SAB_LATE_CLEAR) { clear = m->bridge_clear_due; m->bridge_clear_due = due; }
-        if (clear && !(m->sabotage & FDFN_SAB_NO_CLEAR) && ainr_bridge_reset_synthesis(m->hop.bridge) != 0)
-            return -1;
-    } else if (m->sabotage & FDFN_SAB_WHOLE_HOP) {
+    if (!m->hop.bridge && (m->sabotage & FDFN_SAB_WHOLE_HOP)) {
         if (due) dfn_hop_reset(&m->hop);
-    } else if (m->hop.istft) {
-        /* the frame built on the hop of the event reaches the synthesis reset_delay hops later: clear only the
-         * synthesis just before that push, DFN2 keeps running */
-        m->reset_pending = (m->reset_pending << 1) | (uint32_t)due;
-        if (!(m->sabotage & FDFN_SAB_NO_CLEAR) &&
-            (m->reset_pending >> ((m->sabotage & FDFN_SAB_NO_DELAY) ? 0 : m->reset_delay)) & 1u) {
-            ac_istft_reset(m->hop.istft);
+    } else if (!(m->sabotage & FDFN_SAB_NO_CLEAR)) {
+        /* what main.c does on every hop: the bridge clears its host-grid synthesis on the hop of the event, the direct
+         * path clears the hop's own synthesis reset_delay hops later, DFN2 keeps running */
+        int moved = due, cleared;
+        if (m->hop.bridge && (m->sabotage & FDFN_SAB_LATE_CLEAR)) { moved = m->bridge_clear_due; m->bridge_clear_due = due; }
+        if (m->sabotage & FDFN_SAB_NO_DELAY) m->follow.delay = 0;
+        cleared = dfn_reset_follow(&m->follow, &m->hop, moved);
+        if (cleared < 0) return -1;
+        if (cleared && !m->hop.bridge) {
             ++m->clears;
             m->last_clear = m->hops_begun - 1;
         }
@@ -522,6 +533,42 @@ static int run_array_reset_direct(int sabotage, long *diff_hops, long *resets, u
     return 0;
 }
 
+/* main.c's own DfnSample at 48 kHz (the direct path), identity model: an event on hop `event_at` (the application restarts
+ * the array), and on hop `reset_at` (when >= 0) a reset of every stage, as a refused call does. Returns the number of
+ * synthesis clears over the run, the hop of the last one and main.c's own lookahead pair (its grid is the shipped one,
+ * whatever pair the test grid is built with). */
+static int run_main_c(int event_at, int reset_at, int *lookahead, long *clears, long *clear_frame) {
+    DfnSample s;
+    ArraySampleHopView view;
+    char *argv[] = { (char *)"4ch_aec_bf_dfn_res", (char *)"--sample-rate", (char *)"48000" };
+    static float tones[130 * DFN2_HOP_LEN];
+    int frame, i, ch, frames = 130;
+    memset(&s, 0, sizeof s);
+    if (dfn_parse(&s, 3, argv) != 0 || dfn_setup(&s, &view) != 0) return 1;
+    if (s.hop.bridge || !s.hop.istft || view.hop != DFN2_HOP_LEN) { dfn_cleanup(&s); return 2; }
+    dfn_fixture_multitone(tones, (size_t)frames * DFN2_HOP_LEN, DFN2_SR);
+    *lookahead = s.args.model_grid.mask_lookahead + s.args.model_grid.df_lookahead;
+    g_istft_resets = 0;
+    g_istft_reset_frame = -1;
+    for (frame = 0; frame < frames; ++frame) {
+        for (i = 0; i < DFN2_HOP_LEN; ++i) {
+            int t = frame * DFN2_HOP_LEN + i;
+            far[i] = tones[t];
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                microphones[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
+                    (t >= ECHO_DELAY ? 0.5f * tones[t - ECHO_DELAY] : 0.0f) + 0.01f * sinf((float)t * 0.071f + (float)ch);
+        }
+        g_frame = frame;
+        if (frame == event_at) array_sample_beam_reset(s.unit);
+        if (frame == reset_at) dfn_reset(&s);
+        if (dfn_process(&s, frame) != 0) { dfn_cleanup(&s); return 10 + frame; }
+    }
+    *clears = g_istft_resets;
+    *clear_frame = g_istft_reset_frame;
+    dfn_cleanup(&s);
+    return 0;
+}
+
 /* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
 static int run_rejections(void) {
     ArrayTestUnitConfig cfg = unit_config(8000, 0);
@@ -708,6 +755,24 @@ int main(void) {
             printf("4ch_aec_bf_dfn_res: array reset 48 kHz: planted defect %d reported on %ld hop(s) (clears %ld, generation %u)\n",
                    sabs[c], diff, clears, generation);
         }
+    }
+    {
+        long clears, clear_frame;
+        int lookahead = 0;
+        rc = run_main_c(81, -1, &lookahead, &clears, &clear_frame);
+        if (rc || clears != 1 || clear_frame != 81 + lookahead) {
+            fprintf(stderr, "4ch DFN main.c, event on hop 81: rc %d, %ld synthesis clear(s), the last on hop %ld, want 1 on hop %d\n",
+                    rc, clears, clear_frame, 81 + lookahead);
+            return 1;
+        }
+        printf("4ch_aec_bf_dfn_res: main.c, event on hop 81: the synthesis is cleared once, on hop %ld\n", clear_frame);
+        rc = run_main_c(40, 41, &lookahead, &clears, &clear_frame);
+        if (rc || clears != 1 || clear_frame != 41) {
+            fprintf(stderr, "4ch DFN main.c, event on hop 40, reset of every stage on hop 41: rc %d, %ld synthesis clear(s), the last on hop %ld, want 1 on hop 41\n",
+                    rc, clears, clear_frame);
+            return 1;
+        }
+        printf("4ch_aec_bf_dfn_res: main.c, event on hop 40 then a reset of every stage on hop 41: the reset's own clear only, the event is no longer followed\n");
     }
     {
         static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};

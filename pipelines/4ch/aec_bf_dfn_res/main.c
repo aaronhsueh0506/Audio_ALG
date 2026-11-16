@@ -83,8 +83,7 @@ typedef struct DfnSample {
     ArraySampleBeam *unit;
     Complex *post;                    /* P */
     uint32_t reset_handled;           /* AecResidualView.post_reset_serial last followed */
-    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
-    int reset_delay;                  /* hops the direct path delays a frame by (the model's lookahead) */
+    DfnResetFollow follow;            /* the synthesis clear that follows a hard reset */
     DfnHop hop;                       /* hop.bridge / hop.istft: the bridge, or the synthesis */
     const char *program;
     char rates_text[64];
@@ -179,7 +178,7 @@ static int dfn_plan(DfnSample *s) {
 static void dfn_reset(DfnSample *s) {
     array_sample_beam_reset(s->unit);
     s->reset_handled=aec_post_reset_serial(s->aec);
-    s->reset_pending=0u;
+    dfn_reset_follow_clear(&s->follow);
     dfn_hop_reset(&s->hop);
 }
 
@@ -209,8 +208,7 @@ static int dfn_build(DfnSample *s) {
     if (!s->unit) return -1;
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
     s->reset_handled=0u;
-    s->reset_pending=0u;
-    s->reset_delay=dfn_hop_lookahead_frames(&s->args.model_grid);
+    dfn_reset_follow_init(&s->follow,&s->args.model_grid);
     return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,&s->hop);
 }
 
@@ -273,16 +271,10 @@ static int dfn_read(void *user, int frame) {
 }
 /* P = B * G_res, plus comfort noise on the bins the gain cut when enabled (no denoiser: unity extra
  * gain); a lane's post-chain reset first clears the synthesis that receives the first post-reset frame: the
- * bridge's host-grid tail now on the bridge path, the hop's own AcIstft dfn_hop_lookahead_frames() hops
+ * bridge's host-grid tail on the bridge path, the hop's own AcIstft dfn_hop_lookahead_frames() hops
  * later on the direct path. Before the hop enters the DFN hop. 0, or -1 on a refusal. */
 static int dfn_form(DfnSample *s, const AecResidualView *f) {
-    uint32_t moved=(uint32_t)array_sample_post_reset_due(&s->reset_handled,f);
-    if (s->hop.bridge) {
-        if (moved) (void)ainr_bridge_reset_synthesis(s->hop.bridge);   /* between hops: cannot refuse */
-    } else if (s->hop.istft) {
-        s->reset_pending=(s->reset_pending<<1)|moved;
-        if ((s->reset_pending>>s->reset_delay)&1u) ac_istft_reset(s->hop.istft);
-    }
+    (void)dfn_reset_follow(&s->follow,&s->hop,array_sample_post_reset_due(&s->reset_handled,f));   /* between hops: cannot refuse */
     if (aec_apply_gain(s->aec,NULL,s->post) != AEC_OK) return -1;
     if (s->args.enable_cng && aec_apply_cng(s->aec,NULL,s->post) != AEC_OK) return -1;
     return 0;
