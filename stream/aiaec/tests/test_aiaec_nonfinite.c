@@ -36,13 +36,13 @@ static int g_fail = 0;
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } while (0)
 #define CHECK(cond, ...) do { if (!(cond)) FAIL(__VA_ARGS__); } while (0)
 
-typedef struct Grid { int fft, n; } Grid;
-static const Grid GRIDS[] = { { 256, 1 }, { 256, 8 }, { 512, 1 } };
+typedef struct Grid { int sr, fft, n; } Grid;
+static const Grid GRIDS[] = { { 16000, 256, 1 }, { 16000, 256, 8 }, { 16000, 512, 1 }, { 48000, 1024, 1 }, { 48000, 1024, 2 } };
 #define N_GRIDS ((int)(sizeof(GRIDS) / sizeof(GRIDS[0])))
 
 /* One instance of one family on a pool of exactly its size, and the buffers one block needs. */
 typedef struct Inst {
-    int freq, fft, n, hop, nb, hop_in;
+    int freq, sr, fft, n, hop, nb, hop_in;
     AiaecCtx *pcm;
     AiaecFreqCtx *fc;
     void *pool;
@@ -57,14 +57,14 @@ static size_t plane_len(const Inst *x) { return (size_t)x->n * (size_t)x->nb; }
 static int plane_count(const Inst *x) { return x->freq ? 4 : (PRODUCT_AL ? 2 : 0); }
 static size_t this_plane_len(const Inst *x, int p) { return x->freq ? plane_len(x) : (size_t)x->hop_in * (p >= 0); }
 
-static int inst_open(Inst *x, int fft, int n, int freq) {
+static int inst_open(Inst *x, int sr, int fft, int n, int freq) {
     AiaecConfig cfg;
     StreamMemReq req;
     AiaecInfo info;
     int rc;
     memset(x, 0, sizeof(*x));
-    x->freq = freq; x->fft = fft; x->n = n; x->hop = fft / 2; x->nb = fft / 2 + 1; x->hop_in = x->hop * n;
-    cfg.sr = 16000; cfg.fft = fft; cfg.hop_in = x->hop_in;
+    x->freq = freq; x->sr = sr; x->fft = fft; x->n = n; x->hop = fft / 2; x->nb = fft / 2 + 1; x->hop_in = x->hop * n;
+    cfg.sr = sr; cfg.fft = fft; cfg.hop_in = x->hop_in;
     rc = freq ? aiaec_get_mem_size_freq(&cfg, &req) : aiaec_get_mem_size(&cfg, &req);
     if (rc != AIAEC_OK) { FAIL("get_mem_size fft=%d n=%d rc=%d", fft, n, rc); return -1; }
     x->pool = alloc_aligned((size_t)req.bytes);
@@ -220,7 +220,7 @@ static int section_limit(void) {
                     int rc;
                     if (!fam && only >= 2) continue;
                     if (fam && pat >= PAT_COS_DC) continue;   /* the sign patterns exist for the PCM input only */
-                    if (inst_open(&x, GRIDS[g].fft, GRIDS[g].n, fam) != 0) return 1;
+                    if (inst_open(&x, GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, fam) != 0) return 1;
                     fill_clean(&x, 0);
                     fill_limit(&x, (Pattern)pat, only);
                     rc = inst_pre(&x, &w);
@@ -261,7 +261,7 @@ static int section_overflow(void) {
         size_t i, len;
         unsigned int before;
         int rc, zero = 1;
-        if (inst_open(&x, GRIDS[g].fft, GRIDS[g].n, 1) != 0 || inst_open(&y, GRIDS[g].fft, GRIDS[g].n, 1) != 0) return 1;
+        if (inst_open(&x, GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, 1) != 0 || inst_open(&y, GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, 1) != 0) return 1;
         len = plane_len(&x);
         fill_clean(&x, 0);
         for (i = 0; i < len; ++i) { x.plane[0][i] = 3.0e38f; x.plane[1][i] = 0.0f; }
@@ -314,12 +314,12 @@ static void trace_add(Trace *t, const void *p, size_t n) {
 /* Runs TRACE_BLOCKS clean blocks. With bad_plane >= 0 a corrupt block (value at index idx of that plane) is offered
  * before block BAD_AT and must be refused; it is never offered again. Appends, per clean block, the action, the
  * generation the work carries, the tensors handed to the accelerator and the output. */
-static int run_trace(int fft, int n, int fam, int bad_plane, int idx_last, float bad_value, Trace *t, const char *label) {
+static int run_trace(int sr, int fft, int n, int fam, int bad_plane, int idx_last, float bad_value, Trace *t, const char *label) {
     static Out out;
     Inst x;
     int blk, rc, ok = 1;
 
-    if (inst_open(&x, fft, n, fam) != 0) return 1;
+    if (inst_open(&x, sr, fft, n, fam) != 0) return 1;
     t->len = 0;
     for (blk = 0; blk < TRACE_BLOCKS; ++blk) {
         StreamWork w;
@@ -380,7 +380,7 @@ static int section_refusal(void) {
             float BAD[6];
             char label[96];
             if (PRODUCT_DV && !fam) continue;
-            if (inst_open(&x, GRIDS[g].fft, GRIDS[g].n, fam) != 0) return 1;
+            if (inst_open(&x, GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, fam) != 0) return 1;
             planes = plane_count(&x);
             BAD[0] = NAN; BAD[1] = INFINITY; BAD[2] = -INFINITY;
             n_bad = 3;
@@ -389,12 +389,12 @@ static int section_refusal(void) {
             }
             inst_close(&x);
             snprintf(label, sizeof(label), "refusal fft=%d N=%d %s twin", GRIDS[g].fft, GRIDS[g].n, fam ? "freq" : "pcm");
-            if (run_trace(GRIDS[g].fft, GRIDS[g].n, fam, -1, 0, 0.0f, &twin, label) != 0) { bad = 1; continue; }
+            if (run_trace(GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, fam, -1, 0, 0.0f, &twin, label) != 0) { bad = 1; continue; }
             for (pl = 0; pl < planes; ++pl)
                 for (last = 0; last < 2; ++last)
                     for (v = 0; v < n_bad; ++v) {
                         snprintf(label, sizeof(label), "refusal fft=%d N=%d %s", GRIDS[g].fft, GRIDS[g].n, fam ? "freq" : "pcm");
-                        if (run_trace(GRIDS[g].fft, GRIDS[g].n, fam, pl, last, BAD[v], &probe, label) != 0) { bad = 1; continue; }
+                        if (run_trace(GRIDS[g].sr, GRIDS[g].fft, GRIDS[g].n, fam, pl, last, BAD[v], &probe, label) != 0) { bad = 1; continue; }
                         if (probe.len != twin.len || memcmp(probe.buf, twin.buf, twin.len) != 0) {
                             FAIL("%s: plane %d %s %g: the run that was offered the bad block differs from the twin (tensors, generation or output)",
                                  label, pl, last ? "last" : "first", (double)BAD[v]);
@@ -419,7 +419,7 @@ static int section_order(void) {
     const int fam = PRODUCT_AL ? 0 : 1;
     int bad = 0;
 
-    if (inst_open(&x, 256, 1, fam) != 0) return 1;
+    if (inst_open(&x, 16000, 256, 1, fam) != 0) return 1;
     fill_clean(&x, 0);
     x.plane[0][0] = NAN;
     if (PRODUCT_AL && !fam) {

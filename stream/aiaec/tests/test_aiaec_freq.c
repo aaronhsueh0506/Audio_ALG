@@ -46,7 +46,7 @@ static int g_fail = 0;
 static AiaecConfig make_cfg(int fft, int n) {
     AiaecConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.sr = 16000; cfg.fft = fft; cfg.hop_in = (fft / 2) * n;
+    cfg.sr = fft == 1024 ? 48000 : 16000; cfg.fft = fft; cfg.hop_in = (fft / 2) * n;
     return cfg;
 }
 
@@ -633,7 +633,8 @@ static int section_bind_and_pool(int fft, int n) {
         framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +
                   ck_align16_size(((PRODUCT_DV ? 3u : 1u) * (size_t)hop + 6u * plane) * sizeof(float));
-        pinned = PRODUCT_DV ? (fft == 512 ? 35744u : n == 8 ? 119376u : 18336u) : (fft == 512 ? 15056u : 7888u);
+        pinned = PRODUCT_DV ? (fft == 1024 ? (n == 2 ? 127968u : 70560u) : fft == 512 ? 35744u : n == 8 ? 119376u : 18336u)
+                            : (fft == 1024 ? (n == 2 ? 58096u : 29392u) : fft == 512 ? 15056u : 7888u);
         CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
                   (unsigned long long)rb.bytes, (unsigned long long)rf.bytes, framing);
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
@@ -839,6 +840,8 @@ int main(void) {
     g_fail |= section_bind_and_pool(256, 1);
     g_fail |= section_bind_and_pool(256, 8);
     g_fail |= section_bind_and_pool(512, 1);
+    g_fail |= section_bind_and_pool(1024, 1);
+    g_fail |= section_bind_and_pool(1024, 2);
     g_fail |= section_fail_closed_all();
 #else
     static const Ev sched[12] = {
@@ -854,6 +857,8 @@ int main(void) {
     g_fail |= section_tail(512, 1);
     g_fail |= section_bind_and_pool(256, 1);
     g_fail |= section_bind_and_pool(512, 1);
+    g_fail |= section_bind_and_pool(1024, 1);
+    g_fail |= section_bind_and_pool(1024, 2);
 #endif
     g_fail |= section_scale();
     g_fail |= section_gates();
