@@ -153,9 +153,10 @@ DFN3Prepost *p = dfn3_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &req);
 ```
 
 The per-hop order is DFN2's (see [`../DeepFilterNet2/README.md`](../DeepFilterNet2/reference/frequency-api.md#calling-the-library)) with the `dfn3_`
-names: `ac_stft_push_planar()`, `dfn3_prepost_pre_process_freq()` (1 on every hop), `frame_open()`, the model, `frame_finish()`
-(`frame_bypass()` on a refusal), then `dfn3_prepost_post_process_freq()` and `ac_istft_push_planar()` on every hop (the zero
-spectrum before the first output yields zeros); `dfn3_model_run_frame()` wraps the middle three. DFN3 has no `frames_per_call`. The
+names: `ac_stft_push_planar()`, `dfn3_prepost_pre_process_freq()` (0 for the first `mask_lookahead` hops, 1 from then on), and
+on a 1 `frame_open()`, the model, `frame_finish()` (`frame_bypass()` on a refusal), then `dfn3_prepost_post_process_freq()` and
+`ac_istft_push_planar()` on every hop (the zero spectrum before the first output yields zeros); `dfn3_model_run_frame()` wraps the
+middle three. DFN3 has no `frames_per_call`. The
 first `mask_lookahead` hops after init or reset have no complete graph window: `dfn3_prepost_pre_process_freq()` returns 0, no
 accelerator job runs and no frame opens (do not call `frame_open()` / `frame_finish()`), the output spectrum is zero with `valid` 0, and the
 generation does not move; the first job starts from the zero state the registration holds, and the audio is unchanged. The recurrent state (`h_gru`,
@@ -167,11 +168,11 @@ Use `dfn3_enhance_spectrum_stream()` at the accelerator boundary; `dfn3_enhance_
 the aligned arithmetic reference. The streaming API applies each head to the
 frame it describes, returns its output frame index and validates frame order.
 The low-band ring holds raw spectra; the high-band mask stays aligned to the
-same output frame. To flush the tail the application pushes `output_delay` zero
-spectra while the accelerator keeps running, draining the last analysed frame; a
-caller running a full STFT/OLA from PCM needs one more zero audio hop to drain the
-last real hop (`output_delay + 1` total), the extra one being the overlap-add tail.
-See `dfn3_prepost.h` for the lifecycle and flush contract. Both DFN2 and DFN3 pass
+same output frame. The tail is drained by pushing `output_delay` zero spectra
+while the accelerator keeps running; a caller running a full STFT/OLA from PCM needs
+one more zero audio hop (`output_delay + 1` total), the extra one being the
+overlap-add tail. The `dfn3_prepost_pre_process_freq()` comment in `dfn3_prepost.h`
+gives the same latency. Both DFN2 and DFN3 pass
 normalized STFT spectra (`grid.stft_scale`
 in, `grid.stft_unscale` out); the feature analysis scale is applied inside the feature
 branch only and must not be applied to the audio path.
