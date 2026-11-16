@@ -3,6 +3,13 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — Unused Python evaluators, the released-pointer bump guard, a broken makefile test and an unused conftest are removed
+
+- **Removed (no caller in the build, the tests or the docs).** `pipelines/4ch/evaluate_recordings.py`, `pipelines/4ch/evaluate_external_recordings.py`, their tests `pipelines/4ch/tests/test_evaluator.py` and `test_external_evaluator.py`, and `pipelines/tools/eval_dfn2_4ch_inputs.py`. `pipelines/4ch/README.md` loses the recording-test commands and the fixture-alignment paragraph, `pipelines/4ch/aec_bf_dfn_res/README.md` the input-arm command; `pipelines/requirements.txt` keeps `scipy` (the pyc-parity input generator imports it).
+- **AIAEC.** `AIAEC/dataset_gen/released_pointer_bump_guard.py` and `AIAEC/tests/test_released_pointer_bump_guard.py` are gone, with the README sentence that named the guard. `RELEASED_INFERENCE_POINTER_BUMPS` and `RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY` stay: `test_linear_aec_behavior_migration` pins both empty and the second is read by `require_inference_linear_aec_contract`. `AIAEC/tests/conftest.py` is removed (its three fixtures were requested by no test; `ledger_corpus.py` is imported by name and stays).
+- **Test merge.** `AIAEC/tests/test_calibration_state_layout_version.py` moved into `AIAEC/tests/test_export_streaming_calibration.py` as `test_manifest_layout_version_equals_graph_metadata` (DeepVQE-S and Align-ULCNet, N = 1 and 8, `--format` bin and npz; the manifest `state_layout_version` equals the exported graph's and is not None). The same eight cases are collected.
+- **AINR.** `AINR/RNNoise-ERB/test/run_makefile_build_safety_test.sh` is removed: it was broken and nothing referenced it.
+
 ## [Unreleased] — 2026-11-16 — Dependency pins follow the final audiolib, AEC and NR heads; the AINR product pool table is re-measured on the layered streams
 
 - **Pins.** `lib/audiolib.pin`, `lib/aec.pin`, `lib/nr.pin` and the `lib/aec` and `lib/nr` gitlinks name the heads that carry the pyc-parity tie registration (AEC), the NEON frozen-run twin fix (audiolib) and the `run_hops = 0` test row (NR); none of the three moves a pool or a layout version. `make -C pipelines check-pins` passes with no gitlink note.

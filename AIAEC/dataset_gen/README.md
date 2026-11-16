@@ -877,8 +877,7 @@ with a "may differ" warning. It is **empty**: the analysis/rendering split of
 `lib/aec` changes `linear_error` itself, so that checkpoint is refused for
 inference, packing, rematerialization and training alike (pinned by
 `tests/test_linear_aec_behavior_migration.py`, which also shows the refusal is
-the table's emptiness). It is not re-pointed at the new hash. A re-introduced
-entry is reported by `released_pointer_bump_guard.py`. To evaluate that
+the table's emptiness). It is not re-pointed at the new hash. To evaluate that
 checkpoint, run it with a `lib/aec` checkout whose behaviour hash is the recorded
 one, or feed it a `materialize_pair` output with `--input-is-linear-error`
 (evaluation only).

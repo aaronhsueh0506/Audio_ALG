@@ -106,22 +106,9 @@ the product's measured one; numbers are parsed strictly by `example_cli.h`, so v
 publishes the model I/O descriptor of the model grid, which a product replaces with
 the one from its model's exported metadata).
 
-The Python evaluator compares the original NR+RES tail, RES-only and the DFN
-feature-source experiments on the same fused contexts. The C example uses
-the beamformed-error source only; a raw-capture or single-lane estimate is
-not phase-consistent with the post-beam spectrum, so those arms are
-meaningful with a mask-only model (no deep filter) and stay experiments:
-
-```sh
-python pipelines/tools/eval_dfn2_4ch_inputs.py \
-  --checkpoint /path/to/a-v6-checkpoint.pth \
-  --output-dir dfn2-input-ab
-```
-
-`--identity-model` is a pipeline/resampler smoke gate only. It requires every
-DFN arm to equal RES-only exactly and makes no speech-quality claim. The
-contract gate refuses a checkpoint whose model/feature versions differ from the
-current model-v6/feature-v5.
+The C example estimates the DFN2 heads from the beamformed-error spectrum only: a
+raw-capture or single-lane estimate is not phase-consistent with the post-beam
+spectrum.
 
 ## Calling sequence and parameters
 

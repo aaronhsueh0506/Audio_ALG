@@ -7,9 +7,11 @@ layout. These tests run the two tools and compare their JSON side by side.
 """
 
 import contextlib
+import io
 import json
 import os
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -18,6 +20,7 @@ import torch
 
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.Align_ULCNet.model import AlignULCNet
+from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC._streaming_calibration import (
     far_mode_provenance,
     input_range_report,
@@ -531,3 +534,80 @@ def test_corpus_ledger_stamps_stems_and_refuses_partial_claims(tmp_path):
     # Agreeing with a retired checkpoint is no excuse either.
     with pytest.raises(ValueError, match='retired'):
         linear_error_provenance(seqs, old.as_dict())
+
+
+# ---- the manifest carries the exported graph's state layout version ---------
+#
+# Both come off the same export in one process; a delivery side matches graph
+# and calibration set on this field, so a null manifest value is a defect.
+
+LAYOUT_GRID = SignalGrid(16000, 256, 256, 128)
+
+
+@pytest.fixture(scope='module')
+def layout_work(tmp_path_factory):
+    from AIAEC.dataset_gen import make_linear_aec_contract
+
+    pytest.importorskip('onnx')
+    root = tmp_path_factory.mktemp('layout_version')
+    sr, n_fft, hop = LAYOUT_GRID.sample_rate, LAYOUT_GRID.n_fft, LAYOUT_GRID.hop_len
+    torch.manual_seed(3)
+    deepvqe = DeepVQES(LAYOUT_GRID, max_delay_seconds=0.5).eval()
+    torch.save({'contract': {
+        'model_name': 'DeepVQE_S', 'task': DeepVQES.task, 'sr': sr,
+        'n_fft': n_fft, 'win_len': n_fft, 'hop_len': hop,
+        'loss_version': 'test', 'ctor_max_delay_seconds': 0.5,
+        'ctor_similarity_channels': 4, 'ctor_gru_hidden': 192,
+        'ctor_compression_exponent': 0.3,
+    }, 'state_dict': deepvqe.state_dict()}, root / 'dv.pth')
+    ulcnet = AlignULCNet(LAYOUT_GRID, max_delay_seconds=0.5).eval()
+    linear = make_linear_aec_contract(sr, frame_size=n_fft)
+    torch.save({'contract': {
+        'model_name': 'Align_ULCNet', 'task': AlignULCNet.task, 'sr': sr,
+        'n_fft': n_fft, 'win_len': n_fft, 'hop_len': hop,
+        'loss_version': 'test', 'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+        'ctor_max_delay_seconds': 0.5,
+    }, 'state_dict': ulcnet.state_dict()}, root / 'al.pth')
+    rng = np.random.RandomState(4)
+    for name in ('primary', 'far'):
+        (root / name).mkdir()
+        sf.write(root / name / 'a.wav',
+                 0.1 * rng.randn(sr * 3 + 10).astype('f'), sr)
+    return root
+
+
+def _calibrate_for_layout(root, model_name, checkpoint, n, artifact_format):
+    from AIAEC import _streaming_calibration as calibration
+
+    output = root / ('%s_n%d' % (model_name, n)
+                     + ('.npz' if artifact_format == 'npz' else '_bin'))
+    arguments = ['calib', '--checkpoint', str(root / checkpoint),
+                 '--primary-dir', str(root / 'primary'),
+                 '--far-dir', str(root / 'far'), '--frames', '4',
+                 '--format', artifact_format, '--frames-per-call', str(n),
+                 '--output', str(output)]
+    if model_name == 'Align_ULCNet':
+        arguments.append('--allow-unstamped-linear-error')
+    with _argv(*arguments), contextlib.redirect_stdout(io.StringIO()), \
+            warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        calibration.main(model_name)
+    with open(calibration_report_path(output, artifact_format)) as stream:
+        manifest = json.load(stream)
+    with open(os.path.splitext(sibling_onnx_path(output))[0]
+              + '.json') as stream:
+        graph = json.load(stream)
+    return manifest, graph
+
+
+@pytest.mark.parametrize('artifact_format', ['bin', 'npz'])
+@pytest.mark.parametrize('n', [1, 8])
+@pytest.mark.parametrize('model_name,checkpoint', [
+    ('DeepVQE_S', 'dv.pth'), ('Align_ULCNet', 'al.pth')])
+def test_manifest_layout_version_equals_graph_metadata(
+        layout_work, model_name, checkpoint, n, artifact_format):
+    manifest, graph = _calibrate_for_layout(
+        layout_work, model_name, checkpoint, n, artifact_format)
+    assert graph['state_layout_version'] is not None
+    assert manifest['state_layout_version'] == graph['state_layout_version']

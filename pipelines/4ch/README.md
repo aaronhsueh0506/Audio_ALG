@@ -3,8 +3,7 @@
 The four-microphone linear-AEC flow is an instance of the AEC library (`AecConfig.n_mics = AEC_ARRAY_MICS`, `aec.h`,
 `AEC/c_impl/src/aec_array.c`); this directory holds the sample-layer helpers built beside it (`array_sample_beam`,
 `array_sample_driver`, header-only `array_sample_post.h` and `array_sample_unit.h`), the example programs that chain the post-beam
-stages over it (`4ch_external_static`, `4ch_static`, `4ch_raw`), its Python twin (`pipeline.py`), host evaluation
-tools and their tests.
+stages over it (`4ch_external_static`, `4ch_static`, `4ch_raw`), its Python twin (`pipeline.py`) and their tests.
 
 The array is **one `Aec`, one pool**. A single `aec_get_mem_requirements()` / `aec_init_ex()` builds the shared delay
 estimator (MATCHED mode), the alignment ring, the aligned far, four lanes (each an `EXTERNAL_ALIGNED` single-channel
@@ -342,48 +341,6 @@ shared parser.
 (AEC: mild, balanced, aggressive, no_floor; NR: mild, moderate, balanced, aggressive; a name is refused) and a second AEC level (positional or `--aec-level`), with exit 2; `--nr-preset` is the same option as
 `--nr-level` under its earlier name; the mono programs (`aec_nr_pipeline`, `aec_nr_pipeline_static`) apply the same one-AEC-level rule. Still lenient: a repeated option keeps the last value. C level == Python preset.
 
-Reproduce the two recording tests from the `Audio_ALG` directory. The evaluators read the case directories
-`aec_take_turn` and `aec_together` under `--datasets-root` (default: the `datasets` directory beside `Audio_ALG`,
-which is not in git); each needs `unprocessed_4ch.wav`, `man.wav` and `woman(ref).wav` (or `women(ref).wav`):
-
-```bash
-../.venv/bin/python -m pipelines.4ch.evaluate_recordings
-
-# Complete C SRP-PHAT/BF path:
-make -C pipelines/4ch 4ch_raw
-../.venv/bin/python -m pipelines.4ch.evaluate_external_recordings
-
-# Exercise both 16 kHz grids:
-../.venv/bin/python -m pipelines.4ch.evaluate_external_recordings \
-  --fft-size 256
-../.venv/bin/python -m pipelines.4ch.evaluate_external_recordings \
-  --fft-size 512
-```
-
-The command is an acceptance test, not only a report generator. It exits
-nonzero unless both cases remain finite, preserve the `1 matcher / 4 linear /
-1 post-beam RES` resource boundary (the runner reports the array's gain stage as `post_res`), acquire a solid nonzero shared delay, and
-finish within the declared delay tolerance of the independent file-level
-measurement (the C low-latency evaluator uses `max(half hop, 5 ms)`).
-Use `--no-contract-check` only when inspecting a deliberately changed fixture.
-`evaluate_external_recordings` runs the C array and the example chain (`4ch_raw`: the array's shared
-matcher, four linear AEC lanes and gain stage, the sample helper's SRP-PHAT and BF, then one NR) and verifies
-the reported DOA/BF grids. The separate Python `evaluate_recordings` command
-uses `EqualWeightBeamformer` only to test the open Python pre/post seam.
-
 The sample helper's default is a four-microphone UCA with 35 mm radius only so the API
 has a runnable example. Product integration must set the measured UCA radius,
 ULA spacing, or all four custom `(x, y)` coordinates and confirm channel order.
-The recordings do not carry array-geometry metadata, so their DOA
-angles and attenuation report are integration smoke evidence, not a beamformer
-quality sign-off.
-
-`woman(ref).wav` and `man.wav` are two stems on one source timeline, while that
-timeline and `unprocessed_4ch.wav` have different recording starts. The
-evaluator estimates the one fixture offset from the near stem and applies it to
-both. It deliberately does **not** align the far stem directly to its echo in
-the mic, because doing so would erase the acoustic/system delay that the one
-live shared matched filter is supposed to estimate. The C evaluator uses the
-same alignment rule, writes raw float hops for `4ch_raw`, and checks
-the complete `1 matcher / 4 linear AEC / SRP-PHAT / BF / 1 NR / 1 post-RES`
-resource and delay contract.

@@ -5,7 +5,7 @@
 # this file covers what pipelines/ itself imports directly.
 
 numpy
-scipy          # 4ch recording evaluator and evaluation/resampling tools
+scipy          # pyc-parity input generator
 soundfile      # WAV I/O
 PyYAML         # mono/aec_nr_res/pipeline.py's load_config() -> lib/nr/python/process_audio.py reads v3_2_config.yaml
 

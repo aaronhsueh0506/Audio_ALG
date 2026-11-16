@@ -519,9 +519,9 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
 # evidence and its own refusal and warning tests.
 RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {}
 
-# Bump history of the table above, read by released_pointer_bump_guard.py: one
-# row (date, old_value, new_value) per bump while an entry exists, each `old`
-# copied from the previous row's `new`. Empty with the table; git has the rest.
+# Bump history of the table above: one row (date, old_value, new_value) per bump
+# while an entry exists, each `old` copied from the previous row's `new`. Empty
+# with the table; git has the rest.
 RELEASED_INFERENCE_POINTER_BUMPS: Tuple[Tuple[str, str, str], ...] = ()
 
 _RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {}
