@@ -2,13 +2,24 @@
 
 ## Unreleased
 
+### The first `mask_lookahead` hops run no accelerator job; the stream has no tail and no trim
+
+- `dfn2_prepost_pre_process_freq{,_dual}` and `dfn3_prepost_pre_process_freq` return 0 for the first `mask_lookahead` hops after init or
+  reset (with `frames_per_call` 1) and open no frame; the generation does not move on them. The
+  product `ainr_preprocess{,_freq}` returns an all-zero `StreamWork` (`action = STREAM_WORK_BYPASS`) with `AINR_OK` for such a hop and
+  `ainr_postprocess*` is still called once. A sample skips the accelerator on BYPASS and posts `STREAM_RUN_NOT_STARTED`. Output is
+  bit-identical; what changes is that the accelerator runs `mask_lookahead` times fewer per init or reset and the generation no longer steps on those hops (the entry on `DFN2Prepost / DFN3Prepost` below has the flow).
+- `AinrInfo.trim_samples` and `AinrInfo.tail_zero_blocks` are removed (`AinrInfo` is 16 bytes on LP64, was 24); the output trails the input by
+  `queue_frames + 1` hops and nothing is trimmed, padded or flushed. `AiaecInfo` carries the graph path only. Rebuild the library and every
+  caller that includes `ainr.h` together. The full text is in `pipelines/CHANGELOG.md`.
+
 ### `4ch_aec_bf_dfn_res` clears only its own synthesis on an upstream hard reset (direct path), at the hop the frame reaches it
 
 On a lane's post-chain reset the direct (48 kHz) path of `pipelines/4ch/aec_bf_dfn_res/main.c` no longer calls `dfn_hop_reset()` (which restarted the whole DFN: stream, model state, synthesis, output spectrum, and with it `queue_frames` hops of output). It delays the event by `dfn_hop_lookahead_frames()` hops through a per-hop shift register that starts at 0 and calls `ac_istft_reset()` on the hop's `AcIstft` just before the frame built on the event hop is pushed, the rule `mono_aec_dfn_res` already followed; DFN2 keeps running and its generation does not move. The refused-call path still resets everything and also clears the shift register. The bridge path is unchanged (`ainr_bridge_reset_synthesis()` on the event hop). The rule text of `ainr.h` (direct caller: block `t + (queue_frames - (N - 1))`, N = 1 here) gained the bridge half, and the DFN2 manual page states it. `test_4ch_dfn.c` runs an array reset at 48 kHz against the hand-written chain restarted the same way, bit for bit, with three planted defects (clear on the event hop, no clear, the old whole-hop reset) that it must report.
 
 ### The DFN2 product and the desktop pipelines read the run status of `stream_run.h`; the library zeroes its side and advances the generation for a failed run
 
-`ainr_postprocess{,_freq}(ctx, run_status, ...)` (the parameter was `infer_status`) passes the status to `dfn2_stream_post_process{,_freq}`, which closes the frame by it: 0 commits (a refused commit is a bypass after the library zeroed and advanced), `STREAM_RUN_NOT_STARTED` leaves the registered state and the generation alone, any other value zeroes the registered state and advances the generation by one (`dfn2_prepost_frame_fail`). Before, any non-zero status was a plain bypass that left the generation unchanged and the sample kept its own "recovery pending" flag; now the sample zeroes the device state only when `StreamWork.state_generation` differs from its value at the last zeroing. The warm-up job is unchanged (each of the first `mask_lookahead` blocks after init or reset still advances the generation once, whatever the status).
+`ainr_postprocess{,_freq}(ctx, run_status, ...)` (the parameter was `infer_status`) passes the status to `dfn2_stream_post_process{,_freq}`, which closes the frame by it: 0 commits (a refused commit is a bypass after the library zeroed and advanced), `STREAM_RUN_NOT_STARTED` leaves the registered state and the generation alone, any other value zeroes the registered state and advances the generation by one (`dfn2_prepost_frame_fail`). Before, any non-zero status was a plain bypass that left the generation unchanged and the sample kept its own "recovery pending" flag; now the sample zeroes the device state only when `StreamWork.state_generation` differs from its value at the last zeroing. The first `mask_lookahead` hops after init or reset carry no job and do not move the generation (see the first entry).
 
 `pipelines/dfn` follows: `dfn_hop_infer()` and `dfn_res_stage_infer()` return `STREAM_RUN_NOT_STARTED` when no model callback is set (they returned -1); `dfn_hop_end()` and `dfn_rate_bridge_finish()` close a frame the caller took and left open with `STREAM_RUN_FAILED` and a frame never fetched with `STREAM_RUN_NOT_STARTED`; `dfn_res_stage_end()` closes through the same three-way. The two desktop `run_accelerator()` stubs return `STREAM_RUN_NOT_STARTED`. A model callback that fails before the accelerator starts should return `STREAM_RUN_NOT_STARTED` too; any other non-zero value costs one state zeroing. The identity path of the examples (no model) therefore keeps `dfn_hop_state_generation()` at `1 + M`.
 
@@ -16,7 +27,7 @@ On a lane's post-chain reset the direct (48 kHz) path of `pipelines/4ch/aec_bf_d
 
 ### `ainr.h` uses the shared `StreamWork` (`stream/common/stream_run.h`); `AinrWork` and its tensor types are gone
 
-`ainr_preprocess()` and `ainr_preprocess_freq()` take a `StreamWork *`; `AinrWork`, `AinrTensorIn`, `AinrTensorOut`, `AINR_MAX_INPUT_TENSORS` and `AINR_MAX_OUTPUT_TENSORS` are removed, with no alias (`StreamTensorIn`, `StreamTensorOut`, `STREAM_WORK_MAX_INPUTS`, `STREAM_WORK_MAX_OUTPUTS` replace them). The extra field is `action`, which a DFN2 block always sets to `STREAM_WORK_SUBMIT`; every other field, count and shape is as before. `StreamWork` is larger than `AinrWork` (the shared arrays hold five inputs and three outputs), the same in the full and the lite archive. A caller rebuilds against `stream_run.h`, which sits in `stream/common` beside `stream_mem.h`. The `graph_io_fits()` bounds a sample passes become `STREAM_WORK_MAX_INPUTS` / `STREAM_WORK_MAX_OUTPUTS`. No numerics changed.
+`ainr_preprocess()` and `ainr_preprocess_freq()` take a `StreamWork *`; `AinrWork`, `AinrTensorIn`, `AinrTensorOut`, `AINR_MAX_INPUT_TENSORS` and `AINR_MAX_OUTPUT_TENSORS` are removed, with no alias (`StreamTensorIn`, `StreamTensorOut`, `STREAM_WORK_MAX_INPUTS`, `STREAM_WORK_MAX_OUTPUTS` replace them). The extra field is `action`: `STREAM_WORK_SUBMIT` for a DFN2 block with a job, `STREAM_WORK_BYPASS` (an all-zero work) for a hop without one; every other field, count and shape is as before. `StreamWork` is larger than `AinrWork` (the shared arrays hold five inputs and three outputs), the same in the full and the lite archive. A caller rebuilds against `stream_run.h`, which sits in `stream/common` beside `stream_mem.h`. The `graph_io_fits()` bounds a sample passes become `STREAM_WORK_MAX_INPUTS` / `STREAM_WORK_MAX_OUTPUTS`. No numerics changed.
 
 ### DFN2 ERB file loader: the file must end after the two tables and the forward table must be finite
 
@@ -190,29 +201,24 @@ No numerics changed (the `test_c_prepost`, `test_nn_chains`, `test_dfn3_stream` 
   link variants, build-time pairs) are retired or replaced; pool bytes and hash are pinned against an independent Python layout
   mirror. Not run: a board, an ARM32 build, ASan.
 
-### DFN2Prepost / DFN3Prepost: one flow on every hop (warm-up frames)
+### DFN2Prepost / DFN3Prepost: the first `mask_lookahead` hops have no frame and run no job
 
-- With `frames_per_call` 1 and `mask_lookahead` M >= 1 (DFN3: its `mask_lookahead`), `*_prepost_pre_process_freq()` / `_dual()` returns 1
-  on every hop, where it returned 0 on the first M hops after init or reset. The application runs the same flow on each hop:
-  `pre_process_freq`, `frame_open`, the accelerator, `frame_finish` (`frame_bypass` on failure), `post_process_freq`, the synthesis
-  push; no `ready` variable and no `valid` branch. The first M hops are warm-up frames: `frame_open()` publishes the window as it is
-  (zero-filled at the start) with NaN heads; `frame_finish()` and `frame_bypass()` do not read the heads, advance the frame clock,
-  zero the registered state, advance the state generation by exactly one (also when nothing is registered) and return 0.
-  `dfn2_model_run_frame()` / `dfn3_model_run_frame()` return 1 on a warm-up frame whose `infer()` succeeded, although its heads are
-  discarded. A refused `frame_finish()` of a real frame keeps its old meaning; `*_prepost_reset()` restarts the warm-up.
-- The audio is bit-identical for every grid and every M / D pair: the first real frame still starts from zero state (the zeroing after
-  each warm-up frame replaces the old "no run"). Changed on purpose: the return code of `pre_process_freq` and `frame_open` on those
-  hops, one extra accelerator run per warm-up frame once per stream start (a board's `state_generation_sync` reloads quantized zeros
-  after each, M times in all), and the state generation (1 after init, plus one per reset, per warm-up frame and per refused commit).
-  The post stage is unchanged: `valid` is 0 and the spectrum all zero for the first M + D hops, so with an `AcIstft` in
-  `AC_OLA_ACCUMULATE` mode (the default) the application may push the synthesis on every hop without looking at `valid`; flushing the DFN2
-  tail takes M + D + 1 zero audio hops (DFN3: `output_delay` zero spectra plus the overlap-add hop), the accelerator running on all of them.
-- Unchanged: `frames_per_call` > 1 (the earlier hops still return 0, then one call every N frames, and no frame is a warm-up frame) and M = 0 (no warm-up frame);
+- With `frames_per_call` 1 and `mask_lookahead` M >= 1 (DFN3: its `mask_lookahead`), `*_prepost_pre_process_freq()` / `_dual()` returns 0
+  for the first M hops after init or reset and 1 from then on. A 0 hop opens no frame, runs no accelerator job and does not move the
+  state generation; the enhance clock advances without heads. On a 1 the application runs `frame_open`, the accelerator,
+  `frame_finish` (`frame_bypass` on failure); every hop then runs `post_process_freq` and the synthesis push, with no `valid`
+  branch. `frame_open()` on a 0 hop returns -1 (no frame is open), and `*_prepost_reset()` restarts the count of M hops.
+  `dfn2_model_run_frame()` / `dfn3_model_run_frame()` wrap `frame_open`, `infer()` and `frame_finish` for a hop that returned 1.
+- The audio is bit-identical for every grid and every M / D pair: the first real frame starts from the zero state the registration
+  holds. The state generation is 1 after init, plus one per reset and per refused commit. The post stage is unchanged: `valid` is 0 and
+  the spectrum all zero for the first M + D hops, so with an `AcIstft` in `AC_OLA_ACCUMULATE` mode (the default) the application may
+  push the synthesis on every hop without looking at `valid`. The output trails the input by M + D + 1 hops for DFN2 and by
+  `output_delay` + 1 hops for DFN3; the tail is drained by pushing zero hops while the accelerator keeps running.
+- Unchanged: `frames_per_call` > 1 (the earlier hops still return 0, then one call every N frames) and M = 0 (every hop has a frame);
   no symbol, struct size or `DFN2_PREPOST_CARVE_VERSION` (11) / `DFN3_PREPOST_CARVE_VERSION` (9) change. The words "compose" and "composed" are gone from the DFN2 / DFN3
   public headers and READMEs (the Python `compose()` and `--dfn-compose` identifiers stay); the board samples call `fetch_heads`.
-- Tests: the warm-up frame is open, the heads are discarded even when NaN or garbage, the registered state is zero after it, the
-  generation advances by exactly one, and the next real frame sees the inputs it saw before; the chain digests and the DFN3 stream digest
-  (`5b831894`) are unchanged. The pipelines side is in `pipelines/CHANGELOG.md`.
+- Tests: a 0 hop leaves the frame closed and the generation alone, `frame_open()` on it is refused, the next real frame sees the inputs
+  it saw before; the chain digests and the DFN3 stream digest (`5b831894`) are unchanged. The pipelines side is in `pipelines/CHANGELOG.md`.
 
 ### DFN2 grid is a run-time value (`DFN2Grid`, `dfn2_grid.h`)
 
