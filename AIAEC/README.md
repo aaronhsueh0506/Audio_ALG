@@ -9,7 +9,7 @@ Choose the model by the signal available at the application boundary. The accele
 | [Align-CRUSE](Align_CRUSE/README.md) | Microphone and far end | [Graph contract](../docs/html/models/align-cruse/index.html). No C code: the application owns framing, graph I/O, the mask multiply and state. |
 | [CAGCRN](CAGCRN/README.md) | Microphone and far end | [Graph contract](../docs/html/models/cagcrn/index.html). No C code: the application owns framing, graph I/O, the mask multiply and state. |
 
-For C integration, initialize once per stream. A device-owned recurrent state must match the generation returned with a real job. If an accelerator run may have written state before reporting failure, the adapter reloads quantized zero before the next inference. Each model’s deployment page gives its return values and output policy.
+For C integration, initialize once per stream. A device-owned recurrent state must match the generation returned with a real job. The library advances the state generation after a reset, a refused result (non-finite mask, state or enhanced spectrum) and a run that started and failed; the sample zeroes the accelerator state whenever `StreamWork.state_generation` differs from its value at the last zeroing (`stream_run.h`, `aiaec.h`). Each model’s deployment page gives its return values and output policy.
 
 - [Dataset, training commands and losses](reference/training.md)
 - [ONNX export, checkpoint compatibility and calibration](reference/export.md)
