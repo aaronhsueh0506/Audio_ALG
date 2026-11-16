@@ -74,7 +74,8 @@ mono:  mic/ref ─► Aec ─► AecResidualView { error_spec, near_spec, far_sp
                         └► base_spec = B = rendering base (E, or E + echo on a guard hop); aec_post_reset_serial ─► reset event
 4-ch:  mics/ref ─► aec_process_linear + aec_get_array ─► beamformer ─► aec_process_residual ─► AecResidualView { error_spec, near_spec, far_spec, r2, comfort_noise, res_gain, base_spec, formed_hop = NULL, ... }
                       │
-        gain stages   ├─ G_nr: anr_process_gain_with_residual_psd(nr, B, residual_psd_audio)    (residual_psd_audio = R² / 32768², while the linear estimate is usable)
+        gain stages   ├─ G_nr: anr_process_gain_with_residual_psd(nr, S, residual_psd_audio)    (residual_psd_audio = R² / 32768², while the linear estimate is usable)
+                      │        S = B for mono; S = E = v.error_spec for 4-ch (array_sample_anr_gain()); the gain is applied on B in both
                       ├─ G_res: v.res_gain (mono: the AEC's own; 4-ch: the array's one gain stage over the fused spectra; applied by aec_apply_gain)
         combination   └─ aec_apply_gain → aec_apply_cng → ac_istft_push → out   (the same two calls for both)
 ```
@@ -172,7 +173,9 @@ Rules the chain relies on:
   The 4-channel array behaves the same way: its generator restarts at `AEC_CNG_SEED` on a lane's hard reset and on `aec_reset()`.
 - `v.error_spec` / `v.formed_hop` are the analysis seam and are never rendered; the chain renders the
   rendering base `v.base_spec` (the same spectrum `aec_process()` multiplies by its gain, `E`
-  bit for bit on every hop the output guard leaves alone) and the denoiser estimates on that same spectrum.
+  bit for bit on every hop the output guard leaves alone). Mono: the denoiser estimates on that same spectrum. 4-channel:
+  it estimates on `v.error_spec` (`array_sample_anr_gain()`; the two differ only on output-guard hops, see the 4ch README,
+  "Analysis and rendering spectra") and its gain is applied on `v.base_spec`.
 - A spectrum-type stage (the 4-channel beamformer) is a function that takes the
   lane spectra and returns a spectrum; it replaces the error spectrum (`error_spec` of the
   `AecResidualView`) in the chain. The sample helper hands the BF spectrum to `aec_process_residual()` inside
