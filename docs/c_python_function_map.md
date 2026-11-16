@@ -78,11 +78,11 @@
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 307 | 39 | 19 | 20 | 268 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 137 | 42 | 25 | 17 | 95 | 0 | 2 | 13 |
-| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 98 | 35 | 14 | 21 | 63 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 841 | 162 | 78 | 84 | 679 | 0 | 57 | 60 |
+| `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 91 | 32 | 13 | 19 | 59 | 0 | 0 | 14 |
+| `TOTAL` 合計 | 824 | 151 | 77 | 74 | 673 | 0 | 57 | 54 |
 <!-- map:stats:end -->
 
-讀法：841 個 C 函式中，162 個有 Python 對應（mirror 78、partial 84），其中 60 個的配對是推論；679 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：824 個 C 函式中，151 個有 Python 對應（mirror 77、partial 74），其中 54 個的配對是推論；673 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 

@@ -10,7 +10,7 @@
 <nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
 <main>
 <h1>模型開發與部署</h1>
-<p>PCM SDK 負責窗函數、STFT／ISTFT 及模型前後處理，每 hop 交給呼叫端執行加速器。已經拿到頻譜的應用，可直接用 <code>lib/ainr/</code> 或 <code>lib/aiaec/</code> 內的 model core。</p>
+<p>PCM SDK（<code>stream/</code>）負責窗函數、STFT／ISTFT 與每包的呼叫流程（選圖、<code>StreamWork</code>、輸入範圍檢查、N 個 frame 的迴圈），每包交給呼叫端執行加速器。模型的前後處理本身在 <code>lib/ainr/</code>、<code>lib/aiaec/</code>：DFN2、DeepVQE-S、Align-ULCNet 是逐 frame 函式加模型 state（<code>pre_frame</code>／<code>views</code>／<code>validate_run</code>／<code>post_frame</code>／<code>zero_state</code>），呼叫流程由各自的 stream 負責；DFN3、GTCRN、RNNoise-ERB 沒有 stream 層，沿用 <code>pre_process</code>／<code>frame_open</code>／<code>frame_finish</code> 一類。已經拿到頻譜的應用，可直接用 lib 內的 model core。</p>
 
 <h2>AINR</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
 <tr><th><a href="dfn2/index.html">DeepFilterNet2</a></th><td><code>ainr.h</code>（PCM、PCM → 頻譜、頻譜 → 頻譜）、頻域 core</td><td>int16 語音 → 增強 PCM；客戶只設 sr、fft、hop_in，full 或 lite 由產品綁定。</td></tr>

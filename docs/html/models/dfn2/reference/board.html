@@ -103,9 +103,9 @@ ainr_postprocess(ctx, run_status, pcm_out);</code></pre>
 <thead><tr><th>sample</th><th>使用的入口</th><th>啟動</th></tr></thead>
 <tbody>
 <tr><th><code>alg_ai3_dfn.c</code>（full）</th><td><code>ainr_*</code>（PCM）</td><td>一個 host 端初始化函式依序做 size、pool、<code>ainr_init()</code>，由 config 算 N，查 <code>stream/ainr/graph_io_dfn2.h</code> 的列；開圖後埠檢查，再用 <code>ainr_state_generation()</code> 設同步起點；組態被拒或查無列時結束碼 1，未執行加速器</td></tr>
-<tr><th><code>alg_ai3_dfn_lite.c</code>（lite）</th><td>同上</td><td>同上；只登錄 48000／1024／512</td></tr>
+<tr><th><code>alg_ai3_dfn_lite.c</code>（lite）</th><td>同上</td><td>同上；<code>alg_ai3_dfn.c</code> 以 <code>-DDFN2_MASK_ONLY</code> 編成的薄包裝（<code>#include "alg_ai3_dfn.c"</code>），選項與流程相同；只登錄 48000／1024／512</td></tr>
 <tr><th><code>uvc_ai_nr_stream.c</code></th><td><code>ainr_*</code>（PCM）</td><td>固定 48000／1024／512；模型設定查不到該列時拒絕；開圖後埠檢查</td></tr>
-<tr><th><code>alg_ai3_aec_dfn.c</code>（full）</th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td><code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 給模型 grid（N=1），SDK 呼叫之前做 size、pool、<code>ainr_init_freq()</code>；host 取樣率（<code>--sr</code>）不是模型的取樣率時另建 <code>AinrBridge</code>；查 full 的列；開圖後埠檢查。模型檔由 sample 依量化選項自己選</td></tr>
+<tr><th><code>alg_ai3_aec_dfn.c</code>（full）</th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td><code>--ai-sample-rate</code>／<code>--ai-fft-size</code> 給模型 grid（N=1），SDK 呼叫之前做 size、pool、<code>ainr_init_freq()</code>；host 取樣率（<code>--sr</code>）不是模型的取樣率時另建 <code>AinrBridge</code>；查 full 的列；開圖後埠檢查。模型檔取 <code>AinrInfo.graph_path</code>（函式庫依 grid 解出的檔名，每個 grid 一個），量化由產品 build 決定，沒有 <code>--quant8</code>／<code>--quant16_8</code></td></tr>
 <tr><th><code>uvc_audio_live2a.c</code></th><td><code>ainr_*_freq</code>（E／P 頻譜）</td><td>固定 48000／1024／512，16 kHz 的 pipeline 經 <code>AinrBridge</code>；同樣查列；開圖後埠檢查</td></tr>
 </tbody></table>
 <p>五支 sample 共用同一份 DFN2 模型設定，按位置把 <code>work.inputs[i]</code>、<code>work.outputs[j]</code> 對到 SDK 的第 i 個輸入與第 j 個輸出，state 對依 <code>signal_in_count</code>／<code>head_out_count</code> 之後的位置綁同一塊 buffer，都依 <code>work.state_generation</code> 與執行狀態回復 state（見上節），每次成功的 pre 都接一次 post，<code>work.action</code> 為 SUBMIT 才接一次 AI3 執行。保留 full 的 alpha 對應與既有的數值處理。</p>

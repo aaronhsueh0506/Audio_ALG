@@ -71,7 +71,7 @@ dfn_hop_begin(&amp;hop, E, P)                                    (phase 0 → 1)
 while (dfn_hop_nn_begin(&amp;hop, &amp;job) &gt; 0) {            (phase 1 → 2;每 hop 0..2 次)
     rc = run_npu(&amp;job);          ← 呼叫端:DFN2PrepostInputs → 加速器 → DFN2PrepostOutputs
     dfn_hop_nn_end(&amp;hop, rc);                          (phase 2 → 1)
-}   【48 kHz】dfn_hop_close_frame(rc, out_spec) = dfn2_stream_post_process_freq():rc = 0 → 驗證並 commit(輸出未寫／非有限 → frame_bypass());
+}   【48 kHz】dfn_hop_close_frame(rc, out_spec) = dfn2_stream_post_process_freq():rc = 0 → 驗證並 commit(輸出未寫／非有限 → 整包 post_frame_identity());
         rc = STREAM_RUN_NOT_STARTED → identity;其他 rc → zero_state + identity(generation +1) ← fail-open
     【16 kHz】bridge:48 kHz FIFO 每滿 512,ainr_bridge_model_begin() 交出一幀,hop 對它 open_frame／close_frame;
         ainr_bridge_model_end() → 降頻 → 原生 out FIFO
@@ -128,7 +128,7 @@ bridge 原生 WOLA    e0,p0(各 128) e1,p1         e2,p2         e3,p3         e
 <tr><td>遞迴狀態 <code>h_gru</code>、<code>df_convp_history</code></td><td>出貨 graph 128,000 B(32,000 float)</td><td>板端 runtime(定點副本)</td><td>模型串流登錄 NULL／0,不在任何 pool;<code>job.state_generation</code>(<code>dfn_hop_state_generation()</code>)init 後為 1,reset、被拒的 commit 與執行已開始卻失敗的幀（<code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 狀態）各加 1,板端與上次歸零時的值不同就把 state 重載成量化後的零</td></tr>
 <tr><td><b>只在 16 kHz 存在:<code>AinrBridge</code> pool</b></td><td><b>117,856 B(ne10;fft 256,<code>ainr_bridge_get_mem_requirements()</code>)</b>,不含模型串流;DFN2 尾段合計 214,448 B(骨架 <code>pool</code> 行減去 array、helper 與 P 緩衝)</td><td>helper 與 P 緩衝之後</td><td>E、P 各一顆升頻器與自己的 FIFO,降頻器共用一顆;out FIFO 預填 <code>prefill</code> 個零(fft 256 → 128、fft 512 → 85)。逐項見 <a href="../../reference/dfn2/configuration.html#details">DFN2 pipeline 參數與狀態</a></td></tr>
 <tr><td>NN 權重</td><td>—</td><td><b>不在本 pool 內</b></td><td>屬於板端 runtime</td></tr>
-<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:1,536,352 B(ne10)</b><br>48 kHz:5,053,600 B(ne10)<br>16 kHz 核心 + 16000/256 模型(模型串流直接在核心格點):1,379,872 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值(骨架印出的 <code>pool</code> 行,為 array、helper、P 緩衝與 DFN2 尾段各塊對齊後的和);換 rate/backend/編譯選項/相依庫 一律以各自的大小查詢重查</td></tr>
+<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:1,532,128 B(ne10)</b><br>48 kHz:5,049,376 B(ne10)<br>16 kHz 核心 + 16000/256 模型(模型串流直接在核心格點):1,378,720 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值(骨架印出的 <code>pool</code> 行,為 array、helper、P 緩衝與 DFN2 尾段各塊對齊後的和);換 rate/backend/編譯選項/相依庫 一律以各自的大小查詢重查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

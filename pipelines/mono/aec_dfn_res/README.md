@@ -108,7 +108,7 @@ DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AI
 pair is refused with the list, exit 2) and hands it to `DfnHopPoolPlan.stream_cfg.grid` (`dfn_hop_pool_plan_init()`). The model stream takes its rate and FFT size from that grid, and
 `DfnHop` its input and output scales (1/sqrt(n_fft) and its inverse). A host at the model's rate needs no bridge:
 `--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the model stream (hop 128, algorithmic latency 128
-samples for the 0/0 row, pool 302,464 B), against 800 samples and
+samples for the 0/0 row, pool 301,312 B), against 800 samples and
 454,720 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
 48 kHz / 1024 model (`dfn_hop_pool_plan()` returns -1 on any other model grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
@@ -202,9 +202,9 @@ Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter ban
 of `aec_get_mem_size()`, the post spectrum buffer of the RES path and the DFN tail of
 `dfn_hop_pool_bytes()`, each part 16-byte aligned): 454,720 bytes at the 16 kHz default (the AEC and the RES post spectrum plus a
 DFN tail of 214,448 bytes: the model stream 84,272, the six conversion buffers 12,312 and the bridge 117,856),
-921,648 bytes at 48 kHz (a DFN tail of 147,760 bytes: the stream and the buffers as above, the synthesis 42,832 and the
+921,648 bytes at 48 kHz (a DFN tail of 143,536 bytes: the stream and the buffers as above, the synthesis 42,832 and the
 output spectrum 4,104; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 956,240 bytes) and 427,984 bytes at 8 kHz (tail 220,304). The 16 kHz / 256 model on a 16 kHz host: 302,464 bytes
+grid needs 956,240 bytes) and 427,984 bytes at 8 kHz (tail 216,080). The 16 kHz / 256 model on a 16 kHz host: 301,312 bytes
 (tail 61,040: stream 45,552, buffers 3,096, synthesis 11,344, spectrum 1,032). The stream is a `freq_only` one
 (`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`): its pool is the `DFN2Prepost` (79,984 of the 84,272 bytes), with no
 analysis, synthesis or PCM buffer, since the hop uses the spectrum entries only. Model weights, accelerator activation/

@@ -89,7 +89,7 @@ int ainr_get_mem_size(const AinrConfig *cfg, StreamMemReq *req);
  * misaligned pool is not written. */
 int ainr_init(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrCtx **ctx, AinrInfo *info);
 
-/* Back to the start: state zeroed, generation advanced, a partly gathered block dropped; ERB tables kept. */
+/* Back to the start: state zeroed, generation advanced, an open call dropped; ERB tables kept. */
 void ainr_reset(AinrCtx *ctx);
 
 /* Attenuation limit of |atten_lim_db| dB (sign ignored; 0 disables, the default), between blocks only.

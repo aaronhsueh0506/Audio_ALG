@@ -15,7 +15,7 @@
 <li><a href="#section-1">使用者入口</a></li>
 <li><a href="#section-2">AINR</a></li>
 <li><a href="#section-3">AIAEC</a></li>
-<li><a href="#section-4">C pre/post 類別（四個模型共用的形狀）</a></li>
+<li><a href="#section-4">C pre/post：lib 的逐 frame 函式與 stream 的呼叫流程</a></li>
 <li><a href="#section-5">哪些模型有 C 類別</a></li>
 <li><a href="#section-6">Build</a></li>
 <li><a href="#section-7">Calibration signal seam</a></li>
@@ -61,14 +61,14 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
 <tr><td>Align-ULCNet</td><td>layout 18(唯一的 boundary):四個壓縮域特徵(error_mag/far_mag/error_cos/error_sin,host signed-pow 前端;壓縮域 error 頻譜留在 model_io state,不進 graph) + 四個 rank-4 state:K/V window <code>[1,32,D,TA]</code>(newest-first)、logit window <code>[1,32,5,D]</code>(oldest-first)、單一 <code>h_gru [1,4,1,128]</code>(由應用端持有)</td>
-<td>graph 止於 complex_mask 1×1 Conv,output = 複數 mask(planar <code>[1,2,1,K]</code>;host 以壓縮域 error 乘它再逆冪) + <b>每個 state 的完整下一個 window</b>(shape 同輸入;位移在 graph 內:輸入端 Slice 加 Concat)</td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.c/h</code>(<code>ulcnet_model_io_prepare()</code>／<code>ulcnet_model_io_enhance_spectrum()</code> 內建前後端),
-外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
+<td>graph 止於 complex_mask 1×1 Conv,output = 複數 mask(planar <code>[1,2,1,K]</code>;host 以壓縮域 error 乘它再逆冪) + <b>每個 state 的完整下一個 window</b>(shape 同輸入;位移在 graph 內:輸入端 Slice 加 Concat)</td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.c/h</code>(<code>ulcnet_model_io_pre_frame()</code>／<code>_views()</code>／<code>_validate_run()</code>／<code>_post_frame()</code> 內建前後端),
+外面包 <b><code>ulcnet_prepost.c/h</code>（逐 frame 函式）</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
 <td>real mask + next state</td><td>無（沒有 C 程式碼）</td></tr>
 <tr><td>DeepVQE-S</td><td>mic + far(host 壓縮後的 planar 頻譜 <code>[1,2,1,257]</code>，graph 自第一個 conv 起) + 16 個 rank-4 顯式 state(conv window 4 幀、score window 5 幀、attention ring D 幀、<code>h_gru [1,1,1,192]</code>)</td>
 <td>3x3 complex CCM taps + <b>每個 state 的完整下一個 window</b></td>
 <td><code>lib/aiaec/deepvqe_s/deepvqe_process.c/h</code>，
-外面包 <b><code>deepvqe_prepost.c/h</code> 類別</b></td></tr>
+外面包 <b><code>deepvqe_prepost.c/h</code>（逐 frame 函式）</b></td></tr>
 <tr><td>CAGCRN</td><td>mic + far + conv/GRU/delay state</td>
 <td>complex mask + next state</td><td>無（沒有 C 程式碼）</td></tr>
 </table>
@@ -77,61 +77,80 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 index 必須是 int64，兩者不可做 integer PTQ。Align-ULCNet 的 ONNX、
 calibration manifest 與 CPU descriptor 必須使用相同 D。</p>
 
-<h2 id="section-4">C pre/post 類別（四個模型共用的形狀）</h2>
+<h2 id="section-4">C pre/post：lib 的逐 frame 函式與 stream 的呼叫流程</h2>
 
-<p>Align-ULCNet、DeepVQE-S、DFN2、DFN3 各有一個 pre/post 類別，把「頻譜 ↔ 加速器張量」之間的一切收進<b>一個物件</b>：
-特徵前後端、feature window／ring、frame 狀態機。類別只處理<b>頻域</b>：framing（<code>AcStft</code>／<code>AcIstft</code>、FFT handle、window）
-由<b>應用端</b>用 audiolib 建立並呼叫，類別不持有；遞迴 state 同樣由應用端持有。
-四個類別的 API 形狀相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> / <code>deepvqe</code> / <code>dfn2</code> / <code>dfn3</code>）：</p>
+<p>Align-ULCNet、DeepVQE-S、DFN2 的 lib（<code>lib/aiaec/&lt;model&gt;/</code>、<code>lib/ainr/dfn2/</code> 的 <code>*_prepost.c/h</code>）只有<b>逐 frame 函式與模型 state</b>：特徵與正規化 EMA、模型 I/O 視窗、lookahead ring、逐 frame 後處理、輸出與 state 檢查、歸零與 generation、reset。
+<b>每一包的呼叫流程在各自的 stream</b>（<code>dfn2_stream</code>、<code>deepvqe_stream</code>、<code>ulcnet_stream</code>）：送件或旁路、發布張量 view、結案與失敗的順序、STFT／ISTFT、N&gt;1 時 N 次逐 frame 呼叫夾一次加速器，以及輸入範圍檢查
+（<code>DFN2_STREAM_ERR_RANGE</code>／<code>DEEPVQE_STREAM_ERR_RANGE</code>／<code>ULCNET_STREAM_ERR_RANGE</code> = −2，在任何狀態移動之前回；product 轉成 <code>*_ERR_NONFINITE_INPUT</code>）。lib 不含任何 stream 標頭，也沒有每包的 latch。
+DFN3、GTCRN、RNNoise-ERB 沒有 stream 層，維持原來的類別（<code>pre_process_freq</code>／<code>frame_open</code>／<code>frame_finish</code>／<code>frame_bypass</code>／<code>post_process_freq</code>），這一版沒有改。
+類別只處理<b>頻域</b>：framing（<code>AcStft</code>／<code>AcIstft</code>、FFT handle、window）由<b>應用端</b>（或 stream 的 PCM 入口）用 audiolib 建立並呼叫，lib 不持有；遞迴 state 同樣由應用端持有。
+建構的 API 形狀對這幾個類別相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> / <code>deepvqe</code> / <code>dfn2</code> / <code>dfn3</code>）：</p>
 
 <pre>&lt;lib&gt;_grid_make(&amp;grid, &amp;spec);                  /* 執行期 grid；spec 是匯出模型定下的值（DFN2／DFN3 含 lookahead pair） */
 &lt;pfx&gt;_prepost_config_defaults(&amp;cfg, &amp;grid);        /* grid 複製進 cfg；DFN2／DFN3 再設 cfg.erb_fwd／erb_inv */
 float host：cfg 登錄 state 緩衝（指標＋元素數，全登或全不登）；板端：不登錄
 &lt;pfx&gt;_prepost_get_mem_size(&amp;cfg, &amp;req);            /* reject-first：壞參數回 −1、req 不動 */
-p = &lt;pfx&gt;_prepost_init(pool, req.bytes, &amp;cfg);       /* 或 _init_ex(pool, bytes, &amp;cfg, &amp;expected)；host 工具：_create(&amp;cfg) */
-每 hop：
-  ac_stft_push_planar(stft, hop_in, re, im);      /* 應用端 framing */
-  n = &lt;pfx&gt;_prepost_pre_process_freq(p, 頻譜…);   /* 這一 hop 的推論次數 */
-  if (n == 1) {
-      &lt;pfx&gt;_prepost_frame_open(p, &amp;in, &amp;out);   /* pool 內的 view；非 state 輸出預填 NaN；state 為登錄的緩衝（板端 NULL） */
+p = &lt;pfx&gt;_prepost_init(pool, req.bytes, &amp;cfg);       /* 或 _init_ex(pool, bytes, &amp;cfg, &amp;expected)；host 工具：_create(&amp;cfg) */</pre>
+
+<p><b>DFN2、DeepVQE-S、Align-ULCNet：stream 內部每包的順序</b>（整合者呼叫的是 stream 入口，不是這些函式）：</p>
+
+<pre>  ac_stft_push_planar(stft, hop_in, re, im);      /* N 個 frame，各一次（PCM 入口由 stream 做） */
+  for (k = 0; k &lt; N; ++k)
+      r = &lt;pfx&gt;_prepost_pre_frame(p, [slot k,] 頻譜…);   /* 特徵、正規化與視窗前進；DFN2 回 1 = 這一包有 job、0 = 還沒有 */
+  if (有 job) {
+      &lt;pfx&gt;_prepost_views(p, &amp;in, &amp;out);       /* 每次加速器執行一次：heads 預填 NaN，發布張量 view */
       加速器填 out                                /* 每個 state 輸出綁到同名輸入的位址（先讀完 state 輸入再寫輸出） */
-      if (&lt;pfx&gt;_prepost_frame_finish(p) != 0) &lt;pfx&gt;_prepost_frame_bypass(p);
+      ok = (&lt;pfx&gt;_prepost_validate_run(p) == 0);  /* −1：登錄 state 歸零、generation 加一（lib 內一次），整包走 identity */
+      執行狀態不是 OK 也不是 NOT_STARTED：&lt;pfx&gt;_prepost_zero_state(p)
   }
-  &lt;pfx&gt;_prepost_post_process_freq(p, out_re, out_im[, &amp;valid]);
-  ac_istft_push_planar(istft, out_re, out_im, hop_out);   /* AC_OLA_ACCUMULATE：每 hop 都 push，valid 只是資訊 */
+  for (k = 0; k &lt; N; ++k)
+      ok ? &lt;pfx&gt;_prepost_post_frame(p, k, …, out_re, out_im)   /* 0／−1 引數／−2 增強後頻譜非有限（DeepVQE-S、Align-ULCNet：stream 再 zero_state 一次） */
+         : identity;                                       /* DFN2 post_frame_identity；DeepVQE-S 靜音；Align-ULCNet 原 error 頻譜 */
+  ac_istft_push_planar(istft, out_re, out_im, hop_out);   /* AC_OLA_ACCUMULATE：每 hop 都 push */
 其餘：_reset（應用端的 AcStft／AcIstft 要一併 reset）／_destroy／_state_generation（見下）</pre>
 
-<p><b>一 hop = 一次推論</b>：<code>pre_process_freq</code> 回傳這一 hop 需要的加速器呼叫次數（−1 = 引數為 NULL 或上一幀還開著）。
-Align-ULCNet（引數 <code>err_re, err_im, far_re, far_im</code>）與 DeepVQE-S（<code>mic_re, mic_im, far_re, far_im</code>）<b>從 hop 0 起恆為 1</b>，<code>post_process_freq</code> 不帶 <code>valid</code>；
-DFN3（引數 <code>re, im</code>）<b>也每 hop 回 1</b>，前 M 個 hop 是暖機幀（M = <code>mask_lookahead</code>；graph 的視窗是
-<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到）：加速器照跑，heads 由 <code>frame_finish</code>／<code>frame_bypass</code> 丟棄、登錄 state 歸零，音訊不變。
-DFN2（N = 1）前 M 個 hop（出貨 M = 1 即第一個 hop）沒有 job：<code>pre_process_freq</code> 回 0、不開 frame、加速器不跑，登錄 state 與 generation 不動，之後每 hop 回 1。<code>post_process_freq</code> 的 <code>valid</code> 為 0 時輸出是零頻譜。
+<p><b>DFN3：沒有 stream 層，類別本身的 hop 流程</b>：</p>
+
+<pre>  ac_stft_push_planar(stft, hop_in, re, im);
+  n = dfn3_prepost_pre_process_freq(p, re, im);       /* 1 = 這一 hop 要推論；前 M 個 hop（M = mask_lookahead）回 0：沒有 job、不開幀 */
+  if (n == 1) {
+      dfn3_prepost_frame_open(p, &amp;in, &amp;out);       /* pool 內的 view；非 state 輸出預填 NaN */
+      加速器填 out
+      if (dfn3_prepost_frame_finish(p) != 0) dfn3_prepost_frame_bypass(p);
+  }
+  dfn3_prepost_post_process_freq(p, out_re, out_im, &amp;valid);
+  ac_istft_push_planar(istft, out_re, out_im, hop_out);</pre>
+
+<p><b>一 hop = 一次推論</b>（第一個 hop 起有沒有 job）：Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起每一包都有一次推論</b>，沒有暖機拍。
+DFN2（N = 1）與 DFN3 的前 M 個 hop（M = <code>mask_lookahead</code>，出貨 M = 1 即第一個 hop）<b>沒有 job</b>：圖的視窗是
+<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到，所以 pre 回 0、不開幀、加速器不跑，登錄 state 與 generation 不動，輸出是零頻譜（<code>valid</code> 為 0；DFN2 的 <code>DFN2HopIO.action</code> = <code>STREAM_WORK_BYPASS</code>），之後每 hop 一次 job。
+DFN2 的 N&gt;1 在任何 <code>mask_lookahead</code> 都每一包一個 job：一包取最新 N+2 個 frame，heads 是 frame T−N+1−M..T−M，第一包前 M 個 head 屬於串流開始之前的 frame，被丟棄，該拍輸出零頻譜。
 M 與 <code>df_lookahead</code> D 是 <code>DFN2GridSpec</code>／<code>DFN3GridSpec</code> 的欄位（15 組合法 pair，出貨 1/1；圖本身與 pair 無關，metadata 記錄 pair；見 <a href="../dfn2/reference/core.html#memory">DeepFilterNet2 頻域與模型契約</a>）。
 DFN2 另可匯出每次 invocation N 個 frame 的 graph（<code>--frames-per-call N</code>，輸入 N+2 個 feature frame、輸出 N 個 frame 的 heads）：
-N 是 <code>DFN2GridSpec.frames_per_call</code>（1..64；N&gt;1 要求 <code>mask_lookahead</code> 0），N&gt;1 的一包 N 個 frame 走 <code>dfn2_prepost_pre_process_block_dual()</code> 一次 job，<code>dfn2_prepost_latency_frames()</code> = M + D（與 N 無關）；pipelines 固定 N=1。</p>
+N 是 <code>DFN2GridSpec.frames_per_call</code>（1..64），N&gt;1 的一包 N 個 frame 走 <code>dfn2_stream</code> 的 packet 入口，一次 job，<code>dfn2_prepost_latency_frames()</code> = M + D（與 N 無關）；pipelines 固定 N=1。</p>
 
 <p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成開幀 → 取張量 → 呼叫端在 NPU 上推論 → 回報 rc → 收幀。
 DFN2 應用用 <code>dfn/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnHopJob</code>（模型串流的 <code>DFN2HopIO</code>：<code>DFN2PrepostInputs/Outputs</code> 視圖與 <code>state_generation</code>）。
 ULCNet 應用用模型串流的頻譜進出口 <code>stream/aiaec/ulcnet/ulcnet_stream.h</code>：應用端的 <code>ac_stft_push_planar()</code> → <code>ulcnet_stream_pre_process_freq()</code>（回 1 並交出 <code>UlcnetHopIO</code>：<code>UlcnetModelIoInputs/Outputs</code> 視圖與 <code>state_generation</code>；回 0 表示本 hop 無模型幀）→ 推論 → <code>ulcnet_stream_post_process_freq(rc)</code> → 應用端的 <code>ac_istft_push_planar()</code>。
-兩者都是：<code>rc==0</code> 且輸出有限才提交，否則該幀走 identity（等同 <code>_frame_bypass</code> 的語意）；輸出預填 NaN；合成剛好一個 hop。
+兩者都是：<code>rc==0</code> 且輸出有限才提交，否則該幀走 identity；輸出預填 NaN；合成剛好一個 hop。
 DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>dfn_hop_nn_begin()</code> 放在迴圈裡。
 逐步呼叫序列與時序圖見「相關檔案」，另見 <code>pipelines/README.md</code> 的 Call flow。</p>
 
-<p><b>frame 狀態機</b>：<code>frame_open</code> 只把<b>非 state 的輸出</b>
+<p><b>驗證與失敗</b>：<code>views</code> 只把<b>非 state 的輸出</b>
 （heads：<code>output</code>／<code>taps</code>／<code>erb_mask</code>／<code>coefs</code>／<code>alpha</code>，
-Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，state 不預填。<code>frame_finish</code> 是<b>純驗證</b>：
-heads 與（有登錄時）state 都有限才成功，之後 CCM ring／enhance_spectrum／輸出暫存照常前進，本身不複製任何 state。
-state 已被加速器就地覆寫、<b>無法回滾</b>，所以遇到任何一處非有限值時<b>所有登錄的遞迴 state 歸零</b>（冷啟動）、state generation 加一、
-輸出暫存不前進（DeepVQE-S 的 CCM ring 與 state 一同清空）、幀維持開啟、回 −1
-（Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2、DFN3：<code>h_gru</code> 與 <code>df_convp_history</code> 兩個遞迴張量；DeepVQE-S：16 個 state），
-呼叫端再選 <code>frame_bypass</code> 或用新的 <code>frame_open</code> 從冷 state 重跑加速器。
-<code>frame_bypass</code> 該幀取 identity（DeepVQE-S 為靜音）、遞迴 state 維持原樣（加速器寫完的樣子；回報失敗的 runtime 視為沒有寫入）；DFN2、DFN3 的 frame clock 照常前進，DeepVQE-S 的 CCM ring 不前進。
-<code>frame_fail</code>（DeepVQE-S）在加速器執行沒成功時關閉該幀，輸出同 <code>frame_bypass</code>；已啟動的執行另把登錄 state 歸零、清空 CCM ring、generation 加一。
-<code>frame_finish</code> 沒有 <code>frame_open</code> 就回 −1，heads 預填 NaN，所以「加速器根本沒跑」不會被當成結果收下；幀還開著時再呼叫 <code>pre_process_freq</code> 回 −1。</p>
+Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，state 不預填，可重複呼叫。<code>validate_run</code> 是<b>純驗證</b>：
+heads 與（有登錄時）state 都有限才回 0，本身不複製任何 state、不推進任何 ring。
+state 已被加速器就地覆寫、<b>無法回滾</b>，所以遇到任何一處非有限值時 <code>validate_run</code> 回 −1，並在 lib 內<b>把所有登錄的遞迴 state 歸零</b>（冷啟動）、state generation 加一（一次；DeepVQE-S 的 CCM ring 與 state 一同清空），
+整包 N 個 frame 輸出 identity：DFN2 是 <code>post_frame_identity</code>（單位 mask、alpha 0；ring 與 frame clock 照常前進），DeepVQE-S 是靜音（PCM 合成仍可含前拍 overlap），Align-ULCNet 是原 error 頻譜
+（Align-ULCNet：key／value／logit 三個 window 與 h_gru 共四個 state；DFN2：<code>h_gru</code> 與 <code>df_convp_history</code> 兩個遞迴張量；DeepVQE-S：16 個 state）。
+加速器執行沒成功（狀態不是 OK）時由 stream 呼叫 <code>zero_state</code>（狀態歸零、generation 加一），輸出同上；<code>STREAM_RUN_NOT_STARTED</code> 什麼都不動。
+<code>post_frame</code> 回 −2（DeepVQE-S、Align-ULCNet 的增強後頻譜有非有限 bin）時，stream 呼叫一次 <code>zero_state</code>，整包 identity。
+lib 沒有每包的 latch：沒有 <code>views</code> 就呼叫的 <code>validate_run</code> 會看到預填的 NaN，所以「加速器根本沒跑」不會被當成結果收下；
+序列錯誤（上一包還沒收就再 pre、沒有 pre 就 post）由 stream 的 <code>pending</code> 擋下，回 −1。DFN3 的 <code>frame_finish</code> 沒有 <code>frame_open</code> 就回 −1，幀還開著時再呼叫 <code>pre_process_freq</code> 回 −1，<code>frame_bypass</code> 該幀取 identity、遞迴 state 維持原樣。</p>
 
 <p><b>遞迴 state：就地綁定，由應用端持有</b>。每個 state 張量只有一個 buffer、位址在實例壽命內不變，沒有交替的 bank、沒有指標交換、沒有複製路徑。
 float host 把 buffer（指標與<b>元素數</b>，不是 byte）登錄在 config：DFN2／DFN3 的 <code>gru_hidden</code>／<code>df_convp_history</code>、Align-ULCNet 的 <code>key_history</code>／<code>value_history</code>／<code>logit_history</code>／<code>h_gru</code>、
-DeepVQE-S 的 <code>state[16]</code>、GTCRN 的 <code>state[8]</code>、RNNoise-ERB 的 <code>h1</code>／<code>h2</code>／<code>h3</code>；init 與 reset 歸零它們，<code>frame_finish</code>（GTCRN 為 <code>state_validate</code>）掃過每個 buffer 的<b>全部元素</b>，
+DeepVQE-S 的 <code>state[16]</code>、GTCRN 的 <code>state[8]</code>、RNNoise-ERB 的 <code>h1</code>／<code>h2</code>／<code>h3</code>；init 與 reset 歸零它們，<code>validate_run</code>（DFN3 為 <code>frame_finish</code>，GTCRN 為 <code>state_validate</code>）掃過每個 buffer 的<b>全部元素</b>，
 舊格子裡殘留的非有限值也會被拒。板端不登錄（view 回 NULL 與 0），state 由加速器的 buffer 保存。登錄規則一律「全登或全不登」，只給指標或只給元素數會被拒；
 登錄的 buffer 不在 pool 大小與 hash 裡，生命期由應用端負責。
 埠順序只有一條規則：輸入 = 訊號輸入再接 state 輸入，輸出 = head 輸出再接 state 輸出，第 k 組 state 是輸入 <code>signal_in + k</code> 與輸出 <code>head_out + k</code>；<code>stream/ainr</code> 與 <code>stream/aiaec</code> 不保存埠表，只在 <code>StreamWork</code>（<code>stream/common/stream_run.h</code>）給這一包的訊號與 head；完整的埠與 state 形狀在各函式庫旁的模型設定（<code>stream/ainr/graph_io_dfn2.h</code>、<code>stream/aiaec/graph_io_*.h</code>，共用程式 <code>stream/common/graph_io.h</code>），sample 依位置綁，不比對名稱（見<a href="../dfn2/reference/board.html#info">DFN2 板端整合</a>）。
@@ -143,7 +162,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉�
 並為每個 window 宣告丟哪一端（AINR 的 <code>state_slicing</code> 內 <code>drop</code>、AIAEC 的 <code>state_window_drop</code>：time-ordered window 為 <code>first</code>，newest-first ring 為 <code>last</code>），驗證器只接受那一端的 Slice 範圍。RNNoise-ERB 的匯出器只寫 <code>state_layout_version</code>，不寫 <code>state_binding</code>，也不跑這項檢查。</p>
 
 <p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 依同一規則）、
-<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate（DeepVQE-S 另有已啟動的 <code>frame_fail</code>）各加一，有沒有登錄 state 都照算。
+<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、被拒絕的 <code>validate_run</code>（DFN3、GTCRN、RNNoise-ERB 為被拒絕的 <code>frame_finish</code>／validate）與 stream 在執行失敗時呼叫的 <code>zero_state</code> 各加一，有沒有登錄 state 都照算。
 pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
 板端 sample 比較這個值，與上次看到的不同就用量化後的 0 重填 state 輸入。
 起始值不同（DFN2、DFN3、GTCRN、RNNoise-ERB 的 init 後為 1，Align-ULCNet、DeepVQE-S 為 0），所以只比較「是否變動」，不假設起始值。</p>
@@ -162,7 +181,7 @@ RNNoise-ERB 為 24 byte、沒有 reserved 欄）當<b>陳舊 pool 閘</b>：<cod
 <h2 id="section-5">哪些模型有 C 類別</h2>
 
 <table>
-<tr><th>Model</th><th>C 類別</th><th>測試</th><th><code>frame_bypass</code> 政策</th><th>exporter 寫的 metadata key</th></tr>
+<tr><th>Model</th><th>C 類別</th><th>測試</th><th>失敗時的輸出（identity 政策）</th><th>exporter 寫的 metadata key</th></tr>
 <tr><td>Align-ULCNet</td><td><code>lib/aiaec/ulcnet/ulcnet_prepost.c/h</code></td>
 <td><code>AIAEC/tests/test_ulcnet_prepost_c.py</code></td>
 <td>identity：error 頻譜原樣通過（stream 0 是 linear-AEC error）</td>

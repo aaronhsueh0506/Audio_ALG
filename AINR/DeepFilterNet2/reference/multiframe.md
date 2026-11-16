@@ -2,7 +2,7 @@
 
 `export_onnx.py --frames-per-call N` (default 1, at most 64 as in the C host) writes a graph that runs N
 frames per invocation, for an accelerator where one call per hop costs more
-than one call per block of N hops. N > 1 needs `mask_lookahead` 0 and adds no latency. `--frames-per-call 1`, or no option, writes the same
+than one call per block of N hops. N > 1 works at any `mask_lookahead` and adds no latency. `--frames-per-call 1`, or no option, writes the same
 ONNX and JSON bytes as before the option existed.
 
 | | one frame per call | N frames per call |
@@ -61,7 +61,7 @@ streamed in chunks against the one-frame graph, all pairs; a wrong state carry
 fails; metadata and validator; calibration) and
 `../tests/test_dfn2_frames_per_call_c.py` (the block host against the
 one-frame host, byte for byte and with no shift, with a stand-in accelerator; reset, refusal, contract;
-the 72-byte descriptor through a grid of either N; `mask_lookahead` > 0 with N > 1 refused).
+the 72-byte descriptor through a grid of either N; the packet host at `mask_lookahead` 1 and 2 against the one-frame reference: `../../../stream/ainr/dfn2/tests/lookahead_blocks.c`).
 
 ## Mask-only (stage 1)
 
@@ -80,8 +80,8 @@ mask head does not depend on the deep-filter decoder, so the same checkpoint can
   descriptor shrink accordingly, and the output is `noisy * (mask @ erb_inv)` of the head frame, `grid.mask_lookahead`
   frames behind the input. The grid's `df_lookahead` must be 0 (`DFN2_GRID_ERR_DF_LOOKAHEAD` otherwise), `df_order` is stored as 0, and `df_bins` may reach `n_bins`. The final attenuation-limit mix (`--atten-lim`, `dfn2_prepost_set_atten_lim`) stays and acts on
   the stage-1 output in Python and in C. `../tests/test_dfn2_mask_only_c.py` compares it with numpy.
-- Board sample: `alg_ai3_dfn_lite.c` (`audio_sample/`, outside this repo) is the sample for this graph, separate from the
-  full model's `alg_ai3_dfn.c`. Build it and every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own
+- Board sample: `alg_ai3_dfn_lite.c` (`audio_sample/`, outside this repo) is the sample for this graph: a thin wrapper that
+  defines `DFN2_MASK_ONLY` and includes the full model's `alg_ai3_dfn.c`. Build it and every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own
   (objects of the other variant do not link: the link symbol is `dfn2_variant_mask_only`). It binds I/O layout 9: inputs
   `erb, spec, h_gru` (h_gru is `(1, 3, 1, 256)`), outputs `erb_mask, h_gru_out`. The model is read from
   `/mnt/sd/audio_model/<quant>/dfn2_lite/` and the output goes to `/mnt/sd/audio/output/DFN2_LITE/`. Its grid comes from

@@ -22,7 +22,7 @@
 </ul></details>
 <h2 id="section-1">用途與位置</h2>
 <p>主機（AEC、RES、波束、舒適噪聲）跑在 8 或 16 kHz，模型跑在 48 kHz／1024／hop 512 的 grid 時，<code>AinrBridge</code>（<code>stream/ainr/bridge/ainr_bridge.{h,c}</code>）負責兩個格點之間的來回：主機的 estimate／apply 兩路頻譜經原生 WOLA 還原成時域、升頻到 48 kHz、做 sqrt-Hann 1024/512 分析，交給<b>呼叫端的模型</b>，再把模型回的 48 kHz 頻譜做 WOLA、降頻，每個主機 hop 剛好吐出一個 hop。</p>
-<p><b>橋接器不內嵌模型。</b>呼叫端在「取出 48 kHz 頻譜」與「放回」之間自己跑：模型可以是 <code>dfn2_stream_*_freq</code>（記憶體模式）或 <code>ainr_*_freq</code>，DFN3（同為 48 kHz／1024）也能接；兩支桌面 DFN2 pipeline 經 <code>pipelines/dfn/dfn_hop.h</code> 接的是 <code>dfn2_stream_*_freq</code>，板端 sample <code>alg_ai3_aec_dfn.c</code>、<code>uvc_audio_live2a.c</code> 接的是 <code>ainr_*_freq</code>。它放在 <code>stream/</code> 而不在 <code>lib/</code>：橋接器本身用 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>／resampler，<code>lib/</code> 的模型核心不含框化（<code>pipelines/scripts/audit_no_transform_in_models.sh</code> 把關，它不掃 <code>stream/</code>）。</p>
+<p><b>橋接器不內嵌模型。</b>呼叫端在「取出 48 kHz 頻譜」與「放回」之間自己跑：模型可以是 <code>dfn2_stream_*_freq</code>（記憶體模式）或 <code>ainr_*_freq</code>，DFN3（同為 48 kHz／1024）也能接；兩支桌面 DFN2 pipeline 經 <code>pipelines/dfn/dfn_hop.h</code> 接的是 <code>dfn2_stream_*_freq</code>，板端 sample <code>alg_ai3_aec_dfn.c</code>（開函式庫依 grid 解出的 graph 檔 <code>AinrInfo.graph_path</code>，沒有 <code>--quant8</code>／<code>--quant16_8</code>）、<code>uvc_audio_live2a.c</code> 接的是 <code>ainr_*_freq</code>。它放在 <code>stream/</code> 而不在 <code>lib/</code>：橋接器本身用 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>／resampler，<code>lib/</code> 的模型核心不含框化（<code>pipelines/scripts/audit_no_transform_in_models.sh</code> 把關，它不掃 <code>stream/</code>）。</p>
 <h2 id="section-2">呼叫順序</h2>
 <pre>AinrBridgeConfig cfg = ainr_bridge_default_config(host_rate, lookahead_frames);   /* 8000 或 16000 */
 AinrBridgeMemReq req;

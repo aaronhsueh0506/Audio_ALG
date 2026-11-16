@@ -126,7 +126,7 @@
 <div class="note">4ch 的後級物件(<code>AnrDenoiser</code>、<code>AcIstft</code>)與你記的 <code>post_reset_serial</code> 都不在 array／helper 裡,<code>array_sample_beam_reset()</code> 與 <code>aec_reset()</code> 不會動它們;comfort-noise 產生器是 array 自己的,<code>aec_reset()</code> 會重設它。array 的 reset 一併重置四條 lane、estimator 與增益級(level 設定保留)。mono 的 <code>mono/aec_nr_res/main.c</code>(同一份原始碼建出 <code>aec_nr_pipeline_static</code> 與 <code>-DAEC_NR_POOL_SPLIT=1</code> 的 <code>aec_nr_pipeline</code>)在 <code>process_hop()</code> 回 −1 時呼叫 <code>rig_reset()</code> 並把該 hop 輸出填 0;這支 CLI 本身不做輸出有限檢查,<code>example_board_adapter.c</code> 與 4ch 的 <code>static_hop()</code>／<code>raw_post()</code> 才有。</div>
 
 <h2 id="section-6">5. 接 NN 後級的 hop 骨架(摘要)</h2>
-<p>NN 後級把一個 hop 拆開,加速器夾在開幀與收幀之間(ULCNet:<code>pre_process_freq</code> 與 <code>post_process_freq</code>;DFN2:<code>dfn_hop_nn_begin</code> 與 <code>dfn_hop_nn_end</code>);細節與 fail-open 規則在 <a href="integration.html">串接範例</a> 第 5 節、<a href="../../pipelines/mono/align-ulcnet/index.html">Mono · Align-ULCNet</a>／<a href="../../pipelines/mono/dfn2/index.html">Mono · DFN2</a>。</p>
+<p>NN 後級把一個 hop 拆開,加速器夾在開幀與收幀之間(ULCNet:<code>ulcnet_stream_pre_process_freq</code> 與 <code>ulcnet_stream_post_process_freq</code>;DFN2:<code>dfn_hop_nn_begin</code> 與 <code>dfn_hop_nn_end</code>);細節與 fail-open 規則在 <a href="integration.html">串接範例</a> 第 5 節、<a href="../../pipelines/mono/align-ulcnet/index.html">Mono · Align-ULCNet</a>／<a href="../../pipelines/mono/dfn2/index.html">Mono · DFN2</a>。</p>
 <pre>應用            Aec 或 4ch(array＋helper)  模型串流(stream)            NN runtime／加速器
  │── (Aec: aec_process_linear + aec_process_residual + aec_get_residual／aec_get_linear) 或 (4ch: array_sample_beam_process_front/beam[/fuse]) ►│
  │── ac_stft_push_planar(far[, err]) ►│ 應用端分析 err／far
@@ -134,16 +134,16 @@
  │── board_run_npu(io.inputs, io.outputs) ───────────────────────────────►│ mask 已預填 NaN,必須寫滿
  │── ulcnet_stream_post_process_freq(stream,rc,out_re,out_im)  (dfn: dfn_hop_nn_end + dfn_hop_end) ►│ rc≠0 或 mask／輸出非有限 ⇒ identity(fail-open)
  │── ac_istft_push_planar(out_re,out_im) ►│ 應用端合成 → out[hop]</pre>
-<p>不經模型串流、直接用 <code>&lt;pfx&gt;_prepost</code> 類別時（板端 sample 的寫法），framing 由應用端用 audiolib 做，類別只收發頻譜；遞迴 state 由應用端登錄（float host）或留在加速器（板端）。各類別的引數差異見 <a href="../../models/reference/onnx.html">ONNX 邊界與 calibration</a>。</p>
-<pre>應用            AcStft/AcIstft(audiolib)   prepost 類別(頻域)         加速器
+<p>DFN2、DeepVQE-S、Align-ULCNet 的 lib 只有逐 frame 函式（<code>pre_frame</code>／<code>views</code>／<code>validate_run</code>／<code>post_frame</code>／<code>zero_state</code>），每包的呼叫順序在它們的 stream 裡（上圖）。DFN3、GTCRN、RNNoise-ERB 沒有 stream 層，應用端直接用 <code>&lt;pfx&gt;_prepost</code> 類別（下圖是 DFN3）：framing 由應用端用 audiolib 做，類別只收發頻譜；遞迴 state 由應用端登錄（float host）或留在加速器（板端）。各類別的引數差異見 <a href="../../models/reference/onnx.html">ONNX 邊界與 calibration</a>。</p>
+<pre>應用            AcStft/AcIstft(audiolib)   DFN3 prepost 類別(頻域)     加速器
  │── ac_stft_push_planar(stft,hop_in,re,im) ►│
- │── pre_process_freq(p,re,im…) ───────────────────────►│ 1 = 這一 hop 要推論(DFN2 N=1 從第 M 個 hop 起每 hop 是 1,前 M 個 hop 是 0:沒有 job;DFN3 每 hop 都是 1,前 M 幀是暖機幀)
+ │── pre_process_freq(p,re,im…) ───────────────────────►│ 1 = 這一 hop 要推論(前 M 個 hop 回 0:沒有 job、不開幀、加速器不跑、state 與 generation 不動;DFN2 N=1 的 stream 同理)
  │── frame_open(p,&amp;in,&amp;out) ───────────────────────────►│ view:特徵視窗 + 登錄的 state(板端 NULL);heads 預填 NaN
  │── 推論(in,out) ─────────────────────────────────────────────────────►│ 每個 state 輸出寫回同名輸入的位址
- │── frame_finish(p) ──────────────────────────────────►│ 0 = 提交(DFN3 暖機幀:丟棄 heads、state 歸零、generation+1);−1 = 登錄 state 歸零、generation+1、幀維持開啟 → frame_bypass(p)
- │── post_process_freq(p,out_re,out_im…) ──────────────►│ 增強後頻譜(DFN2/DFN3:valid = 0 時為零頻譜,可每 hop 照 push)
+ │── frame_finish(p) ──────────────────────────────────►│ 0 = 提交;−1 = 登錄 state 歸零、generation+1、幀維持開啟 → frame_bypass(p)
+ │── post_process_freq(p,out_re,out_im…) ──────────────►│ 增強後頻譜(valid = 0 時為零頻譜,可每 hop 照 push)
  │── ac_istft_push_planar(istft,out_re,out_im,hop_out) ►│ hop_out[hop]
- │ state_generation 與上次不同(reset、DFN3 的暖機幀、被拒的 frame_finish)⇒ 板端以量化後的零重填加速器的 state 輸入</pre>
+ │ state_generation 與上次不同(reset、被拒的 frame_finish)⇒ 板端以量化後的零重填加速器的 state 輸入</pre>
 </main>
 </body>
 </html>

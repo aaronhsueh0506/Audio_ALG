@@ -102,7 +102,7 @@ make -C AINR/RNNoise-ERB test   # ERB table, feature contract, features, framing
       checkpoint).
 - [ ] The recurrent state of the AINR classes (DeepFilterNet2, DeepFilterNet3, GTCRN, RNNoise-ERB) belongs to the application:
       registration is all-or-none (a pointer with a count of 0, or a count with a NULL pointer, is refused), the state
-      generation is 1 after init and advances on a reset and on a refused finish or validation (the first `mask_lookahead` hops of DeepFilterNet2 and DeepFilterNet3 run no accelerator job and move nothing), and a
+      generation is 1 after init and advances on a reset and on a refused `validate_run`, finish or validation (the first `mask_lookahead` hops of DeepFilterNet2 and DeepFilterNet3 run no accelerator job and move nothing), and a
       refusal zeroes any registered state (`tests/test_c_prepost.c` for DeepFilterNet2 and GTCRN, `tests/test_dfn3_stream.c` for DeepFilterNet3,
       `RNNoise-ERB/test/test_rnnoise_features.c` for RNNoise-ERB, and `tests/test_dfn2_prepost_c.py::
       test_state_generation_counts_every_zeroing_and_nothing_else`) pass.
@@ -213,7 +213,9 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
 - [ ] The SIMD knob changes every member that includes `utility/simd_kernel_nn.h`
       (`ulcnet_model_io`, `deepvqe_process`, `deepvqe_prepost`); never mix a `SIMD=0` archive with a `SIMD=1`
       application, and resolve the archive with `print-lib-path`.
-- [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a translation
+- [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) holds per-frame
+      functions and the model state (`pre_frame`, `views`, `validate_run`, `post_frame`, `zero_state`); the
+      per-call lifecycle is the model stream's (`ulcnet_stream`, `deepvqe_stream`). It is a translation
       unit of its own that uses `ulcnet_model_io` / `deepvqe_process`, which stay
       independently linkable for their own parity tests, and its byte-identity
       tests against the hand-composed path pass.
@@ -222,7 +224,7 @@ make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
       48000/1024 from one build (`test_class_matches_the_hand_composed_path` with `grid=16000,512` and `grid=48000,1024`),
       a pool recorded for another grid or delay depth is refused by `init_ex`
       (`test_stale_pool_gate_holds_and_the_pool_follows_the_grid`), and a refused
-      `frame_finish` advances the state generation and zeroes any registered state
+      `validate_run` advances the state generation and zeroes any registered state
       (DeepVQE-S: `test_state_generation_counts_restarts`; Align-ULCNet: `test_reset_clears_state` and
       `test_frame_state_machine_guards`; 0 after init for both classes).
 
@@ -246,8 +248,7 @@ Include roots: the directory of each header used, `stream/common`, audiolib `com
 `common/include` (`fft_wrapper.h`). An application on a frequency-domain core also includes the
 `lib/ainr/**` / `lib/aiaec/**` headers its model page names; a `-DDFN2_STREAM_NO_STDIO` build calls
 `stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
-`lib/ainr/dfn2/dfn2_prepost.c` includes `stream_run.h` (for `STREAM_RUN_NOT_STARTED` in `dfn2_model_run_frame`): a build that compiles it
-directly, not through the Makefiles of this repo, adds `stream/common` to that object's include roots.
+The DFN2, DeepVQE-S and Align-ULCNet library sources include no stream header; `stream/common` is on the include path of the stream `.c` files (which include `stream_run.h` and `stream_range.h`).
 
 - [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`
       and as C++11, given only the include roots above, and keeps C linkage:
