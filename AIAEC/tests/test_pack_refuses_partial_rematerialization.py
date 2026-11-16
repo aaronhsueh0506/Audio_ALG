@@ -408,18 +408,22 @@ def test_a_corpus_from_the_retired_frontend_does_not_pack(tmp_path):
 # capture on hops the new frontend publishes the real residual.
 PREVIOUS_FRONTEND_HASH = (
     "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5")
+# The frontend before the shadow-copy streak minimum became 80 ms of input.
+STREAK_FRONTEND_HASH = (
+    "9963b6d73df9cfe52a9590251f9eba595788777f2ae984059952141a5cebd4ac")
 
 
-def test_an_identity_ledger_from_the_previous_frontend_is_refused(tmp_path):
+@pytest.mark.parametrize(
+    "retired", (PREVIOUS_FRONTEND_HASH, STREAK_FRONTEND_HASH))
+def test_an_identity_ledger_from_a_retired_frontend_is_refused(tmp_path, retired):
     root = _corpus(str(tmp_path / "c"))
     _identity_ledger(
-        root, _source_contract(UNCOVERED_COMMIT, "c" * 64,
-                               behavior=PREVIOUS_FRONTEND_HASH),
+        root, _source_contract(UNCOVERED_COMMIT, "c" * 64, behavior=retired),
         set(range(N_SEQ)))
     with pytest.raises(ValueError) as caught:
         _gate(root)
     message = str(caught.value)
-    assert PREVIOUS_FRONTEND_HASH[:12] in message
+    assert retired[:12] in message
     assert "different linear_error" in message
     assert "without --resume" in message
 

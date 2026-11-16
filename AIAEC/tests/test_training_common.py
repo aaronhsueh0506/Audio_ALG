@@ -543,6 +543,8 @@ def test_inference_rejects_a_different_linear_aec_build():
         # target; neither is loadable on the current frontend.
         'c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786',
         '9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5',
+        # The frontend before the 80 ms shadow-copy streak minimum.
+        '9963b6d73df9cfe52a9590251f9eba595788777f2ae984059952141a5cebd4ac',
     ),
 )
 def test_inference_refuses_a_checkpoint_from_a_retired_frontend(recorded, recwarn):

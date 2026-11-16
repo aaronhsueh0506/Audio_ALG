@@ -63,9 +63,12 @@ RELEASED_CHECKPOINT_HASH = (
 # this build's, and it must not be registered as a byte-equivalent migration.
 PREVIOUS_FRONTEND_HASH = (
     "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5")
+# The frontend before the shadow-copy streak minimum became 80 ms of input.
+STREAK_FRONTEND_HASH = (
+    "9963b6d73df9cfe52a9590251f9eba595788777f2ae984059952141a5cebd4ac")
 REFUSED_HASHES = (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH, CORPUS_HASH,
                   LAST_MIGRATED_TO_HASH, RELEASED_CHECKPOINT_HASH,
-                  PREVIOUS_FRONTEND_HASH)
+                  PREVIOUS_FRONTEND_HASH, STREAK_FRONTEND_HASH)
 
 
 def _contract_recorded_as(hash_value):
@@ -103,6 +106,13 @@ def test_the_previous_frontend_is_retired_and_not_migrated():
     assert aec_python_behavior_hash() != PREVIOUS_FRONTEND_HASH
 
 
+def test_the_pre_streak_frontend_is_retired_and_not_migrated():
+    assert STREAK_FRONTEND_HASH in RETIRED_BEHAVIOR_HASHES
+    assert STREAK_FRONTEND_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    assert STREAK_FRONTEND_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()
+    assert aec_python_behavior_hash() != STREAK_FRONTEND_HASH
+
+
 def test_released_checkpoint_pointer_is_retired_not_repointed():
     """The released checkpoint (recorded at c1b1f5...) used to point at the
     previous frontend. It must not point at this build, nor at anything."""
@@ -115,7 +125,8 @@ def test_released_checkpoint_pointer_is_retired_not_repointed():
 
 @pytest.mark.parametrize("sample_rate, frame_size", ((16000, 512), (48000, 1024)))
 @pytest.mark.parametrize(
-    "recorded", (RELEASED_CHECKPOINT_HASH, PREVIOUS_FRONTEND_HASH))
+    "recorded",
+    (RELEASED_CHECKPOINT_HASH, PREVIOUS_FRONTEND_HASH, STREAK_FRONTEND_HASH))
 def test_released_checkpoint_is_refused_for_inference_and_training(
         recorded, sample_rate, frame_size, recwarn):
     """Neither the inference gate nor the strict gate admits it, at either

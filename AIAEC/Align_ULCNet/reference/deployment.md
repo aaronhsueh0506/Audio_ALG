@@ -283,7 +283,10 @@ stamped with `linear_aec_contract_version`, `aec_behavior_hash`,
 `unstamped_override`). `PTQ/calib_analyze.py` refuses an artifact whose stamp is
 missing, from another contract version, or retired, both on load and when
 writing a pruned selection; regenerate it with `inference.py calib`. Export
-and inference also refuse a checkpoint recorded under a retired behaviour hash.
+and inference also refuse a checkpoint recorded under a retired behaviour hash;
+`9963b6d7...` (before the 80 ms shadow-copy streak minimum) is one, so a
+checkpoint, graph sidecar or calibration file recorded at it is regenerated, not
+migrated.
 `inference.py --input-is-linear-error` is an evaluation-only bypass and does not
 check the supplied WAV's origin. None of these checks lives in C: the C code
 never refuses a model by front-end version.

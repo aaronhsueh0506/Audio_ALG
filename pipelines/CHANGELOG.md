@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — AIAEC: the frontend before the 80 ms shadow-copy streak minimum is retired
+
+- `RETIRED_BEHAVIOR_HASHES` (`AIAEC/dataset_gen/linear_aec.py`) gains `9963b6d7...`. The AEC Python shadow-copy rescue streak minimum is now 80 ms of input on every grid, so `linear_error` changes at 16 kHz hop 256 and 48 kHz hop 512; 16 kHz hop 128 renders byte-identically. The live `aec_python_behavior_hash()` is `b6346ce9...`.
+- Nothing migrates: corpora, checkpoints, ONNX graph sidecars and calibration files recorded at `9963b6d7...` are refused with the rematerialize / retrain instruction. Tests: `test_linear_aec_behavior_migration`, `test_training_common` and `test_pack_refuses_partial_rematerialization` cover the new hash. `AIAEC/dataset_gen/README.md` and `AIAEC/Align_ULCNet/reference/deployment.md` name it.
+
 ## [Unreleased] — 2026-11-16 — Build guards on one helper, the DFN head check on the vector kernel, docs and tests follow the tree
 
 - **Build guards.** `lib/deps.mk` `TOOLCHAIN_FWD` refuses a `WERROR` that is not exactly one word, 0 or 1 (`WERROR=1 1`, `WERROR=0 1` and an empty `WERROR` used to pass and reach the sub-make command line as a goal); `pipelines/scripts/test_deps_env_safe.sh` has a row for each. `stream/aiaec/front/Makefile` takes its `SIMD` check from `CHECK_01` and `pipelines/4ch/Makefile` its six 0/1 knobs, in place of the local macro; build directory names, `config.manifest` bytes and recipes are unchanged for every valid setting, and the 4ch refusal text no longer repeats the value. The front's `_cfg_guard` and the bridge's `NO_STDIO` check stay as they were (the shared recipe prints a different collision message, and `CHECK_01` would refuse an empty `NO_STDIO`).

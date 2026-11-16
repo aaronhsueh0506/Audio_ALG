@@ -601,6 +601,10 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     # moves because the formed seam no longer carries the capture. Not a
     # migration source; corpora are rematerialized, checkpoints retrained.
     "9fa7a2dec85cef8f123cc4dd02e7eb3c5dc0c1b45d7ec0f32b766cf9cda245e5",
+    # The frontend before the shadow-copy streak minimum became 80 ms of input:
+    # `linear_error` moves at 16 kHz hop 256 and 48 kHz hop 512. Corpora,
+    # checkpoints and graphs at this hash are regenerated and retrained.
+    "9963b6d73df9cfe52a9590251f9eba595788777f2ae984059952141a5cebd4ac",
 })
 
 

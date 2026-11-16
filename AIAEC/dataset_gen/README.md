@@ -666,7 +666,9 @@ hash of the build that wrote the data).
 
 - a v3 shard, ledger or checkpoint is refused on load by `version`, with the
   rematerialize instruction (`RETIRED_CONTRACT_VERSIONS`);
-- `9fa7a2de...` and every earlier hash are in `RETIRED_BEHAVIOR_HASHES`;
+- `9fa7a2de...` and every earlier hash are in `RETIRED_BEHAVIOR_HASHES`, and so
+  is `9963b6d7...`, the frontend before the shadow-copy streak minimum became
+  80 ms of input (`linear_error` moves at 16 kHz hop 256 and 48 kHz hop 512);
 - the released 16 kHz Align-ULCNet checkpoint pointer
   (`RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY`, recorded `c1b1f543...`, it
   used to point at `9fa7a2de...`) is retired with them: it is refused for
