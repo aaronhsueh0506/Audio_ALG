@@ -80,7 +80,7 @@ trained checkpoint; the numbers in this file are for it unless a pair is named.
 Build and test from `pipelines/4ch/` (the Makefile that owns the rules):
 
 ```sh
-make WERROR=1 libdfn_res_stage.a 4ch_aec_bf_dfn_res
+make WERROR=1 4ch_aec_bf_dfn_res
 make WERROR=1 test        # includes test_4ch_dfn and the skeleton
 ```
 

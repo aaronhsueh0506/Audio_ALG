@@ -33,7 +33,7 @@ def test_fp_contract_audit_without_the_array_skips_its_rows():
                          capture_output=True, text=True, timeout=900)
     assert run.returncode == 0, run.stdout[-600:] + run.stderr[-600:]
     assert 'SKIPPED' in run.stdout and 'AEC_NO_ARRAY=1' in run.stdout
-    assert 'objects audited: 7 ' in run.stdout and 'aec_array.o' not in run.stdout
+    assert 'objects audited: 5 ' in run.stdout and 'aec_array.o' not in run.stdout
 
 
 @pytest.mark.parametrize('how', ['world_writable', 'group_writable', 'symlink'])

@@ -44,7 +44,7 @@ The two programs are built by different Makefiles, because the 4-channel one lin
 
 ```sh
 make -C pipelines WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res       # mono example
-make -C pipelines/4ch WERROR=1 libdfn_res_stage.a 4ch_aec_bf_dfn_res   # 4-channel example
+make -C pipelines/4ch WERROR=1 4ch_aec_bf_dfn_res                      # 4-channel example
 make -C pipelines test                                                    # DfnHop (model stream, bridge), mono example
 make -C pipelines/4ch test                                  # includes test_4ch_dfn
 make -C pipelines test-dfn-grids                                          # the DfnHop test built for the 16 and 32 kHz test grids

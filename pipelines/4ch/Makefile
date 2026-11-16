@@ -196,7 +196,7 @@ AEC_FWD = $(FWD) AEC_TESTING=0
 PRODUCERS_ALL := aec nr spatial
 NEEDS_test_4ch_chain := aec nr
 
-DISPATCH_GOALS := all test libs libdfn_res_stage.a \
+DISPATCH_GOALS := all test libs \
         4ch_raw 4ch_external_static 4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
         test_4ch_chain test_array_sample_beam test_4ch_dfn \
@@ -408,7 +408,7 @@ $(DFN_PIPELINE_LIB): $(DFN_PIPELINE_OBJS) | _cfg_guard
 	@echo "libdfn_res_stage.a [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
 ifneq ($(COMMON_LIB),)
-.PHONY: all test libs libdfn_res_stage.a \
+.PHONY: all test libs \
         4ch_raw 4ch_external_static 4ch_static 4ch_alignulcnet \
         4ch_aec_bf_dfn_res \
         test_4ch_chain test_array_sample_beam test_4ch_dfn \
@@ -455,7 +455,6 @@ test: test-third-party test-array-sample-driver \
 	sh ../scripts/test_cli_exit_codes.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet"
 	sh ../scripts/test_delay_depth_refusal.sh 4ch_alignulcnet "$(abspath $(BIN_DIR))/4ch_alignulcnet_d1" 1 2 64
 
-libdfn_res_stage.a: $(DFN_PIPELINE_LIB)
 libs: $(COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(BF_LIB) $(DFN_PIPELINE_LIB) \
       $(SAMPLE_BEAM_OBJ)
 4ch_raw: $(BIN_DIR)/4ch_raw

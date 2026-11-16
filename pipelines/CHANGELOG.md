@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — `pipelines/4ch`: no `libdfn_res_stage.a` goal; the fp-contract audit row count follows the removed modules
+
+- `pipelines/4ch/Makefile` no longer defines the `libdfn_res_stage.a` goal (rule, `DISPATCH_GOALS`, `.PHONY`); `4ch_aec_bf_dfn_res` and `test_4ch_dfn` still build and link the archive as a prerequisite. `pipelines/dfn/README.md` and `pipelines/4ch/aec_bf_dfn_res/README.md` build the example by its own goal.
+- `test_gate_script_modes::test_fp_contract_audit_without_the_array_skips_its_rows` expects 5 audited objects: the audit lost `dfn_res_stage.o` and `dfn_rate_bridge.o` with the two modules.
+
 ## [Unreleased] — 2026-11-16 — AIAEC: the frontend before the 80 ms shadow-copy streak minimum is retired
 
 - `RETIRED_BEHAVIOR_HASHES` (`AIAEC/dataset_gen/linear_aec.py`) gains `9963b6d7...`. The AEC Python shadow-copy rescue streak minimum is now 80 ms of input on every grid, so `linear_error` changes at 16 kHz hop 256 and 48 kHz hop 512; 16 kHz hop 128 renders byte-identically. The live `aec_python_behavior_hash()` is `b6346ce9...`.
