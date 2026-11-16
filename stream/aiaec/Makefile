@@ -172,7 +172,7 @@ PRODUCTS := deepvqe_s=1 align_ulcnet=10
 define RUN_PER_PRODUCT
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(2) -DAIAEC_PRODUCT_MODEL_ID=$$id -Ideepvqe_s -Iulcnet \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(2) -DAIAEC_PRODUCT_MODEL_ID=$$id \
 	    tests/$(1).c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/$(1)_$$tag"; \
 	  "$(OBJ_DIR)/$(1)_$$tag"; \
 	done
@@ -201,7 +201,7 @@ test-aiaec-nonfinite: $(TEST_DEPS) | _cfg_guard
 # test_aiaec_packet: Align-ULCNet's packet graph (N=8, layout 19) against a host accelerator that implements the
 # graph's frame_reset semantics; the Align-ULCNet product only (the test catalog opens its N=8 row).
 test-aiaec-packet: $(TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 -Ideepvqe_s -Iulcnet \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 \
 	  tests/test_aiaec_packet.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_aiaec_packet"
 	"$(OBJ_DIR)/test_aiaec_packet"
 
@@ -211,7 +211,7 @@ test-aiaec-product: $(TEST_DEPS) | _cfg_guard
 	@set -e; for spec in "1 1" "2 10" "3 999"; do \
 	  set -- $$spec; \
 	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_TEST_PRODUCT=$$1 -DAIAEC_PRODUCT_MODEL_ID=$$2 \
-	    -Ideepvqe_s -Iulcnet tests/test_aiaec_product.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm \
+	    tests/test_aiaec_product.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm \
 	    -o "$(OBJ_DIR)/test_aiaec_product_$$1"; \
 	  "$(OBJ_DIR)/test_aiaec_product_$$1" > "$(OBJ_DIR)/test_aiaec_product_$$1.out"; \
 	  cat "$(OBJ_DIR)/test_aiaec_product_$$1.out"; \
@@ -229,7 +229,7 @@ test-aiaec-graph-io: $(TEST_DEPS) tests/test_aiaec_graph_io.c graph_io_deepvqes.
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
 	  for cat in test production; do \
 	    defs=""; [ "$$cat" = test ] && defs="-DAIAEC_TEST_CATALOG"; \
-	    $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $$defs -DAIAEC_PRODUCT_MODEL_ID=$$id -Ideepvqe_s -Iulcnet \
+	    $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $$defs -DAIAEC_PRODUCT_MODEL_ID=$$id \
 	      tests/test_aiaec_graph_io.c $(TEST_SOURCES) ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm \
 	      -o "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
 	    "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
@@ -250,7 +250,7 @@ graph-io-dumper: $(OBJ_DIR)/dump_graph_io
 bind-dumpers: $(TEST_DEPS) | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=$$id -Ideepvqe_s -Iulcnet \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=$$id \
 	    tests/dump_bind_info.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/dump_bind_info_$$tag"; \
 	done
 	@echo "$(abspath $(OBJ_DIR))/dump_bind_info_deepvqe_s"
@@ -259,7 +259,7 @@ bind-dumpers: $(TEST_DEPS) | _cfg_guard
 # packet-driver: tests/packet_driver.c (the Align-ULCNet _freq family behind a binary stdin/stdout protocol, N chosen
 # per request) with the test catalog; prints the binary path for AIAEC/tests/test_aiaec_packet_ort.py.
 packet-driver: $(TEST_DEPS) | _cfg_guard
-	@$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 -Ideepvqe_s -Iulcnet \
+	@$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 \
 	  tests/packet_driver.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/packet_driver"
 	@echo "$(abspath $(OBJ_DIR))/packet_driver"
 
@@ -292,7 +292,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 	  nm "$(LIB)" 2>/dev/null | grep -Eq " T _?$$sym$$" || { echo "FAIL: $$sym not exported by $(LIB)" >&2; exit 1; }; \
 	done; \
 	if nm "$(LIB)" 2>/dev/null | grep -Eq ' T _?aiaec_[a-z_]*_spec$$'; then \
-	  echo "FAIL: $(LIB) exports an aiaec_*_spec entry (the family is retired)" >&2; exit 1; \
+	  echo "FAIL: $(LIB) exports an unexpected aiaec_*_spec entry" >&2; exit 1; \
 	fi; \
 	if nm "$(LIB)" 2>/dev/null | grep -Eq 'stream_check_ports|stream_port_shape'; then \
 	  echo "FAIL: $(LIB) carries the sample-side port check (stream_bind)" >&2; exit 1; \
@@ -344,11 +344,11 @@ _test_single_model_variant: $(OBJ_DIR)/aiaec.o
 	  echo "FAIL: $(AIAEC_MODEL)-only aiaec.o references $(EXPECT_OTHER)_* symbols:" >&2; echo "$$undef_other" >&2; exit 1; \
 	fi; \
 	bin="$(OBJ_DIR)/test_single_model"; \
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -Ideepvqe_s -Iulcnet \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG \
 	  tests/test_single_model.c $$sources aiaec.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$$bin"; \
 	"$$bin"; \
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_TEST_OTHER_BOUND=1 -DAIAEC_PRODUCT_MODEL_ID=$(OTHER_ID) \
-	  -Ideepvqe_s -Iulcnet tests/test_single_model.c $$sources aiaec.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$$bin.other"; \
+	  tests/test_single_model.c $$sources aiaec.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$$bin.other"; \
 	"$$bin.other"; \
 	echo "test-single-model ($(AIAEC_MODEL)): PASS (no $(EXPECT_OTHER)_* symbols, round trip + bound-model refusal verified)"
 
