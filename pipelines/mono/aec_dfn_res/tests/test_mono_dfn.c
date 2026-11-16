@@ -709,7 +709,7 @@ static int run_bridge_scene_tests(void) {
         printf("mono_aec_dfn_res: bridge synthesis %d Hz/%d with the clear on the hop of the event: %ld hops bit-exact to the "
                "hand-written chain (guard hops %ld, resets %ld), max |apply lane - aec_process()| %.2e (on reset hops %.2e)\n",
                g[gi].sr, g[gi].fft, hops, guard, resets, dev, dev_reset);
-        if (resets == 0 || (g[gi].sr == 16000 && guard == 0)) {
+        if (resets < 4 || guard == 0) {   /* three scripted delay changes in the moving scene plus its reset */
             fprintf(stderr, "bridge synthesis %d Hz/%d: scenes miss guard/reset\n", g[gi].sr, g[gi].fft);
             ++failures;
         }

@@ -33,7 +33,7 @@ typedef struct GuardScene {
 static inline int guard_scene_make(GuardScene* s, int sr, int fft, int seconds, uint32_t seed,
                             int speech_far, int echo, int near_burst, int silent_head_hops) {
     int n, i, seg = sr / 4;
-    int d1 = 480 * (sr / 16000), d2 = 1100 * (sr / 16000), d3 = 240 * (sr / 16000);
+    int d1 = 480 * sr / 16000, d2 = 1100 * sr / 16000, d3 = 240 * sr / 16000;
     float env = 0.2f, lp = 0.0f, nlp = 0.0f;
     float* nearv;
     memset(s, 0, sizeof(*s));
