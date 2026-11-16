@@ -174,7 +174,7 @@
 
 <h3>6.4 AEC Level — 單一 Pareto 旋鈕</h3>
 
-<p style="margin: 8px 0 4px;"><code>AecConfig.level</code> 是這條軸唯一的公開設定，它決定函式庫內部的三個值：<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>。下表可由 <code>aec_internal.h</code> 的 <code>aec_level_floor_db()</code>／<code>aec_level_dt_floor_db()</code>／<code>aec_level_split_floor_enabled()</code> 讀出：</p>
+<p style="margin: 8px 0 4px;"><code>AecConfig.level</code> 是這條軸唯一的公開設定，它決定函式庫內部的三個值：<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）、<code>min_gain_floor_dt_db</code>（double-talk 地板）與 <code>min_gain_split_floor_enabled</code>。下表可由 <code>aec_internal.h</code> 的 <code>aec_level_floors()</code> 讀出：</p>
 
 <table>
   <tr><th>Level</th><th>far-active floor</th><th>DT floor</th><th>split floor</th><th>特性 / 場景</th></tr>

@@ -49,8 +49,8 @@ _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
 # Admission of a shared-delay CHANGE (lib/aec's Path B; same values as the C
-# AEC_ARRAY_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
-# aec_array_internal.h): the movement must exceed MIN samples and be offered
+# AEC_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL in
+# aec_impl.h): the movement must exceed MIN samples and be offered
 # again within CONFIRM samples before the held candidate's TTL hops run out.
 _DELAY_CHANGE_MIN_SAMPLES = 32
 _DELAY_CHANGE_CONFIRM_SAMPLES = 16

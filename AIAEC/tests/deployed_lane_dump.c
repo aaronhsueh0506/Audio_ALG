@@ -95,8 +95,7 @@ int main(int argc, char** argv) {
     const AecConfig* c;
     AecDebugStatus status;
     AecResolved resolved;
-    float floor_far_active_db = 0.0f, floor_dt_db = 0.0f;
-    int split_floor_enabled = 0;
+    AecLevelFloors floors;
     void* pool = NULL;
     Aec* aec;
     int grid_index;
@@ -125,9 +124,7 @@ int main(int argc, char** argv) {
     }
     memset(&status, 0, sizeof status);
     aec_debug_status(aec, &status);
-    if (aec_level_floor_db(c->level, &floor_far_active_db) != AEC_OK ||
-        aec_level_dt_floor_db(c->level, &floor_dt_db) != AEC_OK ||
-        aec_level_split_floor_enabled(c->level, &split_floor_enabled) != AEC_OK) {
+    if (aec_level_floors(c->level, &floors) != 0) {
         aec_destroy(aec);
         free(pool);
         return 1;
@@ -160,9 +157,9 @@ int main(int argc, char** argv) {
            c->residual == AEC_RESIDUAL_ESTIMATE ? 1 : 0);
     printf("context_linear_only=%d\n", LANE_DUMP_CONTEXT_LINEAR_ONLY);
     printf("live_observer_enabled=%d\n", resolved.tun.live_observer_enabled);
-    printf("min_gain_floor_far_active_db=%.9g\n", floor_far_active_db);
-    printf("min_gain_floor_dt_db=%.9g\n", floor_dt_db);
-    printf("min_gain_split_floor_enabled=%d\n", split_floor_enabled);
+    printf("min_gain_floor_far_active_db=%.9g\n", floors.far_active_db);
+    printf("min_gain_floor_dt_db=%.9g\n", floors.dt_db);
+    printf("min_gain_split_floor_enabled=%d\n", floors.split_floor_enabled);
     printf("formed_hop_cng_invariant=%d\n", invariant);
     aec_destroy(aec);
     free(pool);

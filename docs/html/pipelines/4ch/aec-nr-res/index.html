@@ -107,7 +107,7 @@ return 0;</pre>
  │    └─ aec_process_linear(aec, mics, ref) + aec_get_array(aec, &amp;front)
  │         ├─ skn_all_finite_f32() 拒非有限輸入(AEC_ERR_ARG)
  │         ├─ update_shared_delay(): delay_aec_accumulate_ex(proxy_ch, ref, run)
- │         │     eligible = est&gt;=0 &amp;&amp; solid &amp;&amp; n_updates&gt;=3 → aec_array_admission_offer() → accepted_delay
+ │         │     eligible = est&gt;=0 &amp;&amp; solid &amp;&amp; n_updates&gt;=3 → aec_delay_admission_offer() → accepted_delay
  │         ├─ align_render(): 共用 delay ring → aligned_ref[hop]
  │         ├─ delay.changed → aec_apply_external_realign(lane 0..3, Δdelay)
  │         └─ 4 lanes: lane0 aec_process_linear(mic0, aligned_ref)

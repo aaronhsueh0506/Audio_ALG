@@ -198,7 +198,7 @@ fallback VAD 的噪聲 EMA 係數（0.999／0.95）同樣依 hop retime。
 | `geometry` 與座標 | 不變 |
 
 ne10、`SIMD=1`、`delay_mode=MATCHED`（`delay_num_filters` = 5）預設的實測（`4ch_static --print-mem-size` 輸出，以及 `aec_get_mem_requirements()`、
-`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 4）。
+`array_sample_beam_get_mem_size()` 的直接查詢；`AEC_LAYOUT_VERSION` 5）。
 **Array** = `aec_get_mem_requirements()` 的 `req.bytes`（四條 lane、共用 estimator、對齊環、融合緩衝與增益級，加 `Aec` 結構）；**helper** = `array_sample_beam_get_mem_size()`；
 **Unit** = Array + helper（`4ch_static` 的 `Unit:`）；**後級** = NR + 合成 + 暫存（範例程式自己各自查大小後加總）。array 與 helper 都**不含**後級，後級另計：
 
