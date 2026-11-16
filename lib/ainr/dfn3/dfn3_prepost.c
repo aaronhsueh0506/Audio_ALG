@@ -364,14 +364,6 @@ int dfn3_prepost_output_frame_index(const DFN3Prepost *p, long long *frame) {
 
 /* ---- per-frame stages ---- */
 
-/* 1 when every |x| is at most `limit` (a positive finite float); NaN and infinity compare above it. */
-static int pp_all_within(const float *values, size_t count, float limit) {
-    size_t i;
-    for (i = 0; i < count; ++i)
-        if (!(fabsf(values[i]) <= limit)) return 0;
-    return 1;
-}
-
 static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
@@ -489,8 +481,8 @@ int dfn3_prepost_frame_finish(DFN3Prepost *p) {
      * state, advances the generation and disarms the transaction; the frame stays open. Windows, enhance state and
      * clocks are untouched. */
     heads_finite =
-        pp_all_within(p->head_erb_mask, dfn3_prepost_erb_mask_elements(&p->grid), DFN3_PREPOST_HEAD_LIMIT) &&
-        pp_all_within(p->head_coefs, dfn3_prepost_coefs_elements(&p->grid), DFN3_PREPOST_HEAD_LIMIT);
+        skn_all_within_f32(p->head_erb_mask, dfn3_prepost_erb_mask_elements(&p->grid), DFN3_PREPOST_HEAD_LIMIT) &&
+        skn_all_within_f32(p->head_coefs, dfn3_prepost_coefs_elements(&p->grid), DFN3_PREPOST_HEAD_LIMIT);
     state_finite = dfn3_model_io_validate_state(p->io) == 0;
     if (!state_finite || !heads_finite) {
         /* validate_state zeroed and counted a bad state; a bad head still restarts the state. */

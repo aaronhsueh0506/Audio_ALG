@@ -415,14 +415,6 @@ static int pp_all_finite(const float *values, size_t count) {
 }
 #endif
 
-/* 1 when every |x| is at most `limit` (a positive finite float); NaN and infinity compare above it. */
-static int pp_all_within(const float *values, size_t count, float limit) {
-    size_t i;
-    for (i = 0; i < count; ++i)
-        if (!(fabsf(values[i]) <= limit)) return 0;
-    return 1;
-}
-
 static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
@@ -612,13 +604,13 @@ int dfn2_prepost_frame_finish(DFN2Prepost *p) {
      * the frame stays open. */
     heads_finite =
 #ifdef DFN2_MASK_ONLY
-        pp_all_within(p->head_erb_mask, dfn2_prepost_erb_mask_elements(&p->grid),
-                      DFN2_PREPOST_HEAD_LIMIT);
+        skn_all_within_f32(p->head_erb_mask, dfn2_prepost_erb_mask_elements(&p->grid),
+                           DFN2_PREPOST_HEAD_LIMIT);
 #else
-        pp_all_within(p->head_erb_mask, dfn2_prepost_erb_mask_elements(&p->grid),
-                      DFN2_PREPOST_HEAD_LIMIT) &&
-        pp_all_within(p->head_coefs, dfn2_prepost_coefs_elements(&p->grid),
-                      DFN2_PREPOST_HEAD_LIMIT) &&
+        skn_all_within_f32(p->head_erb_mask, dfn2_prepost_erb_mask_elements(&p->grid),
+                           DFN2_PREPOST_HEAD_LIMIT) &&
+        skn_all_within_f32(p->head_coefs, dfn2_prepost_coefs_elements(&p->grid),
+                           DFN2_PREPOST_HEAD_LIMIT) &&
         pp_all_finite(p->head_alpha, dfn2_prepost_alpha_elements(&p->grid));
 #endif
     state_finite = dfn2_model_io_validate_state(p->io) == 0;
