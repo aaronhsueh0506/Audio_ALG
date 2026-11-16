@@ -2,11 +2,12 @@
 
 ``DeepVqePrepost`` keeps the last TIME_ORDER raw microphone spectra in a ring
 that the CCM taps convolve over. Whenever the state generation advances (reset,
-a commit refused for a non-finite value, ``frame_fail`` with a started run) the
+a commit refused for a non-finite value, a failed call with a started run) the
 ring is emptied together with the registered state, so the next frame equals the
-Python model's cold start: an empty ring and a zero state. A ``frame_bypass`` and
-a ``frame_fail`` whose run never started do not advance the generation and keep
-the ring.
+Python model's cold start: an empty ring and a zero state. A bypassed call and
+a failed call whose run never started do not advance the generation and keep
+the ring. The per-call order is the stream's, run by ``deepvqe_lifecycle_driver.h``
+(the ``dvl_*`` calls) over the per-frame functions.
 
 Every equality below compares the frames after the restart with a freshly
 initialised instance fed the same frames (memcmp on fp32), and is paired with a
@@ -62,6 +63,7 @@ _DRIVER = r'''
 #include <stdlib.h>
 #include <string.h>
 
+#include "deepvqe_lifecycle_driver.h"
 #include "deepvqe_stream.h"
 #include "stream_run.h"
 
@@ -108,6 +110,7 @@ static int inst_make(Inst *in, int has_state) {
 
 static void inst_free(Inst *in) {
     int id;
+    dvl_forget(in->p);
     free(in->pool);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(in->buf[id]);
 }
@@ -158,24 +161,24 @@ static int do_batch(Inst *in, long batch, Mode mode, Out *out) {
     int k, rc = 0;
     for (k = 0; k < N; ++k) {
         make_frame(batch * N + k, mr, mi, fr, fi);
-        rc = deepvqe_prepost_pre_process_freq(in->p, mr, mi, fr, fi);
+        rc = dvl_pre_process_freq(in->p, mr, mi, fr, fi);
         CHECK(rc == (k == N - 1 ? 1 : 0));
     }
-    CHECK(deepvqe_prepost_frame_open(in->p, &inputs, &outputs) == 0);
+    CHECK(dvl_frame_open(in->p, &inputs, &outputs) == 0);
     if (mode != M_FAIL_IDLE) run_device(&inputs, &outputs);
     if (mode == M_REFUSE) {
         if (in->has_state) outputs.state_out[DEEPVQE_STATE_H_GRU][1] = NAN;
         else outputs.taps[outputs.taps_elements / 3u] = NAN;
     }
     switch (mode) {
-    case M_COMMIT:     CHECK(deepvqe_prepost_frame_finish(in->p) == 0); break;
-    case M_REFUSE:     CHECK(deepvqe_prepost_frame_finish(in->p) == -1);
-                       CHECK(deepvqe_prepost_frame_bypass(in->p) == 0); break;
-    case M_FAIL_RUN:   CHECK(deepvqe_prepost_frame_fail(in->p, 1) == 0); break;
-    case M_FAIL_IDLE:  CHECK(deepvqe_prepost_frame_fail(in->p, 0) == 0); break;
-    case M_BYPASS_RUN: CHECK(deepvqe_prepost_frame_bypass(in->p) == 0); break;
+    case M_COMMIT:     CHECK(dvl_frame_finish(in->p) == 0); break;
+    case M_REFUSE:     CHECK(dvl_frame_finish(in->p) == -1);
+                       CHECK(dvl_frame_bypass(in->p) == 0); break;
+    case M_FAIL_RUN:   CHECK(dvl_frame_fail(in->p, 1) == 0); break;
+    case M_FAIL_IDLE:  CHECK(dvl_frame_fail(in->p, 0) == 0); break;
+    case M_BYPASS_RUN: CHECK(dvl_frame_bypass(in->p) == 0); break;
     }
-    for (k = 0; k < N; ++k) CHECK(deepvqe_prepost_post_process_freq(in->p, out->re[k], out->im[k]) == 0);
+    for (k = 0; k < N; ++k) CHECK(dvl_post_process_freq(in->p, out->re[k], out->im[k]) == 0);
     return 0;
 }
 
@@ -291,7 +294,7 @@ static int case_reset(void) {
     const Step sy[2] = { {2, M_COMMIT}, {3, M_COMMIT} };
     CHECK(inst_make(&x, 1) == 0 && inst_make(&y, 1) == 0);
     CHECK(do_batch(&x, 0, M_COMMIT, &g_out[0]) == 0);
-    deepvqe_prepost_reset(x.p);
+    dvl_reset(x.p);
     CHECK(do_batch(&x, 2, M_COMMIT, &xs[0]) == 0 && do_batch(&x, 3, M_COMMIT, &xs[1]) == 0);
     CHECK(run_steps(&y, sy, 2) == 0);
     copy_tail(ys, 2, 0);
@@ -379,6 +382,7 @@ int main(int argc, char **argv) {
     spec.sample_rate = sr; spec.n_fft = n_fft; spec.delay_depth = 8; spec.frames_per_call = n;
     CHECK(deepvqe_grid_make(&g_grid, &spec) == DEEPVQE_GRID_OK);
     CHECK(g_grid.n_bins <= BINS_MAX && N <= N_MAX);
+    dvl_use_grid(N, g_grid.n_bins);
     if (strcmp(argv[1], "refused") == 0) return case_refused();
     if (strcmp(argv[1], "fail") == 0) return case_fail();
     if (strcmp(argv[1], "notstarted") == 0) return case_notstarted();
@@ -420,7 +424,7 @@ def _build(tmp_path_factory, audio_common_lib, name, *flags):
         [cc, '-O2', '-std=c11', '-D_POSIX_C_SOURCE=200112L',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off',
          '-fno-math-errno', *flags,
-         '-I', _DEEPVQE_DIR, '-I', _STREAM_DIR, '-I', _COMMON_DIR,
+         '-I', _DEEPVQE_DIR, '-I', _STREAM_DIR, '-I', _COMMON_DIR, '-I', _THIS_DIR,
          '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), *_SOURCES, audio_common_lib, '-lm',
          '-o', str(executable)],

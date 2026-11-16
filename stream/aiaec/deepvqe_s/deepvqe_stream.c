@@ -11,6 +11,7 @@
 #include "audio_stft.h"
 #include "utility/mem_align.h"
 #include "stream_mem.h"
+#include "stream_range.h"
 #include "stream_run.h"
 
 struct DeepVqeStream {
@@ -23,18 +24,20 @@ struct DeepVqeStream {
     AcIstft   *istft;
     DeepVqePrepost *prepost;
 
-    /* Per-hop scratch, one slab: mic_f / far_f / hop_out [hop], mic_re / mic_im / far_re / far_im / enh_re / enh_im [n_bins]. */
+    /* Raw mic spectra of the open call [N * n_bins], kept from pre to post for the CCM (both families). */
+    float *mic_re;
+    float *mic_im;
+
+    /* PCM scratch, one slab: mic_f / far_f / hop_out [hop], far_re / far_im [n_bins], enh_re / enh_im [N * n_bins]. */
     float *mic_f;
     float *far_f;
     float *hop_out;
-    float *mic_re;
-    float *mic_im;
     float *far_re;
     float *far_im;
     float *enh_re;
     float *enh_im;
 
-    int pending; /* 1: a pre_process succeeded, its batch is open and the post_process is due */
+    int pending; /* 1: a pre_process succeeded, its call is open and the post_process is due */
 };
 
 typedef struct DeepVqeStreamLayout {
@@ -45,7 +48,8 @@ typedef struct DeepVqeStreamLayout {
     void *istft_mem;
     void *prepost_mem;
     size_t prepost_bytes;
-    void *scratch_mem;   /* the per-hop scratch slab */
+    void *stage_mem;     /* the raw mic spectra of one call */
+    void *scratch_mem;   /* the PCM scratch slab */
     uint32_t prepost_build_hash;   /* DeepVqePrepostMemReq.build_flags_hash, folded into this stream's hash */
 } DeepVqeStreamLayout;
 
@@ -76,7 +80,7 @@ static int cfg_valid(const DeepVqeStreamConfig *cfg) {
 
 /* One carve walk: sizing (base == NULL, *out pointers stay NULL) or carving; *total must match across both with one cfg.
  * -1 on a bad config or an overflowing carve. Order (bump LAYOUT_VERSION and build_flags_hash on a change): self, fft,
- * stft_mic, stft_far, istft, prepost, scratch; cfg.freq_only: self, prepost. */
+ * stft_mic, stft_far, istft, prepost, stage, scratch; cfg.freq_only: self, prepost, stage. */
 static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *base,
                                  DeepVqeStreamLayout *out, size_t *total) {
     size_t cursor = 0;
@@ -84,14 +88,15 @@ static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *
     AcStftConfig scfg;
     DeepVqePrepostConfig pcfg;
     DeepVqePrepostMemReq pp_req;
-    size_t fft_bytes, stft_bytes, istft_bytes, scratch_bytes;
-    size_t hop, n_bins;
+    size_t fft_bytes, stft_bytes, istft_bytes, stage_bytes, scratch_bytes;
+    size_t hop, n_bins, plane;
     int i;
 
     if (!cfg || !out || !total || !cfg_valid(cfg)) return -1;
     memset(out, 0, sizeof(*out));
     hop = (size_t)cfg->grid.hop;
     n_bins = (size_t)cfg->grid.n_bins;
+    plane = ck_mul_size((size_t)cfg->grid.frames_per_call, n_bins);
 
     if (stream_carve(base, &cursor, sizeof(DeepVqeStream), &ptr) != 0) return -1;
     out->self = (DeepVqeStream *)ptr;
@@ -130,12 +135,18 @@ static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
 
-    /* mic_f, far_f, hop_out [hop] + mic_re, mic_im, far_re, far_im, enh_re, enh_im [n_bins], one
-     * slab; only the slab base is part of the pool ABI. */
+    /* mic_re, mic_im [N * n_bins] of the open call. */
+    stage_bytes = ck_mul_size(2u, ck_mul_size(plane, sizeof(float)));
+    if (MEM_SIZE_INVALID(stage_bytes) || stream_carve(base, &cursor, stage_bytes, &ptr) != 0) return -1;
+    out->stage_mem = ptr;
+
+    /* mic_f, far_f, hop_out [hop] + far_re, far_im [n_bins] + enh_re, enh_im [N * n_bins], one slab;
+     * only the slab base is part of the pool ABI. */
     if (!cfg->freq_only) {
         scratch_bytes = ck_add_size(
             ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
-            ck_mul_size(6u, ck_mul_size(n_bins, sizeof(float))));
+            ck_add_size(ck_mul_size(2u, ck_mul_size(n_bins, sizeof(float))),
+                        ck_mul_size(2u, ck_mul_size(plane, sizeof(float)))));
         if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
             return -1;
         out->scratch_mem = ptr;
@@ -195,7 +206,7 @@ static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg,
     DeepVqeStream *s;
     AcStftConfig scfg;
     DeepVqePrepostConfig pcfg;
-    size_t hop, n_bins;
+    size_t hop, n_bins, plane;
     int i;
 
     if (!cfg || !base || !layout || !layout->self) return NULL;
@@ -236,18 +247,19 @@ static DeepVqeStream *deepvqe_stream_finish_init(const DeepVqeStreamConfig *cfg,
     s->prepost = deepvqe_prepost_init(layout->prepost_mem, layout->prepost_bytes, &pcfg);
     if (!s->prepost) return NULL;
 
+    n_bins = (size_t)cfg->grid.n_bins;
+    plane = (size_t)cfg->grid.frames_per_call * n_bins;
+    s->mic_re = (float *)layout->stage_mem;
+    s->mic_im = s->mic_re + plane;
     if (!cfg->freq_only) {
         hop = (size_t)cfg->grid.hop;
-        n_bins = (size_t)cfg->grid.n_bins;
         s->mic_f = (float *)layout->scratch_mem;
         s->far_f = s->mic_f + hop;
         s->hop_out = s->far_f + hop;
-        s->mic_re = s->hop_out + hop;
-        s->mic_im = s->mic_re + n_bins;
-        s->far_re = s->mic_im + n_bins;
+        s->far_re = s->hop_out + hop;
         s->far_im = s->far_re + n_bins;
         s->enh_re = s->far_im + n_bins;
-        s->enh_im = s->enh_re + n_bins;
+        s->enh_im = s->enh_re + plane;
     }
 
     return s;
@@ -295,8 +307,9 @@ int deepvqe_stream_hop_size(const DeepVqeStream *s) {
     return s ? s->grid.hop : -1;
 }
 
-/* N frames in, one frame_open. The PCM entries (mic_in non-NULL) analyse hop by hop into the one-frame scratch and hand each
- * frame over at once; the spectrum entries take the N * n_bins planes. */
+/* N frames in, one accelerator job. The PCM entries (mic_in non-NULL) analyse hop by hop, the mic spectrum straight into
+ * its slot of the call's staging; the spectrum entries copy the N * n_bins mic planes into it. Each frame goes through
+ * pre_frame, then the views are published once. */
 static int open_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *far_in,
                        const float *mic_re, const float *mic_im, const float *far_re, const float *far_im,
                        DeepVqeHopIO *io) {
@@ -305,8 +318,8 @@ static int open_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *f
     int i, k;
 
     for (k = 0; k < n; ++k) {
-        const float *mr, *mi, *fr, *fi;
-        int rc;
+        float *sr = s->mic_re + (size_t)k * nb, *si = s->mic_im + (size_t)k * nb;
+        const float *fr, *fi;
 
         if (mic_in) {
             const size_t off = (size_t)k * (size_t)hop;
@@ -314,18 +327,18 @@ static int open_packet(DeepVqeStream *s, const int16_t *mic_in, const int16_t *f
                 s->mic_f[i] = (float)mic_in[off + (size_t)i] / 32768.0f;
                 s->far_f[i] = (float)far_in[off + (size_t)i] / 32768.0f;
             }
-            ac_stft_push_planar(s->stft_mic, s->mic_f, s->mic_re, s->mic_im);
+            ac_stft_push_planar(s->stft_mic, s->mic_f, sr, si);
             ac_stft_push_planar(s->stft_far, s->far_f, s->far_re, s->far_im);
-            mr = s->mic_re; mi = s->mic_im; fr = s->far_re; fi = s->far_im;
+            fr = s->far_re; fi = s->far_im;
         } else {
-            mr = mic_re + (size_t)k * nb; mi = mic_im + (size_t)k * nb;
+            memcpy(sr, mic_re + (size_t)k * nb, nb * sizeof(float));
+            memcpy(si, mic_im + (size_t)k * nb, nb * sizeof(float));
             fr = far_re + (size_t)k * nb; fi = far_im + (size_t)k * nb;
         }
-        rc = deepvqe_prepost_pre_process_freq(s->prepost, mr, mi, fr, fi);
-        if (rc < 0 || (rc == 1) != (k == n - 1)) return -1;   /* unreachable behind the pending gate */
+        if (deepvqe_prepost_pre_frame(s->prepost, k, sr, si, fr, fi) != DEEPVQE_PREPOST_OK) return -1;
     }
+    if (deepvqe_prepost_views(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
     io->state_generation = deepvqe_prepost_state_generation(s->prepost);
-    if (deepvqe_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
     s->pending = 1;
     return 1;
 }
@@ -338,51 +351,62 @@ int deepvqe_stream_pre_process_packet(DeepVqeStream *s, const int16_t *mic_in, c
 
 int deepvqe_stream_pre_process_packet_freq(DeepVqeStream *s, const float *mic_re, const float *mic_im,
                                            const float *far_re, const float *far_im, DeepVqeHopIO *io) {
+    size_t plane;
     if (!s || !mic_re || !mic_im || !far_re || !far_im || !io || s->pending) return -1;
+    plane = (size_t)s->grid.frames_per_call * (size_t)s->grid.n_bins;
+    if (!stream_plane_within(mic_re, plane, DEEPVQE_STREAM_BIN_LIMIT_BITS) ||
+        !stream_plane_within(mic_im, plane, DEEPVQE_STREAM_BIN_LIMIT_BITS) ||
+        !stream_plane_within(far_re, plane, DEEPVQE_STREAM_BIN_LIMIT_BITS) ||
+        !stream_plane_within(far_im, plane, DEEPVQE_STREAM_BIN_LIMIT_BITS))
+        return DEEPVQE_STREAM_ERR_RANGE;
     return open_packet(s, NULL, NULL, mic_re, mic_im, far_re, far_im, io);
 }
 
-/* Closes the open batch: commit on a clean run, else the library's fail-closed close. A finish that refuses (non-finite tap or
- * state) leaves the batch open: the bypass closes it. */
-static void close_packet(DeepVqeStream *s, int ai_rc) {
-    if (ai_rc == STREAM_RUN_OK) {
-        if (deepvqe_prepost_frame_finish(s->prepost) != 0) deepvqe_prepost_frame_bypass(s->prepost);
-    } else {
-        deepvqe_prepost_frame_fail(s->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
-    }
+/* Closes the open call into re / im (N * n_bins each): commit on a clean run, else N zero frames. A run that left the
+ * device state dirty restarts the state (once); a refused validate_run restarted it already; so does a non-finite
+ * enhanced bin, which discards the frames computed before it. */
+static void close_packet(DeepVqeStream *s, int ai_rc, float *re, float *im) {
+    DeepVqePrepost *p = s->prepost;
+    const int n = s->grid.frames_per_call;
+    const size_t nb = (size_t)s->grid.n_bins;
+    int ok = 0, k;
+
     s->pending = 0;
+    if (ai_rc == STREAM_RUN_OK) {
+        if (deepvqe_prepost_validate_run(p) == 0) {
+            for (k = 0; k < n; ++k)
+                if (deepvqe_prepost_post_frame(p, k, s->mic_re + (size_t)k * nb, s->mic_im + (size_t)k * nb,
+                                               re + (size_t)k * nb, im + (size_t)k * nb) != DEEPVQE_PREPOST_OK) break;
+            ok = k == n;
+            if (!ok) deepvqe_prepost_zero_state(p);
+        }
+    } else if (ai_rc != STREAM_RUN_NOT_STARTED) {
+        deepvqe_prepost_zero_state(p);
+    }
+    if (!ok) {
+        memset(re, 0, (size_t)n * nb * sizeof(float));
+        memset(im, 0, (size_t)n * nb * sizeof(float));
+    }
 }
 
 int deepvqe_stream_post_process_packet_freq(DeepVqeStream *s, int ai_rc, float *re, float *im) {
-    const size_t nb = s ? (size_t)s->grid.n_bins : 0u;
-    int k;
-
     if (!s || !re || !im || !s->pending) return -1;
-    close_packet(s, ai_rc);
-    for (k = 0; k < s->grid.frames_per_call; ++k) {
-        if (deepvqe_prepost_post_process_freq(s->prepost, re + (size_t)k * nb, im + (size_t)k * nb) != 0) {
-            /* Defensive only: the batch was just closed. */
-            memset(re, 0, (size_t)s->grid.frames_per_call * nb * sizeof(float));
-            memset(im, 0, (size_t)s->grid.frames_per_call * nb * sizeof(float));
-            return -1;
-        }
-    }
+    close_packet(s, ai_rc, re, im);
     return 1;
 }
 
 int deepvqe_stream_post_process_packet(DeepVqeStream *s, int ai_rc, int16_t *pcm_out) {
     const int n = s ? s->grid.frames_per_call : 0, hop = s ? s->grid.hop : 0;
+    const size_t nb = s ? (size_t)s->grid.n_bins : 0u;
     int i, k;
 
     if (!s || !pcm_out || !s->istft || !s->pending) return -1;
-    close_packet(s, ai_rc);
+    close_packet(s, ai_rc, s->enh_re, s->enh_im);   /* all N frames before the first synthesis */
     for (k = 0; k < n; ++k) {
-        int written = -1;
+        const int written = ac_istft_push_planar(s->istft, s->enh_re + (size_t)k * nb, s->enh_im + (size_t)k * nb, s->hop_out);
 
-        if (deepvqe_prepost_post_process_freq(s->prepost, s->enh_re, s->enh_im) == 0)
-            written = ac_istft_push_planar(s->istft, s->enh_re, s->enh_im, s->hop_out);
         if (written != hop) {
-            /* Defensive only: the batch was just closed and AC_OLA_ACCUMULATE always returns hop. */
+            /* Defensive only: AC_OLA_ACCUMULATE always returns hop. */
             memset(pcm_out, 0, (size_t)n * (size_t)hop * sizeof(int16_t));
             return -1;
         }

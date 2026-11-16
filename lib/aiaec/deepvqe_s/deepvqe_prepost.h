@@ -1,18 +1,18 @@
-/* DeepVQE-S pre/post class: everything between the caller's spectra and the accelerator's
- * tensors, frequency domain only; one frame in, one inference, one frame out with
- * grid.frames_per_call == 1; with frames_per_call == N > 1, N frames in per accelerator call and
- * N frames out of it:
+/* DeepVQE-S pre/post class: per-frame functions and the model state between the caller's spectra and
+ * the accelerator's tensors, frequency domain only. One call carries N = grid.frames_per_call frames
+ * and one accelerator run; the caller (the stream) sequences it:
  *
- *     deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re, far_im);   // N calls; the Nth returns 1
- *     deepvqe_prepost_frame_open(p, &in, &out);   // N-frame views into the pool
- *     my_npu_run(&in, &out);                        // NPU fills `out` (N taps)
- *     deepvqe_prepost_frame_finish(p);              // after a run; _frame_fail() if it failed
- *     deepvqe_prepost_post_process_freq(p, re, im);   // N calls: the batch's frames, oldest first
+ *     deepvqe_prepost_pre_frame(p, k, mic_re, mic_im, far_re, far_im);   // k = 0 .. N-1
+ *     deepvqe_prepost_views(p, &in, &out);        // after the last pre_frame: NaN-filled head, tensor views
+ *     my_npu_run(&in, &out);                      // fills `out` (N taps)
+ *     deepvqe_prepost_validate_run(p);            // after a run with status OK; -1: state restarted
+ *     deepvqe_prepost_post_frame(p, k, mic_re, mic_im, out_re, out_im);  // k = 0 .. N-1, in order
  *
- * pre_process_freq returns 0 for the first N - 1 calls of a batch (gathering) and 1 for the Nth
- * (the one to follow with frame_open, then finish | fail | bypass); post_process_freq is called
- * after the batch is closed and drains one frame per call, in order. N == 1: pre_process_freq
- * always returns 1.
+ * pre_frame writes frame k into the compressed model windows. post_frame applies the taps of frame k
+ * to the CCM ring of the last TIME_ORDER raw microphone spectra, which the caller keeps from
+ * pre_frame until post_frame (the ring advances once per post_frame). A run that did not succeed
+ * is closed with deepvqe_prepost_zero_state() (or nothing when the device state was not touched).
+ * The class holds no per-call latch: the caller owns the order. Nothing in it names the stream.
  *
  * Framing: one AcStft per stream and one AcIstft for the output, all from
  * ac_stft_config_default(&sc, n_fft) (sqrt-Hann, center 0, hop n_fft / 2, spec_scale =
@@ -49,7 +49,7 @@ extern "C" {
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash; bumped on any change of pool size, carve order or descriptor
  * that ISN'T already a function of frames_per_call (which is folded into the hash directly). */
-#define DEEPVQE_PREPOST_CARVE_VERSION  8u
+#define DEEPVQE_PREPOST_CARVE_VERSION  9u
 
 /* Sanity bounds for the delay depth D (exporter max_delay_frames). D has no default: the
  * application supplies the value its model is exported with; it sizes nothing here. */
@@ -129,7 +129,7 @@ typedef struct DeepVqePrepostConfig {
     DeepVqeGrid grid;    /* deepvqe_grid_make(); copied at init */
     /* The application's recurrent state by DeepVqeStateId: borrowed, must outlive the instance;
      * shapes are the application's, only element counts are given. A float host registers its
-     * sixteen buffers (zeroed at init and reset, finite-checked whole at every frame_finish); a
+     * sixteen buffers (zeroed at init and reset, finite-checked whole at every validate_run); a
      * board whose accelerator owns the state registers nothing and binds each state input and
      * its `_out` to one accelerator buffer. All or none: every pointer non-NULL with a nonzero
      * count, or all NULL/0, else refused. Not in the pool size or hash. */
@@ -185,7 +185,7 @@ typedef struct DeepVqePrepostInputs {
 /* Accelerator-writable outputs; the graph returns the full next value of every state tensor.
  * `state_out[id]` has the address of `inputs.state[id]` (both NULL when nothing is registered;
  * a board binds each pair to one accelerator buffer): read every state input before writing any
- * state output. Only `taps` is NaN-prefilled. */
+ * state output. Only `taps` is NaN-prefilled, by views(). */
 typedef struct DeepVqePrepostOutputs {
     float *taps;   /* [1,N,BINS,TIME_ORDER*FREQ_TAPS*2], packed CCM taps, oldest frame first */
     size_t taps_elements;
@@ -232,11 +232,15 @@ DeepVqePrepost *deepvqe_prepost_create(const DeepVqePrepostConfig *cfg);
 /* Frees only what _create allocated, never the registered state. NULL-safe; no-op for _init. */
 void deepvqe_prepost_destroy(DeepVqePrepost *p);
 
-/* Zero the registered state and the CCM ring, drop any open frame; config, every pointer and the
- * pool stay. Advances the state generation. NULL is ignored. */
+/* Zero the registered state and the CCM ring and clear the model windows; config, every pointer and
+ * the pool stay. Advances the state generation. NULL is ignored. */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
-/* Counter of state restarts (reset, frame_finish refusing a frame, frame_fail with run_started); 0 after
+/* A state restart: zero the registered state, empty the CCM ring, advance the generation; the
+ * windows stay. NULL is ignored. */
+void deepvqe_prepost_zero_state(DeepVqePrepost *p);
+
+/* Counter of state restarts (reset, zero_state, a refusing validate_run); 0 after
  * init and for NULL; kept whether or not a state is registered. Every advance also empties the CCM
  * ring, so the next frame is a cold start. A fixed-point accelerator loads quantized zeros into its
  * own copy of the state at start and on every change. */
@@ -245,44 +249,37 @@ uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
     const DeepVqePrepost *p);
 
-/* One analysed frame per stream (n_bins bins each), accumulated into the current N-frame batch
- * (N = grid.frames_per_call). Returns 1 once the batch is full (frame_open/finish|bypass must
- * follow before the next call), 0 while still gathering (N == 1: always 1, unchanged), or -1 on
- * NULL args or a call made while a batch is open. */
-int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
-                                     const float *mic_re, const float *mic_im,
-                                     const float *far_re, const float *far_im);
+enum {
+    DEEPVQE_PREPOST_OK = 0,
+    DEEPVQE_PREPOST_ERR_ARG = -1,         /* NULL or a slot outside [0, N); nothing changed */
+    DEEPVQE_PREPOST_ERR_NONFINITE = -2    /* post_frame: a non-finite enhanced bin; the ring advanced */
+};
 
-/* Publish the open batch's N-frame accelerator boundary; `taps` is NaN-prefilled so a partial
- * write is caught by frame_finish. Returns 0, or -1 if no batch is open. */
-int deepvqe_prepost_frame_open(DeepVqePrepost *p,
-                                 DeepVqePrepostInputs *inputs,
-                                 DeepVqePrepostOutputs *outputs);
+/* Frame `slot` of the call: compress the n_bins-bin mic and far spectra into the planar [1,2,N,BINS]
+ * windows. Moves no model state. Returns OK or ERR_ARG. */
+int deepvqe_prepost_pre_frame(DeepVqePrepost *p, int slot,
+                              const float *mic_re, const float *mic_im,
+                              const float *far_re, const float *far_im);
 
-/* Call after every accelerator run; needs a batch published by frame_open(), else -1. Every tap
- * and every element of every registered state buffer (whole buffers, older frames of a history
- * window included) must be finite. Then the N taps are applied to the CCM ring in order (the last
- * TIME_ORDER raw microphone spectra, advanced once per frame, oldest batch frame first) and the N
- * enhanced spectra are staged for post_process_freq, one drained per call over the N calls that
- * follow; they must be finite too. On a non-finite value (tap, state element or enhanced bin) the
- * registered buffers are zeroed (nothing registered: no state is checked), the CCM ring is emptied,
- * the state generation advances, the batch stays open and -1 is returned: call frame_bypass() or re-run. */
-int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
+/* NaN-fill the head (`taps`; the state buffers are the accelerator's input too and stay) and fill the
+ * accelerator boundary; once per run, after the last pre_frame. Idempotent. Returns 0, or -1 on NULL. */
+int deepvqe_prepost_views(DeepVqePrepost *p, DeepVqePrepostInputs *inputs,
+                          DeepVqePrepostOutputs *outputs);
 
-/* Fail closed: the primary input is the raw microphone with no canceller in front, so emit
- * silence (not pass-through) for all N frames of the open batch; the CCM ring and state stay as
- * they are. Returns 0, or -1. */
-int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
+/* After a run with status OK: every tap and every element of every registered state buffer (whole
+ * buffers, older frames of a history window included) must be finite. Returns 0 (nothing written), or
+ * -1 on a non-finite value: the registered buffers are zeroed, the CCM ring emptied and the state
+ * generation advanced once. -1 on NULL with nothing touched. */
+int deepvqe_prepost_validate_run(DeepVqePrepost *p);
 
-/* Closes the open batch after a run that did not succeed, with the frame_bypass output. run_started != 0 (the
- * device state may be dirty) also zeroes the registered state, empties the CCM ring and advances the generation.
- * Returns 0, or -1 (nothing changed) if no batch is open. */
-int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started);
-
-/* The enhanced spectrum (n_bins bins) of the next frame of the last closed batch -- one drained
- * per call, in order, over the N calls following that batch. Returns 0, or -1 on NULL re/im or a
- * call made while a batch is open. */
-int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im);
+/* Frame `slot`: push the raw mic spectrum (n_bins bins, kept by the caller since pre_frame) into the CCM
+ * ring, convolve the taps of the frame over (t, t-1, t-2) and write n_bins bins to out_re / out_im, which
+ * do not alias the inputs. Slots run 0 .. N-1 in order. Returns OK; ERR_ARG with nothing advanced and
+ * out untouched; ERR_NONFINITE when an enhanced bin is not finite (the ring advanced: the caller then
+ * calls zero_state once). */
+int deepvqe_prepost_post_frame(DeepVqePrepost *p, int slot,
+                               const float *mic_re, const float *mic_im,
+                               float *out_re, float *out_im);
 
 #ifdef __cplusplus
 }

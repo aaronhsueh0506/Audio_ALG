@@ -1,5 +1,5 @@
 /* DeepVQE-S pre/post class (contract: deepvqe_prepost.h): lifecycle, pool carve, accelerator
- * views and the per-frame state machine over the CCM kernel of deepvqe_process.c.
+ * views and the per-frame functions over the CCM kernel of deepvqe_process.c.
  * Requires -ffp-contract=off. No heap in _init, no globals, no stdio. */
 
 #include "deepvqe_prepost.h"
@@ -67,24 +67,11 @@ struct DeepVqePrepost {
     /* Raw-microphone spectrum ring the CCM taps convolve over (arrays carved from the pool). */
     DeepVqeCcmState ccm;
 
-    float *mic_re;      /* [frames_per_call * n_bins], oldest pending frame first */
-    float *mic_im;
-    float *far_re;
-    float *far_im;
-    float *enh_re;      /* [frames_per_call * n_bins] finish/bypass staging, oldest first */
-    float *enh_im;
-
     size_t taps_elements;
     int n_bins;
     int frames_per_call;
 
-    int pending;         /* frames accumulated into the open batch via pre_process_freq */
-    int deliver_slot;    /* next frame post_process_freq drains from enh_re/enh_im */
-
     uint32_t state_generation;  /* advances whenever the state is zeroed */
-
-    int frame_open;     /* a batch is armed and awaiting finish/bypass */
-    int prepared;       /* frame_open() armed the accelerator transaction */
 
     void *heap_base;    /* _create's allocation; NULL for an _init instance */
 };
@@ -165,19 +152,6 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base, const DeepVqeGrid *
     if (base && p) p->ccm.spectrum_re = (float *)ptr;
     if (pp_carve(base, &cursor, (size_t)DEEPVQE_TIME_ORDER * frame_bytes, &ptr) != 0) return -1;
     if (base && p) p->ccm.spectrum_im = (float *)ptr;
-
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->mic_re = (float *)ptr;
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->mic_im = (float *)ptr;
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->far_re = (float *)ptr;
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->far_im = (float *)ptr;
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->enh_re = (float *)ptr;
-    if (pp_carve(base, &cursor, call_bytes, &ptr) != 0) return -1;
-    if (base && p) p->enh_im = (float *)ptr;
 
     *total = ck_align16_size(cursor);
     return MEM_SIZE_INVALID(*total) ? -1 : 0;
@@ -383,8 +357,8 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p) {
     if (base) free(base);
 }
 
-/* A state restart: the registered state and the CCM ring go cold together, the generation advances. */
-static void zero_state(DeepVqePrepost *p) {
+void deepvqe_prepost_zero_state(DeepVqePrepost *p) {
+    if (!p) return;
     zero_registered(p);
     deepvqe_ccm_reset(&p->ccm);
     ++p->state_generation;
@@ -394,18 +368,10 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
     size_t call_bytes;
     if (!p) return;
     call_bytes = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
-    zero_state(p);
+    deepvqe_prepost_zero_state(p);
     memset(p->taps, 0, p->taps_elements * sizeof(float));
-    memset(p->mic_re, 0, call_bytes);
-    memset(p->mic_im, 0, call_bytes);
-    memset(p->far_re, 0, call_bytes);
-    memset(p->far_im, 0, call_bytes);
-    memset(p->enh_re, 0, call_bytes);
-    memset(p->enh_im, 0, call_bytes);
-    p->frame_open = 0;
-    p->prepared = 0;
-    p->pending = 0;
-    p->deliver_slot = 0;
+    memset(p->mic_ri, 0, 2u * call_bytes);
+    memset(p->far_ri, 0, 2u * call_bytes);
 }
 
 uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p) {
@@ -423,29 +389,6 @@ static void fill_nan(float *values, size_t elements) {
 
 static int all_finite(const float *values, size_t elements) {
     return skn_all_finite_f32(values, elements);
-}
-
-int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
-                                     const float *mic_re, const float *mic_im,
-                                     const float *far_re, const float *far_im) {
-    size_t frame_bytes;
-    size_t at;
-
-    if (!p || !mic_re || !mic_im || !far_re || !far_im) return -1;
-    if (p->frame_open) return -1;   /* previous batch neither finished nor bypassed */
-
-    frame_bytes = (size_t)p->n_bins * sizeof(float);
-    at = (size_t)p->pending * (size_t)p->n_bins;
-    memcpy(p->mic_re + at, mic_re, frame_bytes);
-    memcpy(p->mic_im + at, mic_im, frame_bytes);
-    memcpy(p->far_re + at, far_re, frame_bytes);
-    memcpy(p->far_im + at, far_im, frame_bytes);
-
-    p->pending += 1;
-    if (p->pending < p->frames_per_call) return 0;   /* batch still gathering */
-    p->pending = 0;
-    p->frame_open = 1;
-    return 1;
 }
 
 /* x * |x|^(e-1), |x| = sqrt(re^2 + im^2 + 1e-12): vector sqrt, powf per element, vector scale;
@@ -466,28 +409,27 @@ static void compress_planar(const float *re, const float *im,
     skn_mul_f32(out_im, im, out_im, (size_t)n_bins);
 }
 
-int deepvqe_prepost_frame_open(DeepVqePrepost *p,
-                                 DeepVqePrepostInputs *inputs,
-                                 DeepVqePrepostOutputs *outputs) {
-    int id, i;
-    int n_bins;
-    int n;
+int deepvqe_prepost_pre_frame(DeepVqePrepost *p, int slot,
+                              const float *mic_re, const float *mic_im,
+                              const float *far_re, const float *far_im) {
+    size_t at, plane;
+    if (!p || !mic_re || !mic_im || !far_re || !far_im) return DEEPVQE_PREPOST_ERR_ARG;
+    if (slot < 0 || slot >= p->frames_per_call) return DEEPVQE_PREPOST_ERR_ARG;
 
-    if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    n_bins = p->n_bins;
-    n = p->frames_per_call;
-
-    /* The raw mic spectrum stays in mic_re/mic_im for the CCM ring. Planar packing: mic_ri's
-     * first n*n_bins floats are the real plane (one frame's n_bins at a time, oldest first),
-     * the next n*n_bins are the imaginary plane -- same layout the exporter's [1,2,N,BINS]
+    /* Planar packing: the first N * n_bins floats of mic_ri are the real plane (one frame's n_bins at a
+     * time, oldest first), the next N * n_bins the imaginary plane, as the exporter's [1,2,N,BINS]
      * mic/far inputs trace to. */
-    for (i = 0; i < n; ++i) {
-        const size_t at = (size_t)i * (size_t)n_bins;
-        compress_planar(p->mic_re + at, p->mic_im + at,
-                        p->mic_ri + at, p->mic_ri + (size_t)n * (size_t)n_bins + at, n_bins);
-        compress_planar(p->far_re + at, p->far_im + at,
-                        p->far_ri + at, p->far_ri + (size_t)n * (size_t)n_bins + at, n_bins);
-    }
+    at = (size_t)slot * (size_t)p->n_bins;
+    plane = (size_t)p->frames_per_call * (size_t)p->n_bins;
+    compress_planar(mic_re, mic_im, p->mic_ri + at, p->mic_ri + plane + at, p->n_bins);
+    compress_planar(far_re, far_im, p->far_ri + at, p->far_ri + plane + at, p->n_bins);
+    return DEEPVQE_PREPOST_OK;
+}
+
+int deepvqe_prepost_views(DeepVqePrepost *p, DeepVqePrepostInputs *inputs,
+                          DeepVqePrepostOutputs *outputs) {
+    int id;
+    if (!p || !inputs || !outputs) return -1;
 
     /* NaN-fill the head only: the state tensors are the accelerator's input too. */
     fill_nan(p->taps, p->taps_elements);
@@ -496,7 +438,7 @@ int deepvqe_prepost_frame_open(DeepVqePrepost *p,
     memset(outputs, 0, sizeof(*outputs));
     inputs->mic = p->mic_ri;
     inputs->far = p->far_ri;
-    inputs->spectrum_ri_elements = 2u * (size_t)n * (size_t)n_bins;
+    inputs->spectrum_ri_elements = 2u * (size_t)p->frames_per_call * (size_t)p->n_bins;
     outputs->taps = p->taps;
     outputs->taps_elements = p->taps_elements;
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
@@ -505,83 +447,37 @@ int deepvqe_prepost_frame_open(DeepVqePrepost *p,
         outputs->state_out[id] = p->state[id];
         outputs->state_elements[id] = p->state_elements[id];
     }
-    p->prepared = 1;
     return 0;
 }
 
-int deepvqe_prepost_frame_finish(DeepVqePrepost *p) {
-    int ok;
-    int id, i;
-    int n_bins;
-    size_t taps_per_frame, enh_elements;
-
-    if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
+int deepvqe_prepost_validate_run(DeepVqePrepost *p) {
+    int ok, id;
+    if (!p) return -1;
 
     /* Whole state buffers, older frames included: the accelerator overwrote them in place, so a
-     * non-finite value anywhere would reach a later frame. Taps cover all N frames of the batch. */
+     * non-finite value anywhere would reach a later frame. Taps cover all N frames of the call. */
     ok = all_finite(p->taps, p->taps_elements);
     for (id = 0; ok && id < DEEPVQE_STATE_COUNT; ++id)
         ok = p->state[id] == NULL ||
              all_finite(p->state[id], p->state_elements[id]);
-    if (!ok) {
-        /* Restart cold (state and CCM ring); the batch stays open for frame_bypass(). */
-        zero_state(p);
-        p->prepared = 0;
-        return -1;
-    }
+    if (ok) return 0;
+    deepvqe_prepost_zero_state(p);
+    return -1;
+}
 
-    /* Pushes each frame's raw mic spectrum in order and convolves its taps over (t, t-1, t-2);
-     * the ring advances once per frame, oldest batch frame first, only on a validated batch. */
-    n_bins = p->n_bins;
+int deepvqe_prepost_post_frame(DeepVqePrepost *p, int slot,
+                               const float *mic_re, const float *mic_im,
+                               float *out_re, float *out_im) {
+    size_t taps_per_frame;
+    if (!p || !mic_re || !mic_im || !out_re || !out_im) return DEEPVQE_PREPOST_ERR_ARG;
+    if (slot < 0 || slot >= p->frames_per_call) return DEEPVQE_PREPOST_ERR_ARG;
+
+    /* Pushes the raw mic spectrum of the frame and convolves its taps over (t, t-1, t-2). */
     taps_per_frame = p->taps_elements / (size_t)p->frames_per_call;
-    for (i = 0; i < p->frames_per_call; ++i) {
-        const size_t at = (size_t)i * (size_t)n_bins;
-        deepvqe_ccm_process(&p->ccm, p->mic_re + at, p->mic_im + at,
-                            p->taps + (size_t)i * taps_per_frame,
-                            p->enh_re + at, p->enh_im + at);
-    }
+    deepvqe_ccm_process(&p->ccm, mic_re, mic_im, p->taps + (size_t)slot * taps_per_frame,
+                        out_re, out_im);
     /* Finite taps can still overflow the convolution, and a huge finite mic bin passes through it. */
-    enh_elements = (size_t)p->frames_per_call * (size_t)n_bins;
-    if (!all_finite(p->enh_re, enh_elements) || !all_finite(p->enh_im, enh_elements)) {
-        zero_state(p);
-        p->prepared = 0;
-        return -1;
-    }
-    p->deliver_slot = 0;
-    p->frame_open = 0;
-    p->prepared = 0;
-    return 0;
-}
-
-int deepvqe_prepost_frame_bypass(DeepVqePrepost *p) {
-    size_t call_bytes;
-    if (!p || !p->frame_open) return -1;
-    call_bytes = (size_t)p->frames_per_call * (size_t)p->n_bins * sizeof(float);
-    /* Fail closed: pass-through of the raw microphone would emit the uncancelled echo; emit
-     * silence for every frame of the batch and leave the CCM ring and state as they are. */
-    memset(p->enh_re, 0, call_bytes);
-    memset(p->enh_im, 0, call_bytes);
-    p->deliver_slot = 0;
-    p->frame_open = 0;
-    p->prepared = 0;
-    return 0;
-}
-
-int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started) {
-    if (!p || !p->frame_open) return -1;
-    if (run_started) zero_state(p);
-    return deepvqe_prepost_frame_bypass(p);
-}
-
-int deepvqe_prepost_post_process_freq(DeepVqePrepost *p, float *re, float *im) {
-    size_t frame_bytes;
-    size_t at;
-    if (!p || !re || !im) return -1;
-    if (p->frame_open) return -1;
-    frame_bytes = (size_t)p->n_bins * sizeof(float);
-    at = (size_t)p->deliver_slot * (size_t)p->n_bins;
-    memcpy(re, p->enh_re + at, frame_bytes);
-    memcpy(im, p->enh_im + at, frame_bytes);
-    p->deliver_slot = (p->deliver_slot + 1) % p->frames_per_call;
-    return 0;
+    if (!all_finite(out_re, (size_t)p->n_bins) || !all_finite(out_im, (size_t)p->n_bins))
+        return DEEPVQE_PREPOST_ERR_NONFINITE;
+    return DEEPVQE_PREPOST_OK;
 }

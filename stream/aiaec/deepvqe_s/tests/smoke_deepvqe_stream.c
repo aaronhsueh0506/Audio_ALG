@@ -4,6 +4,7 @@
  * from hop 0 onward (N == 1 here), the one-hop entries refuse a stream with N > 1, and at N == 1
  * they equal the packet entries. */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +158,52 @@ static int one_hop_equals_packet_n1(void) {
     return fail;
 }
 
+/* A NaN, +Inf or -Inf bin in any one of the four _freq planes (N = 1 and a batched N) is DEEPVQE_STREAM_ERR_RANGE: no job, the
+ * generation unchanged, and a post after it is -1 (nothing is open). The same call without the bad bin is accepted. */
+static int freq_range_refusal(int n) {
+    static const float bad[3] = { (float)NAN, (float)INFINITY, -(float)INFINITY };
+    DeepVqeStream *s;
+    void *pool;
+    size_t bytes, plane, which, kind;
+    float *x, *out;
+    int hop, nb, fail = 0;
+
+    make_stream(256, 63, n, &pool, &s, &bytes);
+    hop = deepvqe_stream_hop_size(s);
+    nb = hop + 1;
+    plane = (size_t)n * (size_t)nb;
+    x = (float *)calloc(plane * 6u, sizeof(float));
+    if (!x) exit(2);
+    out = x + 4u * plane;
+    for (which = 0; which < 4u; ++which) {
+        for (kind = 0; kind < 3u; ++kind) {
+            DeepVqeHopIO io, before;
+            const uint32_t gen = deepvqe_stream_state_generation(s);
+            float *p = x + which * plane;
+            size_t at = plane - 1u;   /* the last bin of the last frame */
+            int rc;
+            p[at] = bad[kind];
+            memset(&io, 0x5A, sizeof io);
+            before = io;
+            rc = deepvqe_stream_pre_process_packet_freq(s, x, x + plane, x + 2u * plane, x + 3u * plane, &io);
+            if (rc != DEEPVQE_STREAM_ERR_RANGE || memcmp(&io, &before, sizeof io) != 0 ||
+                deepvqe_stream_state_generation(s) != gen ||
+                deepvqe_stream_post_process_packet_freq(s, 0, out, out + plane) != -1) {
+                fprintf(stderr, "N=%d: plane %zu kind %zu: rc=%d, state moved\n", n, which, kind, rc);
+                fail = 1;
+            }
+            p[at] = 0.0f;
+        }
+    }
+    if (deepvqe_stream_pre_process_packet_freq(s, x, x + plane, x + 2u * plane, x + 3u * plane, &(DeepVqeHopIO){ 0 }) != 1) {
+        fprintf(stderr, "N=%d: the clean call was refused\n", n);
+        fail = 1;
+    }
+    if (!fail) printf("smoke_deepvqe_stream: _freq range refusal (N=%d, four planes, NaN / +Inf / -Inf) -- PASS\n", n);
+    free(x); free(pool);
+    return fail;
+}
+
 int main(void) {
     DeepVqeGridSpec spec;
     DeepVqeGrid grid;
@@ -300,6 +347,7 @@ int main(void) {
 
     if (packet_probe_n8() != 0) return 1;
     if (one_hop_equals_packet_n1() != 0) return 1;
+    if (freq_range_refusal(1) != 0 || freq_range_refusal(8) != 0) return 1;
 
     return 0;
 }

@@ -633,8 +633,8 @@ static int section_bind_and_pool(int fft, int n) {
 #if PRODUCT_DV
         framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +
-                  ck_align16_size((3u * (size_t)hop + 6u * plane) * sizeof(float));
-        pinned = fft == 1024 ? (n == 2 ? 127968u : 70560u) : fft == 512 ? 35744u : n == 8 ? 119376u : 18336u;
+                  ck_align16_size((3u * (size_t)hop + 2u * plane * (1u + (size_t)n)) * sizeof(float));
+        pinned = fft == 1024 ? (n == 2 ? 111440u : 62224u) : fft == 512 ? 31504u : n == 8 ? 102800u : 16144u;
 #else
         framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +

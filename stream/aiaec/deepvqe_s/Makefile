@@ -64,7 +64,7 @@ CORE_HEADERS := ../../../lib/aiaec/deepvqe_s/deepvqe_process.h \
 	../../../lib/aiaec/deepvqe_s/deepvqe_prepost.h
 
 STREAM_SOURCES := deepvqe_stream.c
-STREAM_HEADERS := deepvqe_stream.h ../../common/stream_mem.h ../../common/stream_run.h
+STREAM_HEADERS := deepvqe_stream.h ../../common/stream_mem.h ../../common/stream_range.h ../../common/stream_run.h
 
 LIB := $(OBJ_DIR)/libdeepvqe_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/deepvqe_process.o $(OBJ_DIR)/deepvqe_prepost.o $(OBJ_DIR)/deepvqe_stream.o
@@ -77,7 +77,7 @@ SMOKE_SOURCES := tests/smoke_deepvqe_stream.c $(CORE_SOURCES) deepvqe_stream.c
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) deepvqe_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-freq-only \
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-freq-only test-lifecycle \
 	audit-no-stdio clean _cfg_guard
 
 all: lib
@@ -120,7 +120,18 @@ $(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMO
 test-freq-only: $(FREQ_ONLY_BIN)
 	"$(FREQ_ONLY_BIN)"
 
-test: smoke verify-vs-sample test-freq-only
+# The per-call lifecycle (guards, failure table, range refusal, all-or-none output) through the stream's public entries.
+LIFECYCLE_BIN := $(OBJ_DIR)/lifecycle
+LIFECYCLE_SOURCES := tests/lifecycle.c $(CORE_SOURCES) deepvqe_stream.c
+
+$(LIFECYCLE_BIN): $(LIFECYCLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(LIFECYCLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+test-lifecycle: $(LIFECYCLE_BIN)
+	"$(LIFECYCLE_BIN)"
+
+test: smoke verify-vs-sample test-freq-only test-lifecycle
 
 # audit-no-stdio: builds the archive (the one every real caller in this tree links) and asserts,
 # via `nm -u`, that deepvqe_stream.o references no stdio symbol (nothing in this model needs

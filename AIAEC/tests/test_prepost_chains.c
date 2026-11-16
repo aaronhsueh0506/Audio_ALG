@@ -34,6 +34,7 @@
 #include "ulcnet_prepost.h"
 #elif defined(CHAIN_DEEPVQE)
 #include "deepvqe_prepost.h"
+#include "deepvqe_lifecycle_driver.h"
 #else
 #error "define CHAIN_ULCNET or CHAIN_DEEPVQE"
 #endif
@@ -487,14 +488,15 @@ static uint64_t run_chain(int depth)
     }
     p = deepvqe_prepost_create(&cfg);
     if (!p) exit(2);
+    dvl_use_grid(1, BINS);
     for (int h = 0; h < HOPS; ++h) {
         int kind = hop_kind(h), rc, skipped = 0;
         uint32_t generation_before;
         make_spectrum(h, BINS, m_re, m_im);
         make_spectrum(h + 500, BINS, f_re, f_im);
         hash_u32(&d.status,
-                 (uint32_t)deepvqe_prepost_pre_process_freq(p, m_re, m_im, f_re, f_im));
-        if (deepvqe_prepost_frame_open(p, &in, &out) != 0) exit(2);
+                 (uint32_t)dvl_pre_process_freq(p, m_re, m_im, f_re, f_im));
+        if (dvl_frame_open(p, &in, &out) != 0) exit(2);
         hash_f32(&d.in, in.mic, in.spectrum_ri_elements);
         hash_f32(&d.in, in.far, in.spectrum_ri_elements);
         for (int id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
@@ -533,8 +535,8 @@ static uint64_t run_chain(int depth)
             }
         }
         generation_before = deepvqe_prepost_state_generation(p);
-        rc = kind == K_SKIP ? deepvqe_prepost_frame_bypass(p)
-                            : deepvqe_prepost_frame_finish(p);
+        rc = kind == K_SKIP ? dvl_frame_bypass(p)
+                            : dvl_frame_finish(p);
         if (kind == K_BAD_STATE_OLD) {
             int zeroed = 1;
             for (int id = 0; id < DEEPVQE_STATE_COUNT; ++id)
@@ -542,16 +544,17 @@ static uint64_t run_chain(int depth)
             require_old_slot_refusal(rc, generation_before,
                                      deepvqe_prepost_state_generation(p), zeroed);
         }
-        if (rc != 0 && kind != K_SKIP) skipped = deepvqe_prepost_frame_bypass(p);
+        if (rc != 0 && kind != K_SKIP) skipped = dvl_frame_bypass(p);
         hash_u32(&d.status, (uint32_t)rc);
         hash_u32(&d.status, (uint32_t)skipped);
         hash_u32(&d.status, deepvqe_prepost_state_generation(p));
         for (int id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             hash_f32(&d.state, out.state_out[id], out.state_elements[id]);
-        if (deepvqe_prepost_post_process_freq(p, o_re, o_im) != 0) exit(2);
+        if (dvl_post_process_freq(p, o_re, o_im) != 0) exit(2);
         hash_f32(&d.post, o_re, (size_t)BINS);
         hash_f32(&d.post, o_im, (size_t)BINS);
     }
+    dvl_forget(p);
     deepvqe_prepost_destroy(p);
     for (int id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(buf[id]);
     print_digest(chain_name(), depth, &d);

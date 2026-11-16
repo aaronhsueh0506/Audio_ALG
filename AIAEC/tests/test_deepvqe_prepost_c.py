@@ -1,7 +1,12 @@
 """Equivalence and contract gates for the DeepVQE-S pre/post class.
 
-``DeepVQE_S/deepvqe_prepost.c`` owns no signal processing: it composes the CCM
-kernel (``DeepVQE_S/deepvqe_process.c``) behind one frequency-domain object, so
+``lib/aiaec/deepvqe_s/deepvqe_prepost.c`` owns no signal processing: it composes the CCM
+kernel (``deepvqe_process.c``) behind per-frame functions (pre_frame, views,
+validate_run, post_frame, zero_state), and the call sequence belongs to the
+stream. The driver sequences a call with ``deepvqe_lifecycle_driver.h`` (the
+stream's order over the per-frame functions, with the former batch API's return
+numbers); the stream's own lifecycle cases are in
+``stream/aiaec/deepvqe_s/tests/lifecycle.c``. So
 the gate is that the class reproduces the hand-composed path SAMPLE FOR SAMPLE:
 every numeric comparison is ``memcmp`` on fp32, and every "identical" claim is
 paired with a "not trivially identical" one so no gate passes on silence. The
@@ -23,26 +28,28 @@ for the module):
   stalepool  the stale-pool gate accepts the matching MemReq and refuses every
              mismatched one; the pool follows the grid, not D
   lifecycle  _create/_destroy against _init on a caller pool
-  reject     _get_mem_size / _init / the stage calls, reject-first
+  reject     _get_mem_size / _init / the per-frame calls, reject-first
   reset      _reset really clears state (a re-run reproduces the first run)
-  skip       _frame_bypass MUTES (fail-closed), leaves the state as the
+  skip       a bypassed call MUTES (fail-closed), leaves the state as the
              accelerator wrote it and does not advance the CCM ring
+  frames     N = 1, 2, 8 frames per call: pre_frame windows against the hand-
+             composed compression (any slot order), views (idempotent NaN
+             head), validate_run on every poisoned tensor, post_frame x N
+             against hand-driven CCM calls, slot/NULL refusals, zero_state
   inplace    one buffer per state tensor (input and output are the same pointer,
              the registered buffer, stable for the instance's life), only the
              head NaN-prefilled, and a non-finite write to the newest frame of
              any state tensor zeroes all sixteen and leaves the next frame
              healthy
-  guard      no double pre_process, no commit without frame_open, no re-commit
-             after a refused one
   whole      commit checks the whole of every registered buffer; a non-finite
              value in the newest, an older or the dropped frame is refused
   generation state_generation starts at 0 and advances on reset, on a
-             refused commit and on frame_fail with a started run, and on
+             refused commit and on a failed call with a started run, and on
              nothing else (each advance restarts the CCM ring:
              test_deepvqe_ccm_restart_c.py)
-  fail       frame_fail closes the open batch with the frame_bypass output;
-             a started run zeroes the registered state and advances the
-             generation, a run that never started changes neither
+  fail       a failed call closes with the bypass output; a started run zeroes
+             the registered state and advances the generation, a run that never
+             started changes neither
   boundary   state names and the descriptor validator: the eight external
              fields are refused when perturbed, the four model-interior fields
              are not read
@@ -121,6 +128,7 @@ _DRIVER = r'''
 
 #include "audio_stft.h"
 #include "deepvqe_prepost.h"
+#include "deepvqe_lifecycle_driver.h"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -457,6 +465,7 @@ static int inst_make(Inst *in) {
 
 static void inst_free(Inst *in) {
     int id;
+    dvl_forget(in->p);
     deepvqe_prepost_destroy(in->p);
     free(in->pool);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(in->buf[id]);
@@ -512,13 +521,13 @@ static int drive_spec(DeepVqePrepost *p, int first, int count, HopOut *out) {
         DeepVqePrepostOutputs outputs;
         /* THE contract this class exists to guarantee: one spectrum in, exactly
          * one accelerator invocation, from the very first hop. */
-        if (deepvqe_prepost_pre_process_freq(p, specs[hop].mr, specs[hop].mi,
+        if (dvl_pre_process_freq(p, specs[hop].mr, specs[hop].mi,
                                              specs[hop].fr, specs[hop].fi) != 1)
             return -1;
-        if (deepvqe_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
+        if (dvl_frame_open(p, &inputs, &outputs) != 0) return -1;
         if (fake_run(&inputs, &outputs) != 0) return -1;
-        if (deepvqe_prepost_frame_finish(p) != 0) return -1;
-        if (deepvqe_prepost_post_process_freq(p, out[hop - first].re,
+        if (dvl_frame_finish(p) != 0) return -1;
+        if (dvl_post_process_freq(p, out[hop - first].re,
                                               out[hop - first].im) != 0) return -1;
     }
     return 0;
@@ -572,9 +581,9 @@ static int case_compression(void) {
     CHECK(pool != NULL);
     p = deepvqe_prepost_init(pool, (size_t)req.bytes, &cfg);
     CHECK(p != NULL);
-    CHECK(deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re,
+    CHECK(dvl_pre_process_freq(p, mic_re, mic_im, far_re,
                                            far_im) == 1);
-    CHECK(deepvqe_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dvl_frame_open(p, &inputs, &outputs) == 0);
     CHECK(inputs.spectrum_ri_elements == 2u * BINS);
 
     for (stream = 0; stream < 2; ++stream) {
@@ -820,11 +829,12 @@ static int case_lifecycle(void) {
      * use-after-free, exactly as for fft_destroy; see fft_wrapper.h.) */
     deepvqe_prepost_destroy(stack.p);
     deepvqe_prepost_destroy(stack.p);
-    deepvqe_prepost_reset(stack.p);
+    dvl_reset(stack.p);
     memset(outs_b, 0, sizeof outs_b);
     CHECK(drive_spec(stack.p, 0, SHORT_HOPS, outs_b) == 0);
     CHECK(outs_identical(outs_a, outs_b, SHORT_HOPS));
 
+    dvl_forget(heap.p);
     deepvqe_prepost_destroy(heap.p);
     deepvqe_prepost_destroy(NULL);
     heap.p = NULL;
@@ -839,7 +849,7 @@ static int case_lifecycle(void) {
 
     /* Accessors on NULL. */
     CHECK(deepvqe_prepost_descriptor(NULL) == NULL);
-    deepvqe_prepost_reset(NULL);
+    dvl_reset(NULL);
     return 0;
 }
 
@@ -905,7 +915,7 @@ static int case_reject(void) {
                                (size_t)req.bytes, &cfg) == NULL);
     CHECK(deepvqe_prepost_init(pool, (size_t)req.bytes, &cfg) != NULL);
 
-    /* Stage calls on NULL, out of order, and after a partial write. */
+    /* The per-frame calls on NULL and on a slot outside [0, N). */
     {
         DeepVqePrepost *p = deepvqe_prepost_init(pool, (size_t)req.bytes, &cfg);
         DeepVqePrepostInputs inputs;
@@ -913,31 +923,34 @@ static int case_reject(void) {
         static float got_re[BINS_MAX], got_im[BINS_MAX];
         int id;
         CHECK(p != NULL);
-        CHECK(deepvqe_prepost_pre_process_freq(NULL, specs[0].mr, specs[0].mi,
-                                               specs[0].fr, specs[0].fi) == -1);
-        CHECK(deepvqe_prepost_pre_process_freq(p, NULL, specs[0].mi,
-                                               specs[0].fr, specs[0].fi) == -1);
-        CHECK(deepvqe_prepost_pre_process_freq(p, specs[0].mr, specs[0].mi,
-                                               specs[0].fr, NULL) == -1);
-        CHECK(deepvqe_prepost_post_process_freq(NULL, got_re, got_im) == -1);
-        CHECK(deepvqe_prepost_post_process_freq(p, NULL, got_im) == -1);
-        /* Nothing is open yet: the three frame stages all refuse. */
-        CHECK(deepvqe_prepost_frame_open(p, &inputs, &outputs) == -1);
-        CHECK(deepvqe_prepost_frame_open(NULL, &inputs, &outputs) == -1);
-        CHECK(deepvqe_prepost_frame_finish(p) == -1);
-        CHECK(deepvqe_prepost_frame_finish(NULL) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(p) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(NULL) == -1);
-        /* With no frame open, post_process still emits a defined (silent) hop. */
-        CHECK(deepvqe_prepost_post_process_freq(p, got_re, got_im) == 0);
-        CHECK(all_zero(got_re, BINS) && all_zero(got_im, BINS));
+        CHECK(deepvqe_prepost_pre_frame(NULL, 0, specs[0].mr, specs[0].mi,
+                                        specs[0].fr, specs[0].fi) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(p, 0, NULL, specs[0].mi,
+                                        specs[0].fr, specs[0].fi) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(p, 0, specs[0].mr, specs[0].mi,
+                                        specs[0].fr, NULL) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(p, -1, specs[0].mr, specs[0].mi,
+                                        specs[0].fr, specs[0].fi) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(p, 1, specs[0].mr, specs[0].mi,
+                                        specs[0].fr, specs[0].fi) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_views(NULL, &inputs, &outputs) == -1);
+        CHECK(deepvqe_prepost_views(p, NULL, &outputs) == -1);
+        CHECK(deepvqe_prepost_views(p, &inputs, NULL) == -1);
+        CHECK(deepvqe_prepost_validate_run(NULL) == -1);
+        CHECK(deepvqe_prepost_state_generation(p) == 0u);
+        memset(got_re, 0x7F, sizeof got_re);
+        memset(got_im, 0x7F, sizeof got_im);
+        CHECK(deepvqe_prepost_post_frame(NULL, 0, specs[0].mr, specs[0].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_post_frame(p, 0, NULL, specs[0].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_post_frame(p, 0, specs[0].mr, specs[0].mi, got_re, NULL) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_post_frame(p, -1, specs[0].mr, specs[0].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_post_frame(p, 1, specs[0].mr, specs[0].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(bytes_are(got_re, sizeof got_re, 0x7F) && bytes_are(got_im, sizeof got_im, 0x7F));
+        deepvqe_prepost_zero_state(NULL);
 
-        CHECK(deepvqe_prepost_pre_process_freq(p, specs[0].mr, specs[0].mi,
+        CHECK(dvl_pre_process_freq(p, specs[0].mr, specs[0].mi,
                                                specs[0].fr, specs[0].fi) == 1);
-        CHECK(deepvqe_prepost_frame_open(p, &inputs, &outputs) == 0);
-        CHECK(deepvqe_prepost_frame_open(p, &inputs, NULL) == -1);
-        /* A frame is open: the spectrum cannot be emitted yet. */
-        CHECK(deepvqe_prepost_post_process_freq(p, got_re, got_im) == -1);
+        CHECK(dvl_frame_open(p, &inputs, &outputs) == 0);
         /* A partial accelerator write is refused and moves nothing; the
          * frame stays open so the caller can fail closed. */
         CHECK(fake_run(&inputs, &outputs) == 0);
@@ -946,28 +959,28 @@ static int case_reject(void) {
          * commit's doing. */
         CHECK(!all_zero(outputs.state_out[DEEPVQE_STATE_H_GRU],
                         outputs.state_elements[DEEPVQE_STATE_H_GRU]));
-        CHECK(deepvqe_prepost_frame_finish(p) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(p) == 0);
+        CHECK(dvl_frame_finish(p) == -1);
+        CHECK(dvl_frame_bypass(p) == 0);
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             CHECK(all_zero(outputs.state_out[id], outputs.state_elements[id]));
 
         /* The same refusal when the hole is in the newest frame of ONE state
          * tensor rather than in the taps -- the finite check walks the state,
          * not just the head. */
-        CHECK(deepvqe_prepost_pre_process_freq(p, specs[1].mr, specs[1].mi,
+        CHECK(dvl_pre_process_freq(p, specs[1].mr, specs[1].mi,
                                                specs[1].fr, specs[1].fi) == 1);
-        CHECK(deepvqe_prepost_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
-        CHECK(deepvqe_prepost_frame_finish(p) == 0);   /* teeth: it can pass */
-        CHECK(deepvqe_prepost_post_process_freq(p, got_re, got_im) == 0);
-        CHECK(deepvqe_prepost_pre_process_freq(p, specs[2].mr, specs[2].mi,
+        CHECK(dvl_frame_finish(p) == 0);   /* teeth: it can pass */
+        CHECK(dvl_post_process_freq(p, got_re, got_im) == 0);
+        CHECK(dvl_pre_process_freq(p, specs[2].mr, specs[2].mi,
                                                specs[2].fr, specs[2].fi) == 1);
-        CHECK(deepvqe_prepost_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
         outputs.state_out[DEEPVQE_STATE_MIC3_HISTORY][
             newest_element(DEEPVQE_STATE_MIC3_HISTORY, 0) + 5u] = NAN;
-        CHECK(deepvqe_prepost_frame_finish(p) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(p) == 0);
+        CHECK(dvl_frame_finish(p) == -1);
+        CHECK(dvl_frame_bypass(p) == 0);
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             CHECK(all_zero(outputs.state_out[id], outputs.state_elements[id]));
     }
@@ -990,23 +1003,21 @@ static int case_reset(void) {
     CHECK(drive_spec(inst.p, 0, SHORT_HOPS, outs_b) == 0);
     CHECK(!outs_identical(outs_a, outs_b, SHORT_HOPS));
 
-    deepvqe_prepost_reset(inst.p);
+    dvl_reset(inst.p);
     CHECK(inst_state_zero(&inst));
     CHECK(drive_spec(inst.p, 0, SHORT_HOPS, outs_b) == 0);
     CHECK(outs_identical(outs_a, outs_b, SHORT_HOPS));
 
-    /* Reset mid-frame drops the open frame instead of stranding it. */
+    /* Reset mid-call: state and windows are cleared, the next run reproduces the first. */
     {
         DeepVqePrepostInputs inputs;
         DeepVqePrepostOutputs outputs;
-        CHECK(deepvqe_prepost_pre_process_freq(inst.p, specs[0].mr, specs[0].mi,
+        CHECK(dvl_pre_process_freq(inst.p, specs[0].mr, specs[0].mi,
                                                specs[0].fr, specs[0].fi) == 1);
-        CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(inst.p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
-        deepvqe_prepost_reset(inst.p);
-        CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
-        CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(inst.p) == -1);
+        dvl_reset(inst.p);
+        CHECK(inst_state_zero(&inst));
         memset(outs_b, 0, sizeof outs_b);
         CHECK(drive_spec(inst.p, 0, SHORT_HOPS, outs_b) == 0);
         CHECK(outs_identical(outs_a, outs_b, SHORT_HOPS));
@@ -1032,12 +1043,12 @@ static int commit_freq(DeepVqePrepost *p, const float *mic_re,
                        const float *far_im, float *out_re, float *out_im) {
     DeepVqePrepostInputs inputs;
     DeepVqePrepostOutputs outputs;
-    if (deepvqe_prepost_pre_process_freq(p, mic_re, mic_im,
+    if (dvl_pre_process_freq(p, mic_re, mic_im,
                                          far_re, far_im) != 1) return -1;
-    if (deepvqe_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
+    if (dvl_frame_open(p, &inputs, &outputs) != 0) return -1;
     if (fake_run(&inputs, &outputs) != 0) return -1;
-    if (deepvqe_prepost_frame_finish(p) != 0) return -1;
-    if (deepvqe_prepost_post_process_freq(p, out_re, out_im) != 0) return -1;
+    if (dvl_frame_finish(p) != 0) return -1;
+    if (dvl_post_process_freq(p, out_re, out_im) != 0) return -1;
     return 0;
 }
 
@@ -1078,9 +1089,9 @@ static int case_skip(void) {
      * standing between the run and a commit is frame_bypass's contract. The
      * state is in place, so it is whatever the accelerator wrote: skip does
      * not undo it. */
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, f2_re, f2_im,
+    CHECK(dvl_pre_process_freq(inst.p, f2_re, f2_im,
                                            far_re, far_im) == 1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+    CHECK(dvl_frame_open(inst.p, &inputs, &outputs) == 0);
     {
         int nonzero = 0;
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
@@ -1107,20 +1118,20 @@ static int case_skip(void) {
                    elements[id] * sizeof(float)) != 0) moved = 1;
     }
     CHECK(moved);   /* the run really changed the state */
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, got_re, got_im) == 0);
+    CHECK(dvl_frame_bypass(inst.p) == 0);
+    CHECK(dvl_post_process_freq(inst.p, got_re, got_im) == 0);
     /* FAIL CLOSED: silence, NOT the microphone passed through. Passing the
      * raw microphone would emit the full uncancelled echo -- see
-     * deepvqe_prepost_frame_bypass() in deepvqe_prepost.h. */
+     * dvl_frame_bypass() in deepvqe_prepost.h. */
     CHECK(all_zero(got_re, BINS));
     CHECK(all_zero(got_im, BINS));
     CHECK(!identical(got_re, f2_re, BINS));
 
     /* Frame 3: the state is exactly what the accelerator wrote in frame 2
      * -- the skip neither rolled it back nor zeroed it. */
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, f3_re, f3_im,
+    CHECK(dvl_pre_process_freq(inst.p, f3_re, f3_im,
                                            far_re, far_im) == 1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+    CHECK(dvl_frame_open(inst.p, &inputs, &outputs) == 0);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
         CHECK(inputs.state_elements[id] == elements[id]);
         CHECK(memcmp(inputs.state[id], written[id],
@@ -1128,8 +1139,8 @@ static int case_skip(void) {
     }
     /* A skip WITHOUT frame_open behind it is legal: the accelerator may
      * have failed before it was ever handed the tensors. */
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, got_re, got_im) == 0);
+    CHECK(dvl_frame_bypass(inst.p) == 0);
+    CHECK(dvl_post_process_freq(inst.p, got_re, got_im) == 0);
     CHECK(all_zero(got_re, BINS));
     CHECK(all_zero(got_im, BINS));
 
@@ -1162,22 +1173,22 @@ static int case_skip(void) {
 
         CHECK(commit_freq(a.p, f1_re, f1_im, far_re, far_im,
                           a_re, a_im) == 0);
-        CHECK(deepvqe_prepost_pre_process_freq(a.p, f2_re, f2_im,
+        CHECK(dvl_pre_process_freq(a.p, f2_re, f2_im,
                                                far_re, far_im) == 1);
-        CHECK(deepvqe_prepost_frame_open(a.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(a.p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
-        CHECK(deepvqe_prepost_frame_bypass(a.p) == 0);
-        CHECK(deepvqe_prepost_post_process_freq(a.p, a_re, a_im) == 0);
+        CHECK(dvl_frame_bypass(a.p) == 0);
+        CHECK(dvl_post_process_freq(a.p, a_re, a_im) == 0);
         CHECK(commit_freq(a.p, f3_re, f3_im, far_re, far_im,
                           a_re, a_im) == 0);
 
         CHECK(commit_freq(d.p, f1_re, f1_im, far_re, far_im,
                           d_re, d_im) == 0);
-        CHECK(deepvqe_prepost_pre_process_freq(d.p, f2_re, f2_im,
+        CHECK(dvl_pre_process_freq(d.p, f2_re, f2_im,
                                                far_re, far_im) == 1);
-        CHECK(deepvqe_prepost_frame_open(d.p, &inputs, &outputs) == 0);
-        CHECK(deepvqe_prepost_frame_bypass(d.p) == 0);   /* no fake_run */
-        CHECK(deepvqe_prepost_post_process_freq(d.p, d_re, d_im) == 0);
+        CHECK(dvl_frame_open(d.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_bypass(d.p) == 0);   /* no fake_run */
+        CHECK(dvl_post_process_freq(d.p, d_re, d_im) == 0);
         CHECK(commit_freq(d.p, f3_re, f3_im, far_re, far_im,
                           d_re, d_im) == 0);
 
@@ -1244,9 +1255,9 @@ static int case_inplace(void) {
         CHECK(expect[id] != NULL);
     }
     for (hop = 0; hop < SHORT_HOPS; ++hop) {
-        CHECK(deepvqe_prepost_pre_process_freq(inst.p, specs[hop].mr, specs[hop].mi,
+        CHECK(dvl_pre_process_freq(inst.p, specs[hop].mr, specs[hop].mi,
                                                specs[hop].fr, specs[hop].fi) == 1);
-        CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(inst.p, &inputs, &outputs) == 0);
         if (hop == 0) {
             first_in = inputs;
             first_out = outputs;
@@ -1272,12 +1283,12 @@ static int case_inplace(void) {
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             memcpy(expect[id], outputs.state_out[id],
                    inputs.state_elements[id] * sizeof(float));
-        CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
+        CHECK(dvl_frame_finish(inst.p) == 0);
         /* commit leaves the state exactly as written. */
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             CHECK(memcmp(first_in.state[id], expect[id],
                          first_in.state_elements[id] * sizeof(float)) == 0);
-        CHECK(deepvqe_prepost_post_process_freq(inst.p, got_re, got_im) == 0);
+        CHECK(dvl_post_process_freq(inst.p, got_re, got_im) == 0);
     }
     CHECK(!state_all_zero(&first_in));   /* the stream really moved the state */
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(expect[id]);
@@ -1301,44 +1312,43 @@ static int case_inplace(void) {
         float *victim;
         size_t index;
 
-        deepvqe_prepost_reset(other.p);
+        dvl_reset(other.p);
         CHECK(commit_freq(other.p, f1_re, f1_im, far_re, far_im,
                           got_re, got_im) == 0);
 
         /* Control: the identical frame, uninjected, commits. */
-        CHECK(deepvqe_prepost_pre_process_freq(other.p, f2_re, f2_im,
+        CHECK(dvl_pre_process_freq(other.p, f2_re, f2_im,
                                                far_re, far_im) == 1);
-        CHECK(deepvqe_prepost_frame_open(other.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(other.p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
         CHECK(!state_all_zero(&inputs));
-        CHECK(deepvqe_prepost_frame_finish(other.p) == 0);
-        CHECK(deepvqe_prepost_post_process_freq(other.p, got_re, got_im) == 0);
+        CHECK(dvl_frame_finish(other.p) == 0);
+        CHECK(dvl_post_process_freq(other.p, got_re, got_im) == 0);
         CHECK(!all_zero(got_re, BINS));
 
         /* Same history, now poisoned. */
-        deepvqe_prepost_reset(other.p);
+        dvl_reset(other.p);
         CHECK(commit_freq(other.p, f1_re, f1_im, far_re, far_im,
                           got_re, got_im) == 0);
-        CHECK(deepvqe_prepost_pre_process_freq(other.p, f2_re, f2_im,
+        CHECK(dvl_pre_process_freq(other.p, f2_re, f2_im,
                                                far_re, far_im) == 1);
-        CHECK(deepvqe_prepost_frame_open(other.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(other.p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
         index = newest_element(tensor, last);
         victim = outputs.state_out[tensor];
         victim[index] = poison;
-        CHECK(deepvqe_prepost_frame_finish(other.p) == -1);
+        CHECK(dvl_frame_finish(other.p) == -1);
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             CHECK(all_zero(outputs.state_out[id], outputs.state_elements[id]));
         CHECK(state_all_zero(&inputs));
-        CHECK(deepvqe_prepost_frame_finish(other.p) == -1);   /* disarmed */
 
         /* The next healthy frame works: retry through a fresh frame_open
          * from the cold state. */
-        CHECK(deepvqe_prepost_frame_open(other.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(other.p, &inputs, &outputs) == 0);
         CHECK(state_all_zero(&inputs));
         CHECK(fake_run(&inputs, &outputs) == 0);
-        CHECK(deepvqe_prepost_frame_finish(other.p) == 0);
-        CHECK(deepvqe_prepost_post_process_freq(other.p, got_re, got_im) == 0);
+        CHECK(dvl_frame_finish(other.p) == 0);
+        CHECK(dvl_post_process_freq(other.p, got_re, got_im) == 0);
         CHECK(!all_zero(got_re, BINS));
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
             for (i = 0; i < outputs.state_elements[id]; ++i)
@@ -1359,15 +1369,15 @@ static int case_inplace(void) {
 
         CHECK(inst_make(&y) == 0);
 
-        deepvqe_prepost_reset(other.p);
-        CHECK(deepvqe_prepost_pre_process_freq(other.p, f1_re, f1_im,
+        dvl_reset(other.p);
+        CHECK(dvl_pre_process_freq(other.p, f1_re, f1_im,
                                                far_re, far_im) == 1);
-        CHECK(deepvqe_prepost_frame_open(other.p, &inputs, &outputs) == 0);
+        CHECK(dvl_frame_open(other.p, &inputs, &outputs) == 0);
         CHECK(fake_run(&inputs, &outputs) == 0);
         outputs.state_out[DEEPVQE_STATE_H_GRU][3] = NAN;
-        CHECK(deepvqe_prepost_frame_finish(other.p) == -1);
-        CHECK(deepvqe_prepost_frame_bypass(other.p) == 0);
-        CHECK(deepvqe_prepost_post_process_freq(other.p, x_re, x_im) == 0);
+        CHECK(dvl_frame_finish(other.p) == -1);
+        CHECK(dvl_frame_bypass(other.p) == 0);
+        CHECK(dvl_post_process_freq(other.p, x_re, x_im) == 0);
         CHECK(all_zero(x_re, BINS));
         CHECK(commit_freq(other.p, f2_re, f2_im, far_re, far_im, x_re, x_im) == 0);
 
@@ -1383,71 +1393,176 @@ static int case_inplace(void) {
     return 0;
 }
 
-/* ---- guard: the three transaction gates ------------------------------ */
+/* ---- frames: the per-frame functions at N frames per call ------------ */
 
-static int case_guard(void) {
-    Inst inst;
-    DeepVqePrepostInputs inputs;
-    DeepVqePrepostOutputs outputs;
-    static float f_re[BINS_MAX], f_im[BINS_MAX];
-    static float g_re[BINS_MAX], g_im[BINS_MAX];
+#define FRAMES_N_MAX 8
+
+/* An instance on the grid under test with `n` frames per call and the sixteen state buffers registered. */
+static int frames_inst(Inst *in, int n) {
+    const DeepVqeGridSpec spec = { .sample_rate = g_grid.sample_rate, .n_fft = g_grid.n_fft,
+                                   .delay_depth = D, .frames_per_call = n };
+    DeepVqeGrid grid;
     int id;
     size_t i;
-
-    CHECK(inst_make(&inst) == 0);
-    make_frame(f_re, f_im, 0.0f);
-    make_frame(g_re, g_im, 0.25f);
-
-    /* (1) A spectrum is refused rather than stacked on top of an unfinished
-     * frame, and the refusal does not damage the frame that IS open. */
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, f_re, f_im, g_re, g_im) == 1);
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, g_re, g_im, f_re, f_im) == -1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
-    CHECK(fake_run(&inputs, &outputs) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, f_re, f_im) == 0);
-
-    /* (2) A commit with no frame_open behind it is refused, so an
-     * accelerator that never ran cannot pass untouched buffers off as a
-     * result -- and the same frame commits normally once it has. */
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, g_re, g_im, f_re, f_im) == 1);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
-    CHECK(fake_run(&inputs, &outputs) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, f_re, f_im) == 0);
-
-    /* (3) A refused commit DISARMS the transaction: re-committing without a
-     * fresh frame_open must not succeed by the second walk happening to
-     * find the same buffers. The fresh frame_open then re-fills the head
-     * output with NaN, which is what makes the finite check a partial-write
-     * detector rather than a stale-value detector on the taps. The state
-     * tensors are NOT re-filled: they are the accelerator's input, and after
-     * the refused commit they are the cold (all-zero) state. */
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, f_re, f_im, g_re, g_im) == 1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
-    CHECK(fake_run(&inputs, &outputs) == 0);
-    outputs.state_out[DEEPVQE_STATE_UP3_HISTORY][newest_element(
-        DEEPVQE_STATE_UP3_HISTORY, 0)] = NAN;
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
-    {
-        size_t defined = 0;
-        for (i = 0; i < outputs.taps_elements; ++i)
-            if (!isnan(outputs.taps[i])) ++defined;
-        CHECK(defined == 0u);
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-            CHECK(inputs.state[id] == outputs.state_out[id]);
-            CHECK(all_zero(inputs.state[id], inputs.state_elements[id]));
-        }
-        CHECK(inst_state_zero(&inst));
+    memset(in, 0, sizeof *in);
+    if (deepvqe_grid_make(&grid, &spec) != DEEPVQE_GRID_OK) return -1;
+    if (deepvqe_prepost_config_defaults(&in->cfg, &grid) != 0) return -1;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        const size_t count = state_count(id, D);
+        in->buf[id] = (float *)malloc(count * sizeof(float));
+        if (!in->buf[id]) return -1;
+        for (i = 0; i < count; ++i) in->buf[id][i] = 0.5f;
+        in->cfg.state[id] = in->buf[id];
+        in->cfg.state_elements[id] = count;
     }
-    CHECK(fake_run(&inputs, &outputs) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, f_re, f_im) == 0);
+    if (inst_init(in, 1) != 0) return -1;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)   /* init zeroed them: a state with something in it */
+        for (i = 0; i < state_count(id, D); ++i) in->buf[id][i] = 0.5f;
+    return 0;
+}
 
-    inst_free(&inst);
+/* Poison one element of a clean run and expect the refusal: -1, every registered buffer zero, generation +1. */
+static int frames_refusal(DeepVqePrepost *p, const Inst *in, DeepVqePrepostOutputs *out, int which, int last) {
+    const uint32_t gen = deepvqe_prepost_state_generation(p);
+    int id;
+    if (which < 0) out->taps[last ? out->taps_elements - 1u : 0u] = NAN;
+    else out->state_out[which][last ? out->state_elements[which] - 1u : 0u] = (which & 1) ? INFINITY : NAN;
+    if (deepvqe_prepost_validate_run(p) != -1) return 0;
+    if (deepvqe_prepost_state_generation(p) != gen + 1u) return 0;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        if (!all_zero(in->buf[id], state_count(id, D))) return 0;
+    return 1;
+}
+
+static int case_frames(void) {
+    static const int ns[3] = { 1, 2, 8 };
+    static float want_mic[2 * FRAMES_N_MAX * BINS_MAX], want_far[2 * FRAMES_N_MAX * BINS_MAX];
+    static float tmp[2 * BINS_MAX];
+    static float ref_re[FRAMES_N_MAX * BINS_MAX], ref_im[FRAMES_N_MAX * BINS_MAX];
+    static float got_re[FRAMES_N_MAX * BINS_MAX], got_im[FRAMES_N_MAX * BINS_MAX];
+    static float ring_re[DEEPVQE_TIME_ORDER * BINS_MAX], ring_im[DEEPVQE_TIME_ORDER * BINS_MAX];
+    int run;
+
+    for (run = 0; run < 3; ++run) {
+        const int n = ns[run];
+        const size_t nb = BINS, plane = (size_t)n * nb;
+        const size_t taps_per_frame = nb * TAPS_PER_BIN;
+        Inst in;
+        DeepVqePrepostInputs inputs;
+        DeepVqePrepostOutputs outputs;
+        DeepVqeCcmState ccm;
+        float *mic_ri_before;
+        uint32_t gen;
+        int k, id, which;
+        size_t i;
+
+        CHECK(frames_inst(&in, n) == 0);
+        CHECK(deepvqe_ccm_init(&ccm, g_grid.n_bins, ring_re, ring_im) == 0);
+
+        /* pre_frame in reverse slot order: the window of a slot does not depend on the order. */
+        for (k = n - 1; k >= 0; --k) {
+            const HopSpectra *h = &specs[10 + k];
+            CHECK(deepvqe_prepost_pre_frame(in.p, k, h->mr, h->mi, h->fr, h->fi) == DEEPVQE_PREPOST_OK);
+        }
+        CHECK(deepvqe_prepost_views(in.p, &inputs, &outputs) == 0);
+        CHECK(inputs.spectrum_ri_elements == 2u * plane);
+        CHECK(outputs.taps_elements == plane * TAPS_PER_BIN);
+        for (k = 0; k < n; ++k) {
+            const HopSpectra *h = &specs[10 + k];
+            compress_ref(h->mr, h->mi, tmp);
+            memcpy(want_mic + (size_t)k * nb, tmp, nb * sizeof(float));
+            memcpy(want_mic + plane + (size_t)k * nb, tmp + nb, nb * sizeof(float));
+            compress_ref(h->fr, h->fi, tmp);
+            memcpy(want_far + (size_t)k * nb, tmp, nb * sizeof(float));
+            memcpy(want_far + plane + (size_t)k * nb, tmp + nb, nb * sizeof(float));
+        }
+        CHECK(identical(inputs.mic, want_mic, 2u * plane) && identical(inputs.far, want_far, 2u * plane));
+        CHECK(!all_zero(inputs.mic, 2u * plane));
+
+        /* views: a clean NaN head every time, the state views are the registered buffers and are left alone. */
+        for (i = 0; i < outputs.taps_elements; ++i) CHECK(isnan(outputs.taps[i]));
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+            CHECK(inputs.state[id] == in.buf[id] && outputs.state_out[id] == in.buf[id]);
+            CHECK(inputs.state_elements[id] == state_count(id, D));
+        }
+        for (i = 0; i < outputs.taps_elements; ++i) outputs.taps[i] = 1.0f;
+        outputs.state_out[DEEPVQE_STATE_H_GRU][2] = 7.0f;
+        CHECK(deepvqe_prepost_views(in.p, &inputs, &outputs) == 0);
+        for (i = 0; i < outputs.taps_elements; ++i) CHECK(isnan(outputs.taps[i]));
+        CHECK(outputs.state_out[DEEPVQE_STATE_H_GRU][2] == 7.0f);
+        outputs.state_out[DEEPVQE_STATE_H_GRU][2] = 0.5f;
+
+        /* A slot outside [0, N) or a NULL changes no window. */
+        mic_ri_before = (float *)malloc(2u * plane * sizeof(float));
+        CHECK(mic_ri_before != NULL);
+        memcpy(mic_ri_before, inputs.mic, 2u * plane * sizeof(float));
+        CHECK(deepvqe_prepost_pre_frame(in.p, n, specs[40].mr, specs[40].mi, specs[40].fr, specs[40].fi) ==
+              DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(in.p, -1, specs[40].mr, specs[40].mi, specs[40].fr, specs[40].fi) ==
+              DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_pre_frame(in.p, 0, specs[40].mr, NULL, specs[40].fr, specs[40].fi) ==
+              DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(identical(inputs.mic, mic_ri_before, 2u * plane));
+        free(mic_ri_before);
+
+        /* A refused slot or NULL does not move the ring: the whole run below still equals the hand-driven reference. */
+        memset(got_re, 0x7F, sizeof got_re);
+        CHECK(deepvqe_prepost_post_frame(in.p, n, specs[10].mr, specs[10].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(deepvqe_prepost_post_frame(in.p, 0, specs[10].mr, specs[10].mi, NULL, got_im) == DEEPVQE_PREPOST_ERR_ARG);
+        CHECK(bytes_are(got_re, 4u, 0x7Fu));
+
+        /* A run with the taps of an accelerator stand-in: post_frame x N equals N hand-driven CCM calls. */
+        for (i = 0; i < outputs.taps_elements; ++i) {
+            const size_t slot = i % (size_t)TAPS_PER_BIN;
+            outputs.taps[i] = 0.05f * (float)(((long)(i * 31u) % 17) - 8) / 8.0f + (slot == 8u ? 0.5f : 0.0f);
+        }
+        for (k = 0; k < n; ++k)
+            deepvqe_ccm_process(&ccm, specs[10 + k].mr, specs[10 + k].mi, outputs.taps + (size_t)k * taps_per_frame,
+                                ref_re + (size_t)k * nb, ref_im + (size_t)k * nb);
+        gen = deepvqe_prepost_state_generation(in.p);
+        CHECK(deepvqe_prepost_validate_run(in.p) == 0);
+        CHECK(deepvqe_prepost_state_generation(in.p) == gen);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) CHECK(!all_zero(in.buf[id], state_count(id, D)));
+        for (k = 0; k < n; ++k)
+            CHECK(deepvqe_prepost_post_frame(in.p, k, specs[10 + k].mr, specs[10 + k].mi,
+                                             got_re + (size_t)k * nb, got_im + (size_t)k * nb) == DEEPVQE_PREPOST_OK);
+        CHECK(identical(got_re, ref_re, plane) && identical(got_im, ref_im, plane));
+        CHECK(!all_zero(got_re, plane));
+
+        /* validate_run on every poisoned tensor: the first and the last element of the head and of each of the
+         * sixteen buffers, the state zeroed and the generation advanced once, whatever the call size. */
+        for (which = -1; which < DEEPVQE_STATE_COUNT; ++which) {
+            int last;
+            for (last = 0; last < 2; ++last) {
+                for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+                    for (i = 0; i < state_count(id, D); ++i) in.buf[id][i] = 0.25f;
+                for (i = 0; i < outputs.taps_elements; ++i) outputs.taps[i] = 0.01f;
+                CHECK(frames_refusal(in.p, &in, &outputs, which, last));
+            }
+        }
+        CHECK(deepvqe_prepost_state_generation(in.p) == gen + 2u * (DEEPVQE_STATE_COUNT + 1));
+
+        /* post_frame: an enhanced bin that overflows is -2, the ring has advanced. */
+        for (i = 0; i < outputs.taps_elements; ++i) outputs.taps[i] = 0.0f;
+        memcpy(tmp, specs[10].mr, nb * sizeof(float));
+        tmp[3] = 3.0e38f;
+        for (i = 0; i < 9u; ++i) outputs.taps[3u * TAPS_PER_BIN + 2u * i] = 2.0f;
+        CHECK(deepvqe_prepost_post_frame(in.p, 0, tmp, specs[10].mi, got_re, got_im) == DEEPVQE_PREPOST_ERR_NONFINITE);
+
+        /* zero_state: restart, generation +1, windows kept. */
+        gen = deepvqe_prepost_state_generation(in.p);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) in.buf[id][1] = 1.0f;
+        mic_ri_before = (float *)malloc(2u * plane * sizeof(float));
+        CHECK(mic_ri_before != NULL);
+        memcpy(mic_ri_before, inputs.mic, 2u * plane * sizeof(float));
+        deepvqe_prepost_zero_state(in.p);
+        CHECK(deepvqe_prepost_state_generation(in.p) == gen + 1u && inst_state_zero(&in));
+        CHECK(identical(inputs.mic, mic_ri_before, 2u * plane));
+        free(mic_ri_before);
+
+        dvl_forget(in.p);
+        inst_free(&in);
+    }
     return 0;
 }
 
@@ -1461,9 +1576,9 @@ static int open_and_run(DeepVqePrepost *p, DeepVqePrepostInputs *inputs,
     static float far_re[BINS_MAX], far_im[BINS_MAX];
     make_frame(re, im, seed);
     make_frame(far_re, far_im, seed + 0.0625f);
-    if (deepvqe_prepost_pre_process_freq(p, re, im, far_re, far_im) != 1)
+    if (dvl_pre_process_freq(p, re, im, far_re, far_im) != 1)
         return -1;
-    if (deepvqe_prepost_frame_open(p, inputs, outputs) != 0) return -1;
+    if (dvl_frame_open(p, inputs, outputs) != 0) return -1;
     return fake_run(inputs, outputs);
 }
 
@@ -1485,12 +1600,12 @@ static int case_whole(void) {
             CHECK(open_and_run(inst.p, &inputs, &outputs, 0.125f) == 0);
             CHECK(!all_zero(outputs.state_out[id], outputs.state_elements[id]));
             outputs.state_out[id][at] = which ? INFINITY : NAN;
-            CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+            CHECK(dvl_frame_finish(inst.p) == -1);
             CHECK(deepvqe_prepost_state_generation(inst.p) == before + 1u);
             for (other = 0; other < DEEPVQE_STATE_COUNT; ++other)
                 CHECK(all_zero(outputs.state_out[other],
                                outputs.state_elements[other]));
-            CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+            CHECK(dvl_frame_bypass(inst.p) == 0);
         }
         /* The newest frame is read: poison at its first and last element is
          * refused and takes every tensor with it. */
@@ -1500,12 +1615,12 @@ static int case_whole(void) {
             CHECK(open_and_run(inst.p, &inputs, &outputs, 0.25f) == 0);
             CHECK(!all_zero(outputs.state_out[id], outputs.state_elements[id]));
             outputs.state_out[id][at] = NAN;
-            CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+            CHECK(dvl_frame_finish(inst.p) == -1);
             CHECK(deepvqe_prepost_state_generation(inst.p) == before + 1u);
             for (other = 0; other < DEEPVQE_STATE_COUNT; ++other)
                 CHECK(all_zero(outputs.state_out[other],
                                outputs.state_elements[other]));
-            CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+            CHECK(dvl_frame_bypass(inst.p) == 0);
         }
     }
     /* h_gru is checked whole, in the middle as well as at the end. */
@@ -1518,8 +1633,8 @@ static int case_whole(void) {
         for (which = 0; which < 2; ++which) {
             CHECK(open_and_run(inst.p, &inputs, &outputs, 0.375f) == 0);
             outputs.state_out[DEEPVQE_STATE_H_GRU][picks[which]] = INFINITY;
-            CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
-            CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+            CHECK(dvl_frame_finish(inst.p) == -1);
+            CHECK(dvl_frame_bypass(inst.p) == 0);
         }
     }
     inst_free(&inst);
@@ -1546,24 +1661,24 @@ static int case_enhanced(void) {
     make_frame(g_re, g_im, 0.25f);
     before = deepvqe_prepost_state_generation(inst.p);
 
-    CHECK(deepvqe_prepost_pre_process_freq(inst.p, big_re, big_im, g_re, g_im) == 1);
-    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+    CHECK(dvl_pre_process_freq(inst.p, big_re, big_im, g_re, g_im) == 1);
+    CHECK(dvl_frame_open(inst.p, &inputs, &outputs) == 0);
     for (i = 0; i < outputs.taps_elements; ++i) outputs.taps[i] = 0.5f;
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+    CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == before + 1u);
     CHECK(inst_state_zero(&inst));
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == -1);   /* the batch is still open */
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == 0);
+    CHECK(dvl_post_process_freq(inst.p, a_re, a_im) == -1);   /* the batch is still open */
+    CHECK(dvl_frame_bypass(inst.p) == 0);
+    CHECK(dvl_post_process_freq(inst.p, a_re, a_im) == 0);
     CHECK(all_zero(a_re, BINS) && all_zero(a_im, BINS));
 
     /* the ring was emptied with the state: the next frame equals a fresh instance's first frame */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.125f) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == 0);
+    CHECK(dvl_frame_finish(inst.p) == 0);
+    CHECK(dvl_post_process_freq(inst.p, a_re, a_im) == 0);
     CHECK(open_and_run(fresh.p, &inputs, &outputs, 0.125f) == 0);
-    CHECK(deepvqe_prepost_frame_finish(fresh.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(fresh.p, b_re, b_im) == 0);
+    CHECK(dvl_frame_finish(fresh.p) == 0);
+    CHECK(dvl_post_process_freq(fresh.p, b_re, b_im) == 0);
     CHECK(memcmp(a_re, b_re, BINS * sizeof(float)) == 0 && memcmp(a_im, b_im, BINS * sizeof(float)) == 0);
     CHECK(!all_zero(a_re, BINS));
 
@@ -1586,54 +1701,54 @@ static int case_generation(void) {
 
     /* Healthy commits, skips and new frames change nothing. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.0f) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(inst.p, got_re, got_im) == 0);
+    CHECK(dvl_frame_finish(inst.p) == 0);
+    CHECK(dvl_post_process_freq(inst.p, got_re, got_im) == 0);
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.5f) == 0);
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+    CHECK(dvl_frame_bypass(inst.p) == 0);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 0u);
 
     /* reset advances it, once per call. */
-    deepvqe_prepost_reset(inst.p);
+    dvl_reset(inst.p);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 1u);
-    deepvqe_prepost_reset(inst.p);
+    dvl_reset(inst.p);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 2u);
 
     /* A refused commit advances it once; the refused retry does not. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.25f) == 0);
     outputs.taps[outputs.taps_elements / 2] = NAN;
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+    CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 3u);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+    CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 3u);
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+    CHECK(dvl_frame_bypass(inst.p) == 0);
 
     /* A commit refused for a hole in a state tensor counts the same. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.75f) == 0);
     outputs.state_out[DEEPVQE_STATE_UP3_HISTORY][newest_element(
         DEEPVQE_STATE_UP3_HISTORY, 0)] = NAN;
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+    CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
-    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+    CHECK(dvl_frame_bypass(inst.p) == 0);
 
     /* ...and the next healthy frame leaves it alone. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.125f) == 0);
-    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
+    CHECK(dvl_frame_finish(inst.p) == 0);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
 
     /* frame_fail: a run that never started leaves it, a started one advances it once. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.375f) == 0);
-    CHECK(deepvqe_prepost_frame_fail(inst.p, 0) == 0);
+    CHECK(dvl_frame_fail(inst.p, 0) == 0);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
-    CHECK(deepvqe_prepost_frame_fail(inst.p, 1) == -1);   /* nothing open: refused, unchanged */
+    CHECK(dvl_frame_fail(inst.p, 1) == -1);   /* nothing open: refused, unchanged */
     CHECK(deepvqe_prepost_state_generation(inst.p) == 4u);
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.625f) == 0);
-    CHECK(deepvqe_prepost_frame_fail(inst.p, 1) == 0);
+    CHECK(dvl_frame_fail(inst.p, 1) == 0);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 5u);
     inst_free(&inst);
     return 0;
 }
 
-/* ---- fail: frame_fail closes the batch with the bypass output ------------ */
+/* ---- fail: a failed call closes with the bypass output ------------------- */
 
 static int case_fail(void) {
     Inst a, b, c;
@@ -1643,13 +1758,11 @@ static int case_fail(void) {
     static float far_re[BINS_MAX], far_im[BINS_MAX];
     static float a_re[BINS_MAX], a_im[BINS_MAX], b_re[BINS_MAX], b_im[BINS_MAX];
     static float c_re[BINS_MAX], c_im[BINS_MAX];
-    Snap snap;
     int id;
 
     make_frame(f1_re, f1_im, 0.0f);
     make_frame(f3_re, f3_im, -0.375f);
     make_frame(far_re, far_im, 0.0625f);
-    CHECK(deepvqe_prepost_frame_fail(NULL, 0) == -1 && deepvqe_prepost_frame_fail(NULL, 1) == -1);
 
     CHECK(inst_make(&a) == 0 && inst_make(&b) == 0 && inst_make(&c) == 0);
     CHECK(commit_freq(a.p, f1_re, f1_im, far_re, far_im, a_re, a_im) == 0);
@@ -1657,26 +1770,19 @@ static int case_fail(void) {
     CHECK(commit_freq(c.p, f1_re, f1_im, far_re, far_im, c_re, c_im) == 0);
     CHECK(!all_zero(a_re, BINS));
 
-    /* No batch open: refused, and nothing moves (state, generation). */
-    CHECK(snap_take(&snap, &c) == 0);
-    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == -1 && deepvqe_prepost_frame_fail(c.p, 0) == -1);
-    CHECK(deepvqe_prepost_state_generation(c.p) == 0u && snap_same(&snap, &c));
-    snap_free(&snap);
-
     /* A: the bypass. B: frame_fail, run not started. Same silence, same state, same generation, and the
      * next frame comes out the same, so frame_fail(p, 0) IS frame_bypass. */
     CHECK(open_and_run(a.p, &in_a, &out_a, 0.125f) == 0);
     CHECK(open_and_run(b.p, &in_b, &out_b, 0.125f) == 0);
-    CHECK(deepvqe_prepost_frame_bypass(a.p) == 0);
-    CHECK(deepvqe_prepost_frame_fail(b.p, 0) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(a.p, a_re, a_im) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(b.p, b_re, b_im) == 0);
+    CHECK(dvl_frame_bypass(a.p) == 0);
+    CHECK(dvl_frame_fail(b.p, 0) == 0);
+    CHECK(dvl_post_process_freq(a.p, a_re, a_im) == 0);
+    CHECK(dvl_post_process_freq(b.p, b_re, b_im) == 0);
     CHECK(all_zero(a_re, BINS) && all_zero(a_im, BINS));
     CHECK(identical(a_re, b_re, BINS) && identical(a_im, b_im, BINS));
     CHECK(deepvqe_prepost_state_generation(b.p) == 0u);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
         CHECK(identical(a.buf[id], b.buf[id], state_count(id, D)) && !all_zero(b.buf[id], state_count(id, D)));
-    CHECK(deepvqe_prepost_frame_fail(b.p, 0) == -1);   /* closed: a second call has nothing to close */
     CHECK(commit_freq(a.p, f3_re, f3_im, far_re, far_im, a_re, a_im) == 0);
     CHECK(commit_freq(b.p, f3_re, f3_im, far_re, far_im, b_re, b_im) == 0);
     CHECK(identical(a_re, b_re, BINS) && identical(a_im, b_im, BINS) && !all_zero(b_re, BINS));
@@ -1685,12 +1791,12 @@ static int case_fail(void) {
      * next frame commits from the cold state. */
     CHECK(open_and_run(c.p, &in_c, &out_c, 0.125f) == 0);
     CHECK(!inst_state_zero(&c));
-    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == 0);
+    CHECK(dvl_frame_fail(c.p, 1) == 0);
     CHECK(deepvqe_prepost_state_generation(c.p) == 1u);
     CHECK(inst_state_zero(&c));
-    CHECK(deepvqe_prepost_post_process_freq(c.p, c_re, c_im) == 0);
+    CHECK(dvl_post_process_freq(c.p, c_re, c_im) == 0);
     CHECK(all_zero(c_re, BINS) && all_zero(c_im, BINS));
-    CHECK(deepvqe_prepost_frame_fail(c.p, 1) == -1 && deepvqe_prepost_state_generation(c.p) == 1u);
+    CHECK(deepvqe_prepost_state_generation(c.p) == 1u);
     CHECK(commit_freq(c.p, f3_re, f3_im, far_re, far_im, c_re, c_im) == 0);
     CHECK(!all_zero(c_re, BINS) && deepvqe_prepost_state_generation(c.p) == 1u);
 
@@ -1865,9 +1971,9 @@ static int head_hop(DeepVqePrepost *p, int hop, int empty, int poison) {
     DeepVqePrepostInputs in;
     DeepVqePrepostOutputs out;
     size_t i;
-    if (deepvqe_prepost_pre_process_freq(p, specs[hop].mr, specs[hop].mi,
+    if (dvl_pre_process_freq(p, specs[hop].mr, specs[hop].mi,
                                          specs[hop].fr, specs[hop].fi) != 1) return 2;
-    if (deepvqe_prepost_frame_open(p, &in, &out) != 0) return 2;
+    if (dvl_frame_open(p, &in, &out) != 0) return 2;
     for (i = 0; i < out.taps_elements; ++i) if (!isnan(out.taps[i])) return 2;
     if (empty && !views_empty(&in, &out)) return 2;
     for (i = 0; i < out.taps_elements; ++i) {
@@ -1877,7 +1983,7 @@ static int head_hop(DeepVqePrepost *p, int hop, int empty, int poison) {
             : (float)(0.05 * cos((double)(i + (size_t)hop)));
     }
     if (poison) out.taps[out.taps_elements / 3u] = NAN;
-    return deepvqe_prepost_frame_finish(p);
+    return dvl_frame_finish(p);
 }
 
 static int fences_intact(const unsigned char *raw, size_t bytes) {
@@ -1908,11 +2014,11 @@ static int case_board(void) {
 
     /* Two healthy hops. */
     CHECK(head_hop(board, 0, 1, 0) == 0 && head_hop(twin.p, 0, 0, 0) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(board, got[0].re, got[0].im) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(twin.p, ref[0].re, ref[0].im) == 0);
+    CHECK(dvl_post_process_freq(board, got[0].re, got[0].im) == 0);
+    CHECK(dvl_post_process_freq(twin.p, ref[0].re, ref[0].im) == 0);
     CHECK(head_hop(board, 1, 1, 0) == 0 && head_hop(twin.p, 1, 0, 0) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(board, got[1].re, got[1].im) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(twin.p, ref[1].re, ref[1].im) == 0);
+    CHECK(dvl_post_process_freq(board, got[1].re, got[1].im) == 0);
+    CHECK(dvl_post_process_freq(twin.p, ref[1].re, ref[1].im) == 0);
     CHECK(outs_identical(got, ref, 2) && outs_nonzero(got, 2));
     CHECK(!identical(got[0].re, got[1].re, BINS));
     CHECK(deepvqe_prepost_state_generation(board) == 0u && fences_intact(raw, bytes));
@@ -1922,18 +2028,18 @@ static int case_board(void) {
     CHECK(head_hop(board, 2, 1, 1) == -1 && head_hop(twin.p, 2, 0, 1) == -1);
     CHECK(deepvqe_prepost_state_generation(board) == 1u);
     CHECK(deepvqe_prepost_state_generation(twin.p) == 1u);
-    CHECK(deepvqe_prepost_frame_finish(board) == -1);
+    CHECK(dvl_frame_finish(board) == -1);
     CHECK(deepvqe_prepost_state_generation(board) == 1u);
-    CHECK(deepvqe_prepost_post_process_freq(board, got[2].re, got[2].im) == -1);
-    CHECK(deepvqe_prepost_frame_bypass(board) == 0 && deepvqe_prepost_frame_bypass(twin.p) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(board, got[2].re, got[2].im) == 0);
+    CHECK(dvl_post_process_freq(board, got[2].re, got[2].im) == -1);
+    CHECK(dvl_frame_bypass(board) == 0 && dvl_frame_bypass(twin.p) == 0);
+    CHECK(dvl_post_process_freq(board, got[2].re, got[2].im) == 0);
     CHECK(all_zero(got[2].re, BINS) && all_zero(got[2].im, BINS));   /* fail closed: silence */
     CHECK(deepvqe_prepost_state_generation(board) == 1u && fences_intact(raw, bytes));
 
     /* The next hop recovers and matches the float host again. */
     CHECK(head_hop(board, 3, 1, 0) == 0 && head_hop(twin.p, 3, 0, 0) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(board, got[3].re, got[3].im) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(twin.p, ref[3].re, ref[3].im) == 0);
+    CHECK(dvl_post_process_freq(board, got[3].re, got[3].im) == 0);
+    CHECK(dvl_post_process_freq(twin.p, ref[3].re, ref[3].im) == 0);
     CHECK(identical(got[3].re, ref[3].re, BINS) && identical(got[3].im, ref[3].im, BINS));
     CHECK(!all_zero(got[3].re, BINS));
     CHECK(deepvqe_prepost_state_generation(board) == 1u && fences_intact(raw, bytes));
@@ -1963,13 +2069,13 @@ static int case_fail_board(void) {
     make_frame(re, im, 0.25f);
 
     CHECK(head_hop(board, 0, 1, 0) == 0);
-    CHECK(deepvqe_prepost_post_process_freq(board, got_re, got_im) == 0);
+    CHECK(dvl_post_process_freq(board, got_re, got_im) == 0);
     CHECK(deepvqe_prepost_state_generation(board) == 0u);
-    CHECK(deepvqe_prepost_pre_process_freq(board, re, im, re, im) == 1);
-    CHECK(deepvqe_prepost_frame_fail(board, 0) == 0 && deepvqe_prepost_state_generation(board) == 0u);
-    CHECK(deepvqe_prepost_pre_process_freq(board, re, im, re, im) == 1);
-    CHECK(deepvqe_prepost_frame_fail(board, 1) == 0 && deepvqe_prepost_state_generation(board) == 1u);
-    CHECK(deepvqe_prepost_post_process_freq(board, got_re, got_im) == 0);
+    CHECK(dvl_pre_process_freq(board, re, im, re, im) == 1);
+    CHECK(dvl_frame_fail(board, 0) == 0 && deepvqe_prepost_state_generation(board) == 0u);
+    CHECK(dvl_pre_process_freq(board, re, im, re, im) == 1);
+    CHECK(dvl_frame_fail(board, 1) == 0 && deepvqe_prepost_state_generation(board) == 1u);
+    CHECK(dvl_post_process_freq(board, got_re, got_im) == 0);
     CHECK(all_zero(got_re, BINS) && all_zero(got_im, BINS));
     CHECK(head_hop(board, 2, 1, 0) == 0 && deepvqe_prepost_state_generation(board) == 1u);
     CHECK(fences_intact(raw, bytes));
@@ -2165,6 +2271,7 @@ int main(int argc, char **argv) {
         CHECK(deepvqe_grid_make(&g_grid, &spec) == DEEPVQE_GRID_OK);
     }
     CHECK(g_grid.n_bins <= BINS_MAX && g_grid.hop <= HOP_MAX);
+    dvl_use_grid(g_grid.frames_per_call, g_grid.n_bins);
     ac_window_build(window, N_FFT);
     fill_pcm(pcm_mic, pcm_far, (int)(HOPS * HOP));
 
@@ -2198,7 +2305,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "reject") == 0)    status = case_reject();
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset();
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
-    else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
+    else if (strcmp(argv[1], "frames") == 0)    status = case_frames();
     else if (strcmp(argv[1], "inplace") == 0)   status = case_inplace();
     else if (strcmp(argv[1], "whole") == 0)     status = case_whole();
     else if (strcmp(argv[1], "enhanced") == 0)  status = case_enhanced();
@@ -2249,7 +2356,7 @@ def _build_driver(tmp_path_factory, audio_common_lib, name, *flags):
     subprocess.run(
         [cc, '-O2', '-std=c11',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off', *flags,
-         '-I', _DEEPVQE_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
+         '-I', _DEEPVQE_DIR, '-I', _THIS_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR,
          str(source), *_SOURCES,
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True,
@@ -2422,14 +2529,17 @@ def test_inherit_path_is_gone():
             assert 'inherit' not in stream.read().replace('inherited', ''), path
 
 
-def test_transaction_guards(driver):
-    """The three gates that make the boundary a transaction: a second
-    pre_process while a frame is open is refused without damaging that frame,
-    a commit with no frame_open behind it is refused (an accelerator that
-    never ran cannot pass untouched buffers off as a result), and a refused
-    commit disarms until a fresh frame_open -- which re-fills every tap with
-    NaN and presents the (now cold) state tensors unfilled."""
-    _run(driver, 'guard')
+def test_per_frame_functions_at_n_frames_per_call(driver):
+    """N = 1, 2 and 8 frames per call. pre_frame writes the compressed windows
+    (any slot order) equal, bit for bit, to the hand-composed compression;
+    views NaN-fills the head again on every call and leaves the state alone;
+    validate_run accepts a clean run and, for a non-finite value in the first
+    or last tap or in the first or last element of any of the sixteen
+    registered buffers, zeroes the state and advances the generation exactly
+    once; post_frame x N equals N hand-driven CCM calls; a slot outside [0, N)
+    or a NULL changes nothing; an overflowing enhanced bin is -2; zero_state
+    restarts the state and keeps the windows."""
+    _run(driver, 'frames')
 
 
 def test_state_boundary_names_and_descriptor_validation(driver):
@@ -2649,7 +2759,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+DEEPVQE_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert (layout, carve) == (4, 8)
+    assert (layout, carve) == (4, 9)
     expected = _fnv1a([16000, 512, layout, carve, 8, 1])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
     if ptr_bytes == 4:

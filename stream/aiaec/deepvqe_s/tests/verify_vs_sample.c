@@ -1,7 +1,7 @@
 /* Verifies deepvqe_stream.c (deepvqe_stream_pre_process/post_process) against an independent
  * re-implementation of the same per-hop lifecycle (driver A below): int16->float mic+far (no
- * HPF) -> ac_stft_push_planar x2 -> deepvqe_prepost_pre_process_freq -> deepvqe_prepost_frame_open
- * -> NPU -> deepvqe_prepost_frame_finish/frame_fail -> deepvqe_prepost_post_process_freq ->
+ * HPF) -> ac_stft_push_planar x2 -> deepvqe_prepost_pre_frame -> deepvqe_prepost_views
+ * -> NPU -> deepvqe_prepost_validate_run / zero_state -> deepvqe_prepost_post_frame ->
  * ac_istft_push_planar -> int16 saturate, built directly against
  * lib/aiaec/deepvqe_s/deepvqe_prepost.h and audiolib, never
  * against deepvqe_stream.c itself -- the same lib-level core deepvqe_stream.c wraps, called by
@@ -142,29 +142,31 @@ static int board_pre(BoardDriver *d, const int16_t *mic_in, const int16_t *far_i
     }
     ac_stft_push_planar(d->stft_mic, d->mic_f, d->mic_re, d->mic_im);
     ac_stft_push_planar(d->stft_far, d->far_f, d->far_re, d->far_im);
-    if (deepvqe_prepost_pre_process_freq(d->prepost, d->mic_re, d->mic_im, d->far_re, d->far_im) != 1)
+    if (deepvqe_prepost_pre_frame(d->prepost, 0, d->mic_re, d->mic_im, d->far_re, d->far_im) != DEEPVQE_PREPOST_OK)
         return -1;
-    if (deepvqe_prepost_frame_open(d->prepost, in, out) != 0) return -1;
+    if (deepvqe_prepost_views(d->prepost, in, out) != 0) return -1;
     return 1;
 }
 
 /* Returns 1 (full hop synthesized), 0 (ENV_NORM's first-push-emits-nothing case, or any mode
- * where the push legitimately returns < hop), -1 (post_process_freq contract error). *written_out
- * carries ac_istft_push_planar's own return value for the trace. */
+ * where the push legitimately returns < hop). *written_out carries ac_istft_push_planar's own
+ * return value for the trace. The close is the contract in deepvqe_prepost.h, written out by hand:
+ * a clean run is validated and its frame computed, anything else is a frame of zeros. */
 static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *written_out) {
-    int prc, hop = d->grid.hop, k, written = 0;
+    int hop = d->grid.hop, k, written = 0, ok = 0;
     if (ai_rc == STREAM_RUN_OK) {
-        if (deepvqe_prepost_frame_finish(d->prepost) != 0) deepvqe_prepost_frame_bypass(d->prepost);
-    } else {
-        deepvqe_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+        if (deepvqe_prepost_validate_run(d->prepost) == 0) {
+            ok = deepvqe_prepost_post_frame(d->prepost, 0, d->mic_re, d->mic_im, d->enh_re, d->enh_im) == DEEPVQE_PREPOST_OK;
+            if (!ok) deepvqe_prepost_zero_state(d->prepost);
+        }
+    } else if (ai_rc != STREAM_RUN_NOT_STARTED) {
+        deepvqe_prepost_zero_state(d->prepost);
+    }
+    if (!ok) {
+        memset(d->enh_re, 0, (size_t)d->grid.n_bins * sizeof(float));
+        memset(d->enh_im, 0, (size_t)d->grid.n_bins * sizeof(float));
     }
 
-    prc = deepvqe_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im);
-    if (prc != 0) {
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
-        if (written_out) *written_out = -1;
-        return -1;
-    }
     written = ac_istft_push_planar(d->istft, d->enh_re, d->enh_im, d->hop_out);
     if (written_out) *written_out = written;
     if (written != hop) {
@@ -429,13 +431,13 @@ static int run_ola_matters_proof(void) {
     return 0;
 }
 
-/* ---- fail-closed oracle: the stream against an STFT -> ISTFT chain that never sees the library's bypass ----
+/* ---- fail-closed oracle: the stream against an STFT -> ISTFT chain that never sees the stream's close ----
  * An identity accelerator (CCM taps = 1 + 0j at delay 0, centre frequency) makes the stream's output the mic one hop
  * late. The oracle is that chain built by hand from ac_stft/ac_istft: mic spectrum in, the same spectrum out, except a
  * ZERO spectrum at the failed hop. The stream must equal it sample for sample (+-1 LSB, int16 conversion), so a failed
  * hop that kept the mic spectrum (a passthrough), or one that ignored a reported run status, differs from the oracle
  * by thousands of LSB. Three failures: a reported run status != 0 with valid finite taps, non-finite taps with
- * run status 0 (refused), and both. The oracle is independent of deepvqe_prepost_frame_bypass(). */
+ * run status 0 (refused), and both. The oracle never takes a close from the stream: it zero-fills its own frame. */
 static void identity_taps(DeepVqePrepostOutputs *out) {
     const size_t tapn = 9, bins = out->taps_elements / (tapn * 2u);
     size_t b;
