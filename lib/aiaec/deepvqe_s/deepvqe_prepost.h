@@ -266,17 +266,14 @@ int deepvqe_prepost_pre_frame(DeepVqePrepost *p, int slot,
 int deepvqe_prepost_views(DeepVqePrepost *p, DeepVqePrepostInputs *inputs,
                           DeepVqePrepostOutputs *outputs);
 
-/* After a run with status OK: every tap and every element of every registered state buffer (whole
- * buffers, older frames of a history window included) must be finite. Returns 0 (nothing written), or
- * -1 on a non-finite value: the registered buffers are zeroed, the CCM ring emptied and the state
- * generation advanced once. -1 on NULL with nothing touched. */
+/* After a run with status OK: every tap and every element of every registered buffer (whole) must be
+ * finite. Returns 0, or -1 on a non-finite value: the registered buffers are zeroed, the CCM ring
+ * emptied and the generation advanced once. -1 on NULL touches nothing. */
 int deepvqe_prepost_validate_run(DeepVqePrepost *p);
 
-/* Frame `slot`: push the raw mic spectrum (n_bins bins, kept by the caller since pre_frame) into the CCM
- * ring, convolve the taps of the frame over (t, t-1, t-2) and write n_bins bins to out_re / out_im, which
- * do not alias the inputs. Slots run 0 .. N-1 in order. Returns OK; ERR_ARG with nothing advanced and
- * out untouched; ERR_NONFINITE when an enhanced bin is not finite (the ring advanced: the caller then
- * calls zero_state once). */
+/* Frame `slot`, slots 0 .. N-1 in order: push the raw mic spectrum the caller kept since pre_frame into
+ * the CCM ring, convolve the frame's taps over (t, t-1, t-2), write n_bins bins to out_re / out_im
+ * (not aliasing the inputs). ERR_ARG: nothing advanced. ERR_NONFINITE: the ring advanced; call zero_state. */
 int deepvqe_prepost_post_frame(DeepVqePrepost *p, int slot,
                                const float *mic_re, const float *mic_im,
                                float *out_re, float *out_im);

@@ -4,8 +4,8 @@
 kernel (``deepvqe_process.c``) behind per-frame functions (pre_frame, views,
 validate_run, post_frame, zero_state), and the call sequence belongs to the
 stream. The driver sequences a call with ``deepvqe_lifecycle_driver.h`` (the
-stream's order over the per-frame functions, with the former batch API's return
-numbers); the stream's own lifecycle cases are in
+stream's order over the per-frame functions, with the return numbers listed in
+its header); the stream's own lifecycle cases are in
 ``stream/aiaec/deepvqe_s/tests/lifecycle.c``. So
 the gate is that the class reproduces the hand-composed path SAMPLE FOR SAMPLE:
 every numeric comparison is ``memcmp`` on fp32, and every "identical" claim is

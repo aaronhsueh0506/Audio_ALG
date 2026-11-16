@@ -1,4 +1,4 @@
-/* The per-call lifecycle of deepvqe_stream, which the library no longer holds: the open-call guards, the failure table
+/* The per-call lifecycle of deepvqe_stream (the library keeps no per-call latch): the open-call guards, the failure table
  * (generation effect and output of every run status), the NaN-filled head before every run, the range refusal of the
  * _freq entries and the all-N-frames-or-none output of a call whose enhanced spectrum overflows in a later frame.
  * Per grid row (N = 1 and a batched N), on a full stream (PCM and _freq entries) and on a freq_only stream:
@@ -29,8 +29,12 @@ static int g_fail;
 typedef struct Row { int sr, fft, depth, n; } Row;
 static const Row ROWS[] = { { 16000, 256, 63, 1 }, { 16000, 256, 63, 8 }, { 48000, 1024, 47, 2 } };
 
+#define GUARD 256u
+#define CANARY 0xC3
+
 typedef struct Rig {
     DeepVqeStream *s;
+    unsigned char *raw;   /* the pool between two canary zones */
     void *pool;
     size_t pool_bytes;
     DeepVqeGrid g;
@@ -61,7 +65,9 @@ static int rig_make(Rig *r, const Row *row, int freq_only) {
         cfg.state_elements[id] = ELEMS;
     }
     if (deepvqe_stream_get_mem_size(&cfg, &req) != 0) return -1;
-    if (posix_memalign(&r->pool, 16, (size_t)req.bytes) != 0) return -1;
+    if (posix_memalign((void **)&r->raw, 16, (size_t)req.bytes + 2u * GUARD) != 0) return -1;
+    memset(r->raw, CANARY, (size_t)req.bytes + 2u * GUARD);
+    r->pool = r->raw + GUARD;
     r->pool_bytes = (size_t)req.bytes;
     r->s = deepvqe_stream_init_ex(&cfg, r->pool, r->pool_bytes, &req);
     r->freq_only = freq_only;
@@ -71,7 +77,11 @@ static int rig_make(Rig *r, const Row *row, int freq_only) {
 
 static void rig_free(Rig *r) {
     int id;
-    free(r->pool);
+    size_t k;
+    int intact = 1;
+    for (k = 0; k < GUARD; ++k) intact &= r->raw[k] == CANARY && r->raw[GUARD + r->pool_bytes + k] == CANARY;
+    CHECK(intact, "a stream wrote outside its pool");
+    free(r->raw);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(r->reg[id]);
 }
 

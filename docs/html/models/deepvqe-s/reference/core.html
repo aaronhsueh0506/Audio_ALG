@@ -273,7 +273,7 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <tr><td><code>validate_run</code></td><td>-1</td><td>任一 tap 或登錄 buffer 的任一元素（整塊，含較舊的幀）非有限（沒登錄時只檢查 taps）：登錄的 state 全部歸零、CCM ring 清空（冷啟動）、generation +1 一次，呼叫端不必再呼叫 <code>zero_state</code>；NULL 回 −1 且什麼都不動</td></tr>
 <tr><td><code>post_frame</code></td><td>-1，或 -2</td><td>-1：NULL、slot 不在 [0, N)（什麼都沒推進、輸出不動）。-2：算出的增強頻譜非有限（有限的 tap 乘上接近 FLT_MAX 的 mic 頻譜可能溢位）；CCM ring 已推進，呼叫端接著 <code>zero_state</code> 一次並把該批 N 個輸出頻譜歸零（stream 這樣做）。slot 須依 0…N−1 的順序呼叫，函式庫不檢查順序</td></tr>
 <tr><td><code>zero_state</code></td><td>無回傳</td><td>登錄的 state 全部歸零、CCM ring 清空、generation +1；模型視窗不動；NULL 忽略。用於已啟動而失敗的執行（沒啟動就什麼都不做）</td></tr>
-<tr><td><code>deepvqe_stream_pre_process_packet_freq</code></td><td>-2（<code>DEEPVQE_STREAM_ERR_RANGE</code>），或 -1</td><td>-2：四個平面中任一個 bin 非有限（NaN、±Inf；上限 FLT_MAX），在任何狀態變動之前拒收，pool、generation 與 <code>io</code> 都不動，沒有開啟的 call。-1：契約錯誤（NULL、freq_only 以外的錯誤入口、上一包尚未 post）</td></tr>
+<tr><td><code>deepvqe_stream_pre_process_packet_freq</code></td><td>-2（<code>DEEPVQE_STREAM_ERR_RANGE</code>），或 -1</td><td>-2：四個平面中任一個 bin 非有限（NaN、±Inf；上限 FLT_MAX），在任何狀態變動之前拒收，pool、generation 與 <code>io</code> 都不動，沒有開啟的 call。-1：契約錯誤（NULL，或上一包尚未 post）</td></tr>
 </table></div>
 
 <h2 id="section-7">函式清單：公開 vs 內部</h2>

@@ -1,6 +1,6 @@
 /* Test-only sequencer for lib-only DeepVQE-S builds: the per-call order the stream (deepvqe_stream.c) runs over
- * the per-frame functions of deepvqe_prepost.h, with the return numbers of the former batch API, so a driver can
- * run a whole call without a stream. The library keeps no latch; the open call, the staged raw mic spectra and
+ * the per-frame functions of deepvqe_prepost.h, with the return numbers listed below, so a driver can run a whole
+ * call without a stream. The library keeps no latch; the open call, the staged raw mic spectra and
  * the output frames live here, per instance, in a small table keyed by the instance pointer.
  *
  *     dvl_pre_process_freq   N calls; the Nth returns 1, the others 0; -1 on NULL or while a call is open
@@ -153,7 +153,7 @@ static inline int dvl_post_process_freq(DeepVqePrepost *p, float *re, float *im)
     return 0;
 }
 
-/* deepvqe_prepost_reset() plus the open call dropped, as the former reset did. */
+/* deepvqe_prepost_reset() plus the open call dropped. */
 static inline void dvl_reset(DeepVqePrepost *p) {
     DvlCall *c = dvl_of(p);
     deepvqe_prepost_reset(p);
