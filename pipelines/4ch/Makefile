@@ -414,7 +414,7 @@ $(OBJ_DIR)/4ch_static.o: 4ch_static.c array_sample_beam.h array_sample_driver.h 
 $(OBJ_DIR)/test_4ch_chain.o: tests/test_4ch_chain.c array_sample_beam.h tests/conv_chain_4ch.h tests/array_test_rig.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_array_sample_beam.o: tests/test_array_sample_beam.c array_sample_beam.h tests/conv_chain_4ch.h tests/array_test_rig.h array_sample_post.h | _cfg_guard
+$(OBJ_DIR)/test_array_sample_beam.o: tests/test_array_sample_beam.c array_sample_beam.h tests/conv_chain_4ch.h tests/array_test_rig.h array_sample_post.h array_sample_unit.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c array_sample_beam.h tests/array_test_rig.h | _cfg_guard

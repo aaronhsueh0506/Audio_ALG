@@ -16,6 +16,7 @@
 #include "srp.h"
 #include "conv_chain_4ch.h"
 #include "array_sample_post.h"
+#include "array_sample_unit.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -840,6 +841,82 @@ static int test_unit_chain_equals_reference_chain(void) {
             conv_destroy(ref);
          }
         }
+    }
+    return 1;
+}
+
+/* array_sample_stages_chain (the stages the 4ch examples carve behind the unit) against the reference chain over the same
+ * front end, across hard resets of the array in mid-run: the synthesis follows AecResidualView.post_reset_serial (its
+ * overlap-add tail is cleared on the hop the serial moves), as the reference chain does. At least one reset event must
+ * have been seen. */
+static int test_stages_chain_follows_the_post_reset(void) {
+    static const int grids[2][2] = {{16000, 256}, {48000, 1024}};
+    static const int reset_hops[] = {120, 121, 200};
+    int grid;
+    for (grid = 0; grid < 2; ++grid) {
+        ArrayTestUnitConfig cfg = array_test_unit_default_config(grids[grid][0]);
+        ConvChainOptions opt = conv_default_options();
+        ArraySampleBeam* unit;
+        ArraySampleStages ps;
+        ConvChain* ref;
+        AecResidualView frame;
+        Complex* weights;
+        float *mics, *far, *out_w, *out_r;
+        void* mem = NULL;
+        uint32_t serial = 0u;
+        int hop, n, h, k, r, identical = 1, nonzero = 0, ok = 1, events = 0, built;
+        char label[160];
+
+        cfg.aec_cfg = array_test_level_config(grids[grid][0], grids[grid][1], AEC_LEVEL_BALANCED);
+        cfg.aec_cfg.residual = AEC_RESIDUAL_FULL;
+        cfg.beam.bf_enable = 0;
+        opt.enable_nr = 1;
+        opt.enable_res = 1;
+        opt.enable_cng = 1;
+        unit = array_test_beam_create(&cfg);
+        ref = conv_create(&cfg.aec_cfg, &opt);
+        built = unit && ref && array_sample_stages_plan(&ps, grids[grid][0], grids[grid][1]) == 0 &&
+                posix_memalign(&mem, 16, ps.total) == 0 && array_sample_stages_init(&ps, mem) == 0;
+        snprintf(label, sizeof(label), "stages chain: %d Hz/%d build", grids[grid][0], grids[grid][1]);
+        CHECK(built, label);
+        if (!built) { free(mem); array_test_beam_destroy(unit); conv_destroy(ref); continue; }
+        hop = aec_hop_size(array_test_beam_aec(unit));
+        n = array_test_n_freqs(array_test_beam_aec(unit));
+        mics = (float*)calloc((size_t)hop * AEC_ARRAY_MICS, sizeof(float));
+        far = (float*)calloc((size_t)hop, sizeof(float));
+        out_w = (float*)calloc((size_t)hop, sizeof(float));
+        out_r = (float*)calloc((size_t)hop, sizeof(float));
+        weights = (Complex*)calloc((size_t)AEC_ARRAY_MICS * (size_t)n, sizeof(Complex));
+        for (k = 0; k < n; ++k) weights[k].r = 1.0f;
+        for (h = 0; h < 340 && ok; ++h) {
+            for (r = 0; r < (int)(sizeof reset_hops / sizeof reset_hops[0]); ++r) {
+                if (h == reset_hops[r]) {   /* the application resets the array only: stages follow the serial */
+                    aec_reset(array_test_beam_aec(unit));
+                    aec_reset(ref->aec);
+                }
+            }
+            res_scene_hop(h, hop, mics, far);
+            if (array_sample_beam_process_with_activity(unit, mics, far, 0, 0, NULL, &(ArraySampleBeamResult){0}, NULL) !=
+                    AEC_OK ||
+                array_sample_beam_fuse(unit, &frame) != AEC_OK ||
+                array_sample_stages_chain(&ps, array_test_beam_aec(unit), &frame, out_w) != 0 ||
+                array_test_front(ref->aec, mics, far, &ref->front) != AEC_OK ||
+                conv_post(ref, weights, ref->front.lane_error_spec[0], out_r) != AEC_OK) {
+                ok = 0;
+                break;
+            }
+            if (frame.post_reset_serial != serial) { serial = frame.post_reset_serial; ++events; }
+            if (memcmp(out_w, out_r, (size_t)hop * sizeof(float)) != 0) identical = 0;
+            for (k = 0; k < hop; ++k) if (out_r[k] != 0.0f) nonzero = 1;
+        }
+        snprintf(label, sizeof(label), "stages chain: %d Hz/%d bit-identical to the reference chain across %d reset events",
+                 grids[grid][0], grids[grid][1], events);
+        CHECK(ok && identical && nonzero && events >= 1, label);
+        free(mics); free(far); free(out_w); free(out_r); free(weights);
+        anr_destroy(ps.nr);
+        free(mem);
+        array_test_beam_destroy(unit);
+        conv_destroy(ref);
     }
     return 1;
 }
@@ -2100,6 +2177,8 @@ static int run_all_tests(const char* bin_dir, const char* tmp) {
           "fuse publishes the array's residual gain");
     CHECK(test_unit_chain_equals_reference_chain(),
           "unit + fuse + the examples' chain equals the reference chain over the front end");
+    CHECK(test_stages_chain_follows_the_post_reset(),
+          "the examples' stages follow a post-chain reset like the reference chain");
     CHECK(test_array_gain_reset_and_level(), "the array's gain stage: reset restarts it; a level survives it");
     CHECK(test_array_level_ramp_vs_oracle(),
           "the array's gain stage: a ramped level follows the oracle; skipping it is caught");
