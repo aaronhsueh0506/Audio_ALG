@@ -125,7 +125,11 @@ FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) dfn2_stream.c
 FREQ_ROWS_BIN := $(OBJ_DIR)/freq_rows
 FREQ_ROWS_SOURCES := tests/freq_rows.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
+# The packet entries (N > 1) against N one-frame hops of the same stand-in accelerator.
+PACKET_EQUIV_BIN := $(OBJ_DIR)/packet_equiv
+PACKET_EQUIV_SOURCES := tests/packet_equiv.c $(CORE_SOURCES) dfn2_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -206,6 +210,13 @@ $(FREQ_ROWS_BIN): $(FREQ_ROWS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_
 freq-rows: $(FREQ_ROWS_BIN)
 	"$(FREQ_ROWS_BIN)"
 
+$(PACKET_EQUIV_BIN): $(PACKET_EQUIV_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(PACKET_EQUIV_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+packet-equiv: $(PACKET_EQUIV_BIN)
+	"$(PACKET_EQUIV_BIN)"
+
 $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
@@ -213,7 +224,7 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows erb-partition test-variant-guard check-header-cxx
+test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv erb-partition test-variant-guard check-header-cxx
 
 # check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
 # a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.

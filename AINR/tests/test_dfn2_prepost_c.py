@@ -1007,7 +1007,7 @@ static int case_dual_guards(void) {
     DFN2Prepost *pf;
     void *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 12u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 13u);
 
     config_freq(&cfg_freq);
     CHECK(dfn2_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);

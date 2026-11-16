@@ -27,7 +27,8 @@ struct DFN2Stream {
     DFN2Prepost *prepost;
 
     /* Per-hop scratch of the PCM entries, one slab: hop_in/hop_out [hop] each, spec_re/spec_im/enh_re/enh_im
-     * [n_bins] each (pcm_in/pcm_out are the caller's own buffers, passed by pointer). NULL when freq_only. */
+     * [n_bins] each (a packet stages its N spectra in the DFN2Prepost instead; pcm_in/pcm_out are the caller's
+     * own buffers, passed by pointer). NULL when freq_only. */
     float *hop_in;
     float *hop_out;
     float *spec_re;
@@ -36,9 +37,8 @@ struct DFN2Stream {
     float *enh_im;
 
     int open;    /* 0 closed, 1: a DFN2Prepost frame is open, post_process must finish/bypass it */
-    int pending; /* 0 closed, 1: pre_process succeeded and post_process is due (every hop,
-                  * independent of `open` -- a hop without a job opens no frame, but post_process is
-                  * still due to deliver its output) */
+    int pending; /* 0 closed, 1: pre_process succeeded and post_process is due (every hop or packet,
+                  * independent of `open`: an N == 1 hop before the first window opens no frame) */
 };
 
 typedef struct DFN2StreamLayout {
@@ -388,7 +388,7 @@ int dfn2_stream_hop_size(const DFN2Stream *s) {
     return s ? s->grid.hop : -1;
 }
 
-/* Shared tail of both pre_process entries: rc is the prepost's pre_process result (1: a job for the accelerator,
+/* Shared tail of the pre_process entries: rc is the prepost's pre_process result (1: a job for the accelerator,
  * 0: push only), -1 a contract error. Opens the frame when a job is due and marks post_process due. */
 static int open_hop(DFN2Stream *s, int rc, DFN2HopIO *io) {
     if (rc < 0) return -1;
@@ -405,7 +405,7 @@ static int open_hop(DFN2Stream *s, int rc, DFN2HopIO *io) {
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io) {
     int hop, i, rc;
 
-    if (!s || !pcm_in || !io || s->pending || !s->stft) return -1;
+    if (!s || !pcm_in || !io || s->pending || !s->stft || s->grid.frames_per_call != 1) return -1;
     hop = s->grid.hop;
 
     for (i = 0; i < hop; ++i) s->hop_in[i] = (float)pcm_in[i] / 32768.0f;
@@ -413,9 +413,8 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
 
     ac_stft_push_planar(s->stft, s->hop_in, s->spec_re, s->spec_im);
 
-    /* rc is 1 when the hop has a job for the accelerator: every hop from hop L when frames_per_call == 1,
-     * once every N hops otherwise; 0 for the others (nothing to run) -- io->job_ready carries that to the
-     * caller; -1 is a genuine contract error. */
+    /* rc is 1 once the graph's window is complete (every hop from hop L), 0 before (nothing to run) --
+     * io->job_ready carries that to the caller; -1 is a genuine contract error. */
     rc = dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im);
     return open_hop(s, rc, io);
 }
@@ -437,7 +436,7 @@ static void dfn2_stream_close_frame(DFN2Stream *s, int ai_rc) {
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
     int hop, i, valid;
 
-    if (!s || !pcm_out || !s->pending || !s->istft) return -1;
+    if (!s || !pcm_out || !s->pending || !s->istft || s->grid.frames_per_call != 1) return -1;
     hop = s->grid.hop;
     s->pending = 0;
     dfn2_stream_close_frame(s, ai_rc);
@@ -455,7 +454,8 @@ int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const 
                                       const float *app_re, const float *app_im, DFN2HopIO *io) {
     int rc;
 
-    if (!s || !est_re || !est_im || !app_re || !app_im || !io || s->pending) return -1;
+    if (!s || !est_re || !est_im || !app_re || !app_im || !io || s->pending || s->grid.frames_per_call != 1)
+        return -1;
     /* A bin that is non-finite or too large for the feature power would poison the normaliser until reset. */
     if (!dfn2_stream_bins_in_range(est_re, (size_t)s->grid.n_bins, 1.0f) ||
         !dfn2_stream_bins_in_range(est_im, (size_t)s->grid.n_bins, 1.0f) ||
@@ -468,10 +468,70 @@ int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const 
 }
 
 int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid) {
-    if (!s || !re || !im || !s->pending) return -1;
+    if (!s || !re || !im || !s->pending || s->grid.frames_per_call != 1) return -1;
     s->pending = 0;
     dfn2_stream_close_frame(s, ai_rc);
     return dfn2_prepost_post_process_freq(s->prepost, re, im, valid) == 0 ? 0 : -1;
+}
+
+int dfn2_stream_pre_process_packet(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io) {
+    int hop, nb, n, i, k, rc;
+    float *re, *im;
+
+    if (!s || !pcm_in || !io || s->pending || !s->stft || s->grid.frames_per_call < 2) return -1;
+    if (dfn2_prepost_block_input(s->prepost, &re, &im) != 0) return -1;
+    hop = s->grid.hop;
+    nb = s->grid.n_bins;
+    n = s->grid.frames_per_call;
+    for (i = 0; i < n; ++i) {
+        for (k = 0; k < hop; ++k) s->hop_in[k] = (float)pcm_in[(size_t)i * (size_t)hop + (size_t)k] / 32768.0f;
+        if (s->hpf) hpf_process(s->hpf, s->hop_in, hop);
+        ac_stft_push_planar(s->stft, s->hop_in, re + (size_t)i * (size_t)nb, im + (size_t)i * (size_t)nb);
+    }
+    rc = dfn2_prepost_pre_process_block_dual(s->prepost, re, im, re, im);
+    return open_hop(s, rc, io);
+}
+
+int dfn2_stream_post_process_packet(DFN2Stream *s, int ai_rc, int16_t *pcm_out) {
+    int hop, nb, n, i, k, valid = 0;
+    const float *re, *im;
+
+    if (!s || !pcm_out || !s->pending || !s->istft || s->grid.frames_per_call < 2) return -1;
+    hop = s->grid.hop;
+    nb = s->grid.n_bins;
+    n = s->grid.frames_per_call;
+    s->pending = 0;
+    dfn2_stream_close_frame(s, ai_rc);
+
+    if (dfn2_prepost_block_output(s->prepost, &re, &im) != 0 ||
+        dfn2_prepost_post_process_block(s->prepost, NULL, NULL, &valid) != 0)
+        return -1;
+    for (i = 0; i < n; ++i) {
+        ac_istft_push_planar(s->istft, re + (size_t)i * (size_t)nb, im + (size_t)i * (size_t)nb, s->hop_out);
+        for (k = 0; k < hop; ++k) pcm_out[(size_t)i * (size_t)hop + (size_t)k] = stream_saturate_s16(s->hop_out[k]);
+    }
+    return valid;
+}
+
+int dfn2_stream_pre_process_packet_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,
+                                             const float *app_re, const float *app_im, DFN2HopIO *io) {
+    const size_t count = s ? (size_t)s->grid.n_bins * (size_t)s->grid.frames_per_call : 0u;
+    int rc;
+
+    if (!s || !est_re || !est_im || !app_re || !app_im || !io || s->pending || s->grid.frames_per_call < 2)
+        return -1;
+    if (!dfn2_stream_bins_in_range(est_re, count, 1.0f) || !dfn2_stream_bins_in_range(est_im, count, 1.0f) ||
+        !dfn2_stream_bins_in_range(app_re, count, 1.0f) || !dfn2_stream_bins_in_range(app_im, count, 1.0f))
+        return -1;
+    rc = dfn2_prepost_pre_process_block_dual(s->prepost, est_re, est_im, app_re, app_im);
+    return open_hop(s, rc, io);
+}
+
+int dfn2_stream_post_process_packet_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid_frames) {
+    if (!s || !re || !im || !s->pending || s->grid.frames_per_call < 2) return -1;
+    s->pending = 0;
+    dfn2_stream_close_frame(s, ai_rc);
+    return dfn2_prepost_post_process_block(s->prepost, re, im, valid_frames) == 0 ? 0 : -1;
 }
 
 #ifndef DFN2_STREAM_NO_STDIO

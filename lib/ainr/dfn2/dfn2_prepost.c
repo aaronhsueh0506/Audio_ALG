@@ -29,9 +29,8 @@ struct DFN2Prepost {
     const float *erb_fwd;   /* borrowed, never created or destroyed here */
     const float *erb_inv;
 
-    /* Per-frame staging, one slot per frame of the call; a frame writes the slot
-     * dfn2_model_io_frame_slot() gives after its push. */
-    float *spec_re;     /* [N][n_bins]  frames, original scale */
+    /* Single-frame staging (N == 1); a block (N > 1) stages its frames in apply_*. */
+    float *spec_re;     /* [n_bins]  frame, original scale */
     float *spec_im;
     /* apply_*: the dual entry point's application spectrum; enhanced_* point at what the enhance stage reads */
     float *apply_re;    /* [N][n_bins]                                      */
@@ -57,16 +56,10 @@ struct DFN2Prepost {
     float *skip_coefs;      /* [df_bins * df_order * 2], all 0.0f           */
 #endif
 
-    /* The last call's N enhanced frames are emitted one per frame: slot `deliver`, 0 on the
-     * frame of the commit. */
-    int       deliver;
-    int      *slot_emitted;   /* [N] */
-    long long *slot_frame;    /* [N] */
-
     long long output_frame;  /* source frame of the last emission, -1 none  */
     int       frame_open;    /* a frame awaits commit or skip               */
     int       prepared;      /* frame_open() armed the accelerator transaction for the open frame */
-    int       have_output;   /* this frame emits a spectrum                 */
+    int       valid_frames;  /* frames of the last commit that carry a spectrum (the last ones of the call) */
 
     /* _create bookkeeping; 0 for an _init instance. */
     void *heap_base;
@@ -159,8 +152,8 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
     const size_t frames = (size_t)g->frames_per_call;
     const size_t frame_bins = frames * (size_t)g->n_bins;
     const size_t float_counts[] = {
-        frame_bins,
-        frame_bins,
+        (size_t)g->n_bins,   /* spec_re, spec_im: the single-frame entries (N == 1); a block stages in apply_* */
+        (size_t)g->n_bins,
         (size_t)g->n_erb,
         2u * (size_t)g->df_bins,
         frame_bins,
@@ -218,10 +211,6 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
     if (base && p) p->enhanced_re = (const float **)ptr;
     if (pp_carve(base, &cursor, frames, sizeof(const float *), &ptr) != 0) return -1;
     if (base && p) p->enhanced_im = (const float **)ptr;
-    if (pp_carve(base, &cursor, frames, sizeof(int), &ptr) != 0) return -1;
-    if (base && p) p->slot_emitted = (int *)ptr;
-    if (pp_carve(base, &cursor, frames, sizeof(long long), &ptr) != 0) return -1;
-    if (base && p) p->slot_frame = (long long *)ptr;
 
     if (pp_carve(base, &cursor, frame_bins, sizeof(float), &ptr) != 0) return -1;
     if (base && p) p->apply_re = (float *)ptr;
@@ -247,6 +236,8 @@ static int pp_check_config(const DFN2PrepostConfig *cfg) {
     /* Mask expansion and the ERB feature branch run on the spectrum side. */
     if (!cfg->erb_fwd || !cfg->erb_inv) return -1;
     if (!isfinite(cfg->atten_lim_db)) return -1;
+    /* A block's graph reads its own N frames and two before them, no frame beyond: L == 0. */
+    if (cfg->grid.mask_lookahead > 0 && cfg->grid.frames_per_call > 1) return -1;
     if (dfn2_registration_check(cfg->gru_hidden, cfg->gru_hidden_elements,
                                 cfg->df_convp_history,
                                 cfg->df_convp_history_elements) != 0)
@@ -282,7 +273,7 @@ static void pp_reset_states(DFN2Prepost *p) {
 static void pp_clear_frame(DFN2Prepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
-    p->have_output = 0;
+    p->valid_frames = 0;
 }
 
 static void pp_zero_staging(DFN2Prepost *p) {
@@ -290,9 +281,7 @@ static void pp_zero_staging(DFN2Prepost *p) {
     const size_t frame_bins = frames * (size_t)p->grid.n_bins;
     memset(p->enh_re, 0, frame_bins * sizeof(float));
     memset(p->enh_im, 0, frame_bins * sizeof(float));
-    p->deliver = 0;
-    memset(p->slot_emitted, 0, frames * sizeof(int));
-    memset(p->slot_frame, 0, frames * sizeof(long long));
+    p->valid_frames = 0;
 }
 
 DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
@@ -445,27 +434,10 @@ static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
 
-/* Slot the next push fills. */
-static int pp_input_slot(const DFN2Prepost *p) {
-    return (dfn2_model_io_frame_slot(p->io) + 1) % p->grid.frames_per_call;
-}
-
-static int pp_deliver_slot(const DFN2Prepost *p) {
-    return p->deliver;
-}
-
-static void pp_deliver(DFN2Prepost *p, int slot) {
-    p->deliver = slot;
-    p->have_output = p->slot_emitted[slot];
-    if (p->have_output) p->output_frame = p->slot_frame[slot];
-}
-
-/* Features and graph window, shared by every pre_process entry point. `est_*` is read only inside this call;
- * the hop's source is already in enhanced_*[slot]. Returns the accelerator invocations this hop needs (0 or 1):
- * 0 while the graph window is incomplete (the first L frames after init or reset) and, with N > 1, on the hops
- * between two calls. The first L frames advance the enhance clock here and open no frame. */
-static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
-                          const float *est_im, int slot) {
+/* Features and graph window of one frame of the single-frame entries (N == 1). `est_*` is read only inside this
+ * call; the hop's source is already in enhanced_*[0]. Returns the accelerator invocations this hop needs (0 or 1):
+ * 0 while the graph's window is not complete (the first L frames): the enhance clock advances without heads. */
+static int pp_begin_frame(DFN2Prepost *p, const float *est_re, const float *est_im) {
     int heads_needed;
 
     pp_clear_frame(p);
@@ -475,19 +447,10 @@ static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
     if (heads_needed < 0) return -1;
 
     if (heads_needed == 0) {
-        if (dfn2_model_io_frame_slot(p->io) < 0) {
-            /* before the first window: the clock advances with heads_valid=0, which
-             * dfn2_enhance_spectrum_stream() accepts exactly while current < mask_lookahead. */
-            if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[slot],
-                                    p->enhanced_im[slot], 0, NULL, NULL, 0.0f,
-                                    p->atten_lim_db, p->enh_re, p->enh_im,
-                                    NULL) != 0) {
-                return -1;
-            }
-            return 0;
-        }
-        /* the frame waits in its slot; this call emits the next frame of the previous call */
-        pp_deliver(p, slot + 1);
+        /* dfn2_enhance_spectrum_stream() accepts heads_valid=0 exactly while current < mask_lookahead. */
+        if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[0], p->enhanced_im[0], 0, NULL, NULL, 0.0f,
+                                p->atten_lim_db, p->enh_re, p->enh_im, NULL) != 0)
+            return -1;
         return 0;
     }
     p->frame_open = 1;
@@ -496,43 +459,58 @@ static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
 
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
                                   const float *spec_im) {
-    int slot;
-    float *re;
-    float *im;
     size_t bins;
     if (!p || !spec_re || !spec_im) return -1;
-    if (p->frame_open) return -1;
+    if (p->frame_open || p->grid.frames_per_call != 1) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
-    slot = pp_input_slot(p);
-    re = p->spec_re + (size_t)slot * (size_t)p->grid.n_bins;
-    im = p->spec_im + (size_t)slot * (size_t)p->grid.n_bins;
-    memcpy(re, spec_re, bins);
-    memcpy(im, spec_im, bins);
-    p->enhanced_re[slot] = re;
-    p->enhanced_im[slot] = im;
-    return pp_begin_frame(p, re, im, slot);
+    memcpy(p->spec_re, spec_re, bins);
+    memcpy(p->spec_im, spec_im, bins);
+    p->enhanced_re[0] = p->spec_re;
+    p->enhanced_im[0] = p->spec_im;
+    return pp_begin_frame(p, p->spec_re, p->spec_im);
 }
 
 int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
                                        const float *est_im,
                                        const float *app_re,
                                        const float *app_im) {
-    int slot;
-    float *re;
-    float *im;
     size_t bins;
     if (!p || !est_re || !est_im || !app_re || !app_im) return -1;
-    if (p->frame_open) return -1;
+    if (p->frame_open || p->grid.frames_per_call != 1) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
     /* the application spectrum is read again at commit, so it is copied */
-    slot = pp_input_slot(p);
-    re = p->apply_re + (size_t)slot * (size_t)p->grid.n_bins;
-    im = p->apply_im + (size_t)slot * (size_t)p->grid.n_bins;
-    memcpy(re, app_re, bins);
-    memcpy(im, app_im, bins);
-    p->enhanced_re[slot] = re;
-    p->enhanced_im[slot] = im;
-    return pp_begin_frame(p, est_re, est_im, slot);
+    memcpy(p->apply_re, app_re, bins);
+    memcpy(p->apply_im, app_im, bins);
+    p->enhanced_re[0] = p->apply_re;
+    p->enhanced_im[0] = p->apply_im;
+    return pp_begin_frame(p, est_re, est_im);
+}
+
+int dfn2_prepost_pre_process_block_dual(DFN2Prepost *p, const float *est_re, const float *est_im,
+                                        const float *app_re, const float *app_im) {
+    const int frames = p ? p->grid.frames_per_call : 0;
+    const size_t n_bins = p ? (size_t)p->grid.n_bins : 0u;
+    int i;
+    if (!p || !est_re || !est_im || !app_re || !app_im) return -1;
+    if (p->frame_open || frames < 2) return -1;
+    pp_clear_frame(p);
+    for (i = 0; i < frames; ++i) {
+        float *re = p->apply_re + (size_t)i * n_bins;
+        float *im = p->apply_im + (size_t)i * n_bins;
+        /* the application spectrum is read again at commit, so it is staged unless the caller wrote it there */
+        if (re != app_re + (size_t)i * n_bins) memcpy(re, app_re + (size_t)i * n_bins, n_bins * sizeof(float));
+        if (im != app_im + (size_t)i * n_bins) memcpy(im, app_im + (size_t)i * n_bins, n_bins * sizeof(float));
+        p->enhanced_re[i] = re;
+        p->enhanced_im[i] = im;
+    }
+    /* N pushes: the window is then the call's frames and the two before them */
+    for (i = 0; i < frames; ++i) {
+        dfn2_compute_features(p->dsp, est_re + (size_t)i * n_bins, est_im + (size_t)i * n_bins, p->feat_erb,
+                              p->feat_spec);
+        if (dfn2_model_io_push_features(p->io, p->feat_erb, p->feat_spec) < 0) return -1;
+    }
+    p->frame_open = 1;
+    return 1;
 }
 
 int dfn2_prepost_frame_open(DFN2Prepost *p, DFN2PrepostInputs *inputs,
@@ -587,6 +565,8 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                           const float *coefs, const float *alpha,
                           int stride) {
     int i;
+    int valid = 0;
+    long long last = -1;
 
 #ifdef DFN2_MASK_ONLY
     (void)coefs;   /* no deep filter: only the ERB mask head exists */
@@ -617,12 +597,15 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                                       enh_im, &frame);
 #endif
         if (emitted < 0) return -1;
-        p->slot_emitted[i] = emitted;   /* 0: the cascade has not reached a source frame yet */
-        p->slot_frame[i] = frame;
+        if (emitted) {   /* 0: the cascade has not reached a source frame yet */
+            ++valid;
+            last = frame;
+        }
     }
     p->frame_open = 0;
     p->prepared = 0;
-    pp_deliver(p, 0);
+    p->valid_frames = valid;
+    if (valid) p->output_frame = last;
     return 0;
 }
 
@@ -682,14 +665,36 @@ int dfn2_prepost_frame_fail(DFN2Prepost *p, int run_started) {
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
                                    int *valid) {
     size_t bins;
-    size_t at;
     if (!p || !re || !im) return -1;
-    if (p->frame_open) return -1;
+    if (p->frame_open || p->grid.frames_per_call != 1) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
-    at = (size_t)pp_deliver_slot(p) * (size_t)p->grid.n_bins;
-    memcpy(re, p->enh_re + at, bins);
-    memcpy(im, p->enh_im + at, bins);
-    if (valid) *valid = p->have_output;
+    memcpy(re, p->enh_re, bins);
+    memcpy(im, p->enh_im, bins);
+    if (valid) *valid = p->valid_frames;
+    return 0;
+}
+
+int dfn2_prepost_block_input(DFN2Prepost *p, float **re, float **im) {
+    if (!p || !re || !im || p->frame_open || p->grid.frames_per_call < 2) return -1;
+    *re = p->apply_re;
+    *im = p->apply_im;
+    return 0;
+}
+
+int dfn2_prepost_block_output(const DFN2Prepost *p, const float **re, const float **im) {
+    if (!p || !re || !im || p->frame_open || p->grid.frames_per_call < 2) return -1;
+    *re = p->enh_re;
+    *im = p->enh_im;
+    return 0;
+}
+
+int dfn2_prepost_post_process_block(DFN2Prepost *p, float *re, float *im, int *valid_frames) {
+    size_t bytes;
+    if (!p || p->frame_open || p->grid.frames_per_call < 2) return -1;
+    bytes = (size_t)p->grid.frames_per_call * (size_t)p->grid.n_bins * sizeof(float);
+    if (re) memcpy(re, p->enh_re, bytes);
+    if (im) memcpy(im, p->enh_im, bytes);
+    if (valid_frames) *valid_frames = p->valid_frames;
     return 0;
 }
 

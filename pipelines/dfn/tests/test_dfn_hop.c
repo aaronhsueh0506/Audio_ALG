@@ -753,8 +753,8 @@ static void test_frames_per_call_guard(void) {
     three.frames_per_call = 3;
     CHECK(dfn_hop_lookahead_frames(&one) == one.mask_lookahead + one.df_lookahead, "lookahead: L + D at N = 1");
     CHECK(dfn_hop_lookahead_frames(&three) == dfn2_prepost_latency_frames(&three) &&
-          dfn_hop_lookahead_frames(&three) == three.mask_lookahead + three.df_lookahead + 2,
-          "lookahead: dfn2_prepost_latency_frames (L + D + N - 1) at N = 3");
+          dfn_hop_lookahead_frames(&three) == three.mask_lookahead + three.df_lookahead,
+          "lookahead: dfn2_prepost_latency_frames (L + D) at N = 3");
     CHECK(dfn_hop_lookahead_frames(NULL) == 0, "lookahead: 0 for NULL");
 
     memset(&h, 0xA5, sizeof h);

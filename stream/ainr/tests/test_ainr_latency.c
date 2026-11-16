@@ -55,8 +55,8 @@ static int check_pulse(const float *out, size_t n, size_t idx, const char *label
 }
 
 /* want_queue / want_latency are the literal values of the catalog row (L, D lookahead hops of its grid):
- * queue_frames = L + D + N - 1, latency = (queue_frames + 1) * hop samples -- spelled out per row, not
- * derived from the library's own formula. */
+ * queue_frames = L + D (whatever N is), latency = (queue_frames + 1) * hop samples -- spelled out per row,
+ * not derived from the library's own formula. */
 static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_latency, const char *label) {
     AinrConfig cfg;
     StreamMemReq req;
@@ -173,7 +173,7 @@ int main(void) {
     rc |= run_case(48000, 1024, 32, 1, 1, 1024, "latency[lite 48k/1024 N=1]");
 #else
     rc |= run_case(16000, 256, 24, 1, 0, 128, "latency[full 16k/256 N=1]");
-    rc |= run_case(16000, 256, 24, 8, 7, 1024, "latency[full 16k/256 N=8]");
+    rc |= run_case(16000, 256, 24, 8, 0, 128, "latency[full 16k/256 N=8]");
     rc |= run_case(48000, 1024, 32, 1, 2, 1536, "latency[full 48k/1024 N=1]");
 #endif
     if (rc) { printf("test_ainr_latency: FAIL\n"); return 1; }

@@ -1,31 +1,31 @@
 """The DFN2 C host for N frames per call equals the one-frame host.
 
-A grid with ``frames_per_call = N`` runs the accelerator once per N hops on an ``N + 2`` frame
-window and composes the N returned frames in one burst. The stand-in accelerator below is a pure
-function of (three-frame window slice, state) -> (heads, next state), applied to the N slices in
-order the way the exported graph is, so the N-frame host and the one-frame host see the same
-arithmetic and must agree BYTE FOR BYTE. One driver binary takes N as an argument:
+A grid with ``frames_per_call = N`` (``mask_lookahead = 0`` only) runs the accelerator once per block of N
+frames, on an ``N + 2`` frame window (the block's N frames and the two before them), and returns the N heads in
+one burst. The stand-in accelerator below is a pure function of (three-frame window slice, state) -> (heads, next
+state), applied to the N slices in order the way the exported graph is, so the block host and the one-frame
+host see the same arithmetic and must agree BYTE FOR BYTE, hop for hop, with no shift. One driver binary takes N
+as an argument:
 
   stream       the head sequence the accelerator produced, the final state of both recurrent
-               tensors, and every output hop (the N-frame host trails by N - 1 hops: its hop
-               h + N - 1 is the one-frame host's hop h), for a stream length that is not a
-               multiple of N, with the single and the dual entry mixed
-  reset        a reset in the middle of a call; both segments agree
-  refuse       a call whose head or state comes back non-finite is refused, the state is
+               tensors, and every output hop, for a stream length that is not a multiple of N (the
+               real signal ends mid-block), with the shared and the split est/app spectrum mixed
+  reset        a reset between two blocks; both segments agree
+  refuse       a block whose head or state comes back non-finite is refused, the state is
                zeroed and the N frames pass as the identity, the same as N one-frame refusals
   contract     readiness (L + N hops, then every N; N == 1: every hop from hop L, the first L
                hops open no frame), the window rows at the grid's stride, the
-               descriptor's input_frames (N + 2), the latency accessor, element counts, a
-               descriptor made for another grid refused before infer() runs, and a pool of the
-               one-frame grid or of another grid refused
+               descriptor's input_frames (N + 2), the latency accessor (L + D for every N), element
+               counts, a descriptor made for another grid refused before infer() runs, and a pool of
+               the one-frame grid or of another grid refused; a grid with mask_lookahead > 0 and
+               N > 1 is refused at sizing and at init
   abi          the 72-byte descriptor, filled and checked through a grid of either N: nothing
                written or read past it, a descriptor of 3 input frames refused by N > 1
 
 A stand-in reading the wrong window slice fails the comparison, so it is not vacuous.
 
 The one-frame host (N == 1) opens no frame for the first L hops of its stream start and the stand-in
-is not called for them, so its output equals the N-frame host's, which is the regression gate
-for the per-hop flow (no generation step before the first call).
+is not called for them; the block hosts have L == 0 and no such hops.
 
 The recurrent state is the host's: the driver registers the two buffers. The driver runs the
 grid of ``dfn2_test_grid.h`` (the shipped 48 kHz grid unless ``-DDFN2_GRID_KHZ`` says otherwise)
@@ -44,6 +44,9 @@ import dfn_pairs
 FAMILY = 'DeepFilterNet2'
 _SOURCES = ('prepost', 'process', 'model_io')
 PAIRS = ((1, 1), (0, 0), (2, 4), (0, 1), (2, 0))
+# N > 1 needs mask_lookahead == 0; the other pairs run at N == 1 and are refused above it.
+BLOCK_PAIRS = tuple(pair for pair in PAIRS if pair[0] == 0)
+LOOKAHEAD_PAIRS = tuple(pair for pair in PAIRS if pair[0] > 0)
 FRAMES = (2, 3, 5, 10)
 # Grids other than the shipped 48 kHz one: the 16 and 32 kHz presets of
 # dfn2_test_grid.h and a custom grid (-DDFN2_SR and the three others) whose band
@@ -248,7 +251,10 @@ static DFN2Prepost *make(void) {
 static DFN2PrepostInputs views_in;
 static DFN2PrepostOutputs views_out;
 
-/* freq, reset, refuse: one stream through dfn2_model_run_frame. */
+#define MAX_BLOCK 16
+
+/* freq, reset, refuse: one stream through dfn2_model_run_frame; N == 1 per hop, N > 1 one block of N frames per
+ * call (hops is a multiple of N, a reset falls between two blocks). */
 static int run_stream(int real, int hops, int reset_hop, long long plo, long long phi, int pkind) {
     DFN2Prepost *p;
     DFN2ModelIoDescriptor descriptor;
@@ -257,8 +263,12 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
     static float est_re[DFN2_N_BINS], est_im[DFN2_N_BINS];
     static float app_re[DFN2_N_BINS], app_im[DFN2_N_BINS];
     static float out_spec[2 * DFN2_N_BINS];
+    static float blk_est_re[MAX_BLOCK * DFN2_N_BINS], blk_est_im[MAX_BLOCK * DFN2_N_BINS];
+    static float blk_app_re[MAX_BLOCK * DFN2_N_BINS], blk_app_im[MAX_BLOCK * DFN2_N_BINS];
+    static float blk_out_re[MAX_BLOCK * DFN2_N_BINS], blk_out_im[MAX_BLOCK * DFN2_N_BINS];
     int h, k;
 
+    CHECK(NF <= MAX_BLOCK);
     p = make();
     CHECK(p != NULL);
     CHECK(dfn2_model_io_descriptor_default(&g_grid, &descriptor) == 0);
@@ -270,6 +280,62 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
     model.infer = stub_infer;
     model.reset = NULL;
     model.io_descriptor = &descriptor;
+
+    if (NF > 1) {
+        CHECK(hops % NF == 0 && (reset_hop < 0 || reset_hop % NF == 0));
+        for (h = 0; h < hops; h += NF) {
+            int i, rc, valid = 0;
+            long long last = -1;
+            if (h == reset_hop) {
+                dfn2_prepost_reset(p);
+                stub.next_head = 0;
+                rec('R', h, 0, 0, NULL, 0);
+            }
+            for (i = 0; i < NF; ++i) {
+                const int live = h + i < real;
+                float *er = blk_est_re + (size_t)i * DFN2_N_BINS, *ei = blk_est_im + (size_t)i * DFN2_N_BINS;
+                float *ar = blk_app_re + (size_t)i * DFN2_N_BINS, *ai = blk_app_im + (size_t)i * DFN2_N_BINS;
+                for (k = 0; k < DFN2_N_BINS; ++k) {
+                    er[k] = live ? noise(h + i, 2 * k) : 0.0f;
+                    ei[k] = live ? noise(h + i, 2 * k + 1) : 0.0f;
+                    /* as the one-frame host: every third hop has its own application spectrum, the others
+                     * hand one spectrum as est and app */
+                    if ((h + i) % 3 == 0) {
+                        ar[k] = 0.5f * er[k] + (live ? noise(h + i + 7, k) : 0.0f);
+                        ai[k] = 0.5f * ei[k];
+                    } else {
+                        ar[k] = er[k];
+                        ai[k] = ei[k];
+                    }
+                }
+            }
+            rc = dfn2_prepost_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_app_re, blk_app_im);
+            CHECK(rc == 1);
+            CHECK(dfn2_model_run_frame(&model, p) >= 0);
+            CHECK(dfn2_prepost_post_process_block(p, blk_out_re, blk_out_im, &valid) == 0);
+            CHECK(valid >= 0 && valid <= NF);
+            if (valid) CHECK(dfn2_prepost_output_frame_index(p, &last) == 0);
+            for (i = 0; i < NF; ++i) {
+                const int written = i >= NF - valid;
+                memcpy(out_spec, blk_out_re + (size_t)i * DFN2_N_BINS, DFN2_N_BINS * sizeof(float));
+                memcpy(out_spec + DFN2_N_BINS, blk_out_im + (size_t)i * DFN2_N_BINS, DFN2_N_BINS * sizeof(float));
+                rec('O', h + i, (written ? 1 : 0) | ((i == NF - 1 ? 1 : 0) << 1),
+                    written ? last - (NF - 1 - i) : -1, out_spec, 2 * DFN2_N_BINS);
+            }
+        }
+        CHECK(stub.bad_views == 0);
+        /* the final state, as for N == 1: the views of the next open block */
+        memset(blk_est_re, 0, sizeof blk_est_re);
+        memset(blk_est_im, 0, sizeof blk_est_im);
+        CHECK(dfn2_prepost_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_est_re, blk_est_im) == 1);
+        CHECK(dfn2_prepost_frame_open(p, &views_in, &views_out) == 0);
+        rec('S', 0, 0, 0, views_in.gru_hidden, (int)views_in.gru_hidden_elements);
+        rec('W', 0, 0, 0, views_in.df_convp_window, (int)views_in.df_convp_window_elements);
+        rec('G', (int)dfn2_prepost_state_generation(p), 0, 0, NULL, 0);
+        printf("calls=%d generation=%u\n", stub.calls, dfn2_prepost_state_generation(p));
+        dfn2_prepost_destroy(p);
+        return 0;
+    }
 
     for (h = 0; h < hops; ++h) {
         const int live = h < real;
@@ -389,10 +455,21 @@ static int case_contract(void) {
     }
     free(io_block);
 
+    /* mask_lookahead > 0 with N > 1 is not a grid the class builds: refused at sizing and at init. */
+    if (LA > 0 && NF > 1) {
+        CHECK(dfn2_prepost_config_defaults(&cfg, grid) == 0);
+        cfg.erb_fwd = &erb_fwd[0][0];
+        cfg.erb_inv = &erb_inv[0][0];
+        CHECK(dfn2_prepost_get_mem_size(&cfg, &freq_req) == -1);
+        CHECK(make() == NULL);
+        printf("refused\n");
+        return 0;
+    }
+
     /* The class: pre_process readiness, views, latency, first output. */
     p = make();
     CHECK(p != NULL);
-    CHECK(dfn2_prepost_latency_frames(grid) == LA + DA + NF - 1);
+    CHECK(dfn2_prepost_latency_frames(grid) == LA + DA);
     CHECK(dfn2_prepost_grid(p) != NULL && dfn2_prepost_grid(p)->n_erb == E &&
           dfn2_prepost_grid(p)->df_bins == F &&
           dfn2_prepost_grid(p)->frames_per_call == NF);
@@ -403,15 +480,31 @@ static int case_contract(void) {
     model.reset = NULL;
     bad = d;
     bad.input_frames = DFN2_MODEL_INPUT_FRAMES + (NF == 1);
-    for (h = 0; h < LA + DA + 6 * NF + 4; ++h) {
+    if (NF > 1) {   /* the per-hop entries refuse a block stream, the block entry refuses N == 1 */
+        CHECK(dfn2_prepost_pre_process_freq(p, est_re, est_im) == -1);
+        CHECK(dfn2_prepost_pre_process_freq_dual(p, est_re, est_im, est_re, est_im) == -1);
+        CHECK(dfn2_prepost_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS, NULL) == -1);
+    }
+    for (h = 0; h < LA + DA + 6 * NF + 4; h += (NF > 1 ? NF : 1)) {
         int rc, want;
-        for (b = 0; b < DFN2_N_BINS; ++b) {
-            est_re[b] = noise(h, 2 * b);
-            est_im[b] = noise(h, 2 * b + 1);
+        if (NF > 1) {
+            static float re_blk[MAX_BLOCK * DFN2_N_BINS], im_blk[MAX_BLOCK * DFN2_N_BINS];
+            CHECK(NF <= MAX_BLOCK);
+            for (b = 0; b < NF * DFN2_N_BINS; ++b) {
+                re_blk[b] = noise(h, 2 * b);
+                im_blk[b] = noise(h, 2 * b + 1);
+            }
+            rc = dfn2_prepost_pre_process_block_dual(p, re_blk, im_blk, re_blk, im_blk);
+            CHECK(rc == 1);
+        } else {
+            for (b = 0; b < DFN2_N_BINS; ++b) {
+                est_re[b] = noise(h, 2 * b);
+                est_im[b] = noise(h, 2 * b + 1);
+            }
+            rc = dfn2_prepost_pre_process_freq(p, est_re, est_im);
+            want = h >= LA;   /* N == 1: every hop from hop L */
+            CHECK(rc == want);
         }
-        rc = dfn2_prepost_pre_process_freq(p, est_re, est_im);
-        want = h + 1 >= LA + NF && (h + 1 - LA) % NF == 0;
-        CHECK(rc == want);
         if (rc == 1) {
             int calls = stub.calls;
             /* Another N's descriptor is refused before infer() runs. */
@@ -436,11 +529,19 @@ static int case_contract(void) {
             CHECK(dfn2_model_run_frame(&model, p) == 1);
             CHECK(stub.calls == calls + 1);
         }
-        CHECK(dfn2_prepost_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS,
-                                             &written) == 0);
-        if (written && first_written < 0) first_written = h;
+        if (NF > 1) {
+            static float out_blk_re[MAX_BLOCK * DFN2_N_BINS], out_blk_im[MAX_BLOCK * DFN2_N_BINS];
+            int valid = -1;
+            CHECK(dfn2_prepost_post_process_block(p, out_blk_re, out_blk_im, &valid) == 0);
+            CHECK(valid == NF - (LA + DA > h ? (LA + DA - h < NF ? LA + DA - h : NF) : 0));
+            if (valid && first_written < 0) first_written = h + (NF - valid);
+        } else {
+            CHECK(dfn2_prepost_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS,
+                                                 &written) == 0);
+            if (written && first_written < 0) first_written = h;
+        }
     }
-    CHECK(first_written == LA + DA + NF - 1);
+    CHECK(first_written == LA + DA);
     /* the frames before the first call open nothing and move nothing */
     CHECK(dfn2_prepost_state_generation(p) == 1u);
     dfn2_prepost_destroy(p);
@@ -599,34 +700,32 @@ def _segments(records):
 
 
 def _hops(pair, frames, real=REAL_HOPS):
-    """Hops that emit every real frame from the N-frame host and leave both
+    """Hops that emit every real frame from the block host and leave both
     hosts with the same number of heads: L + N * K."""
     mask, df = pair
-    need = real + mask + df + frames - 1
+    need = real + mask + df
     calls = -(-(need - mask) // frames)
     return mask + frames * calls
 
 
 def _compare(one, many, frames, poison=None):
-    """The N-frame segment `many` against the one-frame segment `one`."""
+    """The block segment `many` against the one-frame segment `one`: the same heads and the same output at every
+    hop, with no shift."""
     heads = sorted(many['heads'])
     assert heads == list(range(len(heads)))
     skip = set(range(*poison)) if poison else set()
     for index in heads:
         if index not in skip:
             assert many['heads'][index] == one['heads'][index], index
-    delay = frames - 1
     out_many, out_one = many['out'], one['out']
     assert len(out_many) == len(out_one)
-    for hop in range(len(out_one) - delay):
-        assert out_many[hop + delay][:3] == out_one[hop][:3], hop
-    for hop in range(delay):
-        assert out_many[hop][0] == 0, 'nothing is emitted in the first N-1 hops'
+    for hop in range(len(out_one)):
+        assert out_many[hop][:3] == out_one[hop][:3], hop
     return len(heads)
 
 
 @pytest.mark.parametrize('frames', FRAMES)
-@pytest.mark.parametrize('pair', PAIRS, ids=_pair_id)
+@pytest.mark.parametrize('pair', BLOCK_PAIRS, ids=_pair_id)
 def test_chunk_host_equals_the_frame_host(drivers, tmp_path, pair, frames):
     hops = _hops(pair, frames)
     driver = drivers(pair)
@@ -638,7 +737,7 @@ def test_chunk_host_equals_the_frame_host(drivers, tmp_path, pair, frames):
     assert many['final'] == one['final']
     assert 'calls=%d ' % (count // frames) in out
     emitted = [entry for entry in many['out'] if entry[0]]
-    assert many['out'].index(emitted[0]) == sum(pair) + frames - 1
+    assert many['out'].index(emitted[0]) == sum(pair)
     assert [entry[1] for entry in emitted][:REAL_HOPS] == list(
         range(REAL_HOPS))
     # Not a vacuous pass: the heads change the signal.
@@ -653,7 +752,7 @@ def test_chunk_host_equals_the_frame_host_on_other_grids(drivers, tmp_path,
     the custom grid, 64 bins, not the shipped model's 32 and 96): the N-frame host
     still equals the one-frame host byte for byte, and the stand-in reads the
     same slices from the packed windows."""
-    pair = (1, 1)
+    pair = (0, 0)
     hops = _hops(pair, frames)
     driver = drivers(pair, khz=khz)
     one, _ = _stream(driver, tmp_path, 1, hops, name='one')
@@ -670,26 +769,23 @@ def test_chunk_host_equals_the_frame_host_on_other_grids(drivers, tmp_path,
 
 
 @pytest.mark.parametrize('frames', [3, 5])
-@pytest.mark.parametrize('pair', [(1, 1), (2, 4), (0, 1)], ids=_pair_id)
-def test_a_reset_in_the_middle_of_a_call(drivers, tmp_path, pair, frames):
-    """Reset with a call half full: the pending frames are dropped with the
-    rest of the stream state, and each segment agrees with the one-frame host
-    on everything the N-frame host had emitted."""
-    reset = pair[0] + 2 * frames + 1
+@pytest.mark.parametrize('pair', [(0, 0), (0, 1)], ids=_pair_id)
+def test_a_reset_between_two_blocks(drivers, tmp_path, pair, frames):
+    """Reset after two blocks: the rings, the windows and the state are dropped with the rest of the stream
+    state, and each segment agrees with the one-frame host at every hop."""
+    reset = 2 * frames
     hops = reset + _hops(pair, frames, real=12)
     driver = drivers(pair)
     one, _ = _stream(driver, tmp_path, 1, hops, reset=reset, name='one')
     many, out = _stream(driver, tmp_path, frames, hops, reset=reset, name='many')
     one, many = _segments(one), _segments(many)
     assert len(one) == len(many) == 2
-    # Before the reset the N-frame host ran only its complete calls and had
-    # emitted up to the hop of the reset.
+    # Before the reset the block host ran its two complete calls.
     first = many[0]
     assert sorted(first['heads']) == list(range(2 * frames))
     for index in first['heads']:
         assert first['heads'][index] == one[0]['heads'][index]
-    for hop in range(reset - (frames - 1)):
-        assert first['out'][hop + frames - 1][:3] == one[0]['out'][hop][:3]
+    assert [entry[:3] for entry in first['out']] == [entry[:3] for entry in one[0]['out']]
     count = _compare(one[1], many[1], frames)
     assert count == len(one[1]['heads'])
     assert many[1]['final'] == one[1]['final']
@@ -698,7 +794,7 @@ def test_a_reset_in_the_middle_of_a_call(drivers, tmp_path, pair, frames):
 
 @pytest.mark.parametrize('kind', [1, 2], ids=['nan_head', 'nan_state'])
 @pytest.mark.parametrize('frames', [2, 5])
-@pytest.mark.parametrize('pair', [(1, 1), (0, 0), (2, 4)], ids=_pair_id)
+@pytest.mark.parametrize('pair', [(0, 0), (0, 1)], ids=_pair_id)
 def test_a_refused_call_is_n_refused_frames(drivers, tmp_path, pair, frames,
                                             kind):
     """A call whose head (kind 1) or state (kind 2) comes back non-finite is
@@ -716,8 +812,7 @@ def test_a_refused_call_is_n_refused_frames(drivers, tmp_path, pair, frames,
     one, many = _segments(one)[0], _segments(many)[0]
     _compare(one, many, frames, poison=poison)
     assert many['final'] == one['final']
-    # N > 1: one refused call. N == 1: `frames` refused frames, one step each; the first pair[0] hops of the
-    # stream start open no frame and move nothing.
+    # N > 1: one refused call. N == 1: `frames` refused frames, one step each.
     assert 'generation=2' in out_many
     assert 'generation=%d' % (1 + frames) in out_one
     # The identity reached the output: the refused frames differ from a run
@@ -731,7 +826,7 @@ def test_a_stand_in_on_the_wrong_slice_fails_the_comparison(drivers,
                                                             tmp_path):
     """The comparison reads the window slices: an accelerator that takes
     slice i + 1 for head i diverges from the one-frame host."""
-    pair, frames = (1, 1), 3
+    pair, frames = (0, 0), 3
     hops = _hops(pair, frames)
     one, _ = _stream(drivers(pair), tmp_path, 1, hops, name='one')
     many, _ = _stream(drivers(pair), tmp_path, frames, hops, name='many', slice_offset=1)
@@ -751,21 +846,36 @@ def _contract(driver, frames):
 
 
 @pytest.mark.parametrize('frames', (1,) + FRAMES)
-@pytest.mark.parametrize('pair', PAIRS, ids=_pair_id)
+@pytest.mark.parametrize('pair', BLOCK_PAIRS, ids=_pair_id)
 def test_contract_readiness_window_descriptor_and_latency(drivers, pair,
                                                           frames):
     _contract(drivers(pair), frames)
 
 
+@pytest.mark.parametrize('frames', (1,) + FRAMES)
+@pytest.mark.parametrize('pair', LOOKAHEAD_PAIRS, ids=_pair_id)
+def test_contract_with_mask_lookahead(drivers, pair, frames):
+    """The window and descriptor contract holds at every pair, the class runs at N == 1 and is refused (sizing and
+    init) above it: a block's graph needs no frame beyond its own."""
+    driver = drivers(pair)
+    if frames == 1:
+        _contract(driver, frames)
+        return
+    done = subprocess.run([str(driver), 'contract', str(frames)],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, (done.stdout, done.stderr)
+    assert done.stdout.splitlines()[-1] == 'refused', done.stdout
+
+
 @pytest.mark.parametrize('frames', (1, 3, 5))
 @pytest.mark.parametrize('khz', OTHER_GRIDS)
 def test_contract_on_other_grids(drivers, khz, frames):
-    _contract(drivers((1, 1), khz=khz), frames)
+    _contract(drivers((0, 0), khz=khz), frames)
 
 
 @pytest.mark.parametrize('frames', FRAMES)
 def test_the_pool_of_another_frame_count_is_refused(drivers, frames):
-    pair = (1, 1)
+    pair = (0, 0)
     driver = drivers(pair)
     single = _contract(driver, 1)
     chunked = _contract(driver, frames)
@@ -784,7 +894,7 @@ def test_the_pool_of_another_grid_is_refused(drivers, khz, frames):
     """The grid is folded into the pool descriptor: the 48 kHz host refuses
     the descriptor (size and hash) a host of another grid computed, and
     accepts its own."""
-    pair = (1, 1)
+    pair = (0, 0)
     shipped_driver = drivers(pair)
     shipped = _contract(shipped_driver, frames)
     other = _contract(drivers(pair, khz=khz), frames)

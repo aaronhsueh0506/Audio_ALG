@@ -129,14 +129,12 @@ static const AinrDfn2ModelEntry AINR_DFN2_CATALOG[] = {
 #endif
 
 /* One context for both families (PCM, _freq): the public Ainr*Ctx types are one-member wrappers around
- * it. stash holds the (n - 1) pre-roll hops of a block: int16 PCM for the PCM family, MODEL-scale
- * spectra ([i][re(n_bins)][im(n_bins)]) for _freq; NULL when n == 1. scratch (_freq only) is one frame
- * of MODEL-scale est/app input, 4 * n_bins floats. The _freq family's inner stream is freq_only. */
+ * it. scratch (_freq only) holds the block's MODEL-scale est/app input, 4 * n * n_bins floats. The _freq
+ * family's inner stream is freq_only. */
 typedef struct AinrCore {
     DFN2Stream  *inner;
     DFN2Grid     grid;
     int          n;            /* frames_per_call */
-    void        *stash;
     float       *scratch;
     int          block_open;
 } AinrCore;
@@ -222,16 +220,14 @@ static void ainr_stream_config(AinrFamily family, const AinrDfn2ModelEntry *entr
 
 typedef struct AinrLayout {
     AinrCore         *core;
-    void             *stash;
     float            *scratch;
     void             *inner_pool;
     DFN2StreamMemReq  sreq;
     size_t            total;
 } AinrLayout;
 
-/* Carves (base != NULL) or just sizes (base == NULL) the core header, the family's stash, the _freq
- * scratch and the inner DFN2Stream's own pool region, in that order, using stream_mem.h's
- * overflow-checked stream_carve(). */
+/* Carves (base != NULL) or just sizes (base == NULL) the core header, the _freq scratch and the inner
+ * DFN2Stream's own pool region, in that order, using stream_mem.h's overflow-checked stream_carve(). */
 static int ainr_pool_layout(AinrFamily family, const AinrDfn2ModelEntry *entry, int n,
                             const DFN2Grid *grid, unsigned char *base, AinrLayout *out)
 {
@@ -243,16 +239,8 @@ static int ainr_pool_layout(AinrFamily family, const AinrDfn2ModelEntry *entry, 
     if (stream_carve(base, &cursor, sizeof(AinrCore), &p) != 0) return -1;
     out->core = (AinrCore *)p;
 
-    if (n > 1) {
-        size_t stash_bytes = family == AINR_FAMILY_PCM
-            ? (size_t)(n - 1) * (size_t)grid->hop * sizeof(int16_t)
-            : (size_t)(n - 1) * (size_t)grid->n_bins * 2u * sizeof(float);
-        if (stream_carve(base, &cursor, stash_bytes, &p) != 0) return -1;
-        out->stash = p;
-    }
-
     if (family == AINR_FAMILY_FREQ) {
-        if (stream_carve(base, &cursor, (size_t)grid->n_bins * 4u * sizeof(float), &p) != 0) return -1;
+        if (stream_carve(base, &cursor, (size_t)n * (size_t)grid->n_bins * 4u * sizeof(float), &p) != 0) return -1;
         out->scratch = (float *)p;
     }
 
@@ -350,7 +338,6 @@ static int ainr_init_common(AinrFamily family, const AinrConfig *cfg, const char
 
     lay.core->grid = grid;
     lay.core->n = n;
-    lay.core->stash = lay.stash;
     lay.core->scratch = lay.scratch;
     lay.core->block_open = 0;
     ainr_fill_info(&grid, graph_path, info);
@@ -518,103 +505,58 @@ static void ainr_prepare_work(const DFN2Grid *grid, const DFN2HopIO *hio, Stream
 }
 
 /* ---------------------------------------------------------------------------------------------
- * Block loops. Each drains the first n - 1 hops of a block into the stash (hops without a job: with
- * mask_lookahead = 0, which frames_per_call > 1 requires, the job comes at the nth hop), then opens
- * the real Nth hop. AINR_OK with *hio filled (job_ready == 1; with n == 1 also job_ready == 0, the
- * first mask_lookahead hops), AINR_ERR_SEQUENCE on a contract error.
+ * Block entries. N == 1 is the per-hop stream (job_ready 0 on the first mask_lookahead hops); N > 1 is one packet
+ * of N hops and one job. AINR_OK with *hio filled, AINR_ERR_SEQUENCE on a contract error.
  * ------------------------------------------------------------------------------------------- */
 
 static int ainr_open_pcm(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
 {
-    int i, hop = c->grid.hop;
-    int16_t *stash = (int16_t *)c->stash;
-
-    for (i = 0; i < c->n - 1; ++i) {
-        if (dfn2_stream_pre_process(c->inner, pcm_in + (size_t)i * (size_t)hop, hio) != 1 || hio->job_ready)
-            return AINR_ERR_SEQUENCE;
-        if (dfn2_stream_post_process(c->inner, 0, stash + (size_t)i * (size_t)hop) < 0)
-            return AINR_ERR_SEQUENCE;
-    }
-    if (dfn2_stream_pre_process(c->inner, pcm_in + (size_t)(c->n - 1) * (size_t)hop, hio) != 1 ||
-        (c->n > 1 && !hio->job_ready))
-        return AINR_ERR_SEQUENCE;
-    return AINR_OK;
+    int rc = c->n == 1 ? dfn2_stream_pre_process(c->inner, pcm_in, hio)
+                       : dfn2_stream_pre_process_packet(c->inner, pcm_in, hio);
+    return rc == 1 ? AINR_OK : AINR_ERR_SEQUENCE;
 }
 
-/* Spectrum -> spectrum: converts each of the n caller-supplied audio-scale est/app frames to MODEL
- * scale in `scratch` (one frame's worth, reused every iteration) before
- * dfn2_stream_pre_process_freq_dual(); drains every frame but the last into the stash, leaves the
- * last open. */
+/* Spectrum -> spectrum: converts the caller's n audio-scale est/app frames to MODEL scale in `scratch` before the
+ * stream's _freq_dual entry. */
 static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
                           const float *app_re, const float *app_im, DFN2HopIO *hio)
 {
-    int i, k, n_bins = c->grid.n_bins;
-    float scale = dfn2_stft_scale(c->grid.n_fft);
-    float *stash = (float *)c->stash;
+    const size_t count = (size_t)c->n * (size_t)c->grid.n_bins;
+    const float scale = dfn2_stft_scale(c->grid.n_fft);
     float *s_est_re = c->scratch;
-    float *s_est_im = c->scratch + n_bins;
-    float *s_app_re = c->scratch + 2 * n_bins;
-    float *s_app_im = c->scratch + 3 * n_bins;
+    float *s_est_im = c->scratch + count;
+    float *s_app_re = c->scratch + 2 * count;
+    float *s_app_im = c->scratch + 3 * count;
+    size_t k;
+    int rc;
 
-    for (i = 0; i < c->n; ++i) {
-        const float *er = est_re + (size_t)i * (size_t)n_bins;
-        const float *ei = est_im + (size_t)i * (size_t)n_bins;
-        const float *ar = app_re + (size_t)i * (size_t)n_bins;
-        const float *ai = app_im + (size_t)i * (size_t)n_bins;
-
-        for (k = 0; k < n_bins; ++k) {
-            s_est_re[k] = er[k] * scale;
-            s_est_im[k] = ei[k] * scale;
-            s_app_re[k] = ar[k] * scale;
-            s_app_im[k] = ai[k] * scale;
-        }
-
-        if (dfn2_stream_pre_process_freq_dual(c->inner, s_est_re, s_est_im, s_app_re, s_app_im, hio) != 1)
-            return AINR_ERR_SEQUENCE;
-
-        if (i < c->n - 1) {
-            float *sre = stash + (size_t)i * (size_t)n_bins * 2u;
-            float *sim = sre + n_bins;
-            int valid = 0;
-            if (hio->job_ready) return AINR_ERR_SEQUENCE;
-            if (dfn2_stream_post_process_freq(c->inner, 0, sre, sim, &valid) < 0) return AINR_ERR_SEQUENCE;
-        } else if (c->n > 1 && !hio->job_ready) {
-            return AINR_ERR_SEQUENCE;
-        }
+    for (k = 0; k < count; ++k) {
+        s_est_re[k] = est_re[k] * scale;
+        s_est_im[k] = est_im[k] * scale;
+        s_app_re[k] = app_re[k] * scale;
+        s_app_im[k] = app_im[k] * scale;
     }
-    return AINR_OK;
+    rc = c->n == 1
+        ? dfn2_stream_pre_process_freq_dual(c->inner, s_est_re, s_est_im, s_app_re, s_app_im, hio)
+        : dfn2_stream_pre_process_packet_freq_dual(c->inner, s_est_re, s_est_im, s_app_re, s_app_im, hio);
+    return rc == 1 ? AINR_OK : AINR_ERR_SEQUENCE;
 }
 
-/* Close/deliver half of _freq: closes the real Nth hop via
- * dfn2_stream_post_process_freq() (ai_rc = run_status), writes it to out_re/out_im's last slot,
- * then copies the n - 1 MODEL-scale stashed frames into the earlier slots -- the SAME
- * dfn2_stft_unscale() multiply applied uniformly to every frame, at delivery time, never twice and
- * never only to some frames. */
+/* Close/deliver half of _freq: closes the block and writes its n frames, the SAME dfn2_stft_unscale() multiply
+ * applied uniformly to every frame, never twice and never only to some frames. */
 static int ainr_close_spectrum(AinrCore *c, int run_status, float *out_re, float *out_im)
 {
-    int i, k, n_bins = c->grid.n_bins;
+    const size_t count = (size_t)c->n * (size_t)c->grid.n_bins;
+    const float unscale = dfn2_stft_unscale(c->grid.n_fft);
     int valid = 0;
-    float unscale = dfn2_stft_unscale(c->grid.n_fft);
-    const float *stash = (const float *)c->stash;
-    float *last_re = out_re + (size_t)(c->n - 1) * (size_t)n_bins;
-    float *last_im = out_im + (size_t)(c->n - 1) * (size_t)n_bins;
+    size_t k;
+    int rc = c->n == 1 ? dfn2_stream_post_process_freq(c->inner, run_status, out_re, out_im, &valid)
+                       : dfn2_stream_post_process_packet_freq(c->inner, run_status, out_re, out_im, &valid);
 
-    if (dfn2_stream_post_process_freq(c->inner, run_status, last_re, last_im, &valid) < 0)
-        return AINR_ERR_SEQUENCE;
-    for (k = 0; k < n_bins; ++k) {
-        last_re[k] *= unscale;
-        last_im[k] *= unscale;
-    }
-
-    for (i = 0; i < c->n - 1; ++i) {
-        const float *sre = stash + (size_t)i * (size_t)n_bins * 2u;
-        const float *sim = sre + n_bins;
-        float *ore = out_re + (size_t)i * (size_t)n_bins;
-        float *oim = out_im + (size_t)i * (size_t)n_bins;
-        for (k = 0; k < n_bins; ++k) {
-            ore[k] = sre[k] * unscale;
-            oim[k] = sim[k] * unscale;
-        }
+    if (rc < 0) return AINR_ERR_SEQUENCE;
+    for (k = 0; k < count; ++k) {
+        out_re[k] *= unscale;
+        out_im[k] *= unscale;
     }
     return AINR_OK;
 }
@@ -637,23 +579,15 @@ int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work)
 int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out)
 {
     AinrCore *c;
-    int i, hop;
+    int rc;
 
     if (!ctx || !pcm_out) return AINR_ERR_NULL;
     c = &ctx->core;
     if (!c->block_open) return AINR_ERR_SEQUENCE;
-    hop = c->grid.hop;
-
-    if (dfn2_stream_post_process(c->inner, run_status, pcm_out + (size_t)(c->n - 1) * (size_t)hop) < 0) {
-        c->block_open = 0;
-        return AINR_ERR_SEQUENCE;
-    }
-    for (i = 0; i < c->n - 1; ++i) {
-        memcpy(pcm_out + (size_t)i * (size_t)hop, (const int16_t *)c->stash + (size_t)i * (size_t)hop,
-               (size_t)hop * sizeof(int16_t));
-    }
+    rc = c->n == 1 ? dfn2_stream_post_process(c->inner, run_status, pcm_out)
+                   : dfn2_stream_post_process_packet(c->inner, run_status, pcm_out);
     c->block_open = 0;
-    return AINR_OK;
+    return rc < 0 ? AINR_ERR_SEQUENCE : AINR_OK;
 }
 
 /* True when every bin of the block's n frames (frame-major, contiguous) passes the stream's guard at the model scale

@@ -243,11 +243,11 @@ static int run_case(int sr, int fft, int n_erb, int n, uint64_t pcm_bytes, uint6
 int main(void) {
     int rc = 0;
 #ifdef DFN2_MASK_ONLY
-    rc |= run_case(48000, 1024, 32, 1, 235360, 171952, "poolgates[lite 48k/1024 N=1]");
+    rc |= run_case(48000, 1024, 32, 1, 235296, 171888, "poolgates[lite 48k/1024 N=1]");
 #else
-    rc |= run_case(16000, 256, 24, 1, 91312, 74752, "poolgates[full 16k/256 N=1]");
-    rc |= run_case(16000, 256, 24, 8, 148480, 137360, "poolgates[full 16k/256 N=8]");
-    rc |= run_case(48000, 1024, 32, 1, 295728, 232320, "poolgates[full 48k/1024 N=1]");
+    rc |= run_case(16000, 256, 24, 1, 91264, 74704, "poolgates[full 16k/256 N=1]");
+    rc |= run_case(16000, 256, 24, 8, 139376, 137264, "poolgates[full 16k/256 N=8]");
+    rc |= run_case(48000, 1024, 32, 1, 295680, 232272, "poolgates[full 48k/1024 N=1]");
 #endif
     if (rc) { printf("test_ainr_pool_gates: FAIL\n"); return 1; }
     printf("test_ainr_pool_gates: PASS\n");

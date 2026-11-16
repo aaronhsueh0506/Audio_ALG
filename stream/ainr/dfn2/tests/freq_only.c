@@ -5,8 +5,9 @@
  *     between hops and inside one) returns, hop for hop, the codes, job tensors, generation, validity flag and
  *     spectra of a full context fed the same;
  *   - the canary zones are intact afterwards: nothing was written outside the pool;
- *   - the PCM entries return -1 and write nothing, hpf_enable is refused, and a descriptor of the other kind of
- *     context is refused in both directions.
+ *   - the PCM entries (per-hop and packet) return -1 and write nothing, hpf_enable is refused, and a descriptor of the
+ *     other kind of context is refused in both directions.
+ * A row with N > 1 runs the packet entries (N frames per call, mask_lookahead 0).
  * File mode also refuses a short file (the last row has more bands than one read chunk, and the missing float is a
  * zero of a table that is a partition without it, so only the read itself can refuse it), another grid's header and
  * an inverse that is not a partition of unity. */
@@ -100,6 +101,17 @@ static int fill_heads(DFN2PrepostOutputs *out, int t, int kind) {
     return 0;
 }
 
+/* The _freq entries of one hop (N == 1) or one packet of N frames. */
+static int pre_freq(DFN2Stream *s, const DFN2Grid *g, const float *er, const float *ei, const float *pr, const float *pi_,
+                    DFN2HopIO *io) {
+    return g->frames_per_call == 1 ? dfn2_stream_pre_process_freq_dual(s, er, ei, pr, pi_, io)
+                                   : dfn2_stream_pre_process_packet_freq_dual(s, er, ei, pr, pi_, io);
+}
+static int post_freq(DFN2Stream *s, const DFN2Grid *g, int rc, float *re, float *im, int *valid) {
+    return g->frames_per_call == 1 ? dfn2_stream_post_process_freq(s, rc, re, im, valid)
+                                   : dfn2_stream_post_process_packet_freq(s, rc, re, im, valid);
+}
+
 static int same_job(const DFN2HopIO *a, const DFN2HopIO *b) {
     if (a->job_ready != b->job_ready || a->state_generation != b->state_generation) return 0;
     if (!a->job_ready) return 1;
@@ -111,7 +123,7 @@ static int same_job(const DFN2HopIO *a, const DFN2HopIO *b) {
 
 /* `slim` (freq_only) against `full`, hop for hop. Returns the number of differing hops. */
 static int run_pair(DFN2Stream *slim, DFN2Stream *full, const DFN2Grid *g, const char *label) {
-    const int nb = g->n_bins;
+    const int nb = g->n_bins * g->frames_per_call;   /* bins of one call */
     float *x = (float *)malloc((size_t)nb * 8u * sizeof(float));
     float *er = x, *ei = x + nb, *pr = x + 2 * nb, *pi_ = x + 3 * nb;
     float *sre = x + 4 * nb, *sim = x + 5 * nb, *fre = x + 6 * nb, *fim = x + 7 * nb;
@@ -140,26 +152,25 @@ static int run_pair(DFN2Stream *slim, DFN2Stream *full, const DFN2Grid *g, const
         if ((t % 13) == 6) {   /* a bin beyond the limit, then a NaN: refused, nothing consumed */
             float keep = er[5];
             er[5] = 1.0e21f;
-            src = dfn2_stream_pre_process_freq_dual(slim, er, ei, pr, pi_, &sio);
-            frc = dfn2_stream_pre_process_freq_dual(full, er, ei, pr, pi_, &fio);
+            src = pre_freq(slim, g, er, ei, pr, pi_, &sio);
+            frc = pre_freq(full, g, er, ei, pr, pi_, &fio);
             er[5] = (float)NAN;
-            if (src != -1 || frc != -1 || dfn2_stream_pre_process_freq_dual(slim, er, ei, pr, pi_, &sio) != -1) ++bad;
+            if (src != -1 || frc != -1 || pre_freq(slim, g, er, ei, pr, pi_, &sio) != -1) ++bad;
             er[5] = keep;
         }
         memset(&sio, 0, sizeof(sio));
         memset(&fio, 0, sizeof(fio));
-        src = dfn2_stream_pre_process_freq_dual(slim, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &sio);
-        frc = dfn2_stream_pre_process_freq_dual(full, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &fio);
+        src = pre_freq(slim, g, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &sio);
+        frc = pre_freq(full, g, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &fio);
         if (src != 1 || frc != 1 || !same_job(&sio, &fio)) { ++bad; break; }
         if (sio.job_ready) { srm = fill_heads(&sio.outputs, t, kind); frm = fill_heads(&fio.outputs, t, kind); }
         if (t == 150 || t == 300) {   /* reset with the hop open: the hop is dropped */
             dfn2_stream_reset(slim); dfn2_stream_reset(full);
-            if (dfn2_stream_post_process_freq(slim, 0, sre, sim, &sv) != -1 ||
-                dfn2_stream_post_process_freq(full, 0, fre, fim, &fv) != -1) ++bad;
+            if (post_freq(slim, g, 0, sre, sim, &sv) != -1 || post_freq(full, g, 0, fre, fim, &fv) != -1) ++bad;
             continue;
         }
-        src = dfn2_stream_post_process_freq(slim, srm, sre, sim, &sv);
-        frc = dfn2_stream_post_process_freq(full, frm, fre, fim, &fv);
+        src = post_freq(slim, g, srm, sre, sim, &sv);
+        frc = post_freq(full, g, frm, fre, fim, &fv);
         if (src != 0 || frc != 0 || sv != fv || srm != frm ||
             dfn2_stream_state_generation(slim) != dfn2_stream_state_generation(full) ||
             memcmp(sre, fre, (size_t)nb * sizeof(float)) != 0 || memcmp(sim, fim, (size_t)nb * sizeof(float)) != 0)
@@ -171,7 +182,7 @@ static int run_pair(DFN2Stream *slim, DFN2Stream *full, const DFN2Grid *g, const
 
 /* The PCM entries on a freq_only context: -1, nothing written, and an open _freq hop is left as it was. */
 static void check_pcm_refused(DFN2Stream *slim, const DFN2Grid *g, const char *label) {
-    const int nb = g->n_bins, hop = g->hop;
+    const int nb = g->n_bins * g->frames_per_call, hop = g->hop * g->frames_per_call;   /* one call */
     int16_t *pcm = (int16_t *)malloc((size_t)hop * 2u * sizeof(int16_t));
     float *z = (float *)calloc((size_t)nb * 2u, sizeof(float));
     DFN2HopIO io, before;
@@ -182,13 +193,15 @@ static void check_pcm_refused(DFN2Stream *slim, const DFN2Grid *g, const char *l
     memset(&io, 0x5A, sizeof(io));
     before = io;
     CHECK(dfn2_stream_pre_process(slim, pcm, &io) == -1, "%s: PCM pre_process accepted", label);
+    CHECK(dfn2_stream_pre_process_packet(slim, pcm, &io) == -1, "%s: PCM pre_process_packet accepted", label);
     CHECK(memcmp(&io, &before, sizeof(io)) == 0, "%s: a refused PCM pre_process wrote io", label);
-    CHECK(dfn2_stream_pre_process_freq_dual(slim, z, z + nb, z, z + nb, &io) == 1, "%s: _freq pre after the refusal", label);
+    CHECK(pre_freq(slim, g, z, z + nb, z, z + nb, &io) == 1, "%s: _freq pre after the refusal", label);
     CHECK(dfn2_stream_post_process(slim, 0, pcm + hop) == -1, "%s: PCM post_process accepted", label);
+    CHECK(dfn2_stream_post_process_packet(slim, 0, pcm + hop) == -1, "%s: PCM post_process_packet accepted", label);
     for (k = 0; k < 2 * hop; ++k) untouched &= pcm[k] == (int16_t)(1234 + k);
     CHECK(untouched, "%s: a refused PCM entry wrote PCM", label);
-    CHECK(dfn2_stream_post_process_freq(slim, 1, z, z + nb, NULL) == 0, "%s: the open _freq hop was lost", label);
-    CHECK(dfn2_stream_hop_size(slim) == hop, "%s: hop size", label);
+    CHECK(post_freq(slim, g, 1, z, z + nb, NULL) == 0, "%s: the open _freq hop was lost", label);
+    CHECK(dfn2_stream_hop_size(slim) == g->hop, "%s: hop size", label);
     free(pcm);
     free(z);
 }

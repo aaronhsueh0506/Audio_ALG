@@ -140,14 +140,15 @@ static int test_n1_matches_reference(const char *erb_path) {
     return 0;
 }
 
-/* 2 & 3. N=8, mask_lookahead=0, df_lookahead=0: PCM delay is exactly one hop_in block (8 hops).
- * Two blocks, the first carrying a non-silent signal and the second all zero, so the tail that
- * lands in the second block's output actually exercises the cross-block stash/boundary logic,
- * not just "both blocks happen to be silence". */
+/* 2 & 3. N=8, mask_lookahead=0, df_lookahead=0: one packet job per block, and the PCM is the N=1 stream's, hop
+ * for hop with no extra delay. The reference is the same grid at N=1 driven per hop (this stand-in accelerator's
+ * heads do not depend on the window, so both reach the same PCM). Two blocks, the first carrying a non-silent
+ * signal and the second all zero: block 1 already carries the signal (one hop of framing delay, none for the
+ * packet), and the tail of its last hop lands in block 2's first hop. */
 static int test_n8_two_blocks_matches_reference(const char *erb_path) {
     AinrConfig cfg;
     StreamMemReq req;
-    DFN2Grid grid = make_grid_16k_256(8);
+    DFN2Grid grid = make_grid_16k_256(1);
     DFN2StreamConfig scfg;
     DFN2StreamMemReq sreq;
     void *ainr_pool, *ref_pool;
@@ -183,19 +184,17 @@ static int test_n8_two_blocks_matches_reference(const char *erb_path) {
     run_reference_hops(ref, pcm_in, hops, hop, ref_out);
 
     if (memcmp(ainr_out, ref_out, (size_t)hops * (size_t)hop * sizeof(int16_t)) != 0) {
-        fprintf(stderr, "test_n8_two_blocks_matches_reference: PCM mismatch\n");
+        fprintf(stderr, "test_n8_two_blocks_matches_reference: PCM differs from the N=1 stream\n");
         return 1;
     }
-    /* The PCM delay (M+D+N hops = 8 hops = one whole hop_in block) means block 1's real signal
-     * can only finish draining inside block 2's output -- confirm block 2 isn't trivially all
-     * zero (that would mean the stash/boundary logic silently dropped the tail). */
     {
-        int16_t *block2 = ainr_out + (size_t)hop_in;
-        int all_zero = 1, i;
-        for (i = 0; i < hop_in; ++i) if (block2[i] != 0) { all_zero = 0; break; }
-        if (all_zero) {
-            fprintf(stderr, "test_n8_two_blocks_matches_reference: block 2 is all-zero, "
-                            "tail of block 1's signal appears to have been dropped\n");
+        int16_t *block1 = ainr_out, *block2 = ainr_out + (size_t)hop_in;
+        int silent1 = 1, silent2_head = 1, i;
+        for (i = hop; i < hop_in; ++i) if (block1[i] != 0) { silent1 = 0; break; }
+        for (i = 0; i < hop; ++i) if (block2[i] != 0) { silent2_head = 0; break; }
+        if (silent1 || silent2_head) {
+            fprintf(stderr, "test_n8_two_blocks_matches_reference: block 1 %s, the first hop of block 2 %s\n",
+                    silent1 ? "is silent" : "carries signal", silent2_head ? "is silent" : "carries signal");
             return 1;
         }
     }
@@ -380,7 +379,7 @@ static int test_larger_pool_accepted(const char *erb_path) {
 
     cfg_big.sr = 16000;
     cfg_big.fft = 256;
-    cfg_big.hop_in = 8 * 128;   /* N = 8: needs stash space, bigger pool */
+    cfg_big.hop_in = 8 * 128;   /* N = 8: the block staging, bigger pool */
 
     cfg_small.sr = 16000;
     cfg_small.fft = 256;

@@ -12,8 +12,9 @@
  *     dfn2_prepost_post_process_freq(p, out_re, out_im, NULL);
  *     ac_istft_push_planar(istft, out_re, out_im, out_samples);   // every hop (AC_OLA_ACCUMULATE)
  *
- * pre_process_freq returns 1 at the zero-indexed hop L + N - 1, then every N hops after (N == 1: every hop from
- * hop L); before that it returns 0 and no frame is opened. */
+ * N == 1: pre_process_freq returns 1 on every hop from hop L, 0 before. N > 1 (only with L == 0): one block of N frames per
+ * call, pre_process_block_dual -> frame_open / accelerator / frame_finish -> post_process_block; the output frame at
+ * position t is source frame t - D, as for N == 1. */
 
 #ifndef DFN2_PREPOST_H
 #define DFN2_PREPOST_H
@@ -29,14 +30,14 @@ extern "C" {
 
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
 /* In build_flags_hash; bump on any change of pool size, carve order or descriptor content. */
-#define DFN2_PREPOST_CARVE_VERSION      12u
+#define DFN2_PREPOST_CARVE_VERSION      13u
 
 #define DFN2_PREPOST_ALIGNMENT 16u   /* the one alignment of every module (audiolib mem_align.h) */
 
-/* Frames the output trails the input by, on top of the framing's hop: L + D + N - 1. */
+/* Frames the output trails the input by, on top of the framing's hop: L + D, whatever N is. */
 static inline int dfn2_prepost_latency_frames(const DFN2Grid *grid)
 {
-    return grid->mask_lookahead + grid->df_lookahead + grid->frames_per_call - 1;
+    return grid->mask_lookahead + grid->df_lookahead;
 }
 
 /* Element counts at the accelerator boundary; the heads hold frames_per_call frames, oldest first. */
@@ -135,8 +136,8 @@ typedef struct DFN2PrepostOutputs {
 /* Fill a config for `grid` (copied), the rest NULL/0; -1 on NULL or an invalid grid. */
 int dfn2_prepost_config_defaults(DFN2PrepostConfig *cfg, const DFN2Grid *grid);
 
-/* Exact pool size; -1 (req untouched) on NULL, missing ERB matrices, non-finite atten_lim_db, an invalid grid
- * or state registration. */
+/* Exact pool size; -1 (req untouched) on NULL, missing ERB matrices, non-finite atten_lim_db, an invalid grid or state
+ * registration, or mask_lookahead > 0 with frames_per_call > 1. */
 int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
                               DFN2PrepostMemReq *req);
 
@@ -178,8 +179,8 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
  * applies to the whole next committed call, frames pushed earlier included. */
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
-/* One analysed frame (n_bins bins), no transform: 1 at hop L + N - 1, then every N hops (N == 1: every hop from hop L), else 0
- * with the clocks advanced and no frame open; -1 on NULL or a frame open. Bins are not checked: each must be finite with
+/* One analysed frame (n_bins bins), no transform, frames_per_call == 1 only: 1 on every hop from hop L, else 0 with the
+ * clocks advanced and no frame open; -1 on NULL, a frame open or N > 1. Bins are not checked: each must be finite with
  * |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
                                   const float *spec_im);
@@ -191,6 +192,17 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
                                        const float *est_im,
                                        const float *app_re,
                                        const float *app_im);
+
+/* N frames at once (frame-major, N * n_bins per plane, MODEL scale), frames_per_call > 1 only; est and app as in the dual
+ * entry, the bin precondition of pre_process_freq() for every frame. One job: 1 with a frame open; -1 on NULL, a frame open
+ * or N == 1. */
+int dfn2_prepost_pre_process_block_dual(DFN2Prepost *p, const float *est_re, const float *est_im,
+                                        const float *app_re, const float *app_im);
+
+/* Zero-copy staging of a block (N > 1, no frame open): the planes the next block's spectrum is written to (pass the same
+ * pointers as est and app) and the planes the last block's output sits in. -1 on NULL, a frame open or N == 1. */
+int dfn2_prepost_block_input(DFN2Prepost *p, float **re, float **im);
+int dfn2_prepost_block_output(const DFN2Prepost *p, const float **re, const float **im);
 
 /* Publish the open frame's accelerator boundary: window and head pointers into the pool, state pointers the
  * registered buffers (NULL when none); heads NaN-prefilled, state not. -1 if no frame is open. */
@@ -216,12 +228,18 @@ int dfn2_prepost_frame_bypass(DFN2Prepost *p);
 int dfn2_prepost_frame_fail(DFN2Prepost *p, int run_started);
 
 /* The enhanced spectrum (n_bins bins) of the frame just emitted, at the input's scale: zeros while `*valid`
- * (may be NULL) reports 0 (the first latency_frames() calls). -1 on NULL or with a frame open. Pushing it
- * into an AcIstft every hop, valid or not, needs AC_OLA_ACCUMULATE: a zero spectrum then yields zeros. */
+ * (may be NULL) reports 0 (the first latency_frames() calls). -1 on NULL, with a frame open or with N > 1. Pushing it into
+ * an AcIstft every hop, valid or not, needs AC_OLA_ACCUMULATE: a zero spectrum then yields zeros. */
 int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
                                    int *valid);
 
-/* Source frame (from 0) of the last emission, written to *frame; -1 on NULL or before the first emission. */
+/* After finish / bypass / fail of a block: its N enhanced frames (N * n_bins per plane, oldest first, input scale; zeros
+ * before frame L + D). *valid_frames (may be NULL) counts the frames with a spectrum, the last ones; a NULL plane is not
+ * copied. -1 on NULL p, a frame open or N == 1. */
+int dfn2_prepost_post_process_block(DFN2Prepost *p, float *re, float *im, int *valid_frames);
+
+/* Source frame (from 0) of the last emission (the last valid frame of a block), written to *frame; -1 on NULL or
+ * before the first emission. */
 int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
 /* Accelerator callbacks: infer() gets the open frame's views and returns the run status (stream_run.h): 0 once every

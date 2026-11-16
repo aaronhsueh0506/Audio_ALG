@@ -21,6 +21,8 @@
  * config is refused before any SDK call. Every successful preprocess pairs with one postprocess, a SUBMIT block
  * also with one run. A BYPASS block is N == 1 with mask_lookahead > 0 and only one of the first mask_lookahead
  * blocks after init or reset: no job, its work is all zero (state_generation included), its output is silence.
+ * N > 1 (mask_lookahead 0 only) is one packet: the N hops of a block are one SUBMIT job whose graph reads N + 2 feature
+ * frames (the block's N and the two before) and returns N heads; the block's output is the same stream as N == 1.
  * StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
  * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
  * File mode only: the pool size assumes the ERB tables load from a file. Under -DDFN2_STREAM_NO_STDIO
@@ -53,7 +55,7 @@ enum {
     AINR_ERR_MODEL_ID = -2,                     /* the bound model is not of this archive variant */
     AINR_ERR_GRID = -3,                         /* no catalog entry for (sr, fft) */
     AINR_ERR_IN_HOP = -4,                       /* hop_in is not a positive multiple of model_hop */
-    AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* N > 1 requires mask_lookahead = 0 */
+    AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* mask_lookahead > 0 with N > 1: not supported, N > 1 requires mask_lookahead = 0 */
     AINR_ERR_FRAMES_PER_CALL = -6,              /* N has no delivered graph */
     AINR_ERR_POOL = -7,                         /* pool too small or misaligned */
     AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short or longer, of another size, a non-finite forward value, or an inverse that is not a partition of unity */
@@ -67,8 +69,8 @@ const char *ainr_status_text(int code);
 /* Result of one init, the same for both families of a config. */
 typedef struct AinrInfo {
     const char  *graph_path;           /* model.bin of this configuration; a static string */
-    int          queue_frames;         /* mask_lookahead + df_lookahead + N - 1: the final PCM trails the input by queue_frames + 1 model hops
-                                              (_freq: after the caller's own ISTFT) */
+    int          queue_frames;         /* mask_lookahead + df_lookahead, for every N: the final PCM trails the input by queue_frames + 1
+                                              model hops (_freq: after the caller's own ISTFT) */
 } AinrInfo;
 
 /* ---- PCM family ----
@@ -114,9 +116,10 @@ int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out);
  * it supplies an estimate spectrum E (features, mask, deep filter) and an apply spectrum P (what mask, deep
  * filter and attenuation limit act on) and does the ISTFT/OLA of the result; E == P (same pointers) is the
  * single-spectrum case. After ainr_reset_freq() reset the analyser too (ac_stft_reset()). A bypass delivers
- * P-aligned near-identity. Direct (non-bridge) caller: an upstream restart at block t belongs to the frame delivered
- * at block t + (queue_frames - (N - 1)); clear the caller's synthesis (ac_istft_reset()) just before pushing it. Through
- * AinrBridge, ainr_bridge_reset_synthesis() on the hop of the event is that same point; the model keeps running. */
+ * P-aligned near-identity. Direct (non-bridge) caller: an upstream restart at input frame f belongs to the output
+ * frame f + queue_frames (position f + queue_frames of the delivered frames, block (f + queue_frames) / N); clear the
+ * caller's synthesis (ac_istft_reset()) just before pushing it. Through AinrBridge,
+ * ainr_bridge_reset_synthesis() on the hop of the event is that same point; the model keeps running. */
 
 typedef struct AinrFreqCtx AinrFreqCtx;
 

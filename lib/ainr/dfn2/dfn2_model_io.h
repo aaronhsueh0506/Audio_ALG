@@ -19,8 +19,8 @@ extern "C" {
 #endif
 
 /* Heads per call: N = frames_per_call, L = mask_lookahead. The graph reads N + 2 feature frames and returns
- * N heads plus the state after the last; N > 1 means readiness every N hops, N heads per commit and N - 1
- * more hops of latency. A call's window is frames [t-(2-L) .. t+N-1+L] for heads[t .. t+N-1] (head i from
+ * N heads plus the state after the last; N > 1 means readiness every N pushes and N heads per commit (the pre/post
+ * class takes the N frames of a call at once, with L == 0, so a call adds no latency). A call's window is frames [t-(2-L) .. t+N-1+L] for heads[t .. t+N-1] (head i from
  * the three frames starting at slot i); frames before the stream start read as zero. */
 
 /* A graph's external contract, compared field by field. The six interior fields (GRU layers and width, encoder

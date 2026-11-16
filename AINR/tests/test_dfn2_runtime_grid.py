@@ -852,7 +852,7 @@ class _PoolMirror:
     layout or of the hash walk is made on purpose, in both places."""
 
     LAYOUT_VERSION = {False: 8, True: 9}
-    CARVE_VERSION = 12
+    CARVE_VERSION = 13
     MODEL_INPUT_FRAMES = 3
     FEATURE_VERSION = 'dfn2_libdf_wnorm_upstream_init_no_eps_v5'
 
@@ -903,7 +903,7 @@ class _PoolMirror:
         fields += ['ptr']
         if not mask:
             fields += ['ptr']
-        fields += ['int', 'ptr', 'ptr', 'll', 'int', 'int', 'int', 'ptr']
+        fields += ['ll', 'int', 'int', 'int', 'ptr']
         return self._struct_size(fields)[0]
 
     def _carve(self, sizes):
@@ -936,13 +936,13 @@ class _PoolMirror:
         io = [4 * g['input_frames'] * ne, 4 * 2 * g['input_frames'] * db]
         sizes = [self._prepost_header(mask), self._state_header(mask), self._carve(state),
                  self._io_header(mask), self._carve(io),
-                 4 * n * nb, 4 * n * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
+                 4 * nb, 4 * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
         if not mask:
             sizes += [4 * n * db * order * 2, 4 * n]
         sizes += [4 * ne]
         if not mask:
             sizes += [4 * db * order * 2]
-        sizes += [P * n, P * n, 4 * n, 8 * n, 4 * n * nb, 4 * n * nb]
+        sizes += [P * n, P * n, 4 * n * nb, 4 * n * nb]
         return self._carve(sizes)
 
     @staticmethod

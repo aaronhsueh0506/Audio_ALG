@@ -54,12 +54,11 @@ static void check_saturate_s16_nonfinite(void) {
     }
 }
 
-/* Runs the full init/hop-loop/reset cycle for one frames_per_call N. Every hop calls
- * pre_process, calls the fake accelerator only when io.job_ready (as the header's usage example
- * does), then always calls post_process -- the one loop shape serves N == 1 and N > 1 alike.
- * Cross-checks io.job_ready against the documented cadence (ready once mask_lookahead + N hops
- * have been pushed, then every N hops): a job on the wrong hop, or the wrong number of jobs
- * total, fails the test instead of just not crashing. */
+/* Runs the full init/hop-loop/reset cycle of the per-hop entries (frames_per_call N == 1). Every hop calls
+ * pre_process, calls the fake accelerator only when io.job_ready (as the header's usage example does), then
+ * always calls post_process. Cross-checks io.job_ready against the documented cadence (a job on every hop from
+ * hop mask_lookahead): a job on the wrong hop, or the wrong number of jobs total, fails the test instead of just
+ * not crashing. */
 static int run_smoke(int frames_per_call) {
     DFN2GridSpec spec;
     DFN2Grid grid;
@@ -147,10 +146,8 @@ static int run_smoke(int frames_per_call) {
             return 1;
         }
 
-        /* Same cadence as dfn2_prepost_pre_process_freq(): ready once mask_lookahead + N hops have been
-         * pushed, then every N (N == 1: every hop from hop mask_lookahead). */
-        ready_expected = (i + 1 >= grid.mask_lookahead + frames_per_call) &&
-                         (i + 1 - grid.mask_lookahead) % frames_per_call == 0;
+        /* Same cadence as dfn2_prepost_pre_process_freq(): every hop from hop mask_lookahead. */
+        ready_expected = i >= grid.mask_lookahead;
         if (io.job_ready != ready_expected) {
             fprintf(stderr, "job_ready=%d at hop %d, expected %d (N=%d)\n",
                    io.job_ready, i, ready_expected, frames_per_call);
@@ -182,7 +179,7 @@ static int run_smoke(int frames_per_call) {
         }
     }
 
-    jobs_expected = (hops - grid.mask_lookahead) / frames_per_call;
+    jobs_expected = hops - grid.mask_lookahead;
     if (jobs_run != jobs_expected) {
         fprintf(stderr, "ran %d accelerator jobs over %d hops, expected %d (N=%d)\n",
                jobs_run, hops, jobs_expected, frames_per_call);
@@ -201,9 +198,123 @@ static int run_smoke(int frames_per_call) {
     return 0;
 }
 
+/* The packet entries (frames_per_call N > 1, mask_lookahead 0): every packet of N hops is one job, the
+ * per-hop entries refuse the stream, and a stream with mask_lookahead > 0 is refused at sizing. */
+static int run_smoke_packet(int sample_rate, int n_fft, int n_erb, int frames_per_call) {
+    DFN2GridSpec spec;
+    DFN2Grid grid;
+    DFN2StreamConfig cfg;
+    DFN2StreamMemReq req;
+    DFN2Stream *s;
+    void *pool = NULL;
+    float *erb_fwd, *erb_inv;
+    int16_t *pcm_in, *pcm_out;
+    int hop, packets, i, k, jobs_run = 0;
+
+    memset(&spec, 0, sizeof(spec));
+    spec.sample_rate = sample_rate;
+    spec.n_fft = n_fft;
+    spec.n_erb = n_erb;
+    spec.df_bins = 96;
+    spec.mask_lookahead = 0;
+#ifdef DFN2_MASK_ONLY
+    spec.df_order = 0;
+    spec.df_lookahead = 0;
+#else
+    spec.df_order = 5;
+    spec.df_lookahead = 0;
+#endif
+    spec.frames_per_call = frames_per_call;
+    if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) {
+        fprintf(stderr, "dfn2_grid_make failed (%d Hz, N=%d)\n", sample_rate, frames_per_call);
+        return 1;
+    }
+    erb_fwd = alloc_filled((size_t)grid.n_bins * (size_t)grid.n_erb, 1.0f / (float)grid.n_erb);
+    erb_inv = alloc_filled((size_t)grid.n_erb * (size_t)grid.n_bins, 0.0f);
+    erb_fixture_unit_inv(erb_inv, grid.n_bins, grid.n_erb);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.grid = grid;
+    cfg.erb_fwd = erb_fwd;
+    cfg.erb_inv = erb_inv;
+    if (dfn2_stream_get_mem_size(&cfg, &req) != 0 || posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0) {
+        fprintf(stderr, "packet stream sizing or allocation failed (%d Hz, N=%d)\n", sample_rate, frames_per_call);
+        return 1;
+    }
+    s = dfn2_stream_init_ex(&cfg, pool, (size_t)req.bytes, &req);
+    if (!s) {
+        fprintf(stderr, "dfn2_stream_init_ex failed (%d Hz, N=%d)\n", sample_rate, frames_per_call);
+        return 1;
+    }
+    hop = dfn2_stream_hop_size(s);
+    pcm_in = (int16_t *)calloc((size_t)hop * (size_t)frames_per_call, sizeof(int16_t));
+    pcm_out = (int16_t *)calloc((size_t)hop * (size_t)frames_per_call, sizeof(int16_t));
+    if (!pcm_in || !pcm_out) return 1;
+
+    {   /* the per-hop entries refuse an N > 1 stream and leave it usable */
+        DFN2HopIO io;
+        if (dfn2_stream_pre_process(s, pcm_in, &io) != -1) {
+            fprintf(stderr, "per-hop pre_process accepted an N=%d stream\n", frames_per_call);
+            return 1;
+        }
+    }
+    packets = 6;
+    for (i = 0; i < packets; ++i) {
+        DFN2HopIO io;
+        int valid;
+        for (k = 0; k < hop * frames_per_call; ++k) pcm_in[k] = (int16_t)((k * 7 + i * 3) % 101 - 50);
+        if (dfn2_stream_pre_process_packet(s, pcm_in, &io) != 1 || !io.job_ready) {
+            fprintf(stderr, "pre_process_packet: no job at packet %d (N=%d)\n", i, frames_per_call);
+            return 1;
+        }
+        if (dfn2_stream_set_atten_lim(s, 6.0f) != -1) {
+            fprintf(stderr, "set_atten_lim accepted inside packet %d (N=%d)\n", i, frames_per_call);
+            return 1;
+        }
+        if (io.inputs.erb_window_elements != (size_t)(frames_per_call + 2) * (size_t)grid.n_erb ||
+            io.outputs.erb_mask_elements != (size_t)frames_per_call * (size_t)grid.n_erb) {
+            fprintf(stderr, "packet window or head sizes wrong (N=%d)\n", frames_per_call);
+            return 1;
+        }
+        fake_accelerator(&io.outputs);
+        ++jobs_run;
+        valid = dfn2_stream_post_process_packet(s, 0, pcm_out);
+        if (valid != frames_per_call) {   /* L = D = 0: every hop of every packet carries a spectrum */
+            fprintf(stderr, "post_process_packet rc=%d at packet %d, expected %d\n", valid, i, frames_per_call);
+            return 1;
+        }
+        if (dfn2_stream_set_atten_lim(s, 0.0f) != 0) {
+            fprintf(stderr, "set_atten_lim refused between packets (after packet %d)\n", i);
+            return 1;
+        }
+    }
+    if (jobs_run != packets) return 1;
+    {   /* a mask_lookahead > 0 N > 1 grid is not accepted by the prepost, hence not by the stream */
+        DFN2GridSpec lk = spec;
+        DFN2Grid lkg;
+        DFN2StreamConfig lkc = cfg;
+        DFN2StreamMemReq lkr;
+        lk.mask_lookahead = 1;
+        if (dfn2_grid_make(&lkg, &lk) != DFN2_GRID_OK) { fprintf(stderr, "grid with lookahead refused\n"); return 1; }
+        lkc.grid = lkg;
+        if (dfn2_stream_get_mem_size(&lkc, &lkr) != -1) {
+            fprintf(stderr, "mask_lookahead 1 with N=%d accepted by the stream\n", frames_per_call);
+            return 1;
+        }
+    }
+    printf("smoke_dfn2_stream: packet N=%d (%d Hz), %d packets, %d accelerator jobs, hop=%d -- PASS\n",
+           frames_per_call, sample_rate, packets, jobs_run, hop);
+    free(pcm_in);
+    free(pcm_out);
+    free(erb_fwd);
+    free(erb_inv);
+    free(pool);
+    return 0;
+}
+
 int main(void) {
     check_saturate_s16_nonfinite();
     if (run_smoke(1) != 0) return 1;   /* a job on every hop from hop mask_lookahead */
-    if (run_smoke(4) != 0) return 1;   /* one job every 4 hops */
+    if (run_smoke_packet(16000, 256, 24, 8) != 0) return 1;     /* one job per packet of 8 hops */
+    if (run_smoke_packet(48000, 1024, 32, 2) != 0) return 1;
     return 0;
 }

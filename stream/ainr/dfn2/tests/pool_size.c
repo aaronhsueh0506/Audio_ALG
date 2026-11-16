@@ -10,8 +10,8 @@
  *   - a freq_only context (cfg.freq_only) needs the literal freq_* byte count: the full count less the FFT table,
  *     the STFT, the ISTFT and the PCM scratch slab, in memory and file mode alike, each taken from audiolib's own
  *     size queries;
- *   - 16 hops of a fixed input through a fixed stand-in accelerator hash to the golden value of
- *     that stream, with a stand-in inverse ERB table in which every bin splits 0.75 / 0.25 between
+ *   - 16 hops of a fixed input (N == 1) or 4 packets of N hops (N > 1) through a fixed stand-in accelerator hash to
+ *     the golden value of that stream, with a stand-in inverse ERB table in which every bin splits 0.75 / 0.25 between
  *     two bands (a partition of unity, which init requires). The hash is the same for the NEON and the scalar kernels
  *     (a Row can still carry a separate NEON golden); the byte counts do not depend on SIMD. */
 
@@ -38,13 +38,13 @@ typedef struct Row {
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 103936, 235264, 156640, 287968, 32320, 163648, 0xa46d74b9f5cac26eull, 0 },
+    { 48000, 1024, 32, 1, 0, 1, 103872, 235200, 156576, 287904, 32256, 163584, 0xa46d74b9f5cac26eull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 66448, 91216, 80752, 105520, 47824, 72592, 0x2f7313027241b827ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 121824, 146592, 136128, 160896, 103200, 127968, 0x89e8cbe10b03a961ull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 164304, 295632, 217008, 348336, 92688, 224016, 0xe0a89c487b7e4ad5ull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 66400, 91168, 80704, 105472, 47776, 72544, 0x2f7313027241b827ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 114512, 139280, 128816, 153584, 95888, 120656, 0x2e1edf1fefe3f177ull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 164256, 295584, 216960, 348288, 92640, 223968, 0xe0a89c487b7e4ad5ull, 0 },
 };
 #endif
 
@@ -106,7 +106,7 @@ static void run_row(const Row *r, int idx) {
     DFN2Stream *s;
     void *pool;
     uint64_t h = 14695981039346656037ull, want;
-    int hop, k, hops = 16;
+    int hop, k, calls = r->n == 1 ? 16 : 4;
     int16_t *pcm_in, *pcm_out;
 
     fwd = (float *)malloc((size_t)n_bins * (size_t)r->n_erb * sizeof(float));
@@ -168,16 +168,22 @@ static void run_row(const Row *r, int idx) {
     if (!s) { free(pool); free(fwd); free(inv); return; }
 
     hop = dfn2_stream_hop_size(s);
-    pcm_in = (int16_t *)malloc((size_t)hop * sizeof(int16_t));
-    pcm_out = (int16_t *)malloc((size_t)hop * sizeof(int16_t));
-    for (i = 0; i < (size_t)hops; ++i) {
+    pcm_in = (int16_t *)malloc((size_t)hop * (size_t)r->n * sizeof(int16_t));
+    pcm_out = (int16_t *)malloc((size_t)hop * (size_t)r->n * sizeof(int16_t));
+    for (i = 0; i < (size_t)calls; ++i) {
         DFN2HopIO io;
         int ai_rc = 0;
-        for (k = 0; k < hop; ++k) pcm_in[k] = (int16_t)((k * 13 + (int)i * 5) % 211 - 100 + ((k / 70) & 1) * 900);
-        if (dfn2_stream_pre_process(s, pcm_in, &io) != 1) { CHECK(0, "row %d: pre_process at hop %zu", idx, i); break; }
+        for (k = 0; k < hop * r->n; ++k) pcm_in[k] = (int16_t)((k * 13 + (int)i * 5) % 211 - 100 + ((k / 70) & 1) * 900);
+        if ((r->n == 1 ? dfn2_stream_pre_process(s, pcm_in, &io) : dfn2_stream_pre_process_packet(s, pcm_in, &io)) != 1) {
+            CHECK(0, "row %d: pre_process at call %zu", idx, i);
+            break;
+        }
         if (io.job_ready) fake_heads(&io.outputs, (int)i);
-        if (dfn2_stream_post_process(s, ai_rc, pcm_out) < 0) { CHECK(0, "row %d: post_process at hop %zu", idx, i); break; }
-        h = fnv(h, pcm_out, (size_t)hop * sizeof(int16_t));
+        if ((r->n == 1 ? dfn2_stream_post_process(s, ai_rc, pcm_out) : dfn2_stream_post_process_packet(s, ai_rc, pcm_out)) < 0) {
+            CHECK(0, "row %d: post_process at call %zu", idx, i);
+            break;
+        }
+        h = fnv(h, pcm_out, (size_t)hop * (size_t)r->n * sizeof(int16_t));
     }
     want = (SK_HAVE_NEON && r->pcm_hash_neon) ? r->pcm_hash_neon : r->pcm_hash;
     CHECK(h == want, "row %d (%d/%d N=%d): pcm hash %016llx, want %016llx", idx, r->sr, r->fft, r->n,

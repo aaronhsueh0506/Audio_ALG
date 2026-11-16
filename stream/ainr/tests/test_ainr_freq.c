@@ -8,7 +8,7 @@
  *      family) vs ainr_preprocess_freq()/ainr_postprocess_freq() through the test's own AcStft and AcIstft on
  *      the same PCM and the same fake-accelerator fill -- the PCM written back is bit-exact, with a forced
  *      bypass hop (run_status != 0) mixed into the run.
- *   2. N > 1 stash/ordering through the public _freq API on the catalog's 16 kHz/256 N=8 row: a committed block
+ *   2. N > 1 packet ordering through the public _freq API on the catalog's 16 kHz/256 N=8 row: a committed block
  *      followed by a bypassed one, and the PCM family against _freq + AcIstft bit-exact over the same blocks.
  *   3. Queue labeling: AinrInfo.queue_frames of both families against the lookahead hops of the grid, spelled
  *      out per row (the output trails the input by queue_frames + 1 model hops).
@@ -190,7 +190,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     return bad;
 }
 
-/* ---- Test 2: N > 1 stash/ordering through the public API (catalog 16k/256 N=8). ---- */
+/* ---- Test 2: N > 1 packet ordering through the public API (catalog 16k/256 N=8). ---- */
 
 #define T2_SR 16000
 #define T2_FFT 256
@@ -199,7 +199,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
 
 /* Two consecutive blocks through the _freq family: block 1 committed, block 2 BYPASSED
  * (run_status != 0). Confirms (a) block 2's oldest frame is not block 1's newest frame repeated
- * (the ordering bug this kind of stash/deliver logic is prone to) and (b) a bypassed block still
+ * (the ordering bug a packet delivery is prone to) and (b) a bypassed block still
  * delivers a full N-frame output of real (non-silent) spectra, not an error or a short block. */
 static int test_core_ordering_and_bypass(void) {
     const int n = T2_N, hop = T2_FFT / 2, n_bins = T2_FFT / 2 + 1;
@@ -251,7 +251,7 @@ static int test_core_ordering_and_bypass(void) {
     }
     if (same) {
         fprintf(stderr, "test_core_ordering: block2 frame 0 equals block1 frame N-1 -- "
-                        "stash/deliver ordering bug\n");
+                        "packet ordering bug\n");
         return 1;
     }
     for (f = 0; f < n; ++f) {
@@ -272,8 +272,8 @@ static int test_core_ordering_and_bypass(void) {
 }
 
 /* The PCM family at N=8 against _freq (E == P from the caller's AcStft) + the caller's AcIstft, bit-exact over
- * two consecutive blocks (block 1 committed, block 2 bypassed) -- exercises the stash branch of the _freq loop
- * (the first N-1 frames of a block, the scratch-reuse-across-frames path that the N=1 coverage never reaches). */
+ * two consecutive blocks (block 1 committed, block 2 bypassed) -- exercises the packet entries of both families
+ * (the N-frame scaling scratch and the block staging that the N=1 coverage never reaches). */
 static int test_freq_core_matches_pcm_core(void) {
     const int n = T2_N, hop = T2_FFT / 2, n_bins = T2_FFT / 2 + 1;
     AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2) };
@@ -343,7 +343,7 @@ static int test_freq_core_matches_pcm_core(void) {
 /* ---- Test 3: queue labeling. ---- */
 
 /* L / D are the mask / deep-filter lookahead hops of the catalog row. Expected values are spelled
- * out here (queue_frames = L + D + N - 1), not read from the library, and must be identical for both
+ * out here (queue_frames = L + D, whatever N is), not read from the library, and must be identical for both
  * families' init info. */
 static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, const char *label) {
     AinrConfig cfg;
@@ -354,7 +354,7 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
     char erb_path[160];
     AinrInfo bi[2];
     int hop = fft / 2, n_bins = fft / 2 + 1, i;
-    int want_queue = L + D + n - 1;
+    int want_queue = L + D;
 
     cfg.sr = sr;
     cfg.fft = fft;
@@ -392,11 +392,11 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
 
 static int test_delay_labeling(void) {
     int rc = 0;
-    /* 16k/256: L = D = 0 -> queue 0, trim one hop (128): the PCM family's own framing hop only. */
+    /* 16k/256: L = D = 0 -> queue 0, latency one hop (128): the PCM family's own framing hop only. */
     rc |= run_delay_labeling(16000, 256, 24, 1, 0, 0, "test_delay_labeling[16k/256]");
-    /* 48k/1024: L = D = 1 -> queue 2, trim 1536 (three hops) -- both lookaheads nonzero. */
+    /* 48k/1024: L = D = 1 -> queue 2, latency 1536 (three hops) -- both lookaheads nonzero. */
     rc |= run_delay_labeling(48000, 1024, 32, 1, 1, 1, "test_delay_labeling[48k/1024]");
-    /* 16k/256 N=8: queue 7, trim 1024; the whole trim is one hop_in block. */
+    /* 16k/256 N=8: queue 0 as for N=1 (a packet adds no delay), the framing hop is the whole latency. */
     rc |= run_delay_labeling(16000, 256, 24, 8, 0, 0, "test_delay_labeling[16k/256 N=8]");
     return rc;
 }
