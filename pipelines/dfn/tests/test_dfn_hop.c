@@ -486,7 +486,7 @@ static void test_path(int bridge_mode) {
         CHECK(dfn_hop_begin(&r.h, e, p) == DFN_HOP_SEQUENCE_ERROR, "a second begin in the same hop");
         CHECK(dfn_hop_end(&r.h, NULL) == DFN_HOP_INVALID, "end with a NULL output");
         CHECK(dfn_hop_end(&r.h, out) == 0, "end");
-        if (!bridge_mode) {   /* the model refuses a block whole; the bridge takes the spectra into its WOLA */
+        {   /* a refused block leaves the hop idle, on the direct path and through the bridge alike */
             unsigned gen = dfn_hop_state_generation(&r.h);
             p[3].r = NAN;
             CHECK(dfn_hop_begin(&r.h, e, p) == DFN_HOP_INVALID, "a non-finite P is refused");

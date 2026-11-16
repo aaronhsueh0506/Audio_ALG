@@ -189,13 +189,18 @@ static inline int dfn_hop_close_frame(DfnHop* h, int model_rc, Complex* out) {
     return 0;
 }
 
-/* Starts a hop on the host-grid spectra E and P (borrowed for this call only). */
+/* Starts a hop on the host-grid spectra E and P (borrowed for this call only). A non-finite bin, or one beyond the
+ * model-scale bound the direct path enforces, is refused with the hop still idle (DFN_HOP_INVALID). */
 static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
     if (!h || !e || !p) return DFN_HOP_INVALID;
     if (h->phase != 0) return DFN_HOP_SEQUENCE_ERROR;
     h->job_pending = 0;
     h->frame_ended = 0;
     if (h->bridge) {
+        const size_t n = 2u * (size_t)ainr_bridge_n_freqs(h->bridge);
+        if (!dfn2_stream_bins_in_range((const float*)e, n, h->scale) ||
+            !dfn2_stream_bins_in_range((const float*)p, n, h->scale))
+            return DFN_HOP_INVALID;
         if (ainr_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
     } else {
         if (dfn_hop_open_frame(h, e, p, &h->job) != 0) return DFN_HOP_INVALID;
