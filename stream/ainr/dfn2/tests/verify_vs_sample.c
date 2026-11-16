@@ -184,7 +184,7 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
     Stats st;
     int16_t *pcm_in, *pcm_out_a, *pcm_out_b, *prev_pcm_out_b;
     long long L, D;
-    long long warm_hops, post_reset_hops, drain_hops;
+    long long first_run_hops, post_reset_hops, trailing_hops;
     unsigned int gen_prev = 0;
     long long fault_hop_index = -1;    /* a run that started and failed */
     long long no_start_hop_index = -1; /* a run that never started */
@@ -237,19 +237,19 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
     pcm_out_b = calloc((size_t)hop, sizeof(int16_t));
     prev_pcm_out_b = calloc((size_t)hop, sizeof(int16_t));
 
-    warm_hops = L + 5;          /* the first L hops (no job) + 5 steady hops, one of them fault-injected */
+    first_run_hops = L + 5;     /* the first L hops (no job) + 5 steady hops, one of them fault-injected */
     fault_hop_index = L + 2;    /* a steady hop, well past the first L */
     no_start_hop_index = L + 3; /* the next one: the state must survive it */
     post_reset_hops = L + 4;    /* after reset: L hops without a job again + 4 steady hops */
-    drain_hops = L + D + 1;     /* documented tail-drain length */
+    trailing_hops = L + D + 1;  /* zero hops after the stream, as many as it trails by plus the framing hop */
 
     {
         long long phase, phase_hops, hop_in_phase;
-        long long total_phases = 2; /* pre-reset run, then reset + post-reset run; drain appended after */
+        long long total_phases = 2; /* pre-reset run, then reset + post-reset run; the trailing zero hops after */
         for (phase = 0; phase < total_phases + 1; ++phase) {
-            if (phase == 0) phase_hops = warm_hops;
+            if (phase == 0) phase_hops = first_run_hops;
             else if (phase == 1) { board_reset(&A); dfn2_stream_reset(B); phase_hops = post_reset_hops; }
-            else phase_hops = drain_hops;
+            else phase_hops = trailing_hops;
 
             for (hop_in_phase = 0; hop_in_phase < phase_hops; ++hop_in_phase, ++ghop) {
                 DFN2HopIO io_b;
