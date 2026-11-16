@@ -274,9 +274,8 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
  * they are. Returns 0, or -1. */
 int deepvqe_prepost_frame_bypass(DeepVqePrepost *p);
 
-/* Closes the open batch after a run that did not succeed: the frame_bypass output. run_started != 0
- * (the device state may be dirty): the registered state is zeroed, the CCM ring is emptied and the
- * generation advances.
+/* Closes the open batch after a run that did not succeed, with the frame_bypass output. run_started != 0 (the
+ * device state may be dirty) also zeroes the registered state, empties the CCM ring and advances the generation.
  * Returns 0, or -1 (nothing changed) if no batch is open. */
 int deepvqe_prepost_frame_fail(DeepVqePrepost *p, int run_started);
 

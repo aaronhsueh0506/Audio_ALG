@@ -26,7 +26,8 @@
  * model: the analysis and synthesis keep running and its pcm_out is the hop's error spectrum through them.
  *
  * Refusals of a preprocess, in this order, before any state change and with no block opened: NULL / SEQUENCE,
- * INPUT_KIND, INPUT_SIZE, NULL input, NONFINITE_INPUT (Align-ULCNet float input only: DeepVQE-S int16 needs no scan).
+ * INPUT_KIND, INPUT_SIZE, NULL input, NONFINITE_INPUT (a NaN or Inf in any plane of a _freq input, either model; for the
+ * Align-ULCNet float PCM input a sample beyond AIAEC_PCM_LIMIT_BITS too; DeepVQE-S int16 PCM needs no scan).
  *
  * Align-ULCNet takes the linear AEC's float residual, the raw far of the same hop and one AiaecAlignEvent per model
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
@@ -67,7 +68,7 @@ enum {
     AIAEC_ERR_SEQUENCE = -7,          /* preprocess/postprocess not called in pairs */
     AIAEC_ERR_INPUT_KIND = -8,        /* AiaecInput.kind does not match the product's model (before any state write) */
     AIAEC_ERR_INPUT_SIZE = -9,        /* samples != hop_in, or (Align-ULCNet) event_count != N (before any state write) */
-    AIAEC_ERR_NONFINITE_INPUT = -10   /* NaN/Inf in an input plane, or an Align-ULCNet PCM sample beyond the limit below
+    AIAEC_ERR_NONFINITE_INPUT = -10   /* NaN/Inf in an input plane, or an Align-ULCNet PCM sample beyond AIAEC_PCM_LIMIT_BITS
                                        * (before any state write: no block is open, the generation does not move) */
 };
 
