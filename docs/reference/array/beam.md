@@ -201,7 +201,7 @@ AEC、DOA、BF，以及你串的 NR，全部**共用同一組格點**，`frame =
 生效值 accessor（見 [§4.6](beam-settings.md#46-你設定的值不一定是實際生效的值)）：
 `array_sample_beam_bf_effective_adapt_interval(b)`、`array_sample_beam_bf_lambda(b)`（`b == NULL` 或已 destroy 時回 `-1`／NaN）。
 
-診斷：`aec_array_get_timing(aec, &t)`（最近一個 hop 的各階段耗時，`AecArrayTiming`；`t` 不得為 NULL；預設全 0，要 `-DAEC_STAGE_TIMING=1`，`make PROFILE=1` 打開）。
+診斷：`aec_array_get_timing(aec, &t)`（最近一個 hop 的各階段耗時，`AecArrayTiming`；`t` 不得為 NULL；預設建置即量測，`make PROFILE=0`（`-DAEC_STAGE_TIMING=0`）關閉後全 0）。
 
 建置資訊：`array_sample_beam_spatial_backend()` —— **不吃 handle**，回傳一個 `const char*`（永不為 NULL），表示 spatial kernel 實際編進去的是哪一種實作（NEON 或 scalar）。純資訊用途，可寫進你的開機 log。
 

@@ -104,10 +104,10 @@ NO_STDIO = 0
 DEBUG = 0
 TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
-# PROFILE=1 turns on per-hop stage timing: through the PROFILE knob forwarded to the lib/aec build
-# the array's stages (aec_array_get_timing()). Off otherwise, so a release build takes no clock reads.
+# PROFILE selects per-hop stage timing: through the PROFILE knob forwarded to the lib/aec build
+# the array's stages (aec_array_get_timing()). On by default; PROFILE=0 takes no clock reads.
 
-PROFILE ?= 0
+PROFILE ?= 1
 EXTRA_LDFLAGS =
 CPPFLAGS ?=
 CXXFLAGS ?=

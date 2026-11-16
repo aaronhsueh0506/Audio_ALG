@@ -57,7 +57,7 @@ aec_get_last_timing(aec, &t);
 | `steering_us` | 主濾波器之後、RES 之前的 stationarity 更新、coarse-error 發布、DT analyzer、EPV、shadow_rise 與失調估計（`aec.h` 的註解） |
 | `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
 
-**本機實測：`delay_us` 是整個 hop 最大的一塊。** 主機（桌面 aarch64、NE10）上以 `-DAEC_STAGE_TIMING=1` 建置，
+**本機實測：`delay_us` 是整個 hop 最大的一塊。** 主機（桌面 aarch64、NE10）上以預設（`-DAEC_STAGE_TIMING=1`）建置，
 `aec_nr_pipeline_static --timing`、16 kHz/256、balanced、一段 10 s 的合成回音輸入、連跑兩次：`delay_us` 約佔呼叫牆鐘的
 53.2–54.0 %，`frontend_us`（mic HPF/RSA/shadow filter）約 10.2–10.3 %。比例隨輸入與平台改變，目標平台上的比例待量測。
 這條線直接對應 `delay_num_filters`（1..5）這個可調旋鈕。
@@ -65,18 +65,18 @@ aec_get_last_timing(aec, &t);
 **各階段不會加總成整通呼叫。** 餘數包含引數檢查、`aec_get_residual()` 與每 hop 結尾的收尾步驟，它們都不在上面五欄內。範例的 `--timing` 表只列 `delay_us`、`frontend_us`、`linear_us`、`res_us` 四列，
 `steering_us` 落在 unattributed。要呈現完整分解的呼叫端必須把餘數明確列出來，不能讓部分看起來像全部。
 
-**預設關閉。** AEC 內部 7 次 clock 讀取，release build 一次都不做，欄位讀 0。
-`make PROFILE=1` 會開啟（`-DAEC_STAGE_TIMING=1`）。呼叫端自己的顯示旗標（`--timing`）**不會**打開 AEC 的量測。
+**預設開啟。** AEC 內部 7 次 clock 讀取（桌面主機約 0.13 µs／hop）。`make PROFILE=0`（`-DAEC_STAGE_TIMING=0`）關閉後欄位讀 0。
+呼叫端自己的顯示旗標（`--timing`）只決定印不印，**不會**開關 AEC 的量測。
 
 **記錄本身不是條件編譯的，只有取樣是。** 欄位無論旗標開關都在 struct 裡，所以
-profile build 與 release build 的 pool 大小與每個 offset 都相同，開旗標不會移動任何 offset。
+`PROFILE=0` 與預設建置的 pool 大小與每個 offset 都相同，切換旗標不會移動任何 offset。
 
 **目標平台沒有 `CLOCK_MONOTONIC` 時。** `clock_gettime` 是 POSIX 而非 C99。這種
-平台用 `make PROFILE=1 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`
-換掉 AEC 的時鐘：巨集要是**純識別字**（Makefile 的 FP policy 不允許 `EXTRA_CFLAGS` 出現括號），
+平台用 `make EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`
+換掉 AEC 的時鐘（或 `make PROFILE=0` 關掉量測）：巨集要是**純識別字**（Makefile 的 FP policy 不允許 `EXTRA_CFLAGS` 出現括號），
 指向不收參數、回傳 `uint32_t` 微秒的函式。替代時鐘必須單調，否則無號減法會產生接近 32-bit 全距的
 荒謬值。每個元件各有自己的覆寫點（`lib/aec` 的 `AEC_NOW_US`，4ch 陣列的 `aec_array_get_timing()` 也用它），刻意不共用——一個元件的時鐘屬於該元件自己的建置契約。
-開著旗標但指向常數函式是合法用法，所有欄位讀 0，`--timing` 的報表無法分辨這種情況與「根本沒開旗標」。
+指向常數函式是合法用法，所有欄位讀 0，`--timing` 的報表無法分辨這種情況與 `PROFILE=0`。
 
 兩支 CLI 都有 `--timing`，在結束時印出整段 run 的每 hop 平均與佔比（含未歸屬餘數）。
 

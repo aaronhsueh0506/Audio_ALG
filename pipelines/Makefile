@@ -245,10 +245,10 @@ ATTEST_STAMP ?=
 # Changing EXTRA_CFLAGS, SIMD, WERROR or NO_STDIO needs no `make clean-libs`: every Makefile in the
 # stack keys its objects/archives on the same axes.
 EXTRA_CFLAGS ?=
-# PROFILE=1 turns on lib/aec's per-hop stage timing (the knob is forwarded by name). Off by
-# default so a release build takes no clock reads. Folded into CFG_SIG by name and through CFLAGS,
-# so profile and release builds occupy different obj/bin directories.
-PROFILE ?= 0
+# PROFILE selects lib/aec's per-hop stage timing (the knob is forwarded by name): on by default,
+# PROFILE=0 builds it out (no clock reads, aec_get_last_timing() reads 0). Folded into CFG_SIG by
+# name and through CFLAGS, so the two builds occupy different obj/bin directories.
+PROFILE ?= 1
 ifneq ($(words $(PROFILE)),1)
 $(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
 endif
@@ -262,13 +262,9 @@ endif
 # assignment (FP policy guard below). These -D land in this Makefile's CFLAGS only: lib/aec gets
 # AEC_STAGE_TIMING from the PROFILE knob forwarded in FWD.
 
-# AEC_STAGE_TIMING is repeated on purpose: aec.h defaults it to 0 in every TU that includes it, and a TU
-# here that tests it must see the value libaec.a was built with.
-ifeq ($(PROFILE),1)
-PROFILE_CFLAGS := -DAEC_STAGE_TIMING=1
-else
-PROFILE_CFLAGS :=
-endif
+# AEC_STAGE_TIMING is repeated on purpose: a TU here that tests it must see the value libaec.a was
+# built with, whatever aec.h defaults to.
+PROFILE_CFLAGS := -DAEC_STAGE_TIMING=$(PROFILE)
 
 SIMD ?= 1
 ifneq ($(words $(SIMD)),1)

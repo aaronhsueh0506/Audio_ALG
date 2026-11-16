@@ -310,7 +310,7 @@ static void print_debug_status(const Aec* aec, const AnrDenoiser* nr, int aec_on
 }
 
 /* --timing: per-stage cost summed over the run and reported as a mean per hop. The AEC rows
- * come from aec_get_last_timing() (built with -DAEC_STAGE_TIMING=1, `make PROFILE=1`); the
+ * come from aec_get_last_timing() (read 0 under -DAEC_STAGE_TIMING=0, `make PROFILE=0`); the
  * gain-chain and synthesis rows are this program's own clock around the calls. */
 typedef struct {
     uint64_t delay, frontend, linear, res, chain, synth, wall;
@@ -343,11 +343,11 @@ static void print_stage_timing(const StageAccum* a) {
     printf("\nStage timing over %llu hops (mean us/hop, share of wall):\n",
            (unsigned long long)a->hops);
     if (aec == 0u) {
-        printf("  the AEC rows read 0 -- this binary was built WITHOUT\n"
-               "  -DAEC_STAGE_TIMING=1. Rebuild with `make PROFILE=1` to\n"
-               "  measure them; a build that substituted a constant stamp\n"
-               "  through AEC_NOW_US reads 0 here too, and this report cannot\n"
-               "  tell the two apart.\n");
+        printf("  the AEC rows read 0 -- this binary was built with\n"
+               "  -DAEC_STAGE_TIMING=0 (`make PROFILE=0`). Rebuild with the\n"
+               "  default `make` to measure them; a build that substituted a\n"
+               "  constant stamp through AEC_NOW_US reads 0 here too, and this\n"
+               "  report cannot tell the two apart.\n");
     }
     stage_accum_row("AEC delay", a->delay, a);
     stage_accum_row("AEC frontend", a->frontend, a);

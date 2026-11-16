@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — AEC stage timing is on by default (`PROFILE=1`)
+
+- `pipelines/Makefile`, `pipelines/4ch/Makefile` and `stream/aiaec/front/Makefile` default `PROFILE` to 1 and forward it to lib/aec, which builds with `-DAEC_STAGE_TIMING=$(PROFILE)`; `pipelines/Makefile` and the AIAEC front keep repeating that `-D` for their own translation units. `make PROFILE=0` builds the timing out (the AEC rows of `--timing` read 0 and the report says why). Outputs are unchanged; about 0.13 us per mono hop and about 0.6 us per four-microphone hop on the development host.
+- Docs: `pipelines/reference/build.md`, the mono pipeline README, `docs/reference/{mono,array,board}/*` and the matching `docs/html` pages describe `PROFILE=0` as the off switch.
+
 ## [Unreleased] — 2026-11-16 — `stream_saturate_s16()` rounds half away from zero exactly
 
 - **Behaviour change** `stream/common/stream_mem.h` `stream_saturate_s16()` truncates the clipped `v * 32768` into an `int32_t` and compares the exact remainder with 0.5, as audiolib `wav_io.h`'s writer does. Before, it added `+-0.5f` in float, so the input just below 0.5 LSB (`nextafterf(0.5f / 32768.0f, 0)`, bit pattern 0x377fffff) and its negative came out as +-1. Over all 2^32 float bit patterns exactly those two inputs change (by 1 LSB); ties, the int16 limits, the clip, NaN (0) and +-Inf (clip) are unchanged.

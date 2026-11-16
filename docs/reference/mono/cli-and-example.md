@@ -43,7 +43,7 @@ BIN="$(make -s -C pipelines print-bin-dir)"
 | `--no-cng` | flag | off | 關閉最終 CNG 注入 |
 | `--fft-size` | `256`／`512`／`1024` | 0（rate default） | 覆寫訊號格點的 FFT/frame 長度（16 kHz 唯一可切換的一項，見 [設定參考](../../html/pipelines/mono/aec-nr-res/reference/configuration.html)「訊號格點」表）；不是十進位整數 exit 2 |
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
-| `--timing` | flag | off | 結束時印每個階段的平均耗時；AEC 的列需要 `make PROFILE=1` |
+| `--timing` | flag | off | 結束時印每個階段的平均耗時；`make PROFILE=0` 建置時 AEC 的列讀 0 |
 
 level 的值不是 `0`..`3` 的一位數字（名稱、`4`、`03`、空字串）一律 exit 2。未知的選項（例如 `--bogus`、單獨的 `--`）和不是 level 的位置參數（`-1`、`-x`、單獨的 `-`）一律在 stderr 印出 `unknown option or malformed argument '<token>'` 與 usage，exit 2；`--print-mem-size` 路徑相同。第 1 個 token 之外的 `--print-mem-size` 也是未知選項。
 

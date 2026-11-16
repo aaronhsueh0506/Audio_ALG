@@ -293,7 +293,7 @@ void aec_array_get_timing(const Aec* a, AecArrayTiming* out);
 沒有自己的 ring 也沒有估計器；相加而不是丟棄，是為了讓日後改變 lane 模式時不會靜默漏掉那筆成本。`frontend_us`、`linear_us`、`lane_res_us` 是四條 lane 各讀一次再相加，
 所以得到的是該階段在整個 lane 迴圈上的 wall-clock 成本。
 
-全部五欄由**同一個旗標** `-DAEC_STAGE_TIMING=1` 管轄（`make PROFILE=1` 打開）；沒開時所有欄位恆為 0（release build 不讀時鐘）。
+全部五欄由**同一個旗標** `AEC_STAGE_TIMING` 管轄（預設 1；`make PROFILE=0` 即 `-DAEC_STAGE_TIMING=0` 關閉）；關閉時所有欄位恆為 0（不讀時鐘）。預設建置每 hop 約三十次 clock 讀取，桌面主機約 0.6 µs。
 各階段**加起來不等於**整個呼叫的時間，呼叫端要自己用減法補餘額：linear 側的餘額涵蓋輸入去交錯／有限值檢查、對齊環的複製與 realign 掃描。
 
 前四欄在 `aec_process_linear()` 接受引數（非 NULL、未 destroy、樣本皆有限）之後清零，`fuse_us` 在 `aec_process_residual()` 通過引數、sequence 與權重檢查之後清零；
@@ -301,7 +301,7 @@ void aec_array_get_timing(const Aec* a, AecArrayTiming* out);
 linear 失敗不會動它（仍是上一次 fuse 的值）。被 NULL 引數、已 destroy 的 handle 或非有限樣本直接拒絕的呼叫整份記錄不動。解析度是微秒，所以低於 1 µs 的階段會讀到 0。
 
 **目標平台沒有 `CLOCK_MONOTONIC` 時**：`clock_gettime` 是 POSIX 而非 C99。用
-`make PROFILE=1 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'` 換掉時鐘；巨集要寫成**純函式名**（程式碼以 `AEC_NOW_US()` 呼叫它），
+`make EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'` 換掉時鐘（或 `make PROFILE=0` 關掉量測）；巨集要寫成**純函式名**（程式碼以 `AEC_NOW_US()` 呼叫它），
 指向不收參數、回傳 `uint32_t` 微秒的函式。替代時鐘必須**單調**，否則無號減法會產生接近 32-bit 全距的荒謬值。
 
 ### 3.2 執行期強度控制

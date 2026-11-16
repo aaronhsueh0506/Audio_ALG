@@ -235,7 +235,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 </table></div>
 <div class="warn"><b>三個常見誤判,先看這裡再懷疑演算法:</b>
 <ul>
-<li><code>aec_get_last_timing()</code> 回全 0 <b>不代表很快</b>——代表沒有用 <code>PROFILE=1</code> 建 library。而且函式<b>不會告訴你</b>它沒被啟用。</li>
+<li><code>aec_get_last_timing()</code> 回全 0 <b>不代表很快</b>——代表用 <code>PROFILE=0</code> 建了 library(預設建置會量測)。而且函式<b>不會告訴你</b>它沒被啟用。</li>
 <li><code>delay_updates</code> 是 matched-filter 的<b>更新總數</b>,<b>不區分</b>「同一值重複確認」與「跳到新值」,不能當成 lock 穩定度指標。</li>
 <li><code>near_power</code>／<code>out_power</code> 是逐樣本的 <b>EMA</b>(alpha = 0.95^(16000/取樣率),16 kHz 為 0.95),不是瞬時值;<code>duty_*</code> 會被 <code>reset()</code> 清零。</li>
 </ul></div>

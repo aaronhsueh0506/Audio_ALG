@@ -17,7 +17,7 @@ endif
 ifneq ($(filter-out 0 1,$(SIMD)),)
 $(error SIMD must be exactly 0 or 1)
 endif
-PROFILE ?= 0
+PROFILE ?= 1
 TOOLCHAIN_CHECK ?= 1
 DEBUG ?= 0
 NO_STDIO ?= 0
@@ -37,9 +37,7 @@ SIMD_CPPFLAGS :=
 ifeq ($(SIMD),0)
 SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
-ifeq ($(PROFILE),1)
-SIMD_CPPFLAGS += -DAEC_STAGE_TIMING=1
-endif
+SIMD_CPPFLAGS += -DAEC_STAGE_TIMING=$(PROFILE)
 
 # Same forwarding as pipelines/Makefile: COMMON_DIR/COMMON_LIB must reach the AEC sub-make so its
 # keyed archive path equals the one resolved here.

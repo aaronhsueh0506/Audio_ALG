@@ -137,23 +137,24 @@ summary printed once at exit.
 `--timing` is a DISPLAY flag: it decides whether a breakdown is printed. The
 gain-chain and synthesis rows are the program's own clock around those calls; the
 AEC rows come from `aec_get_last_timing()`, whose measurement is a build-time
-choice, off by default so a release binary takes none of the AEC's clock reads:
+choice, on by default (`PROFILE=1`; about 0.13 us per mono hop on the development host):
 
 ```sh
-make PROFILE=1                 # lib/aec's stage timing (-DAEC_STAGE_TIMING=1)
-"$(make -s print-bin-dir PROFILE=1)"/aec_nr_pipeline mic.wav ref.wav out.wav --timing
+make                           # lib/aec's stage timing (-DAEC_STAGE_TIMING=1, the default)
+"$(make -s print-bin-dir)"/aec_nr_pipeline mic.wav ref.wav out.wav --timing
+make PROFILE=0                 # builds it out: no AEC clock reads, the AEC rows read 0
 ```
 
-Run `--timing` against a build that did not measure and the AEC rows read 0;
+Run `--timing` against a `PROFILE=0` build and the AEC rows read 0;
 the report says so in words rather than printing a table of zeros.
 
 `CLOCK_MONOTONIC` is POSIX rather than C99. A target whose libc lacks it names
-its own microsecond timer for lib/aec instead — `make PROFILE=1
+its own microsecond timer for lib/aec instead — `make
 EXTRA_CFLAGS='-DAEC_NOW_US=board_timer_us -include my_timer.h'`, a plain
 identifier because these Makefiles reject parentheses in `EXTRA_CFLAGS`. The 4-channel
 array uses the same `AEC_NOW_US` (its stage timing is part of lib/aec: `aec_array_get_timing()`), so a build names one timer per
 component it actually builds. A substitute that returns a constant keeps the flag on
-and reads 0, which `--timing` cannot distinguish from a build without it. The example
+and reads 0, which `--timing` cannot distinguish from a `PROFILE=0` build. The example
 programs read their own clock in `timing_now_us()` (`mono/aec_nr_res/main.c`).
 
 There are no other optional performance compile flags.

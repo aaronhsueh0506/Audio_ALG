@@ -114,7 +114,7 @@ An unknown option (`--bogus`, a lone `--`) or a positional that is not an AEC le
 | `--no-nr`, `--no-res`, `--no-cng` | leave out the denoiser, the RES gain, the comfort noise; `--no-nr` alone (RES on, with or without `--no-cng`) is the AEC's full output, equal to `aec_process()` | off |
 | `--legacy-amin` | the denoiser's noise floor without the residual-echo powers (`use_r2 = 0`) | off |
 | `--fft-size 256\|512\|1024` | grid; 0 = the rate's default (also accepted by `--print-mem-size`); a value that is not a whole decimal integer exits 2 | 0 |
-| `--debug`, `--timing` | once-per-second status line; per-stage cost at exit (`make PROFILE=1` for the AEC rows) | off |
+| `--debug`, `--timing` | once-per-second status line; per-stage cost at exit (the AEC rows read 0 under `make PROFILE=0`) | off |
 | `--sample-rate <hz>` (`aec_nr_pipeline_static --print-mem-size` only) | the rate of the pool query; not a whole decimal integer: exit 2 | 16000 |
 
 Public functions an integrator copies from this main: the ones in the sequence above and `aec_debug_status()`,

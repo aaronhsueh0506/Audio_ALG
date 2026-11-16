@@ -7,7 +7,7 @@
 | **AEC linear path** | 0 samples | PBFDKF overlap-save 的當前 hop 線性誤差可立即取得 |
 | **Synthesis WOLA delay** | 1 hop | NR/RES 頻譜由 sqrt-Hann WOLA 重建；這就是 full-chain 的演算法延遲 |
 | **Pipeline total latency** | 1 hop — 16 ms @ 8 kHz, 8 ms @ 16 kHz default, 16 ms @ 16 kHz alt, ~10.7 ms @ 48 kHz | 不額外保存上一個 AEC context；AEC-only 為 0 samples |
-| **Processing (per hop)** | 待量測 | 目標平台上 AEC + NR + RES 合計的實測；主機端用 `--timing`（`make PROFILE=1`）取各階段 µs |
+| **Processing (per hop)** | 待量測 | 目標平台上 AEC + NR + RES 合計的實測；主機端用 `--timing` 取各階段 µs |
 | **RTF** | 待量測 | 同上；由實測 per-hop 時間除以 hop 時長 |
 
 上表是 conventional mono pipeline 的數字。兩條 Align-ULCNet application 的
