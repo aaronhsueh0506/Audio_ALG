@@ -16,7 +16,7 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
-#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
+#include "ainr_test_fixture.h"   /* write_erb_file(), erb_fixture_scratch_path() */
 #include "ainr_product.h"
 #include "dfn2_model_io.h"
 #include "graph_io.h"
@@ -33,22 +33,6 @@
 static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); \
                                        fprintf(stderr, "\n"); ++g_fail; } } while (0)
-
-static int write_erb(const char *path, int n_bins, int n_erb)
-{
-    size_t elems = (size_t)n_bins * (size_t)n_erb * 2u, i;
-    int32_t hdr[2];
-    FILE *fp = fopen(path, "wb");
-    if (!fp) return -1;
-    hdr[0] = n_bins; hdr[1] = n_erb;
-    if (fwrite(hdr, sizeof(int32_t), 2, fp) != 2) { fclose(fp); return -1; }
-    for (i = 0; i < elems; ++i) {   /* forward zero; inverse: band 0 owns every bin (a partition of unity) */
-        size_t inv = i - elems / 2u;
-        float v = (i >= elems / 2u && inv % (size_t)n_erb == 0u) ? 1.0f : 0.0f;
-        if (fwrite(&v, sizeof v, 1, fp) != 1) { fclose(fp); return -1; }
-    }
-    return fclose(fp);
-}
 
 static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamWork *work)
 {
@@ -133,7 +117,7 @@ static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoCo
     CHECK(rc == AINR_OK, "%s mem size %d", tag, rc);
     if (rc != AINR_OK) return;
     erb_fixture_scratch_path(erb, sizeof(erb), "ainr_graph_io_erb");
-    if (write_erb(erb, bins, (int)mc->wiring.outputs[0].w) != 0) exit(2);
+    write_erb_file(erb, bins, (int)mc->wiring.outputs[0].w, ERB_BAND0);
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
     rc = family == 0 ? ainr_init_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
                      : ainr_init_freq_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &freq, &info);
@@ -214,7 +198,7 @@ int main(void)
     if (ID_HAS_ROWS) {
         char erb[96];
         erb_fixture_scratch_path(erb, sizeof(erb), "ainr_graph_io_refusal");
-        if (write_erb(erb, 513, 32) != 0) exit(2);
+        write_erb_file(erb, 513, 32, ERB_BAND0);
         check_refusals(erb);
         unlink(erb);
     }

@@ -35,11 +35,6 @@
 
 static AinrInfo g_info;
 
-static void fill_pcm(int16_t *pcm, int n, int seed) {
-    int i;
-    for (i = 0; i < n; ++i) pcm[i] = (int16_t)((i * 13 + seed * 7) % 211 - 100);
-}
-
 /* Deterministic, non-constant fake accelerator fill: varies with hop_idx and element index, so an
  * indexing bug (wrong frame, wrong bin, cross-family data confusion) shows up as a mismatch
  * instead of being hidden behind constant values. Operates on StreamWork directly -- the same

@@ -94,11 +94,6 @@ static int run_ainr_blocks(AinrCtx *ctx, const int16_t *pcm_in, int blocks, int 
 
 static AinrInfo g_info;
 
-static void fill_pcm(int16_t *pcm, int n, int seed) {
-    int i;
-    for (i = 0; i < n; ++i) pcm[i] = (int16_t)((i * 13 + seed * 7) % 211 - 100);
-}
-
 /* 1. N=1 catalog entry: ainr_* must be byte-identical to driving dfn2_stream_* directly. */
 static int test_n1_matches_reference(const char *erb_path) {
     AinrConfig cfg;
