@@ -217,6 +217,24 @@ static int windows_match_after(const UlcnetModelIoInputs *in, size_t hop) {
                      : in->h_gru[0] == hidden_value((float)hop, 0u);
 }
 
+/* One frame through the per-frame functions, as a caller composes them. */
+static int prepare_one(UlcnetModelIoState *state, const float *error_re, const float *error_im,
+                       const float *far_re, const float *far_im, UlcnetModelIoInputs *inputs,
+                       UlcnetModelIoOutputs *outputs) {
+    if (ulcnet_model_io_pre_frame(state, 0, error_re, error_im, far_re, far_im, 0) != 0) return -1;
+    return ulcnet_model_io_views(state, inputs, outputs);
+}
+
+/* After the run: validate_run, then post_frame; a non-finite enhanced bin restarts once, as the stream does. */
+static int enhance_one(UlcnetModelIoState *state, float *enhanced_re, float *enhanced_im) {
+    if (ulcnet_model_io_validate_run(state) != 0) return -1;
+    if (ulcnet_model_io_post_frame(state, 0, enhanced_re, enhanced_im) != 0) {
+        ulcnet_model_io_reset(state);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     UlcnetModelIoDescriptor d4, d8, d64, invalid;
     UlcnetModelIoMemReq r4, r8, r64, r8b;
@@ -329,18 +347,30 @@ int main(int argc, char **argv) {
     state = ulcnet_model_io_init(pool, r8.bytes, &d8, &host.buffers);
     CHECK(state != NULL);
     CHECK(ulcnet_model_io_descriptor(state)->delay_depth == 8);
-    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
+
+    /* Misuse of the per-frame calls is refused and changes nothing. */
+    CHECK(ulcnet_model_io_pre_frame(NULL, 0, error_re, error_im, far_re, far_im, 0) == -1);
+    CHECK(ulcnet_model_io_pre_frame(state, 1, error_re, error_im, far_re, far_im, 0) == -1);
+    CHECK(ulcnet_model_io_pre_frame(state, -1, error_re, error_im, far_re, far_im, 0) == -1);
+    CHECK(ulcnet_model_io_pre_frame(state, 0, error_re, error_im, far_re, NULL, 0) == -1);
+    CHECK(ulcnet_model_io_pre_frame(state, 0, error_re, error_im, far_re, far_im, 1) == -1);
+    CHECK(ulcnet_model_io_views(NULL, &inputs, &outputs) == -1);
+    CHECK(ulcnet_model_io_views(state, NULL, &outputs) == -1);
+    CHECK(ulcnet_model_io_validate_run(NULL) == -1);
+    CHECK(ulcnet_model_io_post_frame(NULL, 0, enhanced_re, enhanced_im) == -1);
+    CHECK(ulcnet_model_io_post_frame(state, 1, enhanced_re, enhanced_im) == -1);
+    CHECK(ulcnet_model_io_post_frame(state, 0, NULL, enhanced_im) == -1);
 
     /* A fresh state has restarted nothing. */
     CHECK(ulcnet_model_io_state_generation(state) == 0u);
     CHECK(ulcnet_model_io_state_generation(NULL) == 0u);
 
-    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+    CHECK(prepare_one(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.spectrum_bins_elements == BINS);
     CHECK(outputs.spectrum_ri_elements == 2u * BINS);
     {
-        /* prepare() runs the fixed front end: the same fp32 expressions are
+        /* pre_frame() runs the fixed front end: the same fp32 expressions are
          * evaluated here so the values are pinned exactly. */
         float c_re = signed_power_ref(error_re[17],
                                       ULCNET_MODEL_IO_COMPRESSION_EXP);
@@ -383,7 +413,7 @@ int main(int argc, char **argv) {
     CHECK(windows_match_after(&inputs, 0u));
     CHECK(isnan(outputs.output[0]));
     /* Every state tensor is in-place: each output IS its input, at an
-     * address that never moves, and prepare() does not touch the contents. */
+     * address that never moves, and views() does not touch the contents. */
     CHECK(outputs.key_history_out == inputs.key_history);
     CHECK(outputs.value_history_out == inputs.value_history);
     CHECK(outputs.logit_history_out == inputs.logit_history);
@@ -398,14 +428,14 @@ int main(int argc, char **argv) {
      * oldest first -- at the same addresses. */
     for (hop = 1u; hop <= 3u * DEPTH; ++hop) {
         float base = (float)hop;
-        CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+        CHECK(prepare_one(state, error_re, error_im, far_re,
                                       far_im, &inputs, &outputs) == 0);
         CHECK(windows_match_after(&inputs, hop - 1u));
         fake_run(&inputs, &outputs, base);
         enhanced_re[0] = -7.0f;
-        CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) == 0);
-        /* The compressed error is not handed to the graph; prepare() keeps
-         * it for commit(), which multiplies it by the planar mask, then
+        CHECK(enhance_one(state, enhanced_re, enhanced_im) == 0);
+        /* The compressed error is not handed to the graph; pre_frame() keeps
+         * it for post_frame(), which multiplies it by the planar mask, then
          * applies the inverse signed power. The reference spells the complex
          * multiply out with unfused fp32 products, as
          * export_onnx.apply_mask_ri does, so every bin must match bit for
@@ -426,7 +456,7 @@ int main(int argc, char **argv) {
                   signed_power_ref(p_ri + p_ir, inverse));
         }
     }
-    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+    CHECK(prepare_one(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(windows_match_after(&inputs, 3u * DEPTH));
     CHECK(inputs.key_history == key_address &&
@@ -448,14 +478,10 @@ int main(int argc, char **argv) {
     outputs.output[0] = 7.0f;
     enhanced_re[0] = -7.0f;
     enhanced_im[0] = -8.0f;
-    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
+    CHECK(enhance_one(state, enhanced_re, enhanced_im) != 0);
     CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
     CHECK(ulcnet_model_io_state_generation(state) == 1u);
-    /* One prepare permits one commit attempt; the refused retry does not
-     * count as another restart. */
-    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
-    CHECK(ulcnet_model_io_state_generation(state) == 1u);
-    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+    CHECK(prepare_one(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
     CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
@@ -472,7 +498,7 @@ int main(int argc, char **argv) {
         const size_t key_stride = DEPTH * FEATURE;
         int which;
         for (which = 0; which < 5; ++which) {
-            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+            CHECK(prepare_one(state, error_re, error_im, far_re,
                                           far_im, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs, 4.0f);
             switch (which) {
@@ -492,10 +518,10 @@ int main(int argc, char **argv) {
             enhanced_re[0] = -7.0f;
             enhanced_im[0] = -8.0f;
             generation = ulcnet_model_io_state_generation(state);
-            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
+            CHECK(enhance_one(state, enhanced_re, enhanced_im) != 0);
             CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
             CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
-            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+            CHECK(prepare_one(state, error_re, error_im, far_re,
                                           far_im, &inputs, &outputs) == 0);
             CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
             CHECK(all_zero(inputs.value_history,
@@ -505,12 +531,12 @@ int main(int argc, char **argv) {
             CHECK(all_zero(inputs.h_gru, inputs.gru_hidden_elements));
             /* The state keeps working after a refusal. */
             fake_run(&inputs, &outputs, 5.0f);
-            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re,
+            CHECK(enhance_one(state, enhanced_re,
                                          enhanced_im) == 0);
             CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
         }
     }
-    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+    CHECK(prepare_one(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.key_history[0] == key_now(5.0f, 0u, 0u));
     CHECK(inputs.h_gru[0] == hidden_value(5.0f, 0u));
@@ -532,9 +558,9 @@ int main(int argc, char **argv) {
                      break;
             }
             generation = ulcnet_model_io_state_generation(state);
-            CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0);
+            CHECK(enhance_one(state, enhanced_re, enhanced_im) != 0);
             CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
-            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+            CHECK(prepare_one(state, error_re, error_im, far_re,
                                           far_im, &inputs, &outputs) == 0);
             CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
             CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
@@ -544,7 +570,7 @@ int main(int argc, char **argv) {
     }
     fake_run(&inputs, &outputs, 6.0f);
     generation = ulcnet_model_io_state_generation(state);
-    CHECK(ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) == 0);
+    CHECK(enhance_one(state, enhanced_re, enhanced_im) == 0);
     CHECK(ulcnet_model_io_state_generation(state) == generation);
 
     /* reset() zeroes the state and advances the generation, whether or not a
@@ -553,7 +579,7 @@ int main(int argc, char **argv) {
     ulcnet_model_io_reset(state);
     CHECK(ulcnet_model_io_state_generation(state) == generation + 1u);
     ulcnet_model_io_reset(NULL);
-    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+    CHECK(prepare_one(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(windows_match_after(&inputs, 0u));
     CHECK(all_zero(inputs.h_gru, inputs.gru_hidden_elements));

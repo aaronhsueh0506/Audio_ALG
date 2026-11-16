@@ -1,5 +1,5 @@
-/* Align-ULCNet pre/post class (contract: ulcnet_prepost.h): object lifecycle, pool carve and the per-hop frame state
- * machine over ulcnet_model_io.c. Requires -ffp-contract=off. No heap in _init, no globals, no stdio. */
+/* Align-ULCNet pre/post class (contract: ulcnet_prepost.h): object lifecycle, pool carve and per-frame forwarders over
+ * ulcnet_model_io.c. Requires -ffp-contract=off. No heap in _init, no globals, no stdio. */
 
 #include "ulcnet_prepost.h"
 
@@ -13,20 +13,6 @@
 
 struct UlcnetPrepost {
     UlcnetModelIoState *io;
-
-    float *err_re;      /* [frames * n_bins] */
-    float *err_im;
-    float *far_re;
-    float *far_im;
-    float *enh_re;      /* [frames * n_bins] frame_finish staging */
-    float *enh_im;
-
-    int *events;        /* [frames]; packet instances only, NULL otherwise */
-
-    int n_bins;
-    int frames;         /* frames per graph call: 1, or the packet size */
-    int frame_open;     /* a frame is pending the accelerator */
-    int prepared;       /* frame_open() armed the transaction for the open frame; implies frame_open */
 
     /* _create bookkeeping; 0 for an _init instance. */
     void *heap_base;
@@ -75,34 +61,15 @@ static int pp_layout(UlcnetPrepost *p, unsigned char *base,
                      const UlcnetModelIoStateBuffers *buffers,
                      const UlcnetModelIoMemReq *io_req,
                      size_t *total) {
-    float **slots[6] = { NULL };
-    const size_t frames = (size_t)ulcnet_model_io_descriptor_frames(descriptor);
     size_t cursor = 0;
-    size_t i;
     void *ptr = NULL;
 
-    if (p) {
-        slots[0] = &p->err_re;  slots[1] = &p->err_im;
-        slots[2] = &p->far_re;  slots[3] = &p->far_im;
-        slots[4] = &p->enh_re;  slots[5] = &p->enh_im;
-    }
     if (pp_carve(base, &cursor, 1u, sizeof(UlcnetPrepost), &ptr) != 0) return -1;
 
     if (pp_carve(base, &cursor, io_req->bytes, 1u, &ptr) != 0) return -1;
     if (base && p) {
         p->io = ulcnet_model_io_init(ptr, io_req->bytes, descriptor, buffers);
         if (!p->io) return -1;
-    }
-
-    for (i = 0; i < sizeof slots / sizeof slots[0]; ++i) {
-        if (pp_carve(base, &cursor, frames * (size_t)descriptor->spectrum_bins, sizeof(float),
-                     &ptr) != 0)
-            return -1;
-        if (base && slots[i]) *slots[i] = (float *)ptr;
-    }
-    if (frames > 1u) {
-        if (pp_carve(base, &cursor, frames, sizeof(int), &ptr) != 0) return -1;
-        if (base && p) p->events = (int *)ptr;
     }
 
     *total = ck_align16_size(cursor);
@@ -208,8 +175,6 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
-    p->n_bins = cfg->grid.n_bins;
-    p->frames = ulcnet_model_io_descriptor_frames(&descriptor);
     return p;
 }
 
@@ -251,10 +216,11 @@ void ulcnet_prepost_destroy(UlcnetPrepost *p) {
 void ulcnet_prepost_reset(UlcnetPrepost *p) {
     if (!p) return;
     ulcnet_model_io_reset(p->io);
-    memset(p->enh_re, 0, (size_t)p->frames * (size_t)p->n_bins * sizeof(float));
-    memset(p->enh_im, 0, (size_t)p->frames * (size_t)p->n_bins * sizeof(float));
-    p->frame_open = 0;
-    p->prepared = 0;
+}
+
+void ulcnet_prepost_zero_state(UlcnetPrepost *p) {
+    if (!p) return;
+    ulcnet_model_io_reset(p->io);
 }
 
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p) {
@@ -265,116 +231,24 @@ const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p)
     return p ? ulcnet_model_io_descriptor(p->io) : NULL;
 }
 
-int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
-                                    const float *err_re, const float *err_im,
-                                    const float *far_re, const float *far_im) {
-    size_t bins;
-
-    if (!p || !err_re || !err_im || !far_re || !far_im) return -1;
-    if (p->frame_open || p->frames != 1) return -1;   /* a frame is pending, or this is a packet instance */
-
-    bins = (size_t)p->n_bins * sizeof(float);
-    memcpy(p->err_re, err_re, bins);
-    memcpy(p->err_im, err_im, bins);
-    memcpy(p->far_re, far_re, bins);
-    memcpy(p->far_im, far_im, bins);
-
-    p->frame_open = 1;
-    return 1;
+int ulcnet_prepost_pre_frame(UlcnetPrepost *p, int slot,
+                             const float *err_re, const float *err_im,
+                             const float *far_re, const float *far_im, int event) {
+    if (!p) return ULCNET_PREPOST_ERR_ARG;
+    return ulcnet_model_io_pre_frame(p->io, slot, err_re, err_im, far_re, far_im, event);
 }
 
-int ulcnet_prepost_pre_process_packet(UlcnetPrepost *p,
-                                      const float *err_re, const float *err_im,
-                                      const float *far_re, const float *far_im,
-                                      const int *events) {
-    size_t planes, frame;
-
-    if (!p || !err_re || !err_im || !far_re || !far_im || !events) return -1;
-    if (p->frame_open || p->frames < 2) return -1;
-
-    planes = (size_t)p->frames * (size_t)p->n_bins * sizeof(float);
-    memcpy(p->err_re, err_re, planes);
-    memcpy(p->err_im, err_im, planes);
-    memcpy(p->far_re, far_re, planes);
-    memcpy(p->far_im, far_im, planes);
-    for (frame = 0; frame < (size_t)p->frames; ++frame) p->events[frame] = events[frame] != 0;
-
-    p->frame_open = 1;
-    return 1;
+int ulcnet_prepost_views(UlcnetPrepost *p, UlcnetModelIoInputs *inputs, UlcnetModelIoOutputs *outputs) {
+    if (!p) return -1;
+    return ulcnet_model_io_views(p->io, inputs, outputs);
 }
 
-int ulcnet_prepost_frame_open(UlcnetPrepost *p,
-                                UlcnetModelIoInputs *inputs,
-                                UlcnetModelIoOutputs *outputs) {
-    if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    /* Arms the transaction and NaN-fills the `output` mask, so a repeated request still gets a clean one. */
-    if (p->frames > 1) {
-        if (ulcnet_model_io_prepare_packet(p->io, p->err_re, p->err_im, p->far_re, p->far_im,
-                                           p->events, inputs, outputs) != 0)
-            return -1;
-    } else if (ulcnet_model_io_prepare(p->io, p->err_re, p->err_im,
-                                       p->far_re, p->far_im, inputs, outputs) != 0) {
-        return -1;
-    }
-    p->prepared = 1;
-    return 0;
+int ulcnet_prepost_validate_run(UlcnetPrepost *p) {
+    if (!p) return -1;
+    return ulcnet_model_io_validate_run(p->io);
 }
 
-static void pp_close_frame(UlcnetPrepost *p) {
-    p->frame_open = 0;
-    p->prepared = 0;
-}
-
-int ulcnet_prepost_frame_finish(UlcnetPrepost *p) {
-    /* `prepared` is this class's own latch: after frame_bypass() model_io's transaction stays armed with stale
-     * outputs, so its flag alone would let the next frame_finish accept them without frame_open(). */
-    size_t bins, frame;
-
-    if (!p || !p->prepared) return -1;
-    if ((p->frames > 1 ? ulcnet_model_io_enhance_packet(p->io, p->enh_re, p->enh_im)
-                       : ulcnet_model_io_enhance_spectrum(p->io, p->enh_re, p->enh_im)) != 0) {
-        /* model_io restarted the recurrent state; the frame stays open for frame_bypass() or a fresh frame_open(). */
-        p->prepared = 0;
-        return -1;
-    }
-    /* A packet's event frames were reset and bypassed in the graph: the host fills them with the error spectrum. */
-    bins = (size_t)p->n_bins;
-    for (frame = 0; p->frames > 1 && frame < (size_t)p->frames; ++frame) {
-        if (!p->events[frame]) continue;
-        memcpy(p->enh_re + frame * bins, p->err_re + frame * bins, bins * sizeof(float));
-        memcpy(p->enh_im + frame * bins, p->err_im + frame * bins, bins * sizeof(float));
-    }
-    pp_close_frame(p);
-    return 0;
-}
-
-int ulcnet_prepost_frame_bypass(UlcnetPrepost *p) {
-    size_t bytes;
-    if (!p || !p->frame_open) return -1;
-    bytes = (size_t)p->frames * (size_t)p->n_bins * sizeof(float);
-    memcpy(p->enh_re, p->err_re, bytes);
-    memcpy(p->enh_im, p->err_im, bytes);
-    pp_close_frame(p);
-    return 0;
-}
-
-int ulcnet_prepost_frame_fail(UlcnetPrepost *p, int run_started) {
-    size_t frame;
-    int restart = run_started != 0;
-    if (!p || !p->frame_open) return -1;
-    /* The graph restarts the model at an armed packet's event frame; without its run, restart it here. */
-    for (frame = 0; !restart && p->frames > 1 && p->prepared && frame < (size_t)p->frames; ++frame)
-        restart = p->events[frame] != 0;
-    if (restart) ulcnet_model_io_reset(p->io);
-    return ulcnet_prepost_frame_bypass(p);
-}
-
-int ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float *re, float *im) {
-    size_t bins;
-    if (!p || !re || !im) return -1;
-    if (p->frame_open) return -1;
-    bins = (size_t)p->frames * (size_t)p->n_bins * sizeof(float);
-    memcpy(re, p->enh_re, bins);
-    memcpy(im, p->enh_im, bins);
-    return 0;
+int ulcnet_prepost_post_frame(const UlcnetPrepost *p, int slot, float *out_re, float *out_im) {
+    if (!p) return ULCNET_PREPOST_ERR_ARG;
+    return ulcnet_model_io_post_frame(p->io, slot, out_re, out_im);
 }

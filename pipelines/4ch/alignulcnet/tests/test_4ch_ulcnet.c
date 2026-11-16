@@ -1556,10 +1556,10 @@ static int test_nan_guard(void) {
 
 /* 8. Full-write contract: infer() writes only the FIRST 100 bins (0.5x) on scheduled hops
  *    of the mask but returns rc==0. The stream pre-fills the mask staging with NaN before
- *    every run (ulcnet_model_io_prepare()), so the unwritten bins stay
+ *    every run (ulcnet_model_io_views()), so the unwritten bins stay
  *    NaN and the finite guard discards the frame: bit-identical to the NULL-model pipeline
  *    under the mixing rule of test 7, and the next fully-written frame is applied again.
- *    MUTATION: removing the NaN pre-fill in ulcnet_model_io_prepare() leaves stale finite
+ *    MUTATION: removing the NaN pre-fill in ulcnet_model_io_views() leaves stale finite
  *    values in bins 100..256 and the bit-identical check goes red. */
 
 typedef struct PartialModel {

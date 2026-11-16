@@ -1490,7 +1490,7 @@ static void test_nan_guard(void) {
  *    of the mask but returns rc==0. The stream pre-fills the mask staging with NaN before
  *    every run, so the unwritten bins stay non-finite and the frame takes the
  *    identity path (same mixing rule as test 8); the next fully-written frame is
- *    applied again. MUTATION: removing the pre-fill (ulcnet_model_io_prepare) leaves stale
+ *    applied again. MUTATION: removing the pre-fill (ulcnet_model_io_views) leaves stale
  *    finite values in the unwritten bins and this test goes red.
  * ========================================================================= */
 typedef struct {

@@ -10,7 +10,7 @@ the bit-exact twin of torch.stft/istft(center=True)). One program serves both
 grids: n_fft is an argument. The fixture first builds audiolib's NE10 static lib
 the way the AEC C tests document it. The driver shares ONE FftHandle across
 analysis and synthesis (strictly sequential), the sharing contract the pipeline
-variants rely on. The Align-ULCNet back end (ulcnet_model_io_enhance_spectrum)
+variants rely on. The Align-ULCNet back end (ulcnet_model_io_post_frame)
 and the DeepVQE-S CCM kernel are checked against their Python statements at
 the same widths.
 
@@ -265,8 +265,8 @@ def test_emission_timing_contract(driver):
 
 @pytest.mark.parametrize('scalar_twin', [False, True], ids=['shipped', 'scalar_twin'])
 def test_ulcnet_back_end_matches_python(driver, audio_common_lib, scalar_twin):
-    """The shipped back end (ulcnet_model_io_enhance_spectrum over a prepared
-    state with nothing registered): the compressed error times the planar mask,
+    """The shipped back end (ulcnet_model_io_validate_run + post_frame over a
+    state with the features written and nothing registered): the compressed error times the planar mask,
     then the inverse signed power, against the same statement in torch.
     scalar_twin builds the scalar twin that a NEON build replaces."""
     work, _ = driver
@@ -302,13 +302,14 @@ int main(int argc, char **argv) {
     if (ulcnet_model_io_get_mem_requirements(&descriptor, &req) != 0 || req.bytes > sizeof pool) return 5;
     state = ulcnet_model_io_init(pool, req.bytes, &descriptor, NULL);   /* no state registered */
     if (!state) return 5;
-    if (ulcnet_model_io_prepare(state, in[0], in[1], zero, zero, &inputs, &outputs) != 0) return 6;
+    if (ulcnet_model_io_pre_frame(state, 0, in[0], in[1], zero, zero, 0) != 0) return 6;
+    if (ulcnet_model_io_views(state, &inputs, &outputs) != 0) return 6;
     if (outputs.spectrum_ri_elements != 2u * (size_t)n_bins) return 6;
     for (int bin = 0; bin < n_bins; ++bin) {          /* the planar mask: real plane, then imaginary plane */
         outputs.output[bin] = in[2][bin];
         outputs.output[n_bins + bin] = in[3][bin];
     }
-    if (ulcnet_model_io_enhance_spectrum(state, out[0], out[1]) != 0) return 7;
+    if (ulcnet_model_io_validate_run(state) != 0 || ulcnet_model_io_post_frame(state, 0, out[0], out[1]) != 0) return 7;
     for (int row = 0; row < 2; ++row)
         fwrite(out[row], sizeof(float), (size_t)n_bins, fo);
     fclose(fi); fclose(fo); return 0;

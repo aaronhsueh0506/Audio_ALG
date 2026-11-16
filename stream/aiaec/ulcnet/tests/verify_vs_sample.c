@@ -1,7 +1,6 @@
 /* Verifies ulcnet_stream_pre_process_f32/post_process against a hand-written per-hop loop (the oracle): alignment-edge
- * check -> model restart + armed reprime -> int16->float + two STFT pushes + pre_process_freq -> reprime bypass or
- * frame_open / accelerator / frame_finish-or-fail -> post_process_freq -> ac_istft_push_planar -> int16
- * saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
+ * check -> model restart + armed reprime -> int16->float + two STFT pushes -> reprime identity or pre_frame + views /
+ * accelerator / validate_run + post_frame or restart -> ac_istft_push_planar -> int16 saturate. The oracle is built directly against lib/aiaec/ulcnet/ulcnet_prepost.h and audiolib, never against
  * ulcnet_stream.c, on the grid of the shipped model (16 kHz, FFT 512, delay_depth 32). Both drivers run the SAME
  * deterministic fake accelerator and must produce byte-identical PCM and an identical
  * (pre_rc, ai_rc, post_rc, written, generation) trace, hop for hop. One row needs no oracle: a finite mask whose
@@ -133,6 +132,13 @@ static void board_explicit_reset(BoardDriver *d) {
     d->prev_solid = 0;
 }
 
+/* The hop's frame is the error spectrum, state and generation untouched. */
+static void board_identity(BoardDriver *d) {
+    size_t bytes = (size_t)d->grid.n_bins * sizeof(float);
+    memcpy(d->enh_re, d->err_re, bytes);
+    memcpy(d->enh_im, d->err_im, bytes);
+}
+
 static int board_always_bypass_pre(BoardDriver *d, const int16_t *err_in, const int16_t *far_in) {
     int hop = d->grid.hop, k;
     for (k = 0; k < hop; ++k) {
@@ -141,9 +147,7 @@ static int board_always_bypass_pre(BoardDriver *d, const int16_t *err_in, const 
     }
     ac_stft_push_planar(d->stft_err, d->err_f, d->err_re, d->err_im);
     ac_stft_push_planar(d->stft_far, d->far_f, d->far_re, d->far_im);
-    if (ulcnet_prepost_pre_process_freq(d->prepost, d->err_re, d->err_im, d->far_re, d->far_im) != 1)
-        return -1;
-    (void)ulcnet_prepost_frame_bypass(d->prepost);
+    board_identity(d);
     return 0;
 }
 
@@ -164,15 +168,14 @@ static int board_pre_f32(BoardDriver *d, const float *err_in, const float *far_i
 
     ac_stft_push_planar(d->stft_err, err_in, d->err_re, d->err_im);
     ac_stft_push_planar(d->stft_far, far_in, d->far_re, d->far_im);
-    if (ulcnet_prepost_pre_process_freq(d->prepost, d->err_re, d->err_im, d->far_re, d->far_im) != 1)
-        return -1;
 
     if (d->reprime_remaining > 0) {
         d->reprime_remaining--;
-        (void)ulcnet_prepost_frame_bypass(d->prepost);
+        board_identity(d);
         return 0;
     }
-    if (ulcnet_prepost_frame_open(d->prepost, in, out) != 0) return -1;
+    if (ulcnet_prepost_pre_frame(d->prepost, 0, d->err_re, d->err_im, d->far_re, d->far_im, 0) != 0) return -1;
+    if (ulcnet_prepost_views(d->prepost, in, out) != 0) return -1;
     return 1;
 }
 
@@ -202,23 +205,21 @@ static int stream_pre_s16(UlcnetStream *s, const int16_t *err_in, const int16_t 
     return ulcnet_stream_pre_process_f32(s, e, f, delay, io);
 }
 
-/* Stage 5's close + post_process_freq + synthesis. `pre_rc` selects whether to dispatch
- * frame_finish/frame_fail (1: a real frame was opened) or skip it entirely (0: already bypassed
- * inside board_pre -- ai_rc is ignored). */
+/* Stage 5's close + synthesis. `pre_rc` selects whether to validate the run or restart (1: a real frame was opened)
+ * or skip it entirely (0: identity already staged in board_pre -- ai_rc is ignored). */
 static int board_post(BoardDriver *d, int pre_rc, int ai_rc, int16_t *pcm_out, int *written_out) {
-    int hop = d->grid.hop, k, prc, written = 0;
+    int hop = d->grid.hop, k, written = 0;
     if (pre_rc == 1) {
+        int ok = 0;
         if (ai_rc == STREAM_RUN_OK) {
-            if (ulcnet_prepost_frame_finish(d->prepost) != 0) (void)ulcnet_prepost_frame_bypass(d->prepost);
-        } else {
-            (void)ulcnet_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+            if (ulcnet_prepost_validate_run(d->prepost) == 0) {
+                ok = ulcnet_prepost_post_frame(d->prepost, 0, d->enh_re, d->enh_im) == 0;
+                if (!ok) ulcnet_prepost_zero_state(d->prepost);
+            }
+        } else if (ai_rc != STREAM_RUN_NOT_STARTED) {
+            ulcnet_prepost_zero_state(d->prepost);
         }
-    }
-    prc = ulcnet_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im);
-    if (prc != 0) {
-        memset(pcm_out, 0, (size_t)hop * sizeof(int16_t));
-        if (written_out) *written_out = -1;
-        return -1;
+        if (!ok) board_identity(d);
     }
     written = ac_istft_push_planar(d->istft, d->enh_re, d->enh_im, d->hop_out);
     if (written_out) *written_out = written;
@@ -663,9 +664,8 @@ static int run_float_entry_row(void) {
  * non-finite mask: the hop is the error spectrum bit for bit, the generation advances once, the next hop sees the new
  * generation and is enhanced again. Sub-rows on the stream's _freq entries: a 3.0e30 mask bin at bin 0 of the real
  * plane, then of the imaginary plane (the error's imaginary part is zero there, so exactly one output plane overflows:
- * the real one, then the imaginary one); a NaN error bin under a plain mask; a 3.0e30 mask bin over a zero error
- * spectrum, which stays finite and must be accepted. Then the bare
- * class: a retried frame_finish does not advance the generation again, and a fresh frame_open recovers the frame. ---- */
+ * the real one, then the imaginary one); a 3.0e30 mask bin over a zero error spectrum, which stays finite and must be
+ * accepted; a NaN error bin, which the entry refuses with ULCNET_STREAM_ERR_RANGE before anything moves. ---- */
 enum { REF_HUGE_RE, REF_HUGE_IM, REF_NAN_ERR, REF_HUGE_SILENT, REF_COUNT };
 enum { REF_BAD_HOP = 3, REF_HOPS = 6 };
 
@@ -728,11 +728,20 @@ static int run_refused_spectrum_row(void) {
         for (h = 0; h < REF_HOPS; ++h) {
             UlcnetHopIO io;
             const uint32_t gen_before = ulcnet_stream_state_generation(B);
-            const int refused = (h == REF_BAD_HOP && sub != REF_HUGE_SILENT);
+            const int refused = (h == REF_BAD_HOP && sub != REF_HUGE_SILENT && sub != REF_NAN_ERR);
             uint32_t gen_after;
             int identity, ok;
 
             refused_row_spectra(sub, h, bins, er, ei, fr, fi);
+            if (sub == REF_NAN_ERR && h == REF_BAD_HOP) {   /* out of range: refused, nothing opened, nothing moved */
+                if (ulcnet_stream_pre_process_freq(B, er, ei, fr, fi, delay, &io) != ULCNET_STREAM_ERR_RANGE ||
+                    ulcnet_stream_state_generation(B) != gen_before ||
+                    ulcnet_stream_post_process_freq(B, 0, re, im) != -1) {
+                    fprintf(stderr, "refused-spectrum row (%s): the entry did not refuse a NaN bin cleanly\n", name[sub]);
+                    violations++;
+                }
+                continue;
+            }
             if (ulcnet_stream_pre_process_freq(B, er, ei, fr, fi, delay, &io) != 1 || io.state_generation != gen_before) {
                 fprintf(stderr, "refused-spectrum row (%s): hop %d did not open on generation %u\n", name[sub], h, gen_before);
                 violations++;
@@ -760,48 +769,8 @@ static int run_refused_spectrum_row(void) {
         free(pool);
     }
 
-    {   /* the bare class */
-        UlcnetPrepostConfig pcfg;
-        UlcnetPrepostMemReq preq;
-        UlcnetPrepost *p;
-        UlcnetModelIoInputs in;
-        UlcnetModelIoOutputs out;
-        void *pool = NULL;
-        uint32_t gen;
-        if (ulcnet_prepost_config_defaults(&pcfg, &grid) != 0 || ulcnet_prepost_get_mem_size(&pcfg, &preq) != 0 ||
-            posix_memalign(&pool, (size_t)preq.alignment, (size_t)preq.bytes) != 0)
-            return -1;
-        p = ulcnet_prepost_init_ex(pool, (size_t)preq.bytes, &pcfg, &preq);
-        if (!p) return -1;
-        refused_row_spectra(REF_HUGE_RE, REF_BAD_HOP, bins, er, ei, fr, fi);
-        if (ulcnet_prepost_pre_process_freq(p, er, ei, fr, fi) != 1 || ulcnet_prepost_frame_open(p, &in, &out) != 0) return -1;
-        refused_row_mask(REF_HUGE_RE, REF_BAD_HOP, bins, out.output);
-        gen = ulcnet_prepost_state_generation(p);
-        if (ulcnet_prepost_frame_finish(p) != -1 || ulcnet_prepost_state_generation(p) != gen + 1u) {
-            fprintf(stderr, "refused-spectrum row (bare class): frame_finish accepted an overflowing frame or the "
-                            "generation did not advance by one\n");
-            violations++;
-        }
-        if (ulcnet_prepost_frame_finish(p) != -1 || ulcnet_prepost_state_generation(p) != gen + 1u ||
-            ulcnet_prepost_post_process_freq(p, re, im) != -1) {
-            fprintf(stderr, "refused-spectrum row (bare class): a retried frame_finish was accepted or advanced the "
-                            "generation again, or the refused frame could be read\n");
-            violations++;
-        }
-        /* a fresh frame_open on the still-open frame, a plain mask: accepted, enhanced, generation unchanged */
-        if (ulcnet_prepost_frame_open(p, &in, &out) != 0) return -1;
-        refused_row_mask(REF_HUGE_RE, 0, bins, out.output);
-        if (ulcnet_prepost_frame_finish(p) != 0 || ulcnet_prepost_post_process_freq(p, re, im) != 0 ||
-            ulcnet_prepost_state_generation(p) != gen + 1u || !spectrum_is_finite(re, im, bins) ||
-            (memcmp(re, er, plane) == 0 && memcmp(im, ei, plane) == 0)) {
-            fprintf(stderr, "refused-spectrum row (bare class): the frame did not recover through a fresh frame_open\n");
-            violations++;
-        }
-        free(pool);
-    }
-
-    printf("refused-spectrum row: %s (%d sub-rows of %d hops on the _freq entries, then the bare class's retry and "
-           "recovery)\n", violations == 0 ? "PASS" : "FAIL", (int)REF_COUNT, (int)REF_HOPS);
+    printf("refused-spectrum row: %s (%d sub-rows of %d hops on the _freq entries)\n",
+           violations == 0 ? "PASS" : "FAIL", (int)REF_COUNT, (int)REF_HOPS);
     free(er); free(ei); free(fr); free(fi); free(re); free(im);
     return violations == 0 ? 0 : 1;
 }

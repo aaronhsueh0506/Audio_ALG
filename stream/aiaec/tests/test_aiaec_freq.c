@@ -636,10 +636,15 @@ static int section_bind_and_pool(int fft, int n) {
                   ck_align16_size((3u * (size_t)hop + 2u * plane * (1u + (size_t)n)) * sizeof(float));
         pinned = fft == 1024 ? (n == 2 ? 111440u : 62224u) : fft == 512 ? 31504u : n == 8 ? 102800u : 16144u;
 #else
-        framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
-                  ck_align16_size(ac_istft_get_mem_size(&sc)) +
-                  ck_align16_size((1u * (size_t)hop + 6u * plane) * sizeof(float));
-        pinned = fft == 1024 ? (n == 2 ? 58096u : 29392u) : fft == 512 ? 15056u : 7888u;
+        {   /* the stream's scratch slab: the error planes and events are in both pools, far / enhanced / hop are PCM only */
+            const size_t bins = (size_t)(fft / 2 + 1);
+            const size_t shared = 2u * plane + (n > 1 ? (size_t)n : 0u);
+            framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
+                      ck_align16_size(ac_istft_get_mem_size(&sc)) +
+                      ck_align16_size((shared + 2u * bins + 2u * plane + (size_t)hop) * sizeof(float)) -
+                      ck_align16_size(shared * sizeof(float));
+        }
+        pinned = fft == 1024 ? (n == 2 ? 41552u : 21040u) : fft == 512 ? 10800u : 5680u;
 #endif
         CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
                   (unsigned long long)rb.bytes, (unsigned long long)rf.bytes, framing);

@@ -1,5 +1,6 @@
 /* Align-ULCNet PCM stream: two analysis AcStft (linear error, raw far), one AcIstft (AC_OLA_ACCUMULATE), lib/aiaec/ulcnet's
- * UlcnetPrepost lifecycle and alignment reset / reprime; one hop of PCM per call, no HPF. A post-filter BEHIND a linear
+ * UlcnetPrepost per-frame functions under the call lifecycle (submit / bypass, tensor views, finish, restart), input range
+ * checks and alignment reset / reprime; one hop of PCM per call, no HPF. A post-filter BEHIND a linear
  * AEC: the inputs are its linear-error hop and the raw far, never raw mic.
  *
  *     per hop: pre_rc = ulcnet_stream_pre_process_f32(ctx, err_in, far_in, delay, &io);   // -1: contract error
@@ -12,6 +13,9 @@
  * synthesis keep running: the PCM entries give the samples of the spectrum entries around an AcStft / AcIstft.
  * Fail-OPEN: a bypassed frame is the linear-error spectrum unchanged; a hop whose mask, state or enhanced spectrum is not
  * finite is bypassed and advances the generation, as does a dirty status.
+ * Input range: every pre_process entry refuses a spectrum bin that is NaN or Inf (PCM entries: a sample that is NaN or
+ * beyond ULCNET_STREAM_PCM_LIMIT_BITS) with ULCNET_STREAM_ERR_RANGE before anything moves; the next call equals one that
+ * never saw it.
  *
  * Packet streams (cfg.frames_per_call N >= 2, graph layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): each packet pre_process is
  * one accelerator job (return 1) with one post_process, N * hop samples out (_freq: N * n_bins per plane); the per-hop entries
@@ -41,6 +45,11 @@ extern "C" {
 #define ULCNET_STREAM_ALIGNMENT          16u
 /* Identity hops after an alignment boundary: each frame spans two hops, so only the boundary hop's frame straddles it. */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
+/* IEEE bits of the largest accepted |sample| of a PCM entry (2^112) and |bin| of a spectrum entry (FLT_MAX). */
+#define ULCNET_STREAM_PCM_LIMIT_BITS     0x77800000u
+#define ULCNET_STREAM_BIN_LIMIT_BITS     0x7F7FFFFFu
+/* Returned by a pre_process entry that refused an out-of-range input; -1 stays the contract error. */
+#define ULCNET_STREAM_ERR_RANGE          (-2)
 
 /* Alignment events of the hop from the caller's linear AEC. A 4-channel unit passes delay.changed and delay.solid of
  * its front frame; a mono lane maps AecLinearView.delay_state (changed = CHANGED, solid = not UNLOCKED). */
@@ -101,8 +110,8 @@ typedef struct UlcnetHopIO {
 } UlcnetHopIO;
 
 /* One hop in as full-scale float err_in and far_in (hop_size samples each): alignment-edge check (may restart the model), analysis,
- * pre_process_freq, then frame_bypass (reprime hop: io zeroed, returns 0) or frame_open (returns 1). -1: contract error
- * (a freq_only stream included). */
+ * pre_frame, then views (returns 1) or, on a reprime hop, io zeroed and 0. -1: contract error (a freq_only stream
+ * included); ULCNET_STREAM_ERR_RANGE: an input sample out of range. */
 int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                   UlcnetStreamDelay delay, UlcnetHopIO *io);
 
@@ -112,8 +121,8 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
 /* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then one job; the PCM equals N
- * one-hop calls, event hops included. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a
- * call before the matching post). */
+ * one-hop calls, event hops included. Returns 1, -1 on a contract error (NULL args, a one-hop or freq_only stream, a
+ * call before the matching post), or ULCNET_STREAM_ERR_RANGE. */
 int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                          const UlcnetStreamDelay *delay, UlcnetHopIO *io);
 

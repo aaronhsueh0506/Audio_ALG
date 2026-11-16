@@ -1,10 +1,11 @@
 /* The spectrum-only stream of ulcnet_stream (cfg.freq_only), per grid row, one-hop and packet:
  *   - a pool of exactly get_mem_size() bytes between two canary zones initialises, 16 bytes less is refused; its size
- *     is the pinned one and the full stream's less the FFT, two STFT, one ISTFT and the scratch slab, as audiolib's own
- *     size queries give them;
+ *     is the pinned one and the full stream's less the FFT, two STFT, one ISTFT and the PCM half of the scratch slab, as
+ *     audiolib's own size queries give them;
  *   - a run through the _freq entries (alignment events and their reprime hops, model failure, NaN / Inf / 3e30 /
- *     unwritten masks, a NaN input bin, resets between hops and inside one, calls out of order) returns, hop for hop,
- *     the codes, job tensors, generation, restart mask and spectra of a full stream fed the same;
+ *     unwritten masks, resets between hops and inside one, calls out of order) returns, hop for hop, the codes, job
+ *     tensors, generation, restart mask and spectra of a full stream fed the same; a NaN input bin is refused by both
+ *     with ULCNET_STREAM_ERR_RANGE and moves nothing;
  *   - the canary zones are intact afterwards;
  *   - every PCM entry returns -1 and changes nothing (pool bytes, generation, io, PCM); an open _freq hop survives it;
  *   - a descriptor of the other kind of stream is refused in both directions; any non-zero freq_only is the same build. */
@@ -23,13 +24,13 @@ typedef struct Row { int sr, fft, depth, n; size_t slim_bytes; } Row;
 
 /* The pinned bytes are host (LP64) numbers. */
 static const Row ROWS[] = {
-    { 16000, 256, 63, 1, 7808 },
-    { 16000, 256, 63, 8, 58304 },
-    { 16000, 512, 32, 1, 14976 },
-    { 16000, 512, 32, 8, 115648 },
-    { 48000, 1024, 47, 1, 29312 },
-    { 48000, 1024, 47, 8, 230336 },
-    { 16000, 512, 32, 64, 922048 },
+    { 16000, 256, 63, 1, 5600 },
+    { 16000, 256, 63, 8, 41712 },
+    { 16000, 512, 32, 1, 10720 },
+    { 16000, 512, 32, 8, 82672 },
+    { 48000, 1024, 47, 1, 20960 },
+    { 48000, 1024, 47, 8, 164592 },
+    { 16000, 512, 32, 64, 658800 },
 };
 
 #define GUARD 4096u
@@ -115,7 +116,6 @@ static void fill_spectra(uint32_t *seed, int h, float *er, float *ei, float *fr,
         fr[k] = 0.3f * ((float)(lcg_next(seed) >> 9) / 4194304.0f - 1.0f);
         fi[k] = 0.3f * ((float)(lcg_next(seed) >> 9) / 4194304.0f - 1.0f);
     }
-    if (h % 97 == 40) er[3] = (float)NAN;
 }
 
 /* `slim` (freq_only) against `full`, job for job; n hops per job. Returns the number of differing calls. */
@@ -126,19 +126,20 @@ static int run_pair(UlcnetStream *slim, UlcnetStream *full, const UlcnetGrid *g,
     float *er, *ei, *fr, *fi, *sre, *sim, *fre, *fim;
     UlcnetStreamDelay d[ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL];
     uint32_t seed = 2463534242u + (uint32_t)g->n_fft + (uint32_t)n;
-    int t, k, bad = 0, enhanced = 0, reprimes = 0;
+    int t, k, bad = 0, enhanced = 0, reprimes = 0, offered_nan = 0;
 
     if (!x) exit(2);
     er = x; ei = x + plane; fr = x + 2 * plane; fi = x + 3 * plane;
     sre = x + 4 * plane; sim = x + 5 * plane; fre = x + 6 * plane; fim = x + 7 * plane;
     for (t = 0; t < jobs; ++t) {
         UlcnetHopIO sio, fio;
-        int src, frc, srm = -1, frm = -1, opened;
+        int src, frc, srm = -1, frm = -1, opened, has_nan = 0;
 
         for (k = 0; k < n; ++k) {
             fill_spectra(&seed, t * n + k, er + k * nb, ei + k * nb, fr + k * nb, fi + k * nb, nb);
             d[k] = event_of(t * n + k);
         }
+        if (t % 7 == 3) { er[3] = (float)NAN; has_nan = 1; }   /* a NaN bin in the first frame of every seventh job */
         if (t == jobs / 4) { ulcnet_stream_reset(slim); ulcnet_stream_reset(full); }
         if (t == jobs / 2) {   /* out of order: a post with nothing open, then a second pre in one hop */
             if (ulcnet_stream_post_process_freq(slim, 0, sre, sim) != -1 ||
@@ -153,7 +154,15 @@ static int run_pair(UlcnetStream *slim, UlcnetStream *full, const UlcnetGrid *g,
             src = ulcnet_stream_pre_process_packet_freq(slim, er, ei, fr, fi, d, &sio);
             frc = ulcnet_stream_pre_process_packet_freq(full, er, ei, fr, fi, d, &fio);
         }
-        if (src < 0 || src != frc ||
+        if (src == ULCNET_STREAM_ERR_RANGE || frc == ULCNET_STREAM_ERR_RANGE) {   /* refused: nothing opened, nothing moved */
+            if (!has_nan || src != frc || ulcnet_stream_post_process_freq(slim, 0, sre, sim) != -1 ||
+                ulcnet_stream_post_process_freq(full, 0, fre, fim) != -1 ||
+                ulcnet_stream_state_generation(slim) != ulcnet_stream_state_generation(full))
+                ++bad;
+            offered_nan += has_nan;
+            continue;
+        }
+        if (has_nan || src < 0 || src != frc ||
             (src == 1 && !same_job(&sio, &fio)) || (src == 0 && memcmp(&sio, &fio, sizeof sio) != 0)) {
             ++bad;
             break;
@@ -187,7 +196,7 @@ static int run_pair(UlcnetStream *slim, UlcnetStream *full, const UlcnetGrid *g,
     }
     /* not vacuous: jobs are enhanced (a third of them up to N = 8; 64-hop packets mostly hold a refused frame) and the
      * one-hop run has reprime hops */
-    if (enhanced < 4 || (n <= 8 && enhanced < jobs / 3) || (n == 1 && reprimes < 5)) ++bad;
+    if (enhanced < 4 || (n <= 8 && enhanced < jobs / 3) || (n == 1 && reprimes < 5) || offered_nan < 1) ++bad;
     if (ulcnet_stream_state_generation(slim) < 4u) ++bad;   /* the run did restart the model */
     if (bad) fprintf(stderr, "%s: %d differing call(s), the last at job %d\n", label, bad, t);
     free(x);
@@ -247,11 +256,14 @@ static void check_pcm_refused(UlcnetStream *slim, const unsigned char *pool, siz
 /* What a freq_only pool leaves out, from audiolib's own size queries (each carve 16-aligned). */
 static size_t framing_bytes(const UlcnetGrid *g, int n) {
     AcStftConfig scfg;
-    const size_t hop = (size_t)g->hop, plane = (size_t)n * (size_t)g->n_bins;
+    const size_t hop = (size_t)g->hop, bins = (size_t)g->n_bins, plane = (size_t)n * bins;
+    const size_t shared = 2u * plane + (n > 1 ? (size_t)n : 0u);
     ac_stft_config_default(&scfg, g->n_fft);
     scfg.ola = AC_OLA_ACCUMULATE;
     return ck_align16_size(fft_get_mem_size(g->n_fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&scfg)) +
-           ck_align16_size(ac_istft_get_mem_size(&scfg)) + ck_align16_size((hop + 6u * plane) * sizeof(float));
+           ck_align16_size(ac_istft_get_mem_size(&scfg)) +
+           ck_align16_size((shared + 2u * bins + 2u * plane + hop) * sizeof(float)) -
+           ck_align16_size(shared * sizeof(float));
 }
 
 static void run_row(const Row *r) {

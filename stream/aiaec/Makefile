@@ -278,7 +278,7 @@ link-only-aiaec: $(LINK_ONLY_AIAEC_BIN)
 	  echo "FAIL: $(LIB) carries the sample-side port check (stream_bind)" >&2; exit 1; \
 	fi; \
 	nm "$$dv" 2>/dev/null | grep -Eq ' T _?deepvqe_stream_post_process_freq$$' || { echo "FAIL: deepvqe_stream_post_process_freq not exported by $$dv" >&2; exit 1; }; \
-	for sym in ulcnet_stream_pre_process_f32 ulcnet_stream_pre_process_freq ulcnet_stream_pre_process_packet_f32 ulcnet_stream_pre_process_packet_freq ulcnet_stream_get_mem_size ulcnet_prepost_frame_open ulcnet_prepost_init ulcnet_model_io_prepare ulcnet_model_io_prepare_packet ulcnet_model_io_descriptor_validate; do \
+	for sym in ulcnet_stream_pre_process_f32 ulcnet_stream_pre_process_freq ulcnet_stream_pre_process_packet_f32 ulcnet_stream_pre_process_packet_freq ulcnet_stream_get_mem_size ulcnet_prepost_views ulcnet_prepost_init ulcnet_model_io_pre_frame ulcnet_model_io_views ulcnet_model_io_descriptor_validate; do \
 	  nm "$$ul" 2>/dev/null | grep -Eq " T _?$$sym$$" || { echo "FAIL: $$sym not exported by $$ul" >&2; exit 1; }; \
 	done; \
 	nm "$$dv" 2>/dev/null | grep -Eq ' T _?deepvqe_stream_init$$' || { echo "FAIL: deepvqe_stream_init not exported by $$dv" >&2; exit 1; }; \

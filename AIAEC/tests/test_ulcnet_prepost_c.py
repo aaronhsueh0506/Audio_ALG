@@ -1,10 +1,13 @@
 """Equivalence and contract gates for the Align-ULCNet pre/post class.
 
-``ulcnet_prepost.c`` owns no signal processing: it composes the model-I/O
-translation unit (``ulcnet_model_io.c``: the feature front end and the tensor
-views over the application's recurrent state) behind one frequency-domain
-object, so the gate is that the class reproduces the hand-composed path SAMPLE
-FOR SAMPLE: every comparison is ``memcmp`` on fp32, never a tolerance. The
+``ulcnet_prepost.c`` owns no signal processing: it forwards the per-frame
+functions of the model-I/O translation unit (``ulcnet_model_io.c``: the feature
+front end, the tensor views and the mask application over the application's
+recurrent state) behind one object, so the gate is that the class reproduces
+the hand-composed path SAMPLE FOR SAMPLE: every comparison is ``memcmp`` on
+fp32, never a tolerance. The call lifecycle belongs to the stream
+(stream/aiaec/ulcnet/tests/lifecycle.c); the lib cases here drive the class
+through ulcnet_lifecycle_driver.h, which stands in for it. The
 framing is built from audiolib directly (sqrt-Hann, center 0, hop = n_fft / 2)
 with envelope-normalised synthesis; the application's contract is
 AC_OLA_ACCUMULATE. Both paths use the same synthesis, but the hop-0 checks
@@ -24,16 +27,12 @@ for the module):
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init reject-first validation
   reset     _reset really clears state (re-run reproduces the first run)
-  skip      _frame_bypass is the identity and leaves the state and the generation as written
-  fail      _frame_fail closes a frame whose run did not succeed: a started run
-            zeroes the registered state and advances the generation once, one
-            that never started leaves both except for a packet's event
-            restart; the hop is the error spectrum either way
-  guard     the frame state machine: a spectrum on top of an unfinished frame,
-            a commit with no frame_open and a retry after a refused commit are
-            refused; skip needs no frame_open
+  frame     the per-frame functions: pre_frame / post_frame argument refusals
+            change nothing, views is idempotent and re-NaN-fills the mask,
+            validate_run refuses a poisoned run with one restart, post_frame
+            reports a non-finite enhanced bin without touching state
   board     nothing registered (the accelerator owns the state): empty state
-            views, generation 0 at init, a refused commit advances it by one
+            views, generation 0 at init, a refused run advances it by one
             and the next hop recovers, the pool fences stay intact
   registration  all four state pairs or none: every partial registration is
             refused and changes nothing, then the full one is accepted and runs
@@ -69,6 +68,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "audio_stft.h"
+#include "ulcnet_lifecycle_driver.h"
 #include "ulcnet_prepost.h"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -347,22 +347,23 @@ static int build_specs(void) {
 /* One accelerator transaction through the class for the analysed hops
  * [first, first + count); the enhanced spectra land in `out`. */
 static int drive_spec(UlcnetPrepost *p, int first, int count, HopOut *out) {
-    int hop;
-    for (hop = first; hop < first + count; ++hop) {
+    UlLife life;
+    int hop, rc = 0;
+    if (ul_life_init(&life, p) != 0) return -1;
+    for (hop = first; hop < first + count && rc == 0; ++hop) {
         UlcnetModelIoInputs inputs;
         UlcnetModelIoOutputs outputs;
         /* THE contract this class exists to guarantee: one spectrum in, exactly
          * one accelerator invocation, from the very first hop. */
-        if (ulcnet_prepost_pre_process_freq(p, specs[hop].er, specs[hop].ei,
-                                            specs[hop].fr, specs[hop].fi) != 1)
-            return -1;
-        if (ulcnet_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
-        if (fake_run(NULL, &inputs, &outputs) != 0) return -1;
-        if (ulcnet_prepost_frame_finish(p) != 0) return -1;
-        if (ulcnet_prepost_post_process_freq(p, out[hop - first].re,
-                                             out[hop - first].im) != 0) return -1;
+        if (ul_life_pre(&life, specs[hop].er, specs[hop].ei, specs[hop].fr, specs[hop].fi, NULL) != 1 ||
+            ul_life_views(&life, &inputs, &outputs) != 0 || fake_run(NULL, &inputs, &outputs) != 0 ||
+            ul_life_finish(&life) != 0)
+            rc = -1;
+        else
+            ul_life_out(&life, out[hop - first].re, out[hop - first].im);
     }
-    return 0;
+    ul_life_free(&life);
+    return rc;
 }
 
 static int outs_identical(const HopOut *a, const HopOut *b, int count) {
@@ -413,6 +414,7 @@ static int case_equiv(FftHandle *fft) {
     AcStft *centered;
     UlcnetPrepostMemReq req;
     UlcnetPrepost *p;
+    UlLife life;
     int hop;
 
     /* path A -- the analysis, the model-I/O transaction and the synthesis,
@@ -466,11 +468,12 @@ static int case_equiv(FftHandle *fft) {
             enhanced_re[bin] = NAN;
             enhanced_im[bin] = NAN;
         }
-        CHECK(ulcnet_model_io_prepare(state, error_re, error_im,
-                                      far_re, far_im,
-                                      &inputs, &outputs) == 0);
+        CHECK(ulcnet_model_io_pre_frame(state, 0, error_re, error_im,
+                                        far_re, far_im, 0) == 0);
+        CHECK(ulcnet_model_io_views(state, &inputs, &outputs) == 0);
         CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-        if (ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) != 0) {
+        if (ulcnet_model_io_validate_run(state) != 0 ||
+            ulcnet_model_io_post_frame(state, 0, enhanced_re, enhanced_im) != 0) {
             memcpy(enhanced_re, error_re, sizeof enhanced_re);
             memcpy(enhanced_im, error_im, sizeof enhanced_im);
         }
@@ -487,18 +490,19 @@ static int case_equiv(FftHandle *fft) {
     CHECK(p != NULL);
     CHECK(ulcnet_prepost_descriptor(p) != NULL);
     CHECK(ulcnet_prepost_descriptor(p)->delay_depth == D);
+    CHECK(ul_life_init(&life, p) == 0);
     for (hop = 0; hop < HOPS; ++hop) {
         static float enhanced_re[BINS_MAX], enhanced_im[BINS_MAX];
         float *slot = out_b + (size_t)hop * HOP;
         int wrote;
         UlcnetModelIoInputs inputs;
         UlcnetModelIoOutputs outputs;
-        CHECK(ulcnet_prepost_pre_process_freq(p, specs[hop].er, specs[hop].ei,
-                                              specs[hop].fr, specs[hop].fi) == 1);
-        CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(ul_life_pre(&life, specs[hop].er, specs[hop].ei,
+                          specs[hop].fr, specs[hop].fi, NULL) == 1);
+        CHECK(ul_life_views(&life, &inputs, &outputs) == 0);
         CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-        CHECK(ulcnet_prepost_frame_finish(p) == 0);
-        CHECK(ulcnet_prepost_post_process_freq(p, enhanced_re, enhanced_im) == 0);
+        CHECK(ul_life_finish(&life) == 0);
+        ul_life_out(&life, enhanced_re, enhanced_im);
         wrote = ac_istft_push_planar(fb.synthesis, enhanced_re, enhanced_im, slot);
         CHECK(wrote == (hop == 0 ? 0 : grid.hop));
         if (wrote == 0) memset(slot, 0, HOP * sizeof(float));
@@ -510,6 +514,7 @@ static int case_equiv(FftHandle *fft) {
     CHECK(!identical(out_a, out_b + 1, HOPS * HOP - 1));
     CHECK(identical(out_a, out_b, HOPS * HOP));
 
+    ul_life_free(&life);
     ulcnet_prepost_destroy(p);
     free(pool);
     free(state_mem);
@@ -734,31 +739,34 @@ static int case_reject(void) {
                               (size_t)req.bytes, &cfg) == NULL);
     CHECK(ulcnet_prepost_init(pool, (size_t)req.bytes, &cfg) != NULL);
 
-    /* Stage calls on NULL, and post_process while a frame is still open. */
+    /* The per-frame calls refuse NULL, a bad slot and an event at one frame, and change nothing. */
     {
         UlcnetPrepost *p = ulcnet_prepost_init(pool, (size_t)req.bytes, &cfg);
         UlcnetModelIoInputs inputs;
         UlcnetModelIoOutputs outputs;
         static float got_re[BINS_MAX], got_im[BINS_MAX];
+        const uint32_t generation = p ? ulcnet_prepost_state_generation(p) : 0u;
         CHECK(p != NULL);
-        CHECK(ulcnet_prepost_pre_process_freq(NULL, specs[0].er, specs[0].ei,
-                                              specs[0].fr, specs[0].fi) == -1);
-        CHECK(ulcnet_prepost_pre_process_freq(p, NULL, specs[0].ei,
-                                              specs[0].fr, specs[0].fi) == -1);
-        CHECK(ulcnet_prepost_pre_process_freq(p, specs[0].er, specs[0].ei,
-                                              specs[0].fr, NULL) == -1);
-        CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == -1);
-        CHECK(ulcnet_prepost_frame_finish(p) == -1);
-        CHECK(ulcnet_prepost_frame_bypass(p) == -1);
-        CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
-        CHECK(ulcnet_prepost_pre_process_freq(p, specs[0].er, specs[0].ei,
-                                              specs[0].fr, specs[0].fi) == 1);
-        CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-        CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == -1);
-        /* A partial accelerator write is refused and moves nothing. */
-        outputs.output[0] = 0.0f;
-        CHECK(ulcnet_prepost_frame_finish(p) == -1);
-        CHECK(ulcnet_prepost_frame_bypass(p) == 0);
+        CHECK(ulcnet_prepost_pre_frame(NULL, 0, specs[0].er, specs[0].ei,
+                                       specs[0].fr, specs[0].fi, 0) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_pre_frame(p, 0, NULL, specs[0].ei,
+                                       specs[0].fr, specs[0].fi, 0) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_pre_frame(p, 0, specs[0].er, specs[0].ei,
+                                       specs[0].fr, NULL, 0) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_pre_frame(p, 1, specs[0].er, specs[0].ei,
+                                       specs[0].fr, specs[0].fi, 0) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_pre_frame(p, -1, specs[0].er, specs[0].ei,
+                                       specs[0].fr, specs[0].fi, 0) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_pre_frame(p, 0, specs[0].er, specs[0].ei,
+                                       specs[0].fr, specs[0].fi, 1) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_views(NULL, &inputs, &outputs) == -1);
+        CHECK(ulcnet_prepost_views(p, NULL, &outputs) == -1);
+        CHECK(ulcnet_prepost_validate_run(NULL) == -1);
+        CHECK(ulcnet_prepost_post_frame(NULL, 0, got_re, got_im) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_post_frame(p, 1, got_re, got_im) == ULCNET_PREPOST_ERR_ARG);
+        CHECK(ulcnet_prepost_post_frame(p, 0, NULL, got_im) == ULCNET_PREPOST_ERR_ARG);
+        ulcnet_prepost_zero_state(NULL);
+        CHECK(ulcnet_prepost_state_generation(p) == generation);
     }
 
     free(pool);
@@ -786,23 +794,21 @@ static int case_reset(void) {
     ulcnet_prepost_reset(p);
     CHECK(ulcnet_prepost_state_generation(p) == 1u);
     /* One inference per spectrum, from the very first hop. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[0].er, specs[0].ei,
-                                          specs[0].fr, specs[0].fi) == 1);
     ulcnet_prepost_reset(p);
     CHECK(ulcnet_prepost_state_generation(p) == 2u);
     CHECK(drive_spec(p, 0, SHORT_HOPS, outs_b) == 0);
     CHECK(outs_identical(outs_a, outs_b, SHORT_HOPS));
 
-    /* Reset mid-hop drops the open frame instead of stranding it. */
+    /* A reset between the features and the run of one hop restarts the state; the next full hop is the first one again. */
     {
+        UlLife life;
         UlcnetModelIoInputs inputs;
         UlcnetModelIoOutputs outputs;
-        CHECK(ulcnet_prepost_pre_process_freq(p, specs[0].er, specs[0].ei,
-                                              specs[0].fr, specs[0].fi) == 1);
-        CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(ul_life_init(&life, p) == 0);
+        CHECK(ul_life_pre(&life, specs[0].er, specs[0].ei, specs[0].fr, specs[0].fi, NULL) == 1);
+        CHECK(ul_life_views(&life, &inputs, &outputs) == 0);
         ulcnet_prepost_reset(p);
-        CHECK(ulcnet_prepost_frame_finish(p) == -1);
-        CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == -1);
+        ul_life_free(&life);
         CHECK(drive_spec(p, 0, SHORT_HOPS, outs_b) == 0);
         CHECK(outs_identical(outs_a, outs_b, SHORT_HOPS));
     }
@@ -812,137 +818,8 @@ static int case_reset(void) {
     return 0;
 }
 
-/* ---- skip: the identity, and no ring advance ------------------------- */
+/* ---- frame: the per-frame functions ---------------------------------- */
 
-static int case_skip(void) {
-    UlcnetPrepost *p;
-    static Host host;
-    void *pool;
-    UlcnetModelIoInputs inputs;
-    UlcnetModelIoOutputs outputs;
-    static float error_re[BINS_MAX], error_im[BINS_MAX];
-    static float far_re[BINS_MAX], far_im[BINS_MAX];
-    static float got_re[BINS_MAX], got_im[BINS_MAX];
-    float *key = NULL, *value = NULL, *logit = NULL;
-    float *gru = NULL;
-    size_t key_n, value_n, logit_n, gru_n;
-    size_t bin;
-
-    p = class_make(&host, &pool, NULL);
-    CHECK(p != NULL);
-
-    for (bin = 0; bin < BINS; ++bin) {
-        error_re[bin] = 0.5f - (float)bin / (float)BINS;
-        error_im[bin] = (float)bin / (float)BINS - 0.25f;
-        far_re[bin] = 0.125f + 0.5f * (float)bin / (float)BINS;
-        far_im[bin] = 0.75f - (float)bin / (float)BINS;
-    }
-
-    /* Frame 1: a real commit, so the rings are NON-ZERO for the check. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_frame_finish(p) == 0);
-
-    /* Frame 2: take the identity even though the accelerator produced a
-     * COMPLETE, perfectly committable result.
-     *
-     * The full write is the point. Skipping after a partial write would
-     * prove nothing -- commit() would refuse that frame on its own -- so a
-     * skip that quietly committed would still look correct. Here the only
-     * thing standing between the frame and the pipeline is frame_bypass's
-     * contract. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    key_n = inputs.key_history_elements;
-    value_n = inputs.value_history_elements;
-    logit_n = inputs.logit_history_elements;
-    gru_n = inputs.gru_hidden_elements;
-    /* The views are the registered buffers: a missing registration cannot pass for
-     * an empty window. */
-    CHECK(key_n == (size_t)STATE_CHANNELS * D * FEATURE && gru_n != 0u);
-    CHECK(inputs.key_history == host.key && inputs.h_gru == host.gru);
-    key = (float *)malloc(key_n * sizeof(float));
-    value = (float *)malloc(value_n * sizeof(float));
-    logit = (float *)malloc(logit_n * sizeof(float));
-    gru = (float *)malloc(gru_n * sizeof(float));
-    CHECK(key && value && logit && gru);
-    memcpy(key, inputs.key_history, key_n * sizeof(float));
-    /* The pre-run snapshot must not be all zeros, or "moved" proves
-     * nothing. */
-    {
-        size_t i;
-        int nonzero = 0;
-        for (i = 0; i < key_n; ++i) if (key[i] != 0.0f) nonzero = 1;
-        CHECK(nonzero);
-    }
-
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    /* Every state tensor is in-place: the run has already written it where
-     * the next frame reads it, and skip leaves it there. Snapshot it AFTER
-     * the run. */
-    CHECK(outputs.key_history_out == inputs.key_history);
-    CHECK(outputs.value_history_out == inputs.value_history);
-    CHECK(outputs.logit_history_out == inputs.logit_history);
-    CHECK(outputs.h_gru_out == inputs.h_gru);
-    CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) != 0);
-    memcpy(key, inputs.key_history, key_n * sizeof(float));
-    memcpy(value, inputs.value_history, value_n * sizeof(float));
-    memcpy(logit, inputs.logit_history, logit_n * sizeof(float));
-    memcpy(gru, inputs.h_gru, gru_n * sizeof(float));
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
-    /* Identity: the error spectrum passes through UNCHANGED, bit for bit --
-     * the accelerator's enhanced output is discarded, not applied. */
-    CHECK(identical(error_re, got_re, BINS));
-    CHECK(identical(error_im, got_im, BINS));
-
-    /* Frame 3: the state must be exactly what frame 2's run left. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(inputs.key_history_elements == key_n);
-    CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.value_history, value, value_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.logit_history, logit, logit_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.h_gru, gru, gru_n * sizeof(float)) == 0);
-
-    /* The other reason to skip: the accelerator wrote NOTHING at all. Same
-     * identity, same state. */
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
-    CHECK(identical(error_re, got_re, BINS));
-    CHECK(identical(error_im, got_im, BINS));
-
-    /* Frame 4: still as written -- and a run plus commit here DOES move
-     * the state, so the comparisons above are not measuring a constant. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.h_gru, gru, gru_n * sizeof(float)) == 0);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_frame_finish(p) == 0);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) != 0);
-
-    free(key);
-    free(value);
-    free(logit);
-    free(gru);
-    ulcnet_prepost_destroy(p);
-    free(pool);
-    return 0;
-}
-
-/* ---- fail: _frame_fail closes a frame whose run did not succeed ---- */
-
-#define PACKET_N 4
-/* The registered part of the host's buffers (the rest keeps its NaN fill). */
 #define STATE_ZERO(host) (all_zero((host).key, (size_t)STATE_CHANNELS * D * FEATURE) && \
                           all_zero((host).value, (size_t)STATE_CHANNELS * D * FEATURE) && \
                           all_zero((host).logit, (size_t)STATE_CHANNELS * STATE_SCORE_FRAMES * D) && \
@@ -954,236 +831,77 @@ static int all_zero(const float *v, size_t n) {
     return 1;
 }
 
-/* One packet instance, nothing registered; its N analysed hops, frame-major, in the planes. */
-typedef struct Packet {
+static int case_frame(void) {
+    static Host host;
+    static float re[BINS_MAX], im[BINS_MAX], keep_re[BINS_MAX], keep_im[BINS_MAX];
     UlcnetPrepost *p;
     void *pool;
-    float er[PACKET_N * BINS_MAX], ei[PACKET_N * BINS_MAX], fr[PACKET_N * BINS_MAX], fi[PACKET_N * BINS_MAX];
-} Packet;
-
-static int packet_make(Packet *pk) {
-    UlcnetPrepostConfig cfg;
-    UlcnetPrepostMemReq req;
-    int k;
-    if (ulcnet_prepost_config_defaults(&cfg, &grid) != 0) return -1;
-    cfg.frames_per_call = PACKET_N;
-    if (ulcnet_prepost_get_mem_size(&cfg, &req) != 0) return -1;
-    pk->pool = alloc_aligned(req.alignment, (size_t)req.bytes);
-    if (!pk->pool) return -1;
-    pk->p = ulcnet_prepost_init_ex(pk->pool, (size_t)req.bytes, &cfg, &req);
-    for (k = 0; k < PACKET_N; ++k) {
-        memcpy(pk->er + (size_t)k * BINS, specs[k].er, BINS * sizeof(float));
-        memcpy(pk->ei + (size_t)k * BINS, specs[k].ei, BINS * sizeof(float));
-        memcpy(pk->fr + (size_t)k * BINS, specs[k].fr, BINS * sizeof(float));
-        memcpy(pk->fi + (size_t)k * BINS, specs[k].fi, BINS * sizeof(float));
-    }
-    return pk->p ? 0 : -1;
-}
-
-/* A packet frame with `events`, opened for the accelerator when `open`. */
-static int packet_begin(Packet *pk, const int *events, int open) {
-    UlcnetModelIoInputs in;
-    UlcnetModelIoOutputs out;
-    if (ulcnet_prepost_pre_process_packet(pk->p, pk->er, pk->ei, pk->fr, pk->fi, events) != 1) return -1;
-    return open ? ulcnet_prepost_frame_open(pk->p, &in, &out) : 0;
-}
-
-/* The N frames come back as the error spectra. */
-static int packet_is_identity(Packet *pk) {
-    static float re[PACKET_N * BINS_MAX], im[PACKET_N * BINS_MAX];
-    return ulcnet_prepost_post_process_freq(pk->p, re, im) == 0 &&
-           identical(re, pk->er, PACKET_N * BINS) && identical(im, pk->ei, PACKET_N * BINS);
-}
-
-static int case_fail(void) {
-    static Host host;
-    static HopOut out, fresh_out;
-    UlcnetPrepost *p, *fresh;
-    static Host fresh_host;
-    void *pool, *fresh_pool;
+    UlLife life;
     UlcnetModelIoInputs inputs;
     UlcnetModelIoOutputs outputs;
     uint32_t gen;
-    Packet pk;
-    static const int none[PACKET_N] = { 0, 0, 0, 0 };
-    static const int event[PACKET_N] = { 0, 0, 1, 0 };
+    size_t i;
 
-    /* A run that started: the registered state is zeroed, the generation advances once, the hop is the error spectrum. */
     p = class_make(&host, &pool, NULL);
-    fresh = class_make(&fresh_host, &fresh_pool, NULL);
-    CHECK(p != NULL && fresh != NULL);
+    CHECK(p != NULL && ul_life_init(&life, p) == 0);
     CHECK(drive_spec(p, 0, 3, outs_a) == 0);
     CHECK(!STATE_ZERO(host));
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[3].er, specs[3].ei, specs[3].fr, specs[3].fi) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
+
+    /* views is idempotent: a second call hands out the same tensors and a clean NaN mask again. */
+    CHECK(ul_life_pre(&life, specs[3].er, specs[3].ei, specs[3].fr, specs[3].fi, NULL) == 1);
+    CHECK(ul_life_views(&life, &inputs, &outputs) == 0);
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    gen = ulcnet_prepost_state_generation(p);
-    CHECK(ulcnet_prepost_frame_fail(p, 1) == 0);
-    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u);
-    CHECK(STATE_ZERO(host));
-    CHECK(ulcnet_prepost_post_process_freq(p, out.re, out.im) == 0);
-    CHECK(identical(out.re, specs[3].er, BINS) && identical(out.im, specs[3].ei, BINS));
-    CHECK(ulcnet_prepost_frame_fail(p, 1) == -1);              /* nothing open any more */
-    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u);
-    /* The next hop starts from zero state: it equals a fresh instance's hop. */
-    CHECK(drive_spec(p, 4, 1, &out) == 0 && drive_spec(fresh, 4, 1, &fresh_out) == 0);
-    CHECK(outs_identical(&out, &fresh_out, 1));
-    CHECK(!identical(out.re, specs[4].er, BINS));
-
-    /* A run that never started: state and generation stay, the hop is still the error spectrum. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[5].er, specs[5].ei, specs[5].fr, specs[5].fi) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(!STATE_ZERO(host));
-    gen = ulcnet_prepost_state_generation(p);
-    CHECK(ulcnet_prepost_frame_fail(p, 0) == 0);
-    CHECK(ulcnet_prepost_state_generation(p) == gen && !STATE_ZERO(host));
-    CHECK(ulcnet_prepost_post_process_freq(p, out.re, out.im) == 0);
-    CHECK(identical(out.re, specs[5].er, BINS) && identical(out.im, specs[5].ei, BINS));
-    /* Without a frame_open the run cannot have started; the flag still decides. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[6].er, specs[6].ei, specs[6].fr, specs[6].fi) == 1);
-    CHECK(ulcnet_prepost_frame_fail(p, 0) == 0 && ulcnet_prepost_state_generation(p) == gen);
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[6].er, specs[6].ei, specs[6].fr, specs[6].fi) == 1);
-    CHECK(ulcnet_prepost_frame_fail(p, 1) == 0 && ulcnet_prepost_state_generation(p) == gen + 1u && STATE_ZERO(host));
-    CHECK(ulcnet_prepost_frame_fail(NULL, 1) == -1 && ulcnet_prepost_frame_fail(NULL, 0) == -1);
-    /* A refused commit has restarted the state already: bypass closes it, no second step. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, specs[7].er, specs[7].ei, specs[7].fr, specs[7].fi) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    gen = ulcnet_prepost_state_generation(p);
-    CHECK(ulcnet_prepost_frame_finish(p) == -1 && ulcnet_prepost_state_generation(p) == gen + 1u);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0 && ulcnet_prepost_state_generation(p) == gen + 1u);
-    ulcnet_prepost_destroy(p);
-    ulcnet_prepost_destroy(fresh);
-    free(pool);
-    free(fresh_pool);
-
-    /* A packet: the model restart of an event frame is part of the run that did not happen. */
-    CHECK(packet_make(&pk) == 0);
-    gen = ulcnet_prepost_state_generation(pk.p);
-    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);
-    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
-    CHECK(packet_begin(&pk, none, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);
-    CHECK(ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
-    CHECK(packet_begin(&pk, event, 0) == 0 && ulcnet_prepost_frame_fail(pk.p, 0) == 0);   /* never armed */
-    CHECK(ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
-    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 1) == 0);   /* once, not twice */
-    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
-    CHECK(packet_begin(&pk, none, 1) == 0 && ulcnet_prepost_frame_fail(pk.p, 1) == 0);
-    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen && packet_is_identity(&pk));
-    CHECK(packet_begin(&pk, event, 1) == 0 && ulcnet_prepost_frame_finish(pk.p) == -1);   /* NaN staging: refused */
-    CHECK(ulcnet_prepost_state_generation(pk.p) == ++gen);
-    CHECK(ulcnet_prepost_frame_fail(pk.p, 0) == 0 && ulcnet_prepost_state_generation(pk.p) == gen && packet_is_identity(&pk));
-    CHECK(ulcnet_prepost_frame_fail(pk.p, 1) == -1);
-    ulcnet_prepost_destroy(pk.p);
-    free(pk.pool);
-    return 0;
-}
-
-/* ---- guard: the frame state machine refuses what it must -------------- */
-
-static int case_guard(void) {
-    UlcnetPrepost *p;
-    static Host host;
-    void *pool;
-    UlcnetModelIoInputs inputs;
-    UlcnetModelIoOutputs outputs;
-    static float error_re[BINS_MAX], error_im[BINS_MAX];
-    static float far_re[BINS_MAX], far_im[BINS_MAX];
-    static float got_re[BINS_MAX], got_im[BINS_MAX];
-    size_t i;
-    size_t bin;
-    uint32_t generation;
-
-    p = class_make(&host, &pool, NULL);
-    CHECK(p != NULL);
-    for (bin = 0; bin < BINS; ++bin) {
-        error_re[bin] = 0.5f - (float)bin / (float)BINS;
-        error_im[bin] = (float)bin / (float)BINS - 0.25f;
-        far_re[bin] = 0.125f + 0.5f * (float)bin / (float)BINS;
-        far_im[bin] = 0.75f - (float)bin / (float)BINS;
+    CHECK(!isnan(outputs.output[0]));
+    {
+        UlcnetModelIoInputs again_in;
+        UlcnetModelIoOutputs again_out;
+        CHECK(ulcnet_prepost_views(p, &again_in, &again_out) == 0);
+        CHECK(again_out.output == outputs.output && again_in.error_mag == inputs.error_mag &&
+              again_in.key_history == inputs.key_history);
+        for (i = 0; i < again_out.spectrum_ri_elements; ++i) CHECK(isnan(again_out.output[i]));
     }
-    /* (1) A spectrum on top of an unfinished one is refused, and the open
-     * frame is still the caller's to finish. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == -1);
-    /* (2) A frame is open but the accelerator was never handed it: commit
-     * is refused rather than passing untouched buffers off as a result. */
-    CHECK(ulcnet_prepost_frame_finish(p) == -1);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == -1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == -1);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_frame_finish(p) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
-    /* ...and once finished -- by commit or by skip -- the next spectrum is
-     * accepted again. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
 
-    /* (3) A commit refused on a non-finite output disarms the transaction:
-     * a retry without a fresh frame_open is refused too, the frame is
-     * still open, and the fresh frame_open re-fills the mask with
-     * NaN before the accelerator is asked again. The in-place state is not
-     * refilled: the refusal has already restarted it from zero. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    outputs.h_gru_out[outputs.gru_hidden_elements - 1u] = NAN;
-    generation = ulcnet_prepost_state_generation(p);
-    CHECK(ulcnet_prepost_frame_finish(p) == -1);
-    CHECK(ulcnet_prepost_state_generation(p) == generation + 1u);
-    CHECK(ulcnet_prepost_frame_finish(p) == -1);
-    CHECK(ulcnet_prepost_state_generation(p) == generation + 1u);
-    CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == -1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    for (i = 0; i < outputs.spectrum_ri_elements; ++i)
-        CHECK(isnan(outputs.output[i]));
-    CHECK(outputs.h_gru_out == inputs.h_gru);
-    CHECK(outputs.key_history_out == inputs.key_history);
-    CHECK(outputs.value_history_out == inputs.value_history);
-    CHECK(outputs.logit_history_out == inputs.logit_history);
-    /* The refusal zeroed the registered buffers themselves. */
-    for (i = 0; i < inputs.key_history_elements; ++i)
-        CHECK(host.key[i] == 0.0f);
-    for (i = 0; i < inputs.value_history_elements; ++i)
-        CHECK(host.value[i] == 0.0f);
-    for (i = 0; i < inputs.logit_history_elements; ++i)
-        CHECK(host.logit[i] == 0.0f);
-    for (i = 0; i < outputs.gru_hidden_elements; ++i)
-        CHECK(host.gru[i] == 0.0f);
-    CHECK(inputs.key_history_elements != 0u);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_frame_finish(p) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
-    /* (4) Skipping never needed the accelerator, so it needs no
-     * frame_open either. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
-    /* (5) ...and a skip taken AFTER frame_open armed the accelerator must
-     * not leave that arming behind: the next frame's commit, with no
-     * frame_open of its own, is still refused. This is the state in which
-     * a latch borrowed from model_io alone lets stale outputs through, so
-     * (2) above cannot stand in for it. */
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_open(p, &inputs, &outputs) == 0);
-    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
-    CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
-                                          far_re, far_im) == 1);
-    CHECK(ulcnet_prepost_frame_finish(p) == -1);
-    CHECK(ulcnet_prepost_frame_bypass(p) == 0);
+    /* A run that left the mask unwritten is refused: state zeroed in the registered buffers, generation + 1 once. */
+    gen = ulcnet_prepost_state_generation(p);
+    CHECK(ulcnet_prepost_validate_run(p) == -1);
+    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u && STATE_ZERO(host));
 
+    /* A finished run is accepted and writes nothing: no restart, state as the accelerator left it. */
+    CHECK(drive_spec(p, 4, 1, outs_a) == 0);
+    gen = ulcnet_prepost_state_generation(p);
+    CHECK(!STATE_ZERO(host));
+    CHECK(ul_life_pre(&life, specs[5].er, specs[5].ei, specs[5].fr, specs[5].fi, NULL) == 1);
+    CHECK(ul_life_views(&life, &inputs, &outputs) == 0);
+    CHECK(fake_run(NULL, &inputs, &outputs) == 0);
+    CHECK(ulcnet_prepost_validate_run(p) == 0 && ulcnet_prepost_state_generation(p) == gen && !STATE_ZERO(host));
+
+    /* post_frame: a slot outside the call is refused with out untouched; a mask that overflows the inverse power is
+     * -2 and moves neither the state nor the generation (the caller restarts once per run). */
+    for (i = 0; i < BINS; ++i) { re[i] = keep_re[i] = 7.0f; im[i] = keep_im[i] = 8.0f; }
+    CHECK(ulcnet_prepost_post_frame(p, 1, re, im) == ULCNET_PREPOST_ERR_ARG);
+    CHECK(identical(re, keep_re, BINS) && identical(im, keep_im, BINS));
+    CHECK(ulcnet_prepost_post_frame(p, 0, re, im) == ULCNET_PREPOST_OK);
+    outputs.output[1] = 3.0e30f;
+    CHECK(ulcnet_prepost_validate_run(p) == 0);
+    CHECK(ulcnet_prepost_post_frame(p, 0, re, im) == ULCNET_PREPOST_ERR_NONFINITE);
+    CHECK(ulcnet_prepost_state_generation(p) == gen && !STATE_ZERO(host));
+    ulcnet_prepost_zero_state(p);
+    CHECK(ulcnet_prepost_state_generation(p) == gen + 1u && STATE_ZERO(host));
+
+    /* The next hop starts from zero state: it equals a fresh instance's hop. */
+    {
+        static Host fresh_host;
+        void *fresh_pool;
+        UlcnetPrepost *fresh = class_make(&fresh_host, &fresh_pool, NULL);
+        CHECK(fresh != NULL);
+        CHECK(drive_spec(p, 6, 1, outs_a) == 0 && drive_spec(fresh, 6, 1, outs_b) == 0);
+        CHECK(outs_identical(outs_a, outs_b, 1));
+        CHECK(!identical(outs_a[0].re, specs[6].er, BINS));
+        ulcnet_prepost_destroy(fresh);
+        free(fresh_pool);
+    }
+
+    ul_life_free(&life);
     ulcnet_prepost_destroy(p);
     free(pool);
     return 0;
@@ -1262,15 +980,14 @@ static int views_empty(const UlcnetModelIoInputs *in, const UlcnetModelIoOutputs
            !out->logit_history_elements && !out->gru_hidden_elements;
 }
 
-/* One hop through a head-only stand-in (the mask depends on the hop only): returns frame_finish's
+/* One hop through a head-only stand-in (the mask depends on the hop only): returns finish's
  * status, or 2 when the boundary itself is wrong. `poison` leaves one mask element NaN. */
-static int head_hop(UlcnetPrepost *p, int hop, int empty, int poison) {
+static int head_hop(UlLife *life, int hop, int empty, int poison) {
     UlcnetModelIoInputs in;
     UlcnetModelIoOutputs out;
     size_t i;
-    if (ulcnet_prepost_pre_process_freq(p, specs[hop].er, specs[hop].ei,
-                                        specs[hop].fr, specs[hop].fi) != 1) return 2;
-    if (ulcnet_prepost_frame_open(p, &in, &out) != 0) return 2;
+    if (ul_life_pre(life, specs[hop].er, specs[hop].ei, specs[hop].fr, specs[hop].fi, NULL) != 1) return 2;
+    if (ul_life_views(life, &in, &out) != 0) return 2;
     if (out.spectrum_ri_elements != 2u * BINS || !isnan(out.output[0]) ||
         !isnan(out.output[2u * BINS - 1u])) return 2;
     if (empty && !views_empty(&in, &out)) return 2;
@@ -1279,7 +996,7 @@ static int head_hop(UlcnetPrepost *p, int hop, int empty, int poison) {
         out.output[BINS + i] = 0.125f * cosf((float)(i + (size_t)hop));
     }
     if (poison) out.output[BINS / 2u] = NAN;
-    return ulcnet_prepost_frame_finish(p);
+    return ul_life_finish(life);
 }
 
 static int fences_intact(const unsigned char *raw, size_t bytes) {
@@ -1290,6 +1007,7 @@ static int case_board(void) {
     UlcnetPrepostConfig cfg;
     UlcnetPrepostMemReq req;
     UlcnetPrepost *board, *twin;
+    UlLife board_life, twin_life;
     static Host host;
     static HopOut got[4], ref[4];
     void *twin_pool;
@@ -1309,39 +1027,38 @@ static int case_board(void) {
     CHECK(twin != NULL);
     CHECK(ulcnet_prepost_state_generation(board) == 0u);
     CHECK(ulcnet_prepost_state_generation(twin) == 0u);
+    CHECK(ul_life_init(&board_life, board) == 0 && ul_life_init(&twin_life, twin) == 0);
 
     /* Two healthy hops. */
-    CHECK(head_hop(board, 0, 1, 0) == 0 && head_hop(twin, 0, 0, 0) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(board, got[0].re, got[0].im) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(twin, ref[0].re, ref[0].im) == 0);
-    CHECK(head_hop(board, 1, 1, 0) == 0 && head_hop(twin, 1, 0, 0) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(board, got[1].re, got[1].im) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(twin, ref[1].re, ref[1].im) == 0);
+    CHECK(head_hop(&board_life, 0, 1, 0) == 0 && head_hop(&twin_life, 0, 0, 0) == 0);
+    ul_life_out(&board_life, got[0].re, got[0].im);
+    ul_life_out(&twin_life, ref[0].re, ref[0].im);
+    CHECK(head_hop(&board_life, 1, 1, 0) == 0 && head_hop(&twin_life, 1, 0, 0) == 0);
+    ul_life_out(&board_life, got[1].re, got[1].im);
+    ul_life_out(&twin_life, ref[1].re, ref[1].im);
     CHECK(outs_identical(got, ref, 2));
     CHECK(!identical(got[0].re, got[1].re, BINS) && !identical(got[0].re, specs[0].er, BINS));
     CHECK(ulcnet_prepost_state_generation(board) == 0u && fences_intact(raw, bytes));
 
     /* A non-finite mask: refused, the generation moves by exactly one (nothing registered
-     * included), a retry is refused without moving it again, the frame stays open for bypass. */
-    CHECK(head_hop(board, 2, 1, 1) == -1 && head_hop(twin, 2, 0, 1) == -1);
+     * included), the hop is the error spectrum. */
+    CHECK(head_hop(&board_life, 2, 1, 1) == -1 && head_hop(&twin_life, 2, 0, 1) == -1);
     CHECK(ulcnet_prepost_state_generation(board) == 1u);
     CHECK(ulcnet_prepost_state_generation(twin) == 1u);
-    CHECK(ulcnet_prepost_frame_finish(board) == -1);
-    CHECK(ulcnet_prepost_state_generation(board) == 1u);
-    CHECK(ulcnet_prepost_post_process_freq(board, got[2].re, got[2].im) == -1);
-    CHECK(ulcnet_prepost_frame_bypass(board) == 0 && ulcnet_prepost_frame_bypass(twin) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(board, got[2].re, got[2].im) == 0);
+    ul_life_out(&board_life, got[2].re, got[2].im);
     CHECK(identical(got[2].re, specs[2].er, BINS) && identical(got[2].im, specs[2].ei, BINS));
     CHECK(ulcnet_prepost_state_generation(board) == 1u && fences_intact(raw, bytes));
 
     /* The next hop recovers and matches the float host again. */
-    CHECK(head_hop(board, 3, 1, 0) == 0 && head_hop(twin, 3, 0, 0) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(board, got[3].re, got[3].im) == 0);
-    CHECK(ulcnet_prepost_post_process_freq(twin, ref[3].re, ref[3].im) == 0);
+    CHECK(head_hop(&board_life, 3, 1, 0) == 0 && head_hop(&twin_life, 3, 0, 0) == 0);
+    ul_life_out(&board_life, got[3].re, got[3].im);
+    ul_life_out(&twin_life, ref[3].re, ref[3].im);
     CHECK(identical(got[3].re, ref[3].re, BINS) && identical(got[3].im, ref[3].im, BINS));
     CHECK(!identical(got[3].re, specs[3].er, BINS));
     CHECK(ulcnet_prepost_state_generation(board) == 1u && fences_intact(raw, bytes));
 
+    ul_life_free(&board_life);
+    ul_life_free(&twin_life);
     free(raw);
     free(twin_pool);
     return 0;
@@ -1562,9 +1279,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "lifecycle") == 0) status = case_lifecycle();
     else if (strcmp(argv[1], "reject") == 0)    status = case_reject();
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset();
-    else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
-    else if (strcmp(argv[1], "fail") == 0)      status = case_fail();
-    else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
+    else if (strcmp(argv[1], "frame") == 0)     status = case_frame();
     else if (strcmp(argv[1], "layout") == 0)    status = case_layout();
     else if (strcmp(argv[1], "hash") == 0)      status = case_hash();
     else if (strcmp(argv[1], "board") == 0)     status = case_board();
@@ -1610,7 +1325,7 @@ def _build_driver(tmp_path_factory, audio_common_lib, name, *flags):
     subprocess.run(
         [cc, '-O2', '-std=c11',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off', *flags,
-         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR, str(source),
+         '-I', _ULCNET_DIR, '-I', _THIS_DIR, '-I', _AC_INCLUDE, '-I', _AC_DIR, str(source),
          *[os.path.join(_ULCNET_DIR, unit) for unit in _SOURCES],
          audio_common_lib, '-lm', '-o', str(executable)],
         check=True, capture_output=True,
@@ -1671,7 +1386,7 @@ def test_create_destroy_roundtrip_and_pool_init_agree(driver):
 def test_reject_first_validation(driver):
     """_get_mem_size / _init refuse NULLs, an inconsistent grid, a D outside
     [MIN_D, MAX_D] and an undersized or misaligned pool, leaving *req
-    untouched; the stage calls refuse being run out of order."""
+    untouched; the per-frame calls refuse NULL, a bad slot and an event at one frame."""
     _run(driver, 'reject')
 
 
@@ -1682,31 +1397,14 @@ def test_reset_clears_state(driver):
     _run(driver, 'reset')
 
 
-def test_frame_bypass_is_identity_and_does_not_step_the_rings(driver):
-    """_frame_bypass passes the error spectrum through unchanged and leaves
-    the K/V/logit rings and both GRU hidden tensors exactly as they were --
-    checked against non-zero state, and against a commit that does move
-    them."""
-    _run(driver, 'skip')
-
-
-def test_frame_fail_closes_a_failed_run_with_the_right_restart(driver):
-    """A run that started zeroes the registered state and advances the
-    generation once, whatever the frame held; one that never started leaves
-    both alone, except that a frame_open()ed packet with an event frame
-    restarts the model (+1, once, and not for a packet that was never armed or
-    whose commit was already refused). The hop is the error spectrum bit for
-    bit and the next hop equals a fresh instance's."""
-    _run(driver, 'fail')
-
-
-def test_frame_state_machine_guards(driver):
-    """A spectrum on top of an unfinished frame is refused (and the open frame
-    stays the caller's to finish), a commit with no frame_open behind it
-    is refused, and a commit refused on a non-finite output disarms the
-    transaction until a fresh frame_open -- which NaN-refills every
-    accelerator output. Skipping needs no frame_open at all."""
-    _run(driver, 'guard')
+def test_per_frame_functions_refuse_misuse_and_report_each_failure(driver):
+    """pre_frame / post_frame refuse NULL, a slot outside the call and an
+    event at one frame without changing anything; views is idempotent and
+    re-NaN-fills the mask; validate_run refuses an unwritten mask with the
+    registered state zeroed and the generation moved once; post_frame reports
+    a non-finite enhanced bin (-2) and leaves state and generation alone; the
+    hop after a restart equals a fresh instance's."""
+    _run(driver, 'frame')
 
 
 def test_model_layout_version_field_accepts_only_the_built_layout(driver):
@@ -1743,7 +1441,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+ULCNET_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert carve == 9
+    assert carve == 10
     # grid 16000 / 512, D == 8 (this driver's grid).
     expected = _fnv1a([16000, 512, layout, carve, 8])
     ptr_bytes = int(re.search(r'ptr_bytes=(\d+)', out).group(1))
@@ -1761,9 +1459,9 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
 def test_board_form_nothing_registered_runs_and_counts_restarts(
         request, build, grid):
     """The board configuration: no state registered, the accelerator owns it.
-    The state views are empty, the generation starts at 0, a commit refused on
-    a non-finite mask moves it by exactly one (a retry does not), bypass is the
-    identity, the next hop commits again and equals a float host's output, and
+    The state views are empty, the generation starts at 0, a run refused on
+    a non-finite mask moves it by exactly one and the hop is the identity, the
+    next hop commits again and equals a float host's output, and
     the bytes around the pool are never written. Run on the NEON and the scalar
     build, on both grids."""
     _run(request.getfixturevalue(build), 'board', grid)

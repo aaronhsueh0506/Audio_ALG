@@ -178,14 +178,15 @@ static int test_ulcnet_kernels(void)
         }
 
         ref_front_end(er, ei, fr, fi, w_mag, w_far, w_cos, w_sin, w_ri);
-        CHECK(ulcnet_model_io_prepare(a, er, ei, fr, fi, &in, &out) == 0,
-              "prepare");
+        CHECK(ulcnet_model_io_pre_frame(a, 0, er, ei, fr, fi, 0) == 0 &&
+              ulcnet_model_io_views(a, &in, &out) == 0,
+              "pre_frame + views");
         CHECK(same_bits(a->error_mag, w_mag, BINS) &&
               same_bits(a->far_mag, w_far, BINS) &&
               same_bits(a->error_cos, w_cos, BINS) &&
               same_bits(a->error_sin, w_sin, BINS) &&
               same_bits(a->error_ri, w_ri, 2 * BINS),
-              "prepare equals the plain contract");
+              "pre_frame equals the plain contract");
         {
             const FramePlanes planes_b = frame_planes(b, 0u);
             front_end_scalar(b, &planes_b, er, ei, fr, fi);

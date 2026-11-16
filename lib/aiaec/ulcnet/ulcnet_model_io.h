@@ -1,6 +1,6 @@
-/* Align-ULCNet stateless-accelerator model I/O: carves the feature tensors and mask staging from a caller pool, hands
- * out the frame's tensor views, checks and applies the graph's mask. The recurrent state is the application's: the
- * state tensors belong to the application (on a board, the accelerator's own buffers, loaded with quantized zeros at
+/* Align-ULCNet stateless-accelerator model I/O: carves the feature tensors and mask staging from a caller pool and
+ * provides the per-frame functions (features, views, run validation, mask application). The recurrent state is the
+ * application's: the state tensors belong to the application (on a board, the accelerator's own buffers, loaded with quantized zeros at
  * start and whenever ulcnet_model_io_state_generation() changes) and the library knows none of their shapes. */
 #ifndef ULCNET_MODEL_IO_H
 #define ULCNET_MODEL_IO_H
@@ -20,7 +20,7 @@ extern "C" {
  *            state tensors key_history, value_history [1,C,D,K] (newest frame first), logit_history [1,C,W,D] (oldest
  *            first), h_gru [1,L,1,H] (subband-0 layers, then subband-1); D the delay depth, C K W L H the model's
  *   outputs  `output`, the complex mask planar [1,2,1,BINS] (real, then imaginary), and each state tensor's full next
- *            value as *_out; enhance_spectrum() applies the mask */
+ *            value as *_out; post_frame() applies the mask */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 18u
 
 /* The packet boundary (frames_per_call N in [2, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL]); equals PACKET_LAYOUT_VERSION in
@@ -152,8 +152,8 @@ typedef struct UlcnetModelIoInputs {
 /* `output` is planar: BINS real, then BINS imaginary (packet: the N * BINS real values, then the N * BINS imaginary ones,
  * spectrum_ri_elements = 2 * N * BINS). Each state *_out has the address of the input it continues
  * (NULL and 0 elements when none), fixed for the life of the state: the runtime reads all state inputs before writing
- * any state output. prepare() NaN-fills `output`, so an unwritten mask is refused by enhance_spectrum(); a refused
- * frame zeroes the registered state, advances the generation and is discarded. */
+ * any state output. views() NaN-fills `output`, so an unwritten mask is refused by validate_run(); a refused
+ * run zeroes the registered state, advances the generation and is discarded. */
 typedef struct UlcnetModelIoOutputs {
     float *output;
     float *key_history_out;
@@ -212,45 +212,35 @@ UlcnetModelIoState *ulcnet_model_io_init(
     const UlcnetModelIoDescriptor *descriptor,
     const UlcnetModelIoStateBuffers *state);
 
-/* Zero the registered state tensors (none registered: nothing to zero), drop the open transaction and advance the
- * generation. The pool, the registration and every pointer stay. NULL is ignored. */
+/* Zero the registered state tensors (none registered: nothing to zero) and advance the generation. The pool, the
+ * registration and every pointer stay. NULL is ignored. */
 void ulcnet_model_io_reset(UlcnetModelIoState *state);
 
-/* Run the fixed front end (signed-power compression, magnitudes, phase cos/sin) on the real/imag spectra
- * (spectrum_bins each), return the input views, NaN-prefill `output`. Call once right before every inference. */
-int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float *error_re, const float *error_im,
-                            const float *far_re, const float *far_im,
-                            UlcnetModelIoInputs *inputs,
-                            UlcnetModelIoOutputs *outputs);
+/* Features of frame `slot` (0 <= slot < frames): the four spectra (spectrum_bins floats, read here, not kept) into that
+ * slot of the feature tensors, the compressed error kept for post_frame(), and frame_reset[slot] = event != 0 (event
+ * must be 0 at one frame). Call it for every slot before views(). 0; -1 on NULL, a bad slot or event (nothing written). */
+int ulcnet_model_io_pre_frame(UlcnetModelIoState *state, int slot,
+                              const float *error_re, const float *error_im,
+                              const float *far_re, const float *far_im, int event);
 
-/* Packet boundary (descriptor frames > 1; the one-frame calls above refuse such a state and these refuse a one-frame
- * state): as prepare() for N frames, spectra frame-major (N * spectrum_bins floats per plane, oldest first); events[k] != 0
- * marks frame k as an alignment boundary (frame_reset 1.0; N entries). Every frame's features are computed, event frames too
- * (the graph needs finite inputs); `output` is NaN-prefilled after all of them. */
-int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
-                                   const float *error_re, const float *error_im,
-                                   const float *far_re, const float *far_im,
-                                   const int *events,
-                                   UlcnetModelIoInputs *inputs,
-                                   UlcnetModelIoOutputs *outputs);
+/* Once per run, after the last pre_frame: NaN-fill `output` (an unwritten mask fails validate_run()) and publish the
+ * tensor views. Repeating it gives a clean NaN mask again. 0; -1 on NULL. */
+int ulcnet_model_io_views(UlcnetModelIoState *state, UlcnetModelIoInputs *inputs,
+                          UlcnetModelIoOutputs *outputs);
 
-/* After a successful inference, one call per prepare(): checks mask and registered state are finite, applies mask and
- * inverse signed power into the enhanced arrays, checks those are finite. Non-finite: state zeroed, generation advanced,
- * -1; the arrays are untouched after a refused mask or state, and hold no valid frame after a refused spectrum. */
-int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
-                                     float *enhanced_re, float *enhanced_im);
+/* After a successful run, `output` (every frame) and every registered state buffer must be finite. 0 accepted; -1
+ * refused: the registered state is zeroed and the generation advanced once (NULL: -1, nothing touched). */
+int ulcnet_model_io_validate_run(UlcnetModelIoState *state);
 
-/* As enhance_spectrum() for a packet: enhanced_re / enhanced_im hold N * spectrum_bins floats, frame-major. The
- * frames marked as events are not written (the caller fills them with the error spectrum); the finite check covers the
- * whole mask, event frames included, and the enhanced spectrum of every other frame. */
-int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
-                                   float *enhanced_re, float *enhanced_im);
+/* Frame `slot` of the run: compressed error times its complex mask, inverse signed power, into out_re / out_im
+ * (spectrum_bins floats each). 0; -1 on NULL or a bad slot (out untouched); -2 on a non-finite enhanced bin. State and
+ * generation are never touched: the caller restarts once per run. */
+int ulcnet_model_io_post_frame(const UlcnetModelIoState *state, int slot, float *out_re, float *out_im);
 
 const UlcnetModelIoDescriptor *ulcnet_model_io_descriptor(
     const UlcnetModelIoState *state);
 
-/* Counter of state restarts: advances on reset and when enhance_spectrum() refuses a frame, registered state or not;
+/* Counter of state restarts: advances on reset and when validate_run() refuses a run, registered state or not;
  * 0 for a fresh or NULL state; wraps at 2^32. A fixed-point accelerator (or any runtime holding the state itself)
  * loads quantized zeros into its state at start and on every change. */
 uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state);

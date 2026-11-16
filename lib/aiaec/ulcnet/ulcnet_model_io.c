@@ -22,7 +22,7 @@ struct UlcnetModelIoState {
     float *logit_history;
     float *h_gru;
 
-    /* Feature tensors computed by prepare(), and the compressed error spectrum kept for enhance_spectrum(). */
+    /* Feature tensors computed by pre_frame(), and the compressed error spectrum kept for post_frame(). */
     float *error_mag;
     float *far_mag;
     float *error_cos;
@@ -37,7 +37,6 @@ struct UlcnetModelIoState {
     size_t logit_history_elements;
     size_t gru_hidden_elements;
     uint32_t state_generation;
-    int prepared;
 };
 
 /* Pool arithmetic uses audiolib's saturating helpers: overflow pins the cursor to SIZE_MAX (MEM_SIZE_INVALID). */
@@ -282,7 +281,6 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state) {
         return;
     }
     clear_recurrent_state(state);
-    state->prepared = 0;
 }
 
 uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state) {
@@ -338,7 +336,7 @@ ULCNET_TWIN void front_end_scalar(const UlcnetModelIoState *state, const FramePl
 #if SK_HAVE_NEON
 /* Two-pass front end: libm calls run per bin into planes the frame owns, then
  * sqrt, divide and direction run four bins at a time. The far planes are staged in the start of `output`, which
- * prepare() NaN-fills only after every frame's front end. */
+ * views() NaN-fills only after every frame's front end. */
 static inline void front_end_tail_one(const UlcnetModelIoState *state, const FramePlanes *out, int bin) {
     const float c_re = out->error_ri[2 * bin];
     const float c_im = out->error_ri[2 * bin + 1];
@@ -406,9 +404,9 @@ static inline void front_end(const UlcnetModelIoState *state, size_t frame, cons
 #endif
 }
 
-/* Publish the views of the prepared frame (or packet) and arm the transaction. */
-static void publish_views(UlcnetModelIoState *state, UlcnetModelIoInputs *inputs,
+int ulcnet_model_io_views(UlcnetModelIoState *state, UlcnetModelIoInputs *inputs,
                           UlcnetModelIoOutputs *outputs) {
+    if (!state || !inputs || !outputs) return -1;
     skn_fill_f32(state->output, state->spectrum_ri_elements, NAN);
 
     inputs->error_mag = state->error_mag;
@@ -437,42 +435,18 @@ static void publish_views(UlcnetModelIoState *state, UlcnetModelIoInputs *inputs
     outputs->value_history_elements = state->value_history_elements;
     outputs->logit_history_elements = state->logit_history_elements;
     outputs->gru_hidden_elements = state->gru_hidden_elements;
-    state->prepared = 1;
-}
-
-int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float *error_re, const float *error_im,
-                            const float *far_re, const float *far_im,
-                            UlcnetModelIoInputs *inputs,
-                            UlcnetModelIoOutputs *outputs) {
-    if (!state || !error_re || !error_im || !far_re || !far_im || !inputs ||
-        !outputs || state->frames != 1) {
-        return -1;
-    }
-    front_end(state, 0u, error_re, error_im, far_re, far_im);
-    publish_views(state, inputs, outputs);
     return 0;
 }
 
-int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
-                                   const float *error_re, const float *error_im,
-                                   const float *far_re, const float *far_im,
-                                   const int *events,
-                                   UlcnetModelIoInputs *inputs,
-                                   UlcnetModelIoOutputs *outputs) {
-    const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
-    size_t frame;
-
-    if (!state || !error_re || !error_im || !far_re || !far_im || !events || !inputs ||
-        !outputs || state->frames < 2) {
+int ulcnet_model_io_pre_frame(UlcnetModelIoState *state, int slot,
+                              const float *error_re, const float *error_im,
+                              const float *far_re, const float *far_im, int event) {
+    if (!state || !error_re || !error_im || !far_re || !far_im || slot < 0 || slot >= state->frames ||
+        (event != 0 && !state->frame_reset)) {
         return -1;
     }
-    for (frame = 0; frame < (size_t)state->frames; ++frame) {
-        front_end(state, frame, error_re + frame * bins, error_im + frame * bins,
-                  far_re + frame * bins, far_im + frame * bins);
-        state->frame_reset[frame] = events[frame] != 0 ? 1.0f : 0.0f;
-    }
-    publish_views(state, inputs, outputs);
+    front_end(state, (size_t)slot, error_re, error_im, far_re, far_im);
+    if (state->frame_reset) state->frame_reset[slot] = event != 0 ? 1.0f : 0.0f;
     return 0;
 }
 
@@ -558,56 +532,22 @@ static inline void back_end(const UlcnetModelIoState *state, size_t frame,
 #endif
 }
 
-/* The finite gate shared by both boundaries, for what the accelerator wrote and for the enhanced spectrum. State is
- * updated in place, so a bad frame cannot be rolled back: restart the recurrent state (the registered buffers; a
- * runtime that holds the state itself sees the generation). */
-static int finish_is_valid(UlcnetModelIoState *state, int finite) {
-    if (!finite) {
-        clear_recurrent_state(state);
-        state->prepared = 0;
-        return 0;
-    }
-    return 1;
+/* State is updated in place by the accelerator, so a bad run cannot be rolled back: restart the recurrent state (the
+ * registered buffers; a runtime that holds the state itself sees the generation). */
+int ulcnet_model_io_validate_run(UlcnetModelIoState *state) {
+    if (!state) return -1;
+    if (frame_is_finite(state)) return 0;
+    clear_recurrent_state(state);
+    return -1;
 }
 
-int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
-                                     float *enhanced_re, float *enhanced_im) {
+int ulcnet_model_io_post_frame(const UlcnetModelIoState *state, int slot, float *out_re, float *out_im) {
     const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
 
-    if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames != 1) {
-        return -1;
-    }
-    if (!finish_is_valid(state, frame_is_finite(state))) return -1;
-
+    if (!state || !out_re || !out_im || slot < 0 || slot >= state->frames) return -1;
+    back_end(state, (size_t)slot, out_re, out_im);
     /* A finite mask can still overflow the inverse power, and a non-finite error bin passes straight through it. */
-    back_end(state, 0u, enhanced_re, enhanced_im);
-    if (!finish_is_valid(state, skn_all_finite_f32(enhanced_re, bins) && skn_all_finite_f32(enhanced_im, bins)))
-        return -1;
-    state->prepared = 0;
-    return 0;
-}
-
-int ulcnet_model_io_enhance_packet(UlcnetModelIoState *state,
-                                   float *enhanced_re, float *enhanced_im) {
-    const size_t bins = state ? (size_t)state->descriptor.spectrum_bins : 0u;
-    size_t frame;
-    int finite = 1;
-
-    if (!state || !state->prepared || !enhanced_re || !enhanced_im || state->frames < 2) {
-        return -1;
-    }
-    if (!finish_is_valid(state, frame_is_finite(state))) return -1;
-
-    /* Event frames are not written here, so they are not scanned either. */
-    for (frame = 0; frame < (size_t)state->frames; ++frame) {
-        if (state->frame_reset[frame] != 0.0f) continue;
-        back_end(state, frame, enhanced_re + frame * bins, enhanced_im + frame * bins);
-        finite = finite && skn_all_finite_f32(enhanced_re + frame * bins, bins) &&
-                 skn_all_finite_f32(enhanced_im + frame * bins, bins);
-    }
-    if (!finish_is_valid(state, finite)) return -1;
-    state->prepared = 0;
-    return 0;
+    return skn_all_finite_f32(out_re, bins) && skn_all_finite_f32(out_im, bins) ? 0 : -2;
 }
 
 const UlcnetModelIoDescriptor *ulcnet_model_io_descriptor(

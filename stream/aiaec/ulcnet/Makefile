@@ -65,7 +65,7 @@ CORE_HEADERS := ../../../lib/aiaec/ulcnet/ulcnet_model_io.h \
 	../../../lib/aiaec/ulcnet/ulcnet_prepost.h
 
 STREAM_SOURCES := ulcnet_stream.c
-STREAM_HEADERS := ulcnet_stream.h ../../common/stream_mem.h ../../common/stream_run.h
+STREAM_HEADERS := ulcnet_stream.h ../../common/stream_mem.h ../../common/stream_run.h ../../common/stream_range.h
 
 LIB := $(OBJ_DIR)/libulcnet_stream.a
 LIB_OBJECTS := $(OBJ_DIR)/ulcnet_model_io.o $(OBJ_DIR)/ulcnet_prepost.o $(OBJ_DIR)/ulcnet_stream.o
@@ -91,8 +91,12 @@ PCM_EVENTS_SOURCES := tests/test_ulcnet_pcm_events.c $(CORE_SOURCES) ulcnet_stre
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) ulcnet_stream.c
 
+# The call lifecycle (guards, reprime, status and fault outcomes, range refusal against a twin), public entries only.
+LIFECYCLE_BIN := $(OBJ_DIR)/lifecycle
+LIFECYCLE_SOURCES := tests/lifecycle.c $(CORE_SOURCES) ulcnet_stream.c
+
 .PHONY: all lib print-lib-path print-cflags print-sources test smoke verify-vs-sample test-stream-freq test-pcm-events test-freq-only \
-	audit-no-stdio clean _cfg_guard
+	test-lifecycle audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -156,7 +160,14 @@ test-pcm-events: $(PCM_EVENTS_BIN)
 test-freq-only: $(FREQ_ONLY_BIN)
 	"$(FREQ_ONLY_BIN)"
 
-test: smoke verify-vs-sample test-stream-freq test-pcm-events test-freq-only
+$(LIFECYCLE_BIN): $(LIFECYCLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(LIFECYCLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+test-lifecycle: $(LIFECYCLE_BIN)
+	"$(LIFECYCLE_BIN)"
+
+test: smoke verify-vs-sample test-stream-freq test-pcm-events test-freq-only test-lifecycle
 
 # audit-no-stdio: builds the archive and asserts, via `nm -u`, that ulcnet_stream.o references no
 # stdio symbol (nothing in this model needs stdio at all).

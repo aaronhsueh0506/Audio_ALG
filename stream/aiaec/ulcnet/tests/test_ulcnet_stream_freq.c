@@ -185,8 +185,8 @@ static int kind_of_call(int kind, int period, long call) {
     return period > 0 && call % period == 3 ? kind : K_PLAIN;
 }
 
-/* `n` hops of schedule `sc` through r; a NaN in the error spectrum at hop `nan_err_at` (-1: none); outs gets
- * 2 * BINS floats per hop when given. The tally starts from *t (so a run can continue after a reset). */
+/* `n` hops of schedule `sc` through r; at hop `nan_err_at` (-1: none) the stream is first offered the hop with a NaN
+ * in the error spectrum and must refuse it without moving; outs gets 2 * BINS floats per hop when given. The tally starts from *t (so a run can continue after a reset). */
 static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int nan_err_at, uint32_t seed, Tally *t,
                     float *outs) {
     static float er[BINS_MAX], ei[BINS_MAX], fr[BINS_MAX], fi[BINS_MAX], re[BINS_MAX], im[BINS_MAX];
@@ -201,7 +201,20 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
 
         had_hop = 1; prev_solid = d.solid;
         fill_spectra(&seed, h, er, ei, fr, fi);
-        if (h == nan_err_at) er[7] = NAN;
+        if (h == nan_err_at) {
+            float *probe = (float *)malloc((size_t)BINS * sizeof(float));
+            UlcnetHopIO bad;
+            int rc_bad;
+            if (!probe) return -1;
+            memcpy(probe, er, (size_t)BINS * sizeof(float));
+            probe[7] = NAN;
+            memset(&bad, 0x5A, sizeof bad);
+            rc_bad = ulcnet_stream_pre_process_freq(r->s, probe, ei, fr, fi, d, &bad);
+            free(probe);
+            if (rc_bad != ULCNET_STREAM_ERR_RANGE || ulcnet_stream_post_process_freq(r->s, 0, re, im) != -1 ||
+                ulcnet_stream_state_generation(r->s) != t->generation)
+                t->bad_pre++;
+        }
         if (edge) { t->edges++; t->generation++; }
 
         memset(&io, 0x5A, sizeof io);
@@ -214,7 +227,7 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
                      io.inputs.logit_history == NULL && io.inputs.h_gru == NULL && io.inputs.frame_reset == NULL &&
                      io.outputs.key_history_out == NULL && io.outputs.h_gru_out == NULL;
             for (k = 0; ok && k < 2 * BINS; ++k) ok = isnan(io.outputs.output[k]);
-            if (ok && h != nan_err_at) {
+            if (ok) {
                 front_end_of(er, ei, fr, fi, emag, fmag, ecos, esin);
                 ok = same_bits(io.inputs.error_mag, emag, (size_t)BINS) && same_bits(io.inputs.far_mag, fmag, (size_t)BINS) &&
                      same_bits(io.inputs.error_cos, ecos, (size_t)BINS) && same_bits(io.inputs.error_sin, esin, (size_t)BINS);
@@ -233,7 +246,7 @@ static int run_hops(Rig *r, const Sched *sc, int n, int kind, int period, int na
         if (pre != 1) identity = 1;
         else if (run_kind == K_FAIL) { identity = 1; t->failed++; t->generation++; }
         else if (run_kind == K_NOT_STARTED) { identity = 1; t->failed++; }
-        else if (run_kind != K_PLAIN || h == nan_err_at) { identity = 1; refused = 1; }
+        else if (run_kind != K_PLAIN) { identity = 1; refused = 1; }
         else identity = 0;
         if (refused) { t->refused++; t->generation++; }
         if (identity) {
@@ -329,14 +342,15 @@ static void row_fail_open(void) {
         CHECK(rig_guard_intact(&r), "fail-open: nothing is written past the pool");
         rig_free(&r);
     }
-    {   /* a non-finite error bin under a finite mask: the whole hop is the error spectrum, NaN bin included */
+    {   /* a non-finite error bin: the entry refuses the offer (ULCNET_STREAM_ERR_RANGE), nothing moves, the hop that follows
+         * (an alignment edge included) runs as if it had not been offered */
         Rig r;
         Tally t;
         memset(&t, 0, sizeof t);
         CHECK(rig_init(&r, 0) == 0 && run_hops(&r, &sc, N, K_PLAIN, 0, 30, 71u, &t, NULL) == 0,
-              "fail-open: NaN error bin run");
-        CHECK(tally_clean(&t) && t.refused == 1 && t.enhanced == N - 2,
-              "fail-open: a NaN error bin makes that one hop the error spectrum and restarts the state once");
+              "range: NaN error bin run");
+        CHECK(tally_clean(&t) && t.refused == 0 && t.enhanced == N - 1,
+              "range: a NaN error bin is refused with no state change and the next hop is applied");
         rig_free(&r);
     }
 }

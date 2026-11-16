@@ -1,7 +1,9 @@
-/* Align-ULCNet pre/post class, frequency domain only: the caller's spectra to the accelerator's tensors and back.
- * Per hop: pre_process_freq, frame_open, the NPU run, frame_finish (frame_fail if the run did not succeed),
- * post_process_freq. The recurrent state is outside the pool: it belongs to the application and is optionally
- * registered in the config.
+/* Align-ULCNet pre/post class, frequency domain only: per-frame functions between the caller's spectra and the
+ * accelerator's tensors. Per run (one frame, or a packet of N): pre_frame for every slot, views, the NPU run,
+ * validate_run, then post_frame for every slot (zero_state after a failed run or a non-finite frame). The call
+ * lifecycle, the staging of what must survive to post (the error spectrum, the events) and the identity frames belong
+ * to the stream. The recurrent state is outside the pool: it belongs to the application and is optionally registered
+ * in the config.
  *
  * Framing (the application's, with audiolib on the run-time UlcnetGrid; Python reference aiaec_streaming). Trained
  * against: sqrt-Hann (ac_window_build default); analysis AcStft from ac_stft_config_default(&sc, grid.n_fft),
@@ -10,9 +12,8 @@
  * included), latency grid.hop. FftHandle and window table: caller-owned, shareable.
  *
  * Packet boundary (config frames_per_call N >= 2, model layout ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION): the same
- * sequence with pre_process_packet in place of pre_process_freq, one NPU run for the N frames, and N * n_bins values
- * per spectrum plane everywhere a one-frame call takes n_bins. A frame marked as an alignment event passes the error
- * spectrum through unchanged and is reset in the graph; the host does not restart the state for it. */
+ * sequence over N slots, one NPU run for the N frames. A frame marked as an alignment event is reset in the graph and
+ * bypassed there; the host does not restart the state for it and fills the frame with the error spectrum. */
 
 #ifndef ULCNET_PREPOST_H
 #define ULCNET_PREPOST_H
@@ -28,7 +29,7 @@ extern "C" {
 
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash; bump on any change of pool size, carve order or descriptor content. */
-#define ULCNET_PREPOST_CARVE_VERSION 9u
+#define ULCNET_PREPOST_CARVE_VERSION 10u
 
 typedef struct UlcnetPrepostConfig {
     UlcnetGrid   grid;         /* ulcnet_grid_make(); copied at init; D is a sanity bound only */
@@ -37,7 +38,7 @@ typedef struct UlcnetPrepostConfig {
     int          frames_per_call;  /* 0 or 1: one frame per graph call; 2..ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL: a packet */
     /* Optional registration of the application's recurrent state: borrowed buffers (they must outlive the instance),
      * element counts not bytes; a float host registers all four (zeroed at init and reset, checked whole at every
-     * frame_finish), a board none. Every pair set or all NULL/0, else refused; not in the pool size or hash. */
+     * validate_run), a board none. Every pair set or all NULL/0, else refused; not in the pool size or hash. */
     float       *key_history;
     size_t       key_history_elements;
     float       *value_history;
@@ -63,7 +64,7 @@ typedef struct UlcnetPrepost UlcnetPrepost;
 /* Fill a config for `grid` (copied): nothing registered, the built layout. 0, or -1 on NULL or an invalid grid. */
 int ulcnet_prepost_config_defaults(UlcnetPrepostConfig *cfg, const UlcnetGrid *grid);
 
-/* Exact pool size (instance header, model-I/O block, frame staging, 16-byte aligned; a function of n_bins, not of D).
+/* Exact pool size (instance header, model-I/O block, 16-byte aligned; a function of n_bins, not of D).
  * -1 with *req untouched on NULL, an invalid grid, another layout version or an inconsistent state registration. */
 int ulcnet_prepost_get_mem_size(const UlcnetPrepostConfig *cfg,
                                 UlcnetPrepostMemReq *req);
@@ -83,59 +84,43 @@ UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);   /* host 
 /* Frees only what _create allocated (never the registered buffers); NULL-safe, a no-op on an _init instance. */
 void ulcnet_prepost_destroy(UlcnetPrepost *p);
 
-/* Zero the registered recurrent state and the output staging, drop any open frame, advance the state generation.
- * Every pointer, the registration, the config and the pool stay; NULL is ignored. */
+#define ULCNET_PREPOST_OK            0
+#define ULCNET_PREPOST_ERR_ARG      (-1)   /* NULL, slot out of range, or an event at one frame: nothing changed */
+#define ULCNET_PREPOST_ERR_NONFINITE (-2)  /* post_frame: a non-finite enhanced bin; the caller restarts once */
+
+/* Full reset: zero the registered recurrent state and advance the state generation. Every pointer, the registration,
+ * the config and the pool stay; NULL is ignored. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
 
-/* Counter of state restarts (registered state or not): advances on reset, a refused frame_finish() and the frame_fail()
- * cases; 0 for a fresh instance or NULL. A fixed-point accelerator reloads quantized zeros when it changes. */
+/* The restart verb of a run: the same effect as reset (registered state zeroed, generation + 1). */
+void ulcnet_prepost_zero_state(UlcnetPrepost *p);
+
+/* Counter of state restarts (registered state or not): advances on reset, zero_state and a refused validate_run();
+ * 0 for a fresh instance or NULL. A fixed-point accelerator reloads quantized zeros when it changes. */
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 /* Built from the config's grid and layout; the five interior fields are 0. */
 const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p);
 
-/* One analysed frame per stream (n_bins bins; unnormalised rfft of a sqrt-Hann n_fft block on the hop grid, center
- * 0). The error spectrum is AecResidualView.error_spec, the analysis seam the model is trained on, never
- * AecResidualView.base_spec (on a guard hop it does not pair with the formed hop); the far
- * spectrum is the raw far of the same hop. Returns 1 (one invocation); -1 on NULL args or while a frame is open. */
-int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
-                                    const float *err_re, const float *err_im,
-                                    const float *far_re, const float *far_im);
+/* Features of frame `slot` from one analysed frame per plane (n_bins bins; unnormalised rfft of a sqrt-Hann n_fft
+ * block, center 0): the error spectrum is AecResidualView.error_spec (never base_spec), the far spectrum the raw far of
+ * the same hop. Read here, not kept. `event` != 0 marks an alignment event (packet only). OK or ERR_ARG. */
+int ulcnet_prepost_pre_frame(UlcnetPrepost *p, int slot,
+                             const float *err_re, const float *err_im,
+                             const float *far_re, const float *far_im, int event);
 
-/* As _pre_process_freq for a packet instance: N consecutive frames, frame-major, N * n_bins per plane, oldest first;
- * events[k] != 0 marks frame k as an alignment event (N entries). Refused (-1) on a one-frame instance, as
- * _pre_process_freq is on a packet one. */
-int ulcnet_prepost_pre_process_packet(UlcnetPrepost *p,
-                                      const float *err_re, const float *err_im,
-                                      const float *far_re, const float *far_im,
-                                      const int *events);
+/* Once per run, after the last pre_frame: NaN-fill `output` and publish the boundary. Each state output has the address
+ * of its state input (read every input before writing any output); the state pointers are the registered buffers,
+ * the others point into the pool, all stable for the life of the instance. 0, or -1 on NULL. */
+int ulcnet_prepost_views(UlcnetPrepost *p, UlcnetModelIoInputs *inputs, UlcnetModelIoOutputs *outputs);
 
-/* Publish the current frame's accelerator boundary. `output` is NaN-prefilled so an unwritten frame is caught by
- * frame_finish. Each state output has the address of its state input: read every state input before writing any state
- * output. The state pointers are the registered buffers (NULL and 0 elements when none), the others point into the
- * pool; all are stable for the life of the instance. Returns 0, or -1 if no frame is open. */
-int ulcnet_prepost_frame_open(UlcnetPrepost *p,
-                                UlcnetModelIoInputs *inputs,
-                                UlcnetModelIoOutputs *outputs);
+/* After a successful run the whole mask and every registered state buffer must be finite. 0, or -1 when refused: the
+ * registered state is zeroed and the generation advanced once. */
+int ulcnet_prepost_validate_run(UlcnetPrepost *p);
 
-/* Call after a successful accelerator run (frame_fail() after one that did not succeed); needs an open frame from
- * frame_open(), else refused. Validates a finite mask and registered state (each buffer scanned whole), applies the mask
- * and inverse compression, validates a finite enhanced spectrum and stages it. On failure (-1) the registered state is
- * zeroed, the generation advances and the frame stays open: then frame_bypass() or a fresh frame_open(). */
-int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
-
-/* Identity for the current frame (a reprime hop, or after a refused frame_finish()): the error spectrum, without the AEC
- * output guard (on a guard hop it can exceed the capture). State and generation are left as they are. Returns 0, or -1
- * if no frame is open. */
-int ulcnet_prepost_frame_bypass(UlcnetPrepost *p);
-
-/* Closes the open frame as frame_bypass() does, after a run that did not succeed. run_started != 0: the registered state
- * is zeroed and the generation advances; 0: only a packet with an event frame advances it (+1, as its graph restarts).
- * Not for a frame whose frame_finish() was refused. Returns 0, or -1 if no frame is open. */
-int ulcnet_prepost_frame_fail(UlcnetPrepost *p, int run_started);
-
-/* The enhanced spectrum (n_bins bins; a packet: N * n_bins) of the frame just finished or bypassed. Returns 0, or -1. */
-int ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float *re, float *im);
+/* Frame `slot` of the validated run: compressed error times the slot's mask, inverse compression, into out_re / out_im
+ * (n_bins each). OK; ERR_ARG (nothing written); ERR_NONFINITE (state and generation untouched, the caller restarts). */
+int ulcnet_prepost_post_frame(const UlcnetPrepost *p, int slot, float *out_re, float *out_im);
 
 #ifdef __cplusplus
 }

@@ -32,6 +32,7 @@
 
 #if defined(CHAIN_ULCNET)
 #include "ulcnet_prepost.h"
+#include "ulcnet_lifecycle_driver.h"
 #elif defined(CHAIN_DEEPVQE)
 #include "deepvqe_prepost.h"
 #include "deepvqe_lifecycle_driver.h"
@@ -300,6 +301,7 @@ static uint64_t run_chain(int depth)
         .sample_rate = g_sample_rate, .n_fft = g_n_fft, .delay_depth = depth };
     UlcnetPrepostConfig cfg;
     UlcnetPrepost* p;
+    UlLife life;
     Host host;
     Digest d;
     int huge_silent = 0, huge_refused = 0, huge_accepted = 0;
@@ -313,7 +315,7 @@ static uint64_t run_chain(int depth)
     cfg.logit_history = host.logit; cfg.logit_history_elements = host.nl;
     cfg.h_gru = host.gru;           cfg.gru_hidden_elements = host.ng;
     p = ulcnet_prepost_create(&cfg);
-    if (!p) exit(2);
+    if (!p || ul_life_init(&life, p) != 0) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         UlcnetModelIoInputs in;
         UlcnetModelIoOutputs out;
@@ -321,9 +323,8 @@ static uint64_t run_chain(int depth)
         uint32_t generation_before;
         make_spectrum(h, BINS, e_re, e_im);
         make_spectrum(h + 500, BINS, f_re, f_im);
-        hash_u32(&d.status,
-                 (uint32_t)ulcnet_prepost_pre_process_freq(p, e_re, e_im, f_re, f_im));
-        if (ulcnet_prepost_frame_open(p, &in, &out) != 0) exit(2);
+        hash_u32(&d.status, (uint32_t)ul_life_pre(&life, e_re, e_im, f_re, f_im, NULL));
+        if (ul_life_views(&life, &in, &out) != 0) exit(2);
         /* The views are the registered buffers: a forgotten registration must not
          * hash zero elements and pass. */
         if (in.key_history_elements != host.nk || in.value_history_elements != host.nk ||
@@ -369,8 +370,7 @@ static uint64_t run_chain(int depth)
             }
         }
         generation_before = ulcnet_prepost_state_generation(p);
-        rc = kind == K_SKIP ? ulcnet_prepost_frame_bypass(p)
-                            : ulcnet_prepost_frame_finish(p);
+        rc = kind == K_SKIP ? ul_life_bypass(&life) : ul_life_finish(&life);
         if (kind == K_BAD_STATE_OLD)
             require_old_slot_refusal(rc, generation_before,
                                      ulcnet_prepost_state_generation(p),
@@ -383,7 +383,7 @@ static uint64_t run_chain(int depth)
                                       ulcnet_prepost_state_generation(p),
                                       host_zeroed(&host));
         }
-        if (rc != 0 && kind != K_SKIP) skipped = ulcnet_prepost_frame_bypass(p);
+        if (rc != 0 && kind != K_SKIP) skipped = ul_life_bypass(&life);
         hash_u32(&d.status, (uint32_t)rc);
         hash_u32(&d.status, (uint32_t)skipped);
         hash_u32(&d.status, ulcnet_prepost_state_generation(p));
@@ -391,7 +391,7 @@ static uint64_t run_chain(int depth)
         hash_f32(&d.state, out.value_history_out, out.value_history_elements);
         hash_f32(&d.state, out.logit_history_out, out.logit_history_elements);
         hash_f32(&d.state, out.h_gru_out, out.gru_hidden_elements);
-        if (ulcnet_prepost_post_process_freq(p, o_re, o_im) != 0) exit(2);
+        ul_life_out(&life, o_re, o_im);
         if (kind == K_HUGE && !huge_silent &&
             (memcmp(o_re, e_re, (size_t)BINS * sizeof(float)) != 0 ||
              memcmp(o_im, e_im, (size_t)BINS * sizeof(float)) != 0)) {
@@ -405,6 +405,7 @@ static uint64_t run_chain(int depth)
         fprintf(stderr, "FAIL: huge-mask hops refused %d, accepted %d\n", huge_refused, huge_accepted);
         exit(EXIT_FAILURE);
     }
+    ul_life_free(&life);
     ulcnet_prepost_destroy(p);
     host_free(&host);
     print_digest(chain_name(), depth, &d);

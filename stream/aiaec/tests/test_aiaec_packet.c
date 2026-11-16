@@ -993,7 +993,7 @@ static int section_model_io_pin(void) {
     pc.frames_per_call = -1; pc.model_layout_version = 0u;
     CHECK(ulcnet_prepost_get_mem_size(&pc, &q1) != 0, "prepost negative frames");
 
-    /* one-frame and packet entries refuse each other's state */
+    /* the per-frame calls refuse a slot or an event the instance has no room for */
     {
         UlcnetPrepostConfig c1, c8;
         UlcnetPrepost *p1, *p8;
@@ -1009,13 +1009,18 @@ static int section_model_io_pin(void) {
         p1 = ulcnet_prepost_init(m1p, (size_t)q1.bytes, &c1); p8 = ulcnet_prepost_init(m8p, (size_t)q8.bytes, &c8);
         CHECK(p1 && p8, "prepost init");
         if (p1 && p8) {
-            CHECK(ulcnet_prepost_pre_process_freq(p8, z, z, z, z) == -1, "one-frame entry on a packet instance");
-            CHECK(ulcnet_prepost_pre_process_packet(p1, z, z, z, z, ev) == -1, "packet entry on a one-frame instance");
-            CHECK(ulcnet_prepost_pre_process_packet(p8, z, z, z, z, NULL) == -1, "packet entry without events");
-            CHECK(ulcnet_prepost_pre_process_packet(p8, z, z, z, z, ev) == 1 && ulcnet_prepost_frame_open(p8, &in, &out) == 0 &&
-                  in.frame_reset != NULL && in.frame_reset_elements == NF && in.spectrum_bins_elements == (size_t)NF * BINS &&
+            int k;
+            CHECK(ulcnet_prepost_pre_frame(p8, NF, z, z, z, z, 0) == -1, "slot N on a packet instance");
+            CHECK(ulcnet_prepost_pre_frame(p1, 1, z, z, z, z, 0) == -1, "slot 1 on a one-frame instance");
+            CHECK(ulcnet_prepost_pre_frame(p1, 0, z, z, z, z, 1) == -1, "event on a one-frame instance");
+            CHECK(ulcnet_prepost_pre_frame(p8, 0, NULL, z, z, z, 0) == -1, "packet frame without a spectrum");
+            for (k = 0; k < NF; ++k) ev[k] = k == 2;
+            for (k = 0; k < NF; ++k) CHECK(ulcnet_prepost_pre_frame(p8, k, z, z, z, z, ev[k]) == 0, "packet slot %d", k);
+            CHECK(ulcnet_prepost_views(p8, &in, &out) == 0 &&
+                  in.frame_reset != NULL && in.frame_reset_elements == NF && in.frame_reset[2] == 1.0f &&
+                  in.frame_reset[1] == 0.0f && in.spectrum_bins_elements == (size_t)NF * BINS &&
                   out.spectrum_ri_elements == (size_t)2 * NF * BINS, "packet views");
-            CHECK(ulcnet_prepost_pre_process_freq(p1, z, z, z, z) == 1 && ulcnet_prepost_frame_open(p1, &in, &out) == 0 &&
+            CHECK(ulcnet_prepost_pre_frame(p1, 0, z, z, z, z, 0) == 0 && ulcnet_prepost_views(p1, &in, &out) == 0 &&
                   in.frame_reset == NULL && in.frame_reset_elements == 0u && out.spectrum_ri_elements == (size_t)2 * BINS,
                   "one-frame views carry no frame_reset");
         }
@@ -1034,9 +1039,20 @@ static int packet_frame_finite(const float *re, const float *im, int frame) {
     return 1;
 }
 
+/* The stream's closing sequence over the model-I/O calls: validate_run, then post_frame for every frame that is not an
+ * event (an event frame is the error spectrum, supplied by the caller), one restart on a non-finite enhanced frame. */
+static int close_packet(UlcnetModelIoState *io, const int *ev, float *re, float *im) {
+    int k, ok = 1;
+    if (ulcnet_model_io_validate_run(io) != 0) return -1;
+    for (k = 0; k < NF; ++k)
+        if (!ev[k] && ulcnet_model_io_post_frame(io, k, re + (size_t)k * BINS, im + (size_t)k * BINS) != 0) ok = 0;
+    if (!ok) ulcnet_model_io_reset(io);
+    return ok ? 0 : -1;
+}
+
 /* An event frame is not written, so it is not scanned: a caller array that holds NaN there is left alone and the packet
- * is accepted. A finite mask that overflows a later frame is refused once, with the registered state zeroed; a retry
- * does not advance the generation, at the packet boundary and at the one-frame boundary alike. The mask and state gate
+ * is accepted. A finite mask that overflows a later frame is refused once, with the registered state zeroed, at the
+ * packet boundary and at the one-frame boundary alike. The mask and state gate
  * keeps what the new check cannot see: a NaN mask bin in the event frame and a NaN in the registered state. The overflow
  * also sits alone in frame 0 and in the last bin of each frame (the NEON scan's scalar tail), at both boundaries. */
 static int section_model_io_enhanced_check(void) {
@@ -1076,7 +1092,11 @@ static int section_model_io_enhanced_check(void) {
      * 4: HUGE_MASK in frame 0's real plane, bin 0; 5 + k: in frame k's real plane, last bin (accepted for the event frame) */
     for (pass = 0; pass < PASSES; ++pass) {
         const int accept = pass == 0 || pass == 5 + EVENT_FRAME;
-        CHECK(ulcnet_model_io_prepare_packet(io, g_ere, g_eim, g_fre, g_fim, ev, &in, &out) == 0, "enhanced check: prepare %d", pass);
+        for (k = 0; k < NF; ++k)
+            CHECK(ulcnet_model_io_pre_frame(io, k, g_ere + (size_t)k * BINS, g_eim + (size_t)k * BINS,
+                                            g_fre + (size_t)k * BINS, g_fim + (size_t)k * BINS, ev[k]) == 0,
+                  "enhanced check: pre_frame %d of pass %d", k, pass);
+        CHECK(ulcnet_model_io_views(io, &in, &out) == 0, "enhanced check: views %d", pass);
         for (i = 0; i < out.spectrum_ri_elements; ++i) out.output[i] = i < (size_t)NF * BINS ? 0.7f : 0.1f;
         if (pass == 1) out.output[(size_t)(NF + BAD_FRAME) * BINS] = HUGE_MASK;
         if (pass == 2) out.output[(size_t)EVENT_FRAME * BINS + 3u] = NAN;
@@ -1087,7 +1107,7 @@ static int section_model_io_enhanced_check(void) {
         for (i = 0; i < (size_t)NF * BINS; ++i) { re[i] = NAN; im[i] = NAN; }
         gen = ulcnet_model_io_state_generation(io);
         if (accept) {
-            CHECK(ulcnet_model_io_enhance_packet(io, re, im) == 0 && ulcnet_model_io_state_generation(io) == gen,
+            CHECK(close_packet(io, ev, re, im) == 0 && ulcnet_model_io_state_generation(io) == gen,
                   "enhanced check: pass %d, a packet with an unwritten event frame was refused", pass);
             for (i = 0; i < 32u; ++i) CHECK(st[i / 8u][i % 8u] == 0.25f, "enhanced check: an accepted packet changed the state");
             for (k = 0; k < NF; ++k)
@@ -1097,12 +1117,10 @@ static int section_model_io_enhanced_check(void) {
                 CHECK(isnan(re[(size_t)EVENT_FRAME * BINS + i]) && isnan(im[(size_t)EVENT_FRAME * BINS + i]),
                       "enhanced check: event frame bin %d was written", (int)i);
         } else {
-            CHECK(ulcnet_model_io_enhance_packet(io, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
+            CHECK(close_packet(io, ev, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
                   "enhanced check: bad packet %d was accepted or the generation did not advance by one", pass);
             for (i = 0; i < 32u; ++i)
                 CHECK(st[i / 8u][i % 8u] == 0.0f, "enhanced check: refused packet %d left state element %d", pass, (int)i);
-            CHECK(ulcnet_model_io_enhance_packet(io, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
-                  "enhanced check: a retry of packet %d was accepted or advanced the generation again", pass);
         }
     }
     free(pool);
@@ -1116,22 +1134,26 @@ static int section_model_io_enhanced_check(void) {
         }
         pool = alloc_aligned((size_t)m1.bytes);
         io = ulcnet_model_io_init(pool, (size_t)m1.bytes, &d1, NULL);
-        CHECK(io != NULL && ulcnet_model_io_prepare(io, g_ere, g_eim, g_fre, g_fim, &in, &out) == 0, "enhanced check: one-frame prepare");
+        CHECK(io != NULL && ulcnet_model_io_pre_frame(io, 0, g_ere, g_eim, g_fre, g_fim, 0) == 0 &&
+              ulcnet_model_io_views(io, &in, &out) == 0, "enhanced check: one-frame prepare");
         if (io) {
             for (i = 0; i < out.spectrum_ri_elements; ++i) out.output[i] = i < (size_t)BINS ? 0.7f : 0.1f;
             out.output[0] = HUGE_MASK;
             gen = ulcnet_model_io_state_generation(io);
-            CHECK(ulcnet_model_io_enhance_spectrum(io, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
-                  "enhanced check: an overflowing one-frame spectrum was accepted or the generation did not advance by one");
-            CHECK(ulcnet_model_io_enhance_spectrum(io, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
-                  "enhanced check: a one-frame retry was accepted or advanced the generation again");
+            CHECK(ulcnet_model_io_validate_run(io) == 0 && ulcnet_model_io_post_frame(io, 0, re, im) == -2 &&
+                  ulcnet_model_io_state_generation(io) == gen,
+                  "enhanced check: an overflowing one-frame spectrum was accepted, or post_frame touched the generation");
+            ulcnet_model_io_reset(io);
+            CHECK(ulcnet_model_io_state_generation(io) == gen + 1u, "enhanced check: the restart did not advance by one");
             /* the overflow alone in the last bin */
-            CHECK(ulcnet_model_io_prepare(io, g_ere, g_eim, g_fre, g_fim, &in, &out) == 0, "enhanced check: one-frame re-prepare");
+            CHECK(ulcnet_model_io_pre_frame(io, 0, g_ere, g_eim, g_fre, g_fim, 0) == 0 &&
+                  ulcnet_model_io_views(io, &in, &out) == 0, "enhanced check: one-frame re-prepare");
             for (i = 0; i < out.spectrum_ri_elements; ++i) out.output[i] = i < (size_t)BINS ? 0.7f : 0.1f;
             out.output[BINS - 1] = HUGE_MASK;
             gen = ulcnet_model_io_state_generation(io);
-            CHECK(ulcnet_model_io_enhance_spectrum(io, re, im) == -1 && ulcnet_model_io_state_generation(io) == gen + 1u,
-                  "enhanced check: a one-frame overflow in the last bin was accepted or the generation did not advance by one");
+            CHECK(ulcnet_model_io_validate_run(io) == 0 && ulcnet_model_io_post_frame(io, 0, re, im) == -2 &&
+                  ulcnet_model_io_state_generation(io) == gen,
+                  "enhanced check: a one-frame overflow in the last bin was accepted, or post_frame touched the generation");
         }
         free(pool);
     }
