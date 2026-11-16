@@ -336,7 +336,7 @@ deepvqe_prepost_post_process_freq（N 次，由舊到新）
 ac_istft_push_planar (AcIstft, AC_OLA_ACCUMULATE；每個 frame 回滿一個 hop，含首拍)
   |
   v
-float -> int16 飽和轉換（×32768，四捨五入、半值遠離零）（push 回 0 時填零；N=1 不會發生）
+float -> int16 飽和轉換（×32768，四捨五入、半值遠離零）
   |
   v
 PCM out (int16, 永遠完整 N 個 hop；N=1 時一個 hop)
@@ -385,7 +385,7 @@ k     pre_process_packet -> open -------------------------------> 替身回 -1, 
 <tr><th>項目</th><th>值（16 kHz／512／delay_depth=32）</th><th>出處</th></tr>
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
 <tr><td>模型延遲</td><td>0（每 hop 一幀，<code>deepvqe_prepost.h</code>：「no latency beyond it」）</td><td><code>deepvqe_prepost.h</code></td></tr>
-<tr><td>合成啟動</td><td>無首拍特例：每一包的輸出就是該包 N 個 frame 的合成，hop 0 即為真實合成輸出（前半窗疊加的歷史為零，可能有聲）；沒有 N−1 拍的零填，也沒有跨包的佇列</td><td><code>deepvqe_stream.h</code> 檔頭</td></tr>
+<tr><td>合成啟動</td><td>無首拍特例：每一包的輸出就是該包 N 個 frame 的合成，hop 0 即為真實合成輸出（前半窗疊加的歷史為零，可能有聲）</td><td><code>deepvqe_stream.h</code> 檔頭</td></tr>
 <tr><td>CCM ring 部分零歷史</td><td>前 <code>TIME_ORDER-1</code> = 2 個 hop</td><td>模型自身啟動行為，非延遲</td></tr>
 </table></div>
 </main>

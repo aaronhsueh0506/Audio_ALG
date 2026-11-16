@@ -1,5 +1,5 @@
 /* aiaec.h implementation: a block-level (hop_in samples per call) wrapper over deepvqe_stream's and
- * ulcnet_stream's hop-level (one model_hop samples per call) PCM APIs. The catalog below is the only
+ * ulcnet_stream's packet APIs (N model hops per call). The catalog below is the only
  * place that knows which (model, sample_rate, n_fft) combinations exist and which of their
  * frames_per_call variants have an actual shipped graph. The graph's port wiring is the sample's;
  * this file keeps only the per-hop signal and head views StreamWork carries.

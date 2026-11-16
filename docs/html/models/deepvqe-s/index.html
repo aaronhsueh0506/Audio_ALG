@@ -114,7 +114,7 @@ while (read_blocks(mic, far, hop_in)) {
 <h2>失敗語義與延遲</h2>
 <ul>
 <li>執行失敗或加速器輸出非有限時為 fail-closed：當拍自己的頻譜貢獻歸零，不是直通。<code>pcm_out</code> 仍可能有非零樣本，因為 overlap-add 會加上前一包已提交的結果。失敗那一批 N 個 frame 的頻譜全為零，正是失敗那一包自己的 N 個 hop：第一個 hop 只剩前一個 frame 的 overlap（半個窗），其餘 N − 1 個 hop 恰為零，下一包的第一個 hop 又只有半個窗，再往後恢復正常；N=1 時受影響的是失敗的 hop 與下一個 hop，各只有半個窗。</li>
-<li><code>trim_samples</code> = 一個模型 hop（stream 自己的 STFT／ISTFT hop），與 N 無關，兩個家族相同；<code>queue_frames</code> = 0：每一包的輸出就是這一包 N 個 frame 的合成，沒有跨包的佇列，也沒有啟動期的零填。</li>
+<li><code>trim_samples</code> = 一個模型 hop（stream 自己的 STFT／ISTFT hop），與 N 無關，兩個家族相同；<code>queue_frames</code> = 0：每一包的輸出就是這一包 N 個 frame 的合成。</li>
 <li>檔案尾端：最後一包補成完整 <code>hop_in</code>，再送 <code>info.tail_zero_blocks</code>（恆為 1）包全零，輸出去掉 <code>info.trim_samples</code> 個樣本，保留輸入長度。</li>
 </ul>
 <p>有自己分析與合成器的應用可用 <code>aiaec_*_freq</code>（頻譜進、頻譜出）家族；邊界與 <code>AiaecInfo</code> 相同，延遲與尾端規則見 <a href="../../../../stream/aiaec/aiaec.h">aiaec.h</a> 的 "Tail" 一節。<code>AC_OLA_ACCUMULATE</code> 的 <code>ac_istft_flush()</code> 回 0，外部 ISTFT 要照常推全零頻譜。</p>
