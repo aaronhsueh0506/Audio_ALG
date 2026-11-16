@@ -4,15 +4,15 @@
  * caller supplies the pool get_mem_size() reports; the recurrent state is the application's, optionally registered.
  * M = grid.mask_lookahead. Every hop runs the same flow:
  *     ac_stft_push_planar(stft, in_samples, re, im);
- *     dfn3_prepost_pre_process_freq(p, re, im);              // 1 on every hop
- *     dfn3_prepost_frame_open(p, &in, &out);                 // views into the pool
- *     my_npu_run(&in, &out);                                 // fills `out`
- *     dfn3_prepost_frame_finish(p);                          // -1: dfn3_prepost_frame_bypass(p)
- *                                                            // dfn3_model_run_frame() wraps the three calls
+ *     if (dfn3_prepost_pre_process_freq(p, re, im) == 1) {   // 0 for the first M hops: no job, nothing open
+ *         dfn3_prepost_frame_open(p, &in, &out);             // views into the pool
+ *         my_npu_run(&in, &out);                             // fills `out`
+ *         dfn3_prepost_frame_finish(p);                      // -1: dfn3_prepost_frame_bypass(p)
+ *     }                                                      // dfn3_model_run_frame() wraps the three calls
  *     dfn3_prepost_post_process_freq(p, out_re, out_im, NULL);
  *     ac_istft_push_planar(istft, out_re, out_im, out_samples);   // every hop (AC_OLA_ACCUMULATE)
- * The first M frames after init or reset are warm-up frames: the accelerator runs on them like any other, but
- * their heads describe a frame before the stream start and are discarded (see frame_finish). M == 0: none. */
+ * The first M hops after init or reset have no complete graph window: the accelerator is not called for them and
+ * the post-processed spectrum is zero with valid 0. M == 0: every hop runs. */
 
 #ifndef DFN3_PREPOST_H
 #define DFN3_PREPOST_H
@@ -119,12 +119,11 @@ DFN3Prepost *dfn3_prepost_create(const DFN3PrepostConfig *cfg);
 void dfn3_prepost_destroy(DFN3Prepost *p);
 
 /* Zero every ring and the registered state, drop any open frame, restart the normalisers and the enhance clock;
- * advances the generation and makes the next M frames warm-up frames. The application resets its own AcStft /
- * AcIstft. */
+ * advances the generation. The application resets its own AcStft / AcIstft. */
 void dfn3_prepost_reset(DFN3Prepost *p);
 
-/* State generation (see DFN3ModelIOState): 1 after init, +1 per reset, per warm-up frame and per refused
- * frame_finish(); 0 for NULL. A runtime with its own state copy reloads quantized zeros on every change. */
+/* State generation (see DFN3ModelIOState): 1 after init, +1 per reset and per refused frame_finish(); 0 for NULL.
+ * A runtime with its own state copy reloads quantized zeros on every change. */
 unsigned int dfn3_prepost_state_generation(const DFN3Prepost *p);
 
 /* Use other ERB matrices (borrowed; call again after an in-place rewrite). A swap consistent per source frame needs a
@@ -134,11 +133,12 @@ int dfn3_prepost_set_erb_matrices(DFN3Prepost *p, const float *erb_fwd, const fl
 /* Attenuation limit in dB (0 disables) for the enhance stage. Returns 0, or -1 on NULL, non-finite or frame open. */
 int dfn3_prepost_set_atten_lim(DFN3Prepost *p, float atten_lim_db);
 
-/* One analysed frame (n_bins bins). Returns 1 on every frame (the first M being warm-up frames: their heads are
- * discarded), -1 on NULL args, a non-finite spectrum or with a frame open. With df_lookahead > M the accelerator
- * also runs on frames that emit nothing yet. Flush with output_delay zero spectra while it keeps running: that
- * drains the last analysed frame; draining the last real PCM hop through a full STFT/OLA needs one more
- * (output_delay + 1 zero audio hops), the extra one being the overlap-add tail. */
+/* One analysed frame (n_bins bins). Returns 1 with a frame open from hop M on, 0 for the first M hops (no frame
+ * open: the enhance clock advances without heads, no job runs), -1 on NULL args, a non-finite spectrum or with a
+ * frame open. With df_lookahead > M the accelerator also runs on frames that emit nothing yet. Flush with
+ * output_delay zero spectra while it keeps running: that drains the last analysed frame; draining the last real
+ * PCM hop through a full STFT/OLA needs one more (output_delay + 1 zero audio hops), the extra one being the
+ * overlap-add tail. */
 int dfn3_prepost_pre_process_freq(DFN3Prepost *p, const float *spec_re, const float *spec_im);
 
 /* Dual input: `est` feeds the features and heads, `app` the noisy ring the mask, deep filter and attenuation limit
@@ -152,13 +152,11 @@ int dfn3_prepost_frame_open(DFN3Prepost *p, DFN3PrepostInputs *inputs,
 
 /* Check heads and registered state for finiteness, then build the enhanced spectrum; after frame_open(). A non-finite
  * value zeroes the registered state, advances the generation and returns -1, frame left open: frame_bypass() or
- * frame_open() again. A warm-up frame reads no head: it zeroes the registered state, advances the generation by
- * one, emits nothing and returns 0, so the first real frame starts from zero state. */
+ * frame_open() again. */
 int dfn3_prepost_frame_finish(DFN3Prepost *p);
 
 /* Give up on the open frame and pass the noisy spectrum through (unit ERB gains, a unit tap on the raw low bins).
- * Clocks advance, the recurrent state is left as is. Returns 0, or -1 if no frame is open. A warm-up frame is
- * closed as by frame_finish: state zeroed, generation + 1, nothing emitted. */
+ * Clocks advance, the recurrent state is left as is. Returns 0, or -1 if no frame is open. */
 int dfn3_prepost_frame_bypass(DFN3Prepost *p);
 
 /* The enhanced spectrum (n_bins bins) of the frame just emitted, at the input's scale. The output trails the input by
@@ -180,8 +178,7 @@ typedef struct DFN3Model {
 
 /* Run the open frame: frame_open(), infer(), frame_finish(); a nonzero infer() or a refused commit takes
  * frame_bypass(), so the clocks advance once. Returns 1 when committed, 0 when bypassed, -1 on a contract error (NULL
- * arguments or infer, no frame open, an io_descriptor that is NULL or disagrees with the grid or layout version).
- * A warm-up frame also returns 1 when infer() succeeds, although its heads are discarded. */
+ * arguments or infer, no frame open, an io_descriptor that is NULL or disagrees with the grid or layout version). */
 int dfn3_model_run_frame(const DFN3Model *model, DFN3Prepost *p);
 
 #ifdef __cplusplus

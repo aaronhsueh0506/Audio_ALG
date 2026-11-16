@@ -14,11 +14,6 @@
 
 #define PP_ALIGN ((size_t)DFN3_PREPOST_ALIGNMENT)
 
-/* The open frame is one of the first mask_lookahead frames after init or reset: its heads belong to a
- * frame before the stream start and are never used (stable from pre_process to finish). */
-#define PP_IN_WARMUP(p) \
-    ((p)->io->feature_frames_seen < (unsigned long long)dfn3_model_io_ready_frames((p)->io))
-
 struct DFN3Prepost {
     DFN3State        *dsp;
     DFN3ModelIOState *io;
@@ -377,8 +372,9 @@ static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
 
-/* Features, graph window and frame open, shared by both entries. Returns 1: the accelerator runs on every
- * frame, the first mask_lookahead being warm-up frames. */
+/* Features and graph window, shared by both entries. Returns 1 with a frame open; 0 for the first
+ * mask_lookahead frames, whose window is incomplete: the enhance clock advances without heads and no frame
+ * opens; -1 on error. */
 static int pp_begin_frame(DFN3Prepost *p, const float *est_re,
                           const float *est_im) {
     int heads_needed;
@@ -387,6 +383,12 @@ static int pp_begin_frame(DFN3Prepost *p, const float *est_re,
     dfn3_compute_features(p->dsp, est_re, est_im, p->feat_erb, p->feat_spec);
     heads_needed = dfn3_model_io_push_features(p->io, p->feat_erb, p->feat_spec);
     if (heads_needed < 0) return -1;
+    if (heads_needed == 0) {
+        if (dfn3_enhance_spectrum_stream(p->dsp, p->enhanced_re, p->enhanced_im, 0, NULL, NULL,
+                                         p->atten_lim_db, p->enh_re, p->enh_im, NULL) != 0)
+            return -1;
+        return 0;
+    }
 
     p->frame_open = 1;
     return 1;
@@ -455,24 +457,11 @@ int dfn3_prepost_frame_open(DFN3Prepost *p, DFN3PrepostInputs *inputs,
 }
 
 /* Build the enhanced spectrum with the given heads. Closes the frame on success only; the enhance clock
- * advances once per frame. A warm-up frame reads no head: the clock advances with heads_valid=0 (the stream
- * entry accepts this exactly while current < mask_lookahead, so a disagreement surfaces as -1) and the
- * recurrent state restarts from zero for the first real frame. */
+ * advances once per frame. */
 static int pp_close_frame(DFN3Prepost *p, const float *erb_mask,
                           const float *coefs) {
     long long frame = 0;
     int emitted;
-
-    if (PP_IN_WARMUP(p)) {
-        if (dfn3_enhance_spectrum_stream(p->dsp, p->enhanced_re, p->enhanced_im, 0,
-                                         NULL, NULL, p->atten_lim_db, p->enh_re,
-                                         p->enh_im, NULL) != 0)
-            return -1;
-        dfn3_model_io_zero_recurrent(p->io);
-        p->frame_open = 0;   /* have_output stays 0 from pp_begin_frame, output_frame untouched */
-        p->prepared = 0;
-        return 0;
-    }
 
     /* The stream entry validates before its first write: -1 leaves the enhance state untouched and the
      * frame open for frame_bypass(). */
@@ -491,7 +480,6 @@ int dfn3_prepost_frame_finish(DFN3Prepost *p) {
     int heads_finite;
     int state_finite;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
-    if (PP_IN_WARMUP(p)) return dfn3_prepost_frame_bypass(p);   /* heads never read */
 
     /* A non-finite head or state element zeroes the registered state, advances the generation and disarms the
      * transaction; the frame stays open. Windows, enhance state and clocks are untouched. */

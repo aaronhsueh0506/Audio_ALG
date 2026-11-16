@@ -9,8 +9,8 @@ the first hop is indistinguishable from constructing with the new pair, a
 mid-stream swap leaves the rows already in the graph window untouched, and a
 refused call (NULL argument, or a frame still open) changes nothing.
 
-Every hop opens a frame, the first ``mask_lookahead`` of them being warm-up frames
-whose heads are discarded; the first output comes ``max(mask, df)`` hops in.
+The first ``mask_lookahead`` hops open no frame (``pre_process_freq`` returns 0)
+and run no job; the first output comes ``max(mask, df)`` hops in.
 
 Comparisons between instances are ``tobytes()`` equality, never a tolerance, on
 both halves of the pair: the forward matrix through the ERB feature window and
@@ -285,6 +285,7 @@ class _Instance:
             cfg.df_convp_history_elements = self.convp.size
         self.handle = dll.dfn3_prepost_create(ctypes.byref(cfg))
         assert self.handle
+        self.hops = 0                      # hops pushed since create
         rng = np.random.default_rng(4101)
         # Fixed heads, identical for every instance: a ramp over the bands and
         # small deep-filter taps.  What differs between instances is then only
@@ -333,10 +334,16 @@ class _Instance:
         return valid.value, re, im
 
     def hop(self, re, im):
-        """One full frame; returns (erb_window, valid, out_re, out_im)."""
-        assert self.pre(re, im) == 1
-        window, outputs = self.erb_window()
-        assert self.commit_fixed_heads(outputs) == 0
+        """One hop; returns (erb_window, valid, out_re, out_im).
+
+        The window is None while the hop runs no job."""
+        job = self.hops >= self.dll.mask_lookahead
+        self.hops += 1
+        assert self.pre(re, im) == int(job)
+        window = None
+        if job:
+            window, outputs = self.erb_window()
+            assert self.commit_fixed_heads(outputs) == 0
         valid, out_re, out_im = self.post()
         return window, valid, out_re, out_im
 
@@ -358,8 +365,8 @@ def _run(instance, re, im, first=0, last=None, swap_at=None, swap_to=None):
                 instance.handle, _fp(swap_to[0]), _fp(swap_to[1])) == 0
             instance.fwd, instance.inv = swap_to      # keep the new pair alive
         window, valid, out_re, out_im = instance.hop(re[t], im[t])
-        trace.append((window.tobytes(), valid, out_re.tobytes(),
-                      out_im.tobytes()))
+        trace.append((b'' if window is None else window.tobytes(), valid,
+                      out_re.tobytes(), out_im.tobytes()))
     return trace
 
 
@@ -373,11 +380,12 @@ def pair_b():
     return _erb_pair(True)
 
 
-def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
-    """Every hop opens a frame, the warm-up frames (t < mask_lookahead)
-    included; hop t's window holds frames [t-2 .. t], the frames before the
-    stream start being zero rows; the first output is source frame 0, so the
-    delay is max(mask, df) hops."""
+def test_hops_before_the_lookahead_open_no_frame_and_the_window_is_zero_padded(
+        lib, pair_a):
+    """The first mask_lookahead hops run no job; hop t >= mask opens a frame
+    whose window holds frames [t-2 .. t], the frames before the stream start
+    being zero rows; the first output is source frame 0, so the delay is
+    max(mask, df) hops."""
     mask, delay = lib.mask_lookahead, lib.output_delay
     inst = _Instance(lib, *pair_a)
     try:
@@ -386,6 +394,9 @@ def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
         windows = []
         for t, (window, valid, _re, _im) in enumerate(trace):
             assert valid == int(t >= delay), t
+            if t < mask:
+                assert window == b'', t
+                continue
             rows = np.frombuffer(window, np.float32).reshape(
                 FRAMES_IN_WINDOW, N_ERB)
             pad = max(FRAMES_IN_WINDOW - 1 - t, 0)
@@ -393,13 +404,13 @@ def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
             assert rows[pad:].any(axis=1).all(), t
             windows.append(rows)
         # The newest row moves one frame per hop: the next window drops its
-        # oldest row and keeps the other two, warm-up frames included.
+        # oldest row and keeps the other two.
         for t in range(len(windows) - 1):
             assert windows[t + 1][:-1].tobytes() == windows[t][1:].tobytes(), t
-        # The first real frame (hop mask) holds frames [-(2-mask) .. mask].
+        # The first window (hop mask) holds frames [-(2-mask) .. mask].
         pad = FRAMES_IN_WINDOW - 1 - mask
-        assert not windows[mask][:pad].any()
-        assert windows[mask][pad:].any(axis=1).all()
+        assert not windows[0][:pad].any()
+        assert windows[0][pad:].any(axis=1).all()
         frame = ctypes.c_longlong(-1)
         assert lib.dfn3_prepost_output_frame_index(
             inst.handle, ctypes.byref(frame)) == 0
@@ -408,9 +419,9 @@ def test_warm_up_is_the_lookahead_and_the_window_is_zero_padded(lib, pair_a):
         inst.close()
 
 
-# Digests of a fixed 12-hop stream (fixed heads, _spectra(12)) recorded with the warm-up hops not opened
-# (pre_process_freq returned 0 there): the real frames' ERB windows and every hop's valid flag and enhanced
-# spectrum, per pair (the SIMD and the scalar build agree).
+# Digests of a fixed 12-hop stream (fixed heads, _spectra(12)): the ERB windows
+# of the hops that run a job and every hop's valid flag and enhanced spectrum,
+# per pair (the SIMD and the scalar build agree).
 _RECORDED_STREAM_DIGESTS = {
     (0, 0): '6a0c1669bd6f53f2',
     (0, 1): '0d38db3108381ef7',
@@ -447,80 +458,84 @@ def _stream_digest(lib, pair_a):
 
 def test_real_frame_windows_and_audio_equal_the_recorded_stream(
         lib, pair_a):
-    """The warm-up frames change return codes and counters only: the windows
-    of the real frames and the enhanced spectra are bit-identical to the
-    recorded stream (the digests above)."""
+    """The windows of the hops that run a job and the enhanced spectra are
+    bit-identical to the recorded stream (the digests above)."""
     want = _RECORDED_STREAM_DIGESTS[(lib.mask_lookahead, lib.df_lookahead)]
     assert _stream_digest(lib, pair_a) == want
 
 
-@pytest.mark.parametrize('how', ['finish_nan_heads', 'finish_nan_state',
-                                 'bypass'])
-def test_warm_up_frames_discard_heads_and_zero_the_registered_state(
+@pytest.mark.parametrize('how', ['finish_nan_heads', 'finish_nan_state'])
+def test_hops_before_the_lookahead_run_no_job_and_touch_nothing(
         lib, pair_a, how):
-    """A warm-up frame is closed whatever its heads hold (they are never
-    read, so NaN is fine) and whatever the accelerator wrote into the
-    registered state: the state is zero afterwards, the generation moved by
-    exactly one (also with a non-finite state) and nothing is emitted. The
-    first real frame starts from zero state and its heads are read."""
+    """A hop without a complete window opens no frame: no job can be run, the
+    registered state and the generation stay as they are, nothing is emitted
+    and the spectrum is zero. The first hop with a window opens a frame whose
+    NaN heads or non-finite state are refused as on any other frame."""
     mask = lib.mask_lookahead
     inst = _Instance(lib, *pair_a, registered=True)
     try:
         re, im = _spectra(mask + 2)
         gen0 = inst.generation()
         assert gen0 == 1
+        inst.gru[:] = 7.0
+        inst.convp[:] = 7.0
+        inputs, outputs = _Inputs(), _Outputs()
         for t in range(mask):
-            assert inst.pre(re[t], im[t]) == 1
-            _window, outputs = inst.erb_window()
-            assert np.isnan(
-                (ctypes.c_float * N_ERB).from_address(outputs.erb_mask)[0])
-            inst.gru[:] = 7.0
-            inst.convp[:] = np.nan if how == 'finish_nan_state' else 7.0
-            if how == 'bypass':
-                assert lib.dfn3_prepost_frame_bypass(inst.handle) == 0
-            else:
-                assert lib.dfn3_prepost_frame_finish(inst.handle) == 0
-            assert inst.state_is_zero()
-            assert inst.generation() == gen0 + t + 1
-            # closed: a second close is refused and changes nothing
+            assert inst.pre(re[t], im[t]) == 0
+            assert lib.dfn3_prepost_frame_open(
+                inst.handle, ctypes.byref(inputs), ctypes.byref(outputs)) == -1
             assert lib.dfn3_prepost_frame_finish(inst.handle) == -1
             assert lib.dfn3_prepost_frame_bypass(inst.handle) == -1
-            assert inst.generation() == gen0 + t + 1
+            assert (inst.gru == 7.0).all() and (inst.convp == 7.0).all()
+            assert inst.generation() == gen0
             valid, out_re, out_im = inst.post()
             assert valid == 0 and not out_re.any() and not out_im.any()
             frame = ctypes.c_longlong(-1)
             assert lib.dfn3_prepost_output_frame_index(
                 inst.handle, ctypes.byref(frame)) == -1
-        # the first real frame: zero state in, its NaN heads are refused
+        # the first hop with a window: a frame, its heads and state are read
         assert inst.pre(re[mask], im[mask]) == 1
-        inst.erb_window()
-        assert inst.state_is_zero()
+        _window, outputs = inst.erb_window()
+        assert (inst.gru == 7.0).all()
+        if how == 'finish_nan_state':
+            ctypes.memmove(outputs.erb_mask, inst.mask.ctypes.data,
+                           inst.mask.nbytes)
+            ctypes.memmove(outputs.coefs, inst.coefs.ctypes.data,
+                           inst.coefs.nbytes)
+            inst.convp[0] = np.nan
+        else:
+            assert np.isnan(
+                (ctypes.c_float * N_ERB).from_address(outputs.erb_mask)[0])
         assert lib.dfn3_prepost_frame_finish(inst.handle) == -1
-        assert inst.generation() == gen0 + mask + 1
+        assert inst.state_is_zero()
+        assert inst.generation() == gen0 + 1
+        assert lib.dfn3_prepost_frame_bypass(inst.handle) == 0
+        assert inst.generation() == gen0 + 1
     finally:
         inst.close()
 
 
-def test_reset_restarts_the_warm_up_also_inside_a_warm_up_frame(lib, pair_a):
+def test_reset_restarts_the_hops_without_a_window(lib, pair_a):
     mask = lib.mask_lookahead
     if mask == 0:
-        pytest.skip('no warm-up frame with mask_lookahead 0')
+        pytest.skip('no hop without a window with mask_lookahead 0')
     inst = _Instance(lib, *pair_a, registered=True)
     try:
         re, im = _spectra(mask + 1)
-        assert inst.pre(re[0], im[0]) == 1          # a warm-up frame, left open
+        for t in range(mask):
+            assert inst.pre(re[t], im[t]) == 0
+        assert inst.pre(re[mask], im[mask]) == 1    # a frame, left open
         gen = inst.generation()
         lib.dfn3_prepost_reset(inst.handle)
         assert inst.generation() == gen + 1
         assert lib.dfn3_prepost_frame_finish(inst.handle) == -1
         assert lib.dfn3_prepost_frame_bypass(inst.handle) == -1
-        for t in range(mask):                       # due again, each +1
-            assert inst.pre(re[t], im[t]) == 1
-            assert lib.dfn3_prepost_frame_bypass(inst.handle) == 0
-            assert inst.generation() == gen + 2 + t
-        assert inst.pre(re[mask], im[mask]) == 1    # the real frame
+        for t in range(mask):                       # due again
+            assert inst.pre(re[t], im[t]) == 0
+            assert inst.generation() == gen + 1
+        assert inst.pre(re[mask], im[mask]) == 1    # the first frame
         assert lib.dfn3_prepost_frame_bypass(inst.handle) == 0
-        assert inst.generation() == gen + 1 + mask
+        assert inst.generation() == gen + 1
     finally:
         inst.close()
 
@@ -596,22 +611,35 @@ def test_swap_refuses_null_arguments_and_changes_nothing(lib, pair_a, pair_b):
         probed.close()
 
 
+def _next_hop_takes_the_new_pair(probed, expected, first, pair_b, re, im):
+    """With no frame open the swap is accepted; the next hop's newest feature
+    row comes from the new pair, while the two older rows stay."""
+    fwd_b, inv_b = pair_b
+    assert probed.dll.dfn3_prepost_set_erb_matrices(
+        probed.handle, _fp(fwd_b), _fp(inv_b)) == 0
+    probed.fwd, probed.inv = pair_b
+    assert probed.pre(re[first + 1], im[first + 1]) == 1
+    window, _ = probed.erb_window()
+    rows_new = np.frombuffer(window, np.float32).reshape(
+        FRAMES_IN_WINDOW, N_ERB)
+    rows_old = np.frombuffer(expected[first + 1][0], np.float32).reshape(
+        FRAMES_IN_WINDOW, N_ERB)
+    assert rows_new[:-1].tobytes() == rows_old[:-1].tobytes()
+    assert rows_new[-1].tobytes() != rows_old[-1].tobytes()
+
+
 @pytest.mark.parametrize('close_with', ['commit', 'skip'])
-@pytest.mark.parametrize('open_frame', ['first_real', 'first_warm_up'])
 def test_swap_is_refused_while_a_frame_is_open_and_accepted_after(
-        lib, pair_a, pair_b, close_with, open_frame):
-    if open_frame == 'first_warm_up' and lib.mask_lookahead == 0:
-        pytest.skip('no warm-up frame with mask_lookahead 0')
+        lib, pair_a, pair_b, close_with):
     re, im = _spectra(8)
     control = _Instance(lib, *pair_a)
     probed = _Instance(lib, *pair_a)
     try:
-        # hops run before the frame that is held open
-        first = lib.mask_lookahead if open_frame == 'first_real' else 0
+        first = lib.mask_lookahead          # the first hop that runs a job
         expected = _run(control, re, im, last=first + 2)
         fwd_b, inv_b = pair_b
 
-        for t in range(first):              # the warm-up frames are frames
+        for t in range(first):
             probed.hop(re[t], im[t])
         assert probed.pre(re[first], im[first]) == 1
         window, outputs = probed.erb_window()          # the frame is open
@@ -623,21 +651,26 @@ def test_swap_is_refused_while_a_frame_is_open_and_accepted_after(
         else:
             assert lib.dfn3_prepost_frame_bypass(probed.handle) == 0
         probed.post()
+        _next_hop_takes_the_new_pair(probed, expected, first, pair_b, re, im)
+    finally:
+        control.close()
+        probed.close()
 
-        # With the frame closed the same call is accepted ...
-        assert lib.dfn3_prepost_set_erb_matrices(
-            probed.handle, _fp(fwd_b), _fp(inv_b)) == 0
-        probed.fwd, probed.inv = pair_b
-        # ... and the next hop's newest feature row comes from the new pair,
-        # while the two older rows were already computed and stay.
-        assert probed.pre(re[first + 1], im[first + 1]) == 1
-        window2, _ = probed.erb_window()
-        rows_new = np.frombuffer(window2, np.float32).reshape(
-            FRAMES_IN_WINDOW, N_ERB)
-        rows_old = np.frombuffer(expected[first + 1][0], np.float32).reshape(
-            FRAMES_IN_WINDOW, N_ERB)
-        assert rows_new[:-1].tobytes() == rows_old[:-1].tobytes()
-        assert rows_new[-1].tobytes() != rows_old[-1].tobytes()
+
+def test_swap_is_accepted_on_a_hop_that_opens_no_frame(lib, pair_a, pair_b):
+    if lib.mask_lookahead == 0:
+        pytest.skip('every hop opens a frame with mask_lookahead 0')
+    re, im = _spectra(8)
+    control = _Instance(lib, *pair_a)
+    probed = _Instance(lib, *pair_a)
+    try:
+        first = lib.mask_lookahead - 1      # the last hop without a window
+        expected = _run(control, re, im, last=first + 2)
+        for t in range(first):
+            probed.hop(re[t], im[t])
+        assert probed.pre(re[first], im[first]) == 0
+        probed.post()
+        _next_hop_takes_the_new_pair(probed, expected, first, pair_b, re, im)
     finally:
         control.close()
         probed.close()
