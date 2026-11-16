@@ -235,10 +235,9 @@ int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
                                    UlcnetModelIoInputs *inputs,
                                    UlcnetModelIoOutputs *outputs);
 
-/* Call after a successful inference; one prepare() permits one call. Checks a finite mask and registered state (each
- * buffer scanned whole), applies the mask and inverse signed power into the enhanced arrays, then checks those are
- * finite (a finite mask can overflow the power). On a non-finite value: registered state zeroed, generation advanced,
- * -1; the arrays are untouched after a refused mask or state and hold no valid frame after a refused spectrum. */
+/* After a successful inference, one call per prepare(): checks mask and registered state are finite, applies mask and
+ * inverse signed power into the enhanced arrays, checks those are finite. Non-finite: state zeroed, generation advanced,
+ * -1; the arrays are untouched after a refused mask or state, and hold no valid frame after a refused spectrum. */
 int ulcnet_model_io_enhance_spectrum(UlcnetModelIoState *state,
                                      float *enhanced_re, float *enhanced_im);
 
