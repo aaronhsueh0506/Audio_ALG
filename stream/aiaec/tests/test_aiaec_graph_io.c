@@ -4,8 +4,7 @@
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
  * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
  * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. A SUBMIT work has pairwise disjoint
- * buffers and empty slots beyond its signals, and the two families report one and the same AiaecInfo (trim, queue
- * and tail of the 16 kHz rows pinned by the literals below). The rows
+ * buffers and empty slots beyond its signals, and the two families report one and the same AiaecInfo. The rows
  * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
 
 #include <stdio.h>
@@ -29,11 +28,6 @@
 #define IS_ALIGN 0
 #endif
 
-/* Trim of the 16 kHz rows, as literals (one model hop for both models, queue 0, tail 1). */
-static const struct { int fft, n, trim; } INFO_ROWS[] = {
-    { 256, 1, 128 }, { 256, 8, 128 }, { 512, 1, 256 },
-};
-
 static int g_fail, g_patterns;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_fail; fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
 
@@ -45,8 +39,7 @@ static int disjoint(const void *a, size_t na, const void *b, size_t nb)
 
 static int same_info(const AiaecInfo *a, const AiaecInfo *b)
 {
-    return a->graph_path == b->graph_path && a->trim_samples == b->trim_samples &&
-           a->queue_frames == b->queue_frames && a->tail_zero_blocks == b->tail_zero_blocks;
+    return a->graph_path == b->graph_path;
 }
 
 static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamWork *work)
@@ -148,7 +141,6 @@ int main(void)
     static const int srs[] = { 16000, 48000 };
     int si, fi, n, accepted = 0, rows_hit = 0, compared = 0, family;
     AiaecInfo infos[2];
-    int row;
 
     /* The wiring tables and the libraries name the same graph layouts. */
     CHECK(GRAPH_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION,
@@ -160,10 +152,9 @@ int main(void)
     CHECK(GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
           "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET,
           (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
-    /* AiaecInfo is the init's slim result (graph, trim, queue, tail): no port list can sit inside it. */
-    CHECK(sizeof(AiaecInfo) <= sizeof(const char *) + 4 * sizeof(int),
-          "AiaecInfo grew to %zu bytes (graph path + 4 ints = %zu)", sizeof(AiaecInfo),
-          sizeof(const char *) + 4 * sizeof(int));
+    /* AiaecInfo is the init's slim result (the graph path): no port list can sit inside it. */
+    CHECK(sizeof(AiaecInfo) == sizeof(const char *), "AiaecInfo grew to %zu bytes (graph path = %zu)", sizeof(AiaecInfo),
+          sizeof(const char *));
 
     for (si = 0; si < 2; ++si) for (fi = 0; fi < 4; ++fi) for (n = 1; n <= 8; ++n) {
         AiaecConfig cfg;
@@ -210,12 +201,6 @@ int main(void)
         }
         CHECK(infos[0].graph_path != NULL && same_info(&infos[0], &infos[1]),
               "sr %d fft %d N %d: the two families report one and the same info", cfg.sr, cfg.fft, n);
-        for (row = 0; row < (int)(sizeof INFO_ROWS / sizeof INFO_ROWS[0]); ++row) {
-            if (cfg.sr != 16000 || cfg.fft != INFO_ROWS[row].fft || n != INFO_ROWS[row].n) continue;
-            CHECK(infos[0].trim_samples == INFO_ROWS[row].trim && infos[0].queue_frames == 0 && infos[0].tail_zero_blocks == 1,
-                  "sr %d fft %d N %d: trim %d queue %d tail %d", cfg.sr, cfg.fft, n, infos[0].trim_samples,
-                  infos[0].queue_frames, infos[0].tail_zero_blocks);
-        }
     }
 #ifdef AIAEC_TEST_CATALOG
     CHECK(rows_hit == ROW_COUNT && accepted == ROW_COUNT, "%d rows, %d hit, %d configs accepted", ROW_COUNT, rows_hit, accepted);

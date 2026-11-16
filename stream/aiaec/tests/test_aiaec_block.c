@@ -387,10 +387,10 @@ static int section_fail_closed(void) {
     return rc;
 }
 
-/* AiaecInfo.trim_samples (one hop, whatever N) against an IDENTITY accelerator: CCM taps
+/* The latency (one model hop, whatever N) against an IDENTITY accelerator: CCM taps
  * forced to the (delay 0, centre frequency tap) coefficient 1+0j, so the only reason input and
  * output can differ is the pure sample shift being measured. Every block's output must equal the
- * input delayed by trim_samples. */
+ * input delayed by one model hop. */
 static int section_trim(int n, int fft) {
     AiaecConfig cfg = make_cfg(fft, n);
     void *pool = NULL;
@@ -401,8 +401,6 @@ static int section_trim(int n, int fft) {
     int k, bidx;
 
     if (!ctx) return 1;
-    CHECK(bi.trim_samples == hop && bi.queue_frames == 0,
-          "delay N=%d: trim %d queue %d, want %d / 0", n, bi.trim_samples, bi.queue_frames, hop);
     mic_in = calloc((size_t)bs * blocks, sizeof(int16_t));
     far_zero = calloc((size_t)bs, sizeof(int16_t));
     pcm_out = calloc((size_t)bs, sizeof(int16_t));
@@ -601,8 +599,6 @@ static int section_trim_align(void) {
     int k, bidx;
 
     if (!ctx) return 1;
-    CHECK(bi.trim_samples == hop && bi.queue_frames == 0,
-          "delay(align): trim %d queue %d, want %d / 0", bi.trim_samples, bi.queue_frames, hop);
     residual = calloc((size_t)hop * blocks, sizeof(float));
     far_zero = calloc((size_t)hop, sizeof(float));
     pcm_out = calloc((size_t)hop, sizeof(int16_t));

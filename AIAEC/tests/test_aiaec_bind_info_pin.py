@@ -9,12 +9,12 @@ input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinn
 
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
 ``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
-resolve) prints the AiaecInfo of a real init and the StreamWork of the first real pre call for each family
+resolve) prints the graph path of a real init and the StreamWork of the first real pre call for each family
 (PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1
 and N=8, DeepVQE-S 16k/512 N=1, Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19) and 16k/512 N=1.
 The dumped signal inputs and head output are compared with the exported graph's leading inputs and outputs
 by position and exact padded shape, for both families, and the two families must print one and the
-same views and the same trim / queue / tail. Align-ULCNet's frame_reset values and the BYPASS block of an
+same views. Align-ULCNet's frame_reset values and the BYPASS block of an
 N = 1 event hop are pinned as well.
 
 Set AIAEC_PIN_DUMPERS to ``<deepvqe_s dumper><pathsep><align_ulcnet dumper>`` to compare other
@@ -69,11 +69,6 @@ def signal_names(model_name, n):
     return names + ['frame_reset'] if n > 1 else names
 
 
-def expected_trim_queue(model_name, n, hop):
-    """(trim_samples, queue_frames), the same for both families and both models: one hop and no queue."""
-    return (hop, 0)
-
-
 def _case_id(case):
     model, _sr, fft, n = case
     return '%s-fft%d-N%d' % (model, fft, n)
@@ -111,8 +106,6 @@ def run_dumper(path, sr, fft, hop_in, family=0, event_hop=None):
             dump['rc'] = int(fields[1])
         elif fields[0] == 'graph':
             dump['graph'] = fields[1]
-        elif fields[0] == 'info':
-            dump.update(trim=int(fields[2]), queue=int(fields[4]), tail=int(fields[6]))
         elif fields[0] == 'work':
             dump.update(action=int(fields[2]), inputs=int(fields[4]), outputs=int(fields[6]))
         elif fields[0] in ('in', 'out'):
@@ -186,8 +179,6 @@ def test_c_work_views_equal_the_exported_graph(case, family, dumpers, exports):
     dump = run_dumper(dumpers[model_name], sr, fft, n * hop, family)
 
     assert dump['rc'] == 0
-    want_trim, want_queue = expected_trim_queue(model_name, n, hop)
-    assert (dump['trim'], dump['queue'], dump['tail']) == (want_trim, want_queue, 1)
     assert dump['action'] == 1, 'a quiet block is a SUBMIT (no event)'
 
     # exporter order (names are read only here): signal inputs, then states; heads, then states; the state

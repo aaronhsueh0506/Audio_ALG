@@ -9,7 +9,6 @@
  *     rc <int>                          first refusal of aiaec_get_mem_size*() / aiaec_init*() / aiaec_preprocess*(),
  *                                       0 when all succeed (a refused config prints this line only)
  *     graph <path>                      AiaecInfo.graph_path
- *     info trim <int> queue <int> tail <int>      AiaecInfo trim_samples / queue_frames / tail_zero_blocks
  *     work action <int> inputs <int> outputs <int>   StreamWork.action (0 BYPASS, 1 SUBMIT), input_count, output_count
  *     in <i> <b> <c> <h> <w> <elements>   StreamWork.inputs[i], the signals in graph order (none on a BYPASS block)
  *     out <i> <b> <c> <h> <w> <elements>  StreamWork.outputs[i], the heads (none on a BYPASS block)
@@ -81,7 +80,6 @@ int main(int argc, char **argv) {
     printf("rc %d\n", rc);
     if (rc != AIAEC_OK) goto done;
     printf("graph %s\n", info.graph_path);
-    printf("info trim %d queue %d tail %d\n", info.trim_samples, info.queue_frames, info.tail_zero_blocks);
     printf("work action %d inputs %d outputs %d\n", (int)work.action, work.input_count, work.output_count);
     for (i = 0; i < work.input_count; ++i)
         printf("in %d %u %u %u %u %zu\n", i, work.inputs[i].b, work.inputs[i].c, work.inputs[i].h, work.inputs[i].w,

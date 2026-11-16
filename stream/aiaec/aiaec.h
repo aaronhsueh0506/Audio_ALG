@@ -9,8 +9,7 @@
  *         aiaec_preprocess(ctx, &in, &work);        // work.action: SUBMIT or BYPASS
  *         ...SUBMIT: the sample's accelerator run on work; BYPASS: no accelerator call...
  *         aiaec_postprocess(ctx, run_status, pcm_out);   // once per successful preprocess, failed run or BYPASS included
- *     after the last real block (zero-padded to hop_in): info.tail_zero_blocks all-zero blocks through the same
- *     sequence, then drop info.trim_samples from the start of the output.
+ *     the output trails the input by one model hop (fft / 2 samples), both models, every N; nothing is trimmed or flushed.
  *
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
  * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
@@ -113,18 +112,12 @@ typedef struct AiaecInput {
 } AiaecInput;
 
 /* ---------------------------------------------------------------------------------------------
- * What one init selects: graph, trim / queue / tail length.
+ * What one init selects: the graph.
  * ------------------------------------------------------------------------------------------- */
 
-/* The graph and stream timing the init resolved for this configuration. */
+/* The graph the init resolved for this configuration. */
 typedef struct AiaecInfo {
     const char  *graph_path;           /* model.bin for this configuration; a static string, never NULL here */
-    int          trim_samples;         /* samples to drop from the start of the final PCM (after the caller's ISTFT for
-                                        * _freq), both models and families: model_hop */
-    int          queue_frames;         /* model-queue frames between a frame in and its enhanced frame out: 0 */
-    int          tail_zero_blocks;     /* all-zero hop_in blocks after the last real block: ceil(trim_samples / hop_in); no
-                                        * family flushes: _freq's analyser must first deliver the final frames;
-                                        * queue_frames zero hops alone lose the last hop */
 } AiaecInfo;
 
 /* ---------------------------------------------------------------------------------------------

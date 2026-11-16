@@ -18,8 +18,8 @@
  *             the vendor call count compared: one call per packet at N=8, one per non-event hop at N=1.
  *   pin       the PCM family returns the event hop's signal (the error spectrum through the running analysis and
  *             synthesis) and keeps the audio of the hop before it; N = 8 equals N = 1 through the event.
- *   tail      a 16000-count sample at the last real input sample comes back model_hop later, through the zero block
- *             tail_zero_blocks asks for, and is lost without it.
+ *   tail      a 16000-count sample at the last real input sample comes back model_hop later, through the test's own
+ *             all-zero block, and is lost without it.
  *   failure   an inference failure, a non-finite mask and a finite mask whose enhanced frame overflows pass all N error
  *             spectra through; all advance the generation, except a run that never started (STREAM_RUN_NOT_STARTED), which
  *             does so only for a packet with an event frame. At the model-I/O boundary an event
@@ -532,7 +532,6 @@ static void realign_case(const Sched *s, const PcmRun *none) {
     static PcmRun b1, b8, p8, n8;
     int edge[MAX_HOPS], edges = 0, h, p, maxd, cnt, first;
     const int hops = s->packets * NF;
-    Ctxs i1, i8;
 
     expected_edges(s, edge);
     for (h = 0; h < hops; ++h) edges += edge[h];
@@ -541,9 +540,6 @@ static void realign_case(const Sched *s, const PcmRun *none) {
     run_pcm(s, NF, 1, &p8);
     run_pcm(s, 1, 1, &n8);
 
-    CHECK(ctxs_make(&i1, 1, 1, 0) == 0 && ctxs_make(&i8, NF, 1, 0) == 0 &&
-          i1.ib.trim_samples == HOP && i8.ib.trim_samples == HOP, "%s: PCM trim N=1 %d N=8 %d", s->name, i1.ib.trim_samples, i8.ib.trim_samples);
-    ctxs_free(&i1); ctxs_free(&i8);
     first = first_diff(b1.pcm, b8.pcm, hops * HOP, &maxd, &cnt);
     CHECK(first < 0, "%s: PCM N=8 differs from N=1 in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
     first = first_diff(b1.pcm, p8.pcm, hops * HOP, &maxd, &cnt);
@@ -694,8 +690,7 @@ static int section_frame_reset_inputs(void) {
     for (h = 20; h < 3 * NF; ++h) s.ev[h].solid = 1;   /* a solid false -> true edge at hop 20 */
     expected_edges(&s, edge);
     if (ctxs_make(&c, NF, 1, 1) != 0) return 1;
-    CHECK(c.ib.graph_path == c.if_.graph_path && c.ib.trim_samples == c.if_.trim_samples &&
-          c.ib.tail_zero_blocks == c.if_.tail_zero_blocks, "N=8: the two families report one info");
+    CHECK(c.ib.graph_path == c.if_.graph_path, "N=8: the two families report one info");
     accel_init(&acc[0], aiaec_state_generation(c.blk), ACC_MODEL);
     accel_init(&acc[1], aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s.packets; ++p) {
@@ -754,17 +749,12 @@ static int section_tail(void) {
     static float resid[4 * HOP_IN], farz[4 * HOP_IN];
     static int16_t out[4 * HOP_IN];
     static AiaecAlignEvent ev[NF];
-    AiaecInfo bi;
     Ctxs c;
     Accel acc;
-    int blocks, b, i, peak = 0, tail;
-    const int last_real = 3 * HOP_IN - 1;
+    int blocks, b, i, peak = 0;
+    const int last_real = 3 * HOP_IN - 1, tail = (HOP + HOP_IN - 1) / HOP_IN;
 
     if (ctxs_make(&c, NF, 1, 0) != 0) return 1;
-    bi = c.ib;
-    tail = bi.tail_zero_blocks;
-    CHECK(bi.trim_samples == HOP && bi.queue_frames == 0 && tail == 1, "trim %d queue %d tail %d", bi.trim_samples,
-          bi.queue_frames, tail);
     resid[last_real] = 0.5f;   /* 16384 counts after the int16 conversion */
     blocks = 3 + tail;
     accel_init(&acc, aiaec_state_generation(c.blk), ACC_IDENTITY);
@@ -780,15 +770,15 @@ static int section_tail(void) {
         CHECK(aiaec_postprocess(c.blk, 0, out + (size_t)b * HOP_IN) == AIAEC_OK, "tail postprocess %d", b);
     }
     for (i = 0; i < blocks * HOP_IN; ++i) if (abs(out[i]) > abs(out[peak])) peak = i;
-    CHECK(peak == last_real + bi.trim_samples && abs(out[peak]) > 16000 && abs(out[peak]) < 16800,
-          "pulse at %d came back at %d (%d), want %d (~16384)", last_real, peak, out[peak], last_real + bi.trim_samples);
+    CHECK(peak == last_real + HOP && abs(out[peak]) > 16000 && abs(out[peak]) < 16800,
+          "pulse at %d came back at %d (%d), want %d (~16384)", last_real, peak, out[peak], last_real + HOP);
     {   /* without the tail block the pulse is not in the output */
         int lost = 0;
         for (i = 0; i < 3 * HOP_IN; ++i) if (abs(out[i]) > lost) lost = abs(out[i]);
         CHECK(lost < 1000, "the pulse shows up before the tail block (%d)", lost);
     }
     ctxs_free(&c);
-    printf("section_tail: pulse at %d -> %d (delay %d), tail_zero_blocks %d\n", last_real, peak, bi.trim_samples, tail);
+    printf("section_tail: pulse at %d -> %d (delay %d), drain blocks %d\n", last_real, peak, HOP, tail);
     return 0;
 }
 

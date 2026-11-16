@@ -73,7 +73,7 @@ NN：一次 invocation                 out(F0)   out(F1)    out(F2)    out(F3) �
 （類別的 post_process_freq 交出增強頻譜給它）
 輸出樣本對應輸入區間                 [-256,0)  [0,256)    [256,512)  [512,768)
 hop-lag：端到端 256 samples（16 ms）＝ synthesis 的<b>半窗 trim</b>（不是分析排程）；NN 本身 0 hop。
-hop#0 也有輸出（<code>AC_OLA_ACCUMULATE</code>），對應串流開始前的半窗，由 <code>trim_samples</code> 丟掉。Python reference 的 StreamSTFT/StreamISTFT 仍是 centered 排程，
+hop#0 也有輸出（<code>AC_OLA_ACCUMULATE</code>），對應串流開始前的半窗，不另行丟棄；它就是一個模型 hop 的延遲。Python reference 的 StreamSTFT/StreamISTFT 仍是 centered 排程，
 兩條排程自第二個 hop 起位元相同。</pre>
 
 <h2 id="section-4">I/O 表</h2>

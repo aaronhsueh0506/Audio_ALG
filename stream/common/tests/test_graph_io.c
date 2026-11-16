@@ -1,6 +1,6 @@
 /* graph_io.h alone, over small synthetic rows spelled here (no sample tables, no SDK): row expansion,
  * row lookup, table fit, frame count, state pairing, buffer sizing, the pre -> graph boundary check on
- * stand-in work structs shaped like AinrWork / AiaecWork, and the port check delegated to
+ * two stand-in work structs (StreamWork's member order, and another), and the port check delegated to
  * stream_check_ports(). Each CHECK counts one assertion; the exit status is non-zero on any failure. */
 
 #include <stdint.h>
@@ -356,12 +356,12 @@ static void test_bytes(void)
 typedef struct { const float *data; size_t elements; unsigned int w, h, c, b; } StandInIn;
 typedef struct { float *data; size_t elements; unsigned int w, h, c, b; } StandInOut;
 
-/* A work like AinrWork: counts after the arrays. One spare input slot, so a count one above the widest row
- * still indexes inside the struct. */
+/* A work in StreamWork's member order (counts after the arrays). One spare input slot, so a count one above the
+ * widest row still indexes inside the struct. */
 typedef struct { StandInIn inputs[GRAPH_IO_MAX_SIGNALS + 1]; int input_count;
                  StandInOut outputs[GRAPH_IO_MAX_HEADS]; int output_count; } WorkX;
 
-/* A work like AiaecWork: other member order, extra members, larger arrays. */
+/* A work in another member order, with extra members and larger arrays. */
 typedef struct { int input_count; int output_count; unsigned long long block_id;
                  StandInIn inputs[8]; StandInOut outputs[8]; } WorkY;
 

@@ -14,10 +14,9 @@
  *                across alignment events: the output is the input delayed by one hop throughout.
  *   scale        the spectra at the boundary are audio scale: an identity head returns the supplied
  *                spectrum, a fail-open frame returns its input error spectrum bit for bit.
- *   tail         a single 16000-count sample at the last real input sample comes back at
- *                (real length - 1 + trim_samples) after the documented tail_zero_blocks, through both
- *                families; the queue-only drain with one zero spectrum loses it.
- *   bind/pool    per-family trim / queue / tail, ports; pools: short / misaligned refused, larger constructs,
+ *   tail         a single 16000-count sample at the last real input sample comes back one model hop later
+ *                after the test's own all-zero drain block, through both families.
+ *   bind/pool    the info is shared by both families; pools: short / misaligned refused, larger constructs,
  *                also when the pool is undersized; the _freq pool is the pinned size and the PCM pool is larger
  *                by the framing (FFT, two STFT, one ISTFT, PCM scratch). Every section runs each family in a pool of
  *                exactly its size with a canary zone behind it.
@@ -502,45 +501,35 @@ static int family_info(const AiaecConfig *cfg, int family, AiaecInfo *info) {
     return rc;
 }
 
-/* The round trip on the final PCM and the model queue, from the grid alone: one hop and no queue, both models. */
-static int expected_trim(int hop) { return hop; }
-static int expected_queue(void) { return 0; }
+/* The round trip on the final PCM, from the grid alone: one hop, both models. */
+static int expected_delay(int hop) { return hop; }
 
 static int section_tail(int fft, int n) {
     const int hop = fft / 2, nb = fft / 2 + 1, hop_in = hop * n;
-    const int want_trim = expected_trim(hop), want_queue = expected_queue();
+    const int want_delay = expected_delay(hop), tail = (want_delay + hop_in - 1) / hop_in;
     AiaecConfig cfg = make_cfg(fft, n);
-    AiaecInfo bi_pcm, bi_freq;
     Pair t;
-    Frame ist_f, an_a, an_b, ist_x;
-    int tail, total_blocks, b, f, k, bad = 0;
+    Frame ist_f, an_a, an_b;
+    int total_blocks, b, f, k, bad = 0;
     size_t s_real = (size_t)BLOCKS_REAL * (size_t)hop_in, total, idx;
-    int16_t *pcm, *out16, *zero16;
-    float *outf, *outq, *pf, *resid, *fre, *fim, *a_re, *a_im, *b_re, *b_im, *hopf, *zre, *zim;
+    int16_t *pcm, *out16;
+    float *outq, *pf, *resid, *fre, *fim, *a_re, *a_im, *b_re, *b_im, *hopf;
     AiaecAlignEvent ev[8];
     double v;
     char label[64];
 
     snprintf(label, sizeof(label), "tail(fft=%d N=%d)", fft, n);
-    if (family_info(&cfg, 0, &bi_pcm) != AIAEC_OK || family_info(&cfg, 1, &bi_freq) != AIAEC_OK) { FAIL("%s: info", label); return 1; }
-    tail = bi_pcm.tail_zero_blocks;
-    CHECK(tail == bi_freq.tail_zero_blocks && tail == (want_trim + hop_in - 1) / hop_in, "%s: tail_zero_blocks %d/%d", label,
-          bi_pcm.tail_zero_blocks, bi_freq.tail_zero_blocks);
-    CHECK(bi_pcm.trim_samples == want_trim && bi_freq.trim_samples == want_trim &&
-          bi_pcm.queue_frames == want_queue && bi_freq.queue_frames == want_queue,
-          "%s: trim %d/%d (want %d), queue frames %d/%d (want %d)", label, bi_pcm.trim_samples, bi_freq.trim_samples,
-          want_trim, bi_pcm.queue_frames, bi_freq.queue_frames, want_queue);
     total_blocks = BLOCKS_REAL + tail;
     total = (size_t)total_blocks * (size_t)hop_in;
-    idx = s_real - 1 + (size_t)want_trim;
+    idx = s_real - 1 + (size_t)want_delay;
 
-    pcm = calloc(total, sizeof(int16_t)); out16 = calloc(total, sizeof(int16_t)); zero16 = calloc((size_t)hop_in, sizeof(int16_t));
-    outf = calloc(total, sizeof(float)); outq = calloc(total, sizeof(float)); pf = calloc(total, sizeof(float));
+    pcm = calloc(total, sizeof(int16_t)); out16 = calloc(total, sizeof(int16_t));
+    outq = calloc(total, sizeof(float)); pf = calloc(total, sizeof(float));
     resid = calloc((size_t)hop_in, sizeof(float));
     fre = calloc((size_t)n * nb, sizeof(float)); fim = calloc((size_t)n * nb, sizeof(float));
     a_re = calloc((size_t)n * nb, sizeof(float)); a_im = calloc((size_t)n * nb, sizeof(float));
     b_re = calloc((size_t)n * nb, sizeof(float)); b_im = calloc((size_t)n * nb, sizeof(float));
-    hopf = calloc((size_t)hop, sizeof(float)); zre = calloc((size_t)nb, sizeof(float)); zim = calloc((size_t)nb, sizeof(float));
+    hopf = calloc((size_t)hop, sizeof(float));
     pcm[s_real - 1] = PULSE;
 
     if (pair_make(&t, &cfg) != 0) return 1;
@@ -573,46 +562,13 @@ static int section_tail(int fft, int n) {
 
     for (k = 0; (size_t)k < total; ++k) pf[k] = (float)out16[k] / 32768.0f;
     bad |= check_pulse(pf, total, idx, label, &v);
-    if (!bad) printf("%s: PCM family OK, out[%zu] = %.1f (tail blocks %d)\n", label, idx, v, tail);
+    if (!bad) printf("%s: PCM family OK, out[%zu] = %.1f (drain blocks %d)\n", label, idx, v, tail);
     bad |= check_pulse(outq, total, idx, label, &v);
     if (!bad) printf("%s: _freq (upstream analyser + external ISTFT) OK, out[%zu] = %.1f\n", label, idx, v);
     frame_free(&ist_f); frame_free(&an_a); frame_free(&an_b); pair_free(&t);
 
-    /* The failing procedure (N = 1): only the reported queue_frames in zero PCM hops, then one zero
-     * SPECTRUM to the external ISTFT -- the frame holding the last real hop is never analysed. */
-    if (n == 1) {
-        const int zero_hops = bi_freq.queue_frames;
-        StreamMemReq rf;
-        void *pool;
-        AiaecFreqCtx *cs = NULL;
-        AiaecInfo is;
-        Frame ax_a, ax_b;
-        if (aiaec_get_mem_size_freq(&cfg, &rf) != AIAEC_OK) return 1;
-        pool = alloc_aligned((size_t)rf.bytes);
-        if (aiaec_init_freq(&cfg, pool, (size_t)rf.bytes, &cs, &is) != AIAEC_OK) return 1;
-        frame_make(&ist_x, fft, 0, 1); frame_make(&ax_a, fft, 1, 0); frame_make(&ax_b, fft, 1, 0);
-        memset(outf, 0, total * sizeof(float));
-        for (b = 0; b < BLOCKS_REAL + zero_hops; ++b) {
-            AiaecInput in;
-            AiaecFreqInput fin;
-            StreamWork w;
-            const int16_t *blk = pcm + (size_t)b * hop_in;
-            for (k = 0; k < hop; ++k) hopf[k] = (float)blk[k] / 32768.0f;
-            ac_stft_push_planar(ax_a.stft, hopf, a_re, a_im);
-            ac_stft_push_planar(ax_b.stft, hopf, b_re, b_im);
-            tail_input(&in, &fin, blk, resid, hop_in, ev, a_re, a_im, b_re, b_im, n);
-            if (aiaec_preprocess_freq(cs, &fin, &w) != AIAEC_OK) return 1;
-            if (aiaec_postprocess_freq(cs, w.action == STREAM_WORK_SUBMIT ? tail_accel(&w, n) : 0, fre, fim) != AIAEC_OK) return 1;
-            ac_istft_push_planar(ist_x.istft, fre, fim, outf + (size_t)b * hop);
-        }
-        ac_istft_push_planar(ist_x.istft, zre, zim, outf + (size_t)b * hop);
-        v = (double)outf[idx] * 32768.0;
-        if (fabs(v - (double)PULSE) < 0.5 * PULSE) { FAIL("%s: the queue-only drain unexpectedly kept the pulse (%.1f)", label, v); bad = 1; }
-        else printf("%s: queue-only drain + zero spectrum loses the tail: out[%zu] = %.1f (want %d)\n", label, idx, v, PULSE);
-        frame_free(&ist_x); frame_free(&ax_a); frame_free(&ax_b); free(pool);
-    }
-    free(pcm); free(out16); free(zero16); free(outf); free(outq); free(pf); free(resid); free(fre); free(fim); free(a_re); free(a_im);
-    free(b_re); free(b_im); free(hopf); free(zre); free(zim);
+    free(pcm); free(out16); free(outq); free(pf); free(resid); free(fre); free(fim); free(a_re); free(a_im);
+    free(b_re); free(b_im); free(hopf);
     return bad;
 }
 
@@ -620,7 +576,7 @@ static int section_tail(int fft, int n) {
  * info, delays, pools, gates
  * ------------------------------------------------------------------------------------------- */
 static int section_bind_and_pool(int fft, int n) {
-    const int hop = fft / 2, want_trim = expected_trim(hop), want_queue = expected_queue();
+    const int hop = fft / 2;
     AiaecConfig cfg = make_cfg(fft, n);
     AiaecInfo pb, pf;
     StreamMemReq rb, rf;
@@ -630,7 +586,7 @@ static int section_bind_and_pool(int fft, int n) {
     unsigned int gen_f;
 
     if (family_info(&cfg, 0, &pb) != AIAEC_OK || family_info(&cfg, 1, &pf) != AIAEC_OK) { FAIL("bind: info"); return 1; }
-    CHECK(memcmp(&pb, &pf, sizeof(pb)) == 0, "bind(fft=%d N=%d): the info (graph, trim, queue, tail) differs across families", fft, n);
+    CHECK(memcmp(&pb, &pf, sizeof(pb)) == 0, "bind(fft=%d N=%d): the info differs across families", fft, n);
     CHECK(pb.graph_path && pf.graph_path && strcmp(pb.graph_path, pf.graph_path) == 0, "bind: graph path differs across families");
     {
         AiaecConfig bad_cfg = make_cfg(fft, n);
@@ -647,9 +603,6 @@ static int section_bind_and_pool(int fft, int n) {
     CHECK(memcmp(&t.info_blk, &pb, sizeof(pb)) == 0 && memcmp(&t.info_freq, &pb, sizeof(pb)) == 0,
           "bind: the init info equals the throw-away init's");
     gen_f = aiaec_state_generation_freq(t.freq);
-    CHECK(pb.trim_samples == want_trim && pf.trim_samples == want_trim && pb.queue_frames == want_queue && pf.queue_frames == want_queue,
-          "bind(fft=%d N=%d): trim %d/%d (want %d), queue %d/%d (want %d)", fft, n, pb.trim_samples, pf.trim_samples,
-          want_trim, pb.queue_frames, pf.queue_frames, want_queue);
     CHECK(aiaec_state_generation_freq(NULL) == 0u, "bind: NULL ctx");
     aiaec_reset_freq(t.freq);
     CHECK(aiaec_state_generation_freq(t.freq) != gen_f, "bind: reset must advance the generation");
@@ -686,8 +639,8 @@ static int section_bind_and_pool(int fft, int n) {
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
               (unsigned long long)rf.bytes, pinned);
     }
-    printf("section_bind_and_pool(fft=%d N=%d): info shared, trim %d and queue %d frames in both families, pool sizes enforced"
-           " (block/freq %llu/%llu)\n", fft, n, want_trim, want_queue, (unsigned long long)rb.bytes, (unsigned long long)rf.bytes);
+    printf("section_bind_and_pool(fft=%d N=%d): info shared by both families, pool sizes enforced (block/freq %llu/%llu)\n",
+           fft, n, (unsigned long long)rb.bytes, (unsigned long long)rf.bytes);
     free(pool);
     return bad;
 }

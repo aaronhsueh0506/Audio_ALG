@@ -44,8 +44,7 @@ int main(void) {
             status = 1;
         } else {
             rc = aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, &info);
-            if (rc != AIAEC_OK || !ctx || info.graph_path == NULL || info.trim_samples != 256 || info.queue_frames != 0 ||
-                info.tail_zero_blocks != 1) {
+            if (rc != AIAEC_OK || !ctx || info.graph_path == NULL) {
                 fprintf(stderr, "link_only_aiaec: FAIL shipped row init rc=%d (%s)\n", rc, aiaec_status_text(rc));
                 status = 1;
             } else {
@@ -56,7 +55,7 @@ int main(void) {
                 memset(&in, 0, sizeof in);
                 in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = 256;
                 in.u.deepvqe_s.mic_in = mic; in.u.deepvqe_s.far_in = far;
-                if (info.tail_zero_blocks < 0 || aiaec_preprocess(ctx, &in, &work) != AIAEC_OK || work.input_count != 2 ||
+                if (aiaec_preprocess(ctx, &in, &work) != AIAEC_OK || work.input_count != 2 ||
                     work.output_count != 1 || work.inputs[0].w != 257u || work.outputs[0].w != 18u ||
                     aiaec_postprocess(ctx, 0, out) != AIAEC_OK) {
                     fprintf(stderr, "link_only_aiaec: FAIL shipped row block round trip\n");
@@ -65,13 +64,11 @@ int main(void) {
             }
             /* the _freq family answers for the same row */
             if (aiaec_init_freq(&cfg, pool_f, (size_t)rf.bytes, &cf, &if_) != AIAEC_OK ||
-                if_.queue_frames != 0 || if_.tail_zero_blocks != 1 ||
-                if_.graph_path != info.graph_path || if_.trim_samples != 256) {
+                if_.graph_path != info.graph_path) {
                 fprintf(stderr, "link_only_aiaec: FAIL shipped row _freq entries\n");
                 status = 1;
             } else {
-                printf("link_only_aiaec: shipped row _freq pool %llu bytes, trim %d samples, queue %d frames\n",
-                       (unsigned long long)rf.bytes, if_.trim_samples, if_.queue_frames);
+                printf("link_only_aiaec: shipped row _freq pool %llu bytes\n", (unsigned long long)rf.bytes);
             }
         }
         free(pool); free(pool_f);

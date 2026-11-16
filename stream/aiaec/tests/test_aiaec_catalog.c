@@ -94,8 +94,6 @@ static void section_shipped_row(void) {
     if (ctx) {
         CHECK(info.graph_path && strcmp(info.graph_path, "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin") == 0,
               "shipped row: graph path %s", info.graph_path ? info.graph_path : "(null)");
-        CHECK(info.trim_samples == 256 && info.queue_frames == 0 && info.tail_zero_blocks == 1,
-              "shipped row: info fields (trim %d queue %d tail %d)", info.trim_samples, info.queue_frames, info.tail_zero_blocks);
         CHECK(aiaec_state_generation(ctx) == 0u, "shipped row: generation after init");
         {   /* the delivered graph's views: mic, far [1,2,1,257]; CCM taps [1,1,257,18] */
             static const int16_t zeros[256];

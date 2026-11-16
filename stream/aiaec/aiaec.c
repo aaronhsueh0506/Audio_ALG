@@ -396,15 +396,10 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
     return AIAEC_OK;
 }
 
-/* Round trip on the final PCM, for both models and both families (the _freq caller's own ISTFT supplies the framing hop
- * the PCM family has inside): one hop of framing latency whatever N, and no model queue. */
-static void aiaec_core_info(const AiaecCore *core, const char *graph_path, AiaecInfo *info)
+static void aiaec_core_info(const char *graph_path, AiaecInfo *info)
 {
     memset(info, 0, sizeof(*info));
     info->graph_path = graph_path;
-    info->trim_samples = core->cfg.fft / 2;
-    info->queue_frames = 0;
-    info->tail_zero_blocks = (info->trim_samples + core->cfg.hop_in - 1) / core->cfg.hop_in;
 }
 
 /* The pool is checked against aiaec_core_mem_size() after the configuration resolves; on any error
@@ -481,7 +476,7 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
     core->model_id = AIAEC_BOUND_MODEL_ID;
     core->frames_per_call = n;
     core->block_open = 0;
-    aiaec_core_info(core, graph_path, info);
+    aiaec_core_info(graph_path, info);
     *core_out = core;
     return AIAEC_OK;
 }
