@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 277 | 54 | 34 | 20 | 223 | 0 | 55 | 18 |
+| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 280 | 54 | 34 | 20 | 226 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 146 | 49 | 25 | 24 | 97 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 98 | 35 | 14 | 21 | 63 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 874 | 177 | 92 | 85 | 697 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 877 | 177 | 92 | 85 | 700 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：874 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；697 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：877 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；700 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
