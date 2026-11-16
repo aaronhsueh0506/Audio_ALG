@@ -148,8 +148,8 @@ typedef enum AinrFamily { AINR_FAMILY_PCM = 0, AINR_FAMILY_FREQ } AinrFamily;
 
 /* Resolves cfg to a catalog entry, frames_per_call, and that variant's graph path for the
  * product's bound model. Order: the bound model belongs to this archive variant (see
- * ainr_model_id_in_build()); (model_id, sr, fft) row match; hop_in divisibility; lookahead/N>1
- * rule; then the shipped-variants list, where "shipped" also requires a non-NULL graph_path (a
+ * ainr_model_id_in_build()); (model_id, sr, fft) row match; hop_in divisibility; frames_per_call > 1
+ * requires mask_lookahead = 0; then the shipped-variants list, where "shipped" also requires a non-NULL graph_path (a
  * listed N with no graph is treated as unlisted, never resolved to another N's graph).
  * graph_path_out may be NULL. */
 static int ainr_resolve(const AinrConfig *cfg, const AinrDfn2ModelEntry **entry_out, int *n_out,
@@ -513,8 +513,8 @@ static void ainr_prepare_work(const DFN2Grid *grid, const DFN2HopIO *hio, Stream
 }
 
 /* ---------------------------------------------------------------------------------------------
- * Block loops. Each drains the first n - 1 hops of a block into the stash (they never carry a real
- * job for any catalog entry: the lookahead/N>1 rule in ainr_resolve() guarantees this), then opens
+ * Block loops. Each drains the first n - 1 hops of a block into the stash (hops without a job: with
+ * mask_lookahead = 0, which frames_per_call > 1 requires, the job comes at the nth hop), then opens
  * the real Nth hop. AINR_OK with *hio filled (job_ready == 1; with n == 1 also job_ready == 0, the
  * first mask_lookahead hops), AINR_ERR_SEQUENCE on a contract error.
  * ------------------------------------------------------------------------------------------- */
@@ -716,7 +716,7 @@ const char *ainr_status_text(int code)
     case AINR_ERR_GRID: return "no catalog entry for (sr, fft)";
     case AINR_ERR_IN_HOP: return "hop_in is not a positive multiple of model_hop";
     case AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED:
-        return "mask_lookahead > 0 with frames_per_call > 1: the first block cannot carry a real job";
+        return "frames_per_call > 1 requires mask_lookahead = 0";
     case AINR_ERR_FRAMES_PER_CALL: return "no shipped graph for the resolved frames_per_call";
     case AINR_ERR_POOL: return "pool too small or misaligned";
     case AINR_ERR_ERB_FILE: return "ERB file open/header/short-read/dimension mismatch, bytes after the tables, a non-finite forward value, or the inverse is not a partition of unity";

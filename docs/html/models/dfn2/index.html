@@ -32,7 +32,7 @@
 <tbody>
 <tr><td>sr／fft 不在上表（例：16000/512、32000/512、8000/256）</td><td><code>AINR_ERR_GRID</code>（-3）</td><td><code>AINR_ERR_GRID</code>（-3）；16 kHz 一律在此被拒</td></tr>
 <tr><td><code>hop_in</code> 為 0、負數，或不是 <code>fft / 2</code> 的正整數倍（例：16000/256 的 100；48000/1024 的 256）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td></tr>
-<tr><td>48000/1024，<code>hop_in</code> 為 1024、2048 等（N&gt;1）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td></tr>
+<tr><td>48000/1024，<code>hop_in</code> 為 1024、2048 等（N&gt;1；N&gt;1 要求 <code>mask_lookahead</code> = 0）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td></tr>
 <tr><td>16000/256，<code>hop_in</code> 是 128 的倍數但 N 不是 1 或 8（例：256、2048）</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td><td>不適用（先被 -3 擋下）</td></tr>
 </tbody></table>
 <p>其他回傳碼：<code>AINR_ERR_NULL</code>（-1，必要的指標參數為 NULL）、<code>AINR_ERR_MODEL_ID</code>（-2，產品綁定的模型不屬於這份 archive 的 full 或 lite 版本，屬建置設定錯誤，所有組態都回此碼）、<code>AINR_ERR_POOL</code>（-7，pool 小於 <code>ainr_get_mem_size()</code> 的位元組數或未對齊 <code>AINR_ALIGNMENT</code>；較大的 pool 可以）、<code>AINR_ERR_ERB_FILE</code>（-8，ERB 檔缺失、標頭或尺寸不符、表後還有資料、forward 表有非有限值，或 inverse 不是 partition of unity）、<code>AINR_ERR_SEQUENCE</code>（-9，每包 pre／post 沒有成對呼叫）、<code>AINR_ERR_NONFINITE_INPUT</code>（-10，只有 <code>ainr_preprocess_freq()</code> 會回：呼叫端的 E 或 P 頻譜有 NaN／Inf）。<code>ainr_status_text()</code> 給 log 用的短字串。</p>

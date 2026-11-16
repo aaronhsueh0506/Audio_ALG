@@ -56,7 +56,7 @@ enum {
     AINR_ERR_MODEL_ID = -2,                     /* the bound model is not of this archive variant */
     AINR_ERR_GRID = -3,                         /* no catalog entry for (sr, fft) */
     AINR_ERR_IN_HOP = -4,                       /* hop_in is not a positive multiple of model_hop */
-    AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* mask_lookahead > 0 with N > 1 */
+    AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* N > 1 requires mask_lookahead = 0 */
     AINR_ERR_FRAMES_PER_CALL = -6,              /* N has no delivered graph */
     AINR_ERR_POOL = -7,                         /* pool too small or misaligned */
     AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short or longer, of another size, a non-finite forward value, or an inverse that is not a partition of unity */
@@ -80,7 +80,7 @@ typedef struct AinrInfo {
 typedef struct AinrCtx AinrCtx;
 
 /* Pool size and alignment for cfg: AINR_OK (req filled) or an AINR_ERR_* (req untouched). Checked in order:
- * model vs variant, grid, hop_in divisibility, lookahead/N rule, shipped graph for N. */
+ * model vs variant, grid, hop_in divisibility, N > 1 requires mask_lookahead = 0, shipped graph for N. */
 int ainr_get_mem_size(const AinrConfig *cfg, StreamMemReq *req);
 
 /* Constructs in the pool (AINR_ALIGNMENT-aligned, >= ainr_get_mem_size() bytes) and loads the grid's ERB

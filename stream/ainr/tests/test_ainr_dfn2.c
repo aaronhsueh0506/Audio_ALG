@@ -209,8 +209,8 @@ static int test_n8_two_blocks_matches_reference(const char *erb_path) {
     return 0;
 }
 
-/* 4. Validation ordering: an unshipped N must not be confused with an unsupported lookahead/N>1
- * combination -- the two are different failure reasons and must get different error codes. */
+/* 4. Validation ordering: an unshipped N must not be confused with N > 1 on a grid with mask_lookahead > 0
+ * -- the two are different failure reasons and must get different error codes. */
 static int test_validation_ordering(void) {
     AinrConfig cfg_unshipped, cfg_lookahead_blocked;
     StreamMemReq req;
