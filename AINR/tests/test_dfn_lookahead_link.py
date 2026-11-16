@@ -7,7 +7,7 @@ selects it and no link-time or compile-time check can see it. What guards it:
 * Run time. The grid maker accepts exactly the pairs the model constructor accepts (``mask`` in
   0..2, ``df`` in 0..order-1, ``df`` 0 when mask-only) and names the range that fails for any
   other; a pool sized for another pair is refused by ``dfn2_prepost_init_ex`` (the pool hash
-  folds the whole grid), a model-I/O descriptor of another pair by ``dfn2_model_run_frame``,
+  folds the whole grid), a model-I/O descriptor of another pair by ``dfn2_life_model_run_frame``,
   and a grid whose pair fields were edited by hand by every entry point that takes one.
 * Link time (DeepFilterNet2 only). The state layout of the full and the mask-only model differ,
   so the units reference one symbol, ``dfn2_variant_{full|mask_only}``, and ``dfn2_process.c``
@@ -618,7 +618,7 @@ def test_dfn2_pool_of_another_pair_is_refused(guard_output, build):
 @pytest.mark.parametrize('build', sorted(_GUARD_BUILDS))
 def test_dfn2_descriptor_of_another_pair_is_refused(guard_output, build):
     """A model-I/O descriptor made for another pair is refused by
-    ``dfn2_model_io_descriptor_validate`` and so by ``dfn2_model_run_frame``
+    ``dfn2_model_io_descriptor_validate`` and so by ``dfn2_life_model_run_frame``
     before the accelerator callback is touched (-1, the frame stays open and
     the matching descriptor runs it); the descriptor of the instance's own pair
     runs the frame."""

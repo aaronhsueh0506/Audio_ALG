@@ -284,7 +284,7 @@ class DeepVQES(nn.Module):
         # Host-side CCM: each frame's convolution reads the ring state the
         # previous frame left behind, so it is a plain per-frame loop for
         # T>1 -- never part of the accelerator graph (see _apply_ccm_frame /
-        # lib/aiaec/deepvqe_s's frame_finish, which loops the same way).
+        # lib/aiaec/deepvqe_s's post_frame, which loops the same way).
         enhanced = torch.cat([
             self._apply_ccm_frame(
                 state["spec_ring"].step(microphone[:, i:i + 1])[:, 0, 0],

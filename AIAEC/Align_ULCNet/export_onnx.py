@@ -73,7 +73,7 @@ ends at the ``complex_mask`` 1x1 Conv and returns the learned mask itself,
 ``output`` = ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary); the
 fixed back end (complex multiply of the compressed error by that mask, then
 the inverse power) runs on the host (``host_back_end``; C:
-``ulcnet_model_io_enhance_spectrum``).
+``ulcnet_model_io_post_frame``).
 
 ``export_graph`` validates the written file with
 ``validate_inplace_state_contract`` and records ``state_binding`` and
@@ -157,7 +157,7 @@ GRU_HIDDEN = 128
 # Four separate feature inputs so every tensor keeps its own quantization
 # scale; the fixed front end (signed-power compression, magnitude, phase
 # cos/sin) runs on the HOST -- see stream_features, mirrored in C by
-# ulcnet_model_io_prepare() --
+# ulcnet_model_io_pre_frame() --
 # and the graph starts at the learned reorient/encoder compute. The compressed
 # error spectrum stream_features also returns is not a graph input: only the
 # host back end (host_back_end) multiplies by it.
@@ -467,7 +467,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         ))
         # The graph ends at the mask Conv: the host multiplies the compressed
         # error by it and applies the inverse signed power (host_back_end; C:
-        # ulcnet_model_io_enhance_spectrum).
+        # ulcnet_model_io_post_frame).
         output = model.complex_mask(stage2)
 
         # Concatenated in the order it was sliced, which is also the order
@@ -557,7 +557,7 @@ def stream_features(model, error_ri: Tensor, far_ri: Tensor):
     """Host-side fixed front end from RAW RI spectra ((1, 1, n_freqs, 2) each).
 
     Signed-power compression, magnitudes and the compressed-domain phase as
-    cos/sin, all unlearned and in fp32 (C: ulcnet_model_io_prepare). Returns
+    cos/sin, all unlearned and in fp32 (C: ulcnet_model_io_pre_frame). Returns
     ``(error_mag, far_mag, error_cos, error_sin, error_ri)``: the first four
     are the graph's signal inputs in INPUT_NAMES order, ``error_ri`` is the
     compressed error spectrum the host keeps for host_back_end.
@@ -596,7 +596,7 @@ def host_output(model, compressed_ri: Tensor) -> Tensor:
 
 def host_back_end(model, error_ri: Tensor, mask: Tensor) -> Tensor:
     """Host-side fixed back end: mask multiply, then inverse signed power
-    (C: ulcnet_model_io_enhance_spectrum)."""
+    (C: ulcnet_model_io_post_frame)."""
     return host_output(model, apply_mask_ri(error_ri, mask))
 
 

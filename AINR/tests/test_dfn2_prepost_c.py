@@ -2953,7 +2953,7 @@ def test_dual_entry_guards_and_gain_accessor(driver):
 
 
 def test_model_run_frame_finishes_or_takes_the_identity(driver):
-    """dfn2_model_run_frame: contract errors (-1) for no open frame, a NULL
+    """dfn2_life_model_run_frame: contract errors (-1) for no open frame, a NULL
     model/instance, no infer callback, a NULL io_descriptor or one whose
     mask_lookahead or df_lookahead differs from the instance's grid, or one
     made for a grid that differs in any other value; a full write returns 1 and steps the
@@ -3011,7 +3011,7 @@ def test_warmup_hops_carry_no_job_and_move_nothing(driver):
 
 
 def test_frame_fail_closes_as_bypass_and_zeroes_only_a_started_run(driver):
-    """dfn2_prepost_frame_fail: -1 for NULL or no open frame, moving nothing; the
+    """dfn2_life_frame_fail: -1 for NULL or no open frame, moving nothing; the
     output is frame_bypass()'s bit for bit; run_started 1 zeroes both registered
     tensors and advances the generation by one, run_started 0 leaves the state
     and the generation; a hop without a job has no frame to fail. Dropping the

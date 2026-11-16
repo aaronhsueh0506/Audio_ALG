@@ -1588,7 +1588,7 @@ def test_fixed_batch_bin_contains_every_lane(tmp_path):
 def test_runtime_erb_bins_are_a_bitwise_partition_of_unity(tmp_path):
     """The erb_inv.bin the C host loads must expand a unit band mask to
     exactly 1.0f per bin in df_common_expand_mask's accumulation order --
-    dfn2_prepost_frame_bypass's identity, and every host identity gate built
+    dfn2_prepost_post_frame_identity's identity, and every host identity gate built
     on it, is exact only under that property. The runtime exporter refuses
     to write a matrix that breaks it, and the check itself must be able to
     fail."""

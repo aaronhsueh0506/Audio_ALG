@@ -28,7 +28,7 @@ and the deep-filter history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)``
 slots and ``DF_ORDER - D - 1`` past taps.
 
 Fail-open: a heads callable that raises, or returns a non-finite value in any
-head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_bypass``:
+head or next-state tensor, takes the compose path of ``dfn2_prepost_post_frame_identity``:
 unit ERB mask, zero taps, alpha 0 (an exact identity through the cascade,
 because ``erb_inv`` is a partition of unity), framing and compose clocks
 advanced.  The recurrent state is NOT stepped here.  In the C class a refused
@@ -204,7 +204,7 @@ HeadsResult = Tuple[np.ndarray, np.ndarray, float]
 
 
 class IdentityHeads:
-    """``frame_bypass``'s heads: unit mask, zero taps, alpha 0.  No state."""
+    """``post_frame_identity``'s heads: unit mask, zero taps, alpha 0.  No state."""
 
     def __call__(self, erb_window: np.ndarray, spec_window: np.ndarray) -> HeadsResult:
         return (np.ones(N_ERB, np.float32),
@@ -221,8 +221,8 @@ class Dfn2Heads:
     and owns the two state tensors the accelerator would carry: ``h_gru`` and
     ``df_convp_history``.  A call commits the next state only when every head and every next-state
     tensor is finite; otherwise it raises and leaves the state untouched, so
-    the stage's fail-open path sees the same compose-path refusal as
-    ``frame_finish``.
+    the stage's fail-open path sees the same compose-path refusal as a
+    refused ``dfn2_prepost_validate_run``.
     """
 
     def __init__(self, model: torch.nn.Module):
@@ -426,7 +426,7 @@ class Dfn2Stage:
                         or not np.all(np.isfinite(coefs))):
                     raise FloatingPointError('malformed heads')
             except Exception:
-                # frame_bypass: exact identity for this frame, state untouched.
+                # post_frame_identity: exact identity for this frame, state untouched.
                 self.skips += 1
                 mask, coefs, alpha = IdentityHeads()(self.erb_window, self.spec_window)
         emitted, out_re, out_im, target = self._compose(
