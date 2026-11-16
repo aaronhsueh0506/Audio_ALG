@@ -308,12 +308,11 @@ endif
 	@$(MAKE) --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
 	@full_dfn2_lib="$$($(MAKE) -s --no-print-directory -C dfn2 MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
 	lite_dfn2_lib="$$($(MAKE) -s --no-print-directory -C dfn2 MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
-	full_ainr_info="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path print-cflags)"; \
-	lite_ainr_info="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path print-cflags)"; \
-	full_ainr_lib="$$(printf '%s\n' "$$full_ainr_info" | sed -n 1p)"; \
-	full_cflags="$$(printf '%s\n' "$$full_ainr_info" | sed -n 2p)"; \
-	lite_ainr_lib="$$(printf '%s\n' "$$lite_ainr_info" | sed -n 1p)"; \
-	lite_cflags="$$(printf '%s\n' "$$lite_ainr_info" | sed -n 2p)"; \
+	full_ainr_lib="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
+	full_cflags="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-cflags)"; \
+	lite_ainr_lib="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
+	lite_cflags="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-cflags)"; \
+	test -n "$$full_ainr_lib" && test -n "$$lite_ainr_lib" || { echo "FAIL: print-lib-path returned nothing" >&2; exit 1; }; \
 	full_obj="$$(dirname "$$full_ainr_lib")"; lite_obj="$$(dirname "$$lite_ainr_lib")"; \
 	$(CC) $$full_cflags tests/link_only_ainr.c "$$full_ainr_lib" "$$full_dfn2_lib" "$(COMMON_LIB)" -lm \
 	     -o "$$full_obj/link_only_ainr_full" || exit 1; \
