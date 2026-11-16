@@ -327,8 +327,7 @@ int main(void)
         fprintf(stderr, "FAIL: a chain does not reproduce its own digest\n");
         return EXIT_FAILURE;
     }
-    printf("nn chains: backend=%s/%s digest=%016llx:%016llx\n",
-           SK_NEON_BACKEND_NAME, SK_NEON_BACKEND_NAME,
-           (unsigned long long)dfn2, (unsigned long long)gtcrn);
+    printf("nn chains: backend=%s digest=%016llx:%016llx\n",
+           SK_NEON_BACKEND_NAME, (unsigned long long)dfn2, (unsigned long long)gtcrn);
     return EXIT_SUCCESS;
 }

@@ -1944,9 +1944,7 @@ static int run_all_tests(void)
     CHECK(test_gtcrn_set_erb_matrices(), "GTCRN set_erb_matrices");
     CHECK(test_gtcrn_state_evolution(&digest), "GTCRN state evolution");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");
-    printf("backend=%s/%s digest=%016llx\n",
-           SK_NEON_BACKEND_NAME, SK_NEON_BACKEND_NAME,
-           (unsigned long long)digest);
+    printf("backend=%s digest=%016llx\n", SK_NEON_BACKEND_NAME, (unsigned long long)digest);
     return 1;
 }
 
