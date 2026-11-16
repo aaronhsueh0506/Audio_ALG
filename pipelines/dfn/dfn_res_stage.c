@@ -85,21 +85,6 @@ static int model_valid(const DFN2Model *model, const DFN2Grid *grid) {
            dfn2_model_io_descriptor_validate(grid, model->io_descriptor) == 0;
 }
 
-/* The fail-open identity is exact only when the unit band mask expands to exactly 1.0f in
- * every bin. Each bin sums its bands ascending, the order of the model path's expansion, so
- * the sums match it bit for bit. */
-static int erb_inv_is_partition_of_unity(const float *erb_inv, const DFN2Grid *grid) {
-    const size_t n_bins = (size_t)grid->n_bins;
-    int b, k;
-    for (k = 0; k < grid->n_bins; ++k) {
-        float gain = 0.0f;
-        for (b = 0; b < grid->n_erb; ++b)
-            gain += erb_inv[(size_t)b * n_bins + (size_t)k] * 1.0f;
-        if (gain != 1.0f) return 0;
-    }
-    return 1;
-}
-
 /* Everything init needs, derived from the config once: the DFN2 class config and
  * pool size, and this pool's total. */
 typedef struct Resolved {
@@ -120,7 +105,7 @@ static int resolve(const DfnResStageConfig *cfg, Resolved *r) {
     one = (size_t)cfg->grid.n_bins * sizeof(float);
     if (!isfinite(cfg->atten_lim_db) || !cfg->erb_fwd || !cfg->erb_inv)
         return -1;
-    if (!erb_inv_is_partition_of_unity(cfg->erb_inv, &cfg->grid)) return -1;
+    if (!dfn2_erb_tables_valid(&cfg->grid, cfg->erb_fwd, cfg->erb_inv)) return -1;
     if (!model_valid(&cfg->model, &cfg->grid) || backend_id() == 0u) return -1;
     if (dfn2_prepost_config_defaults(&r->pcfg, &cfg->grid) != 0) return -1;
     r->pcfg.erb_fwd = cfg->erb_fwd;

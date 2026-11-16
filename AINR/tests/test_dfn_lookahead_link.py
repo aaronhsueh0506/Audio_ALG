@@ -343,7 +343,10 @@ static int infer(void *user, const DFN2PrepostInputs *in,
 
 static int make_config(DFN2PrepostConfig *cfg, const DFN2Grid *grid)
 {
+    int k;
     if (dfn2_prepost_config_defaults(cfg, grid) != 0) return -1;
+    for (k = 0; k < N_BINS * N_ERB; ++k) erb_fwd[k] = 0.01f;
+    for (k = 0; k < N_BINS; ++k) erb_inv[k] = 1.0f;   /* band 0 owns every bin: a partition of unity */
     cfg->erb_fwd = erb_fwd;
     cfg->erb_inv = erb_inv;
     return 0;

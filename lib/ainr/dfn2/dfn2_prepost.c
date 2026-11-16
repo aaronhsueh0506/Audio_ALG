@@ -319,6 +319,8 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
         }
     }
 
+    if (!dfn2_erb_tables_valid(&cfg->grid, cfg->erb_fwd, cfg->erb_inv)) return NULL;
+
     /* Zero the whole pool first, the control region included. */
     memset(pool, 0, (size_t)req.bytes);
     p = (DFN2Prepost *)pool;
@@ -403,6 +405,7 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
     if (!p || !erb_fwd || !erb_inv) return -1;
     /* between hops only: a swap must not land inside an open transaction */
     if (p->frame_open) return -1;
+    if (!dfn2_erb_tables_valid(&p->grid, erb_fwd, erb_inv)) return -1;
     p->erb_fwd = erb_fwd;
     p->erb_inv = erb_inv;
     dfn2_set_erb_matrices(p->dsp, erb_fwd, erb_inv);

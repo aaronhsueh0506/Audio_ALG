@@ -254,21 +254,6 @@ static int dfn2_stream_descriptor_matches(const DFN2StreamMemReq *expected, cons
            expected->bytes == req->bytes;
 }
 
-/* The fail-open identity (and every bypass built on it) is exact only when a unit band mask expands to
- * exactly 1.0f in every bin. Each bin sums its bands ascending, the order of the model path's
- * expansion, so the sums match it bit for bit; the same rule as AINR/DeepFilterNet2/export_erb_matrix.py. */
-static int erb_inv_is_partition_of_unity(const float *erb_inv, const DFN2Grid *grid) {
-    const size_t n_bins = (size_t)grid->n_bins;
-    int band, bin;
-    for (bin = 0; bin < grid->n_bins; ++bin) {
-        float gain = 0.0f;
-        for (band = 0; band < grid->n_erb; ++band)
-            gain += erb_inv[(size_t)band * n_bins + (size_t)bin] * 1.0f;
-        if (gain != 1.0f) return 0;
-    }
-    return 1;
-}
-
 /* Constructs every carved object except the ERB tables, which must already hold valid data by the
  * time this runs (the caller's own borrowed pointers in memory mode; `layout`'s pool-owned,
  * already-loaded storage in file mode) -- `erb_fwd`/`erb_inv` are exactly those two pointers.
@@ -284,7 +269,7 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     size_t n_bins;
 
     if (!cfg || !base || !layout || !layout->self || !erb_fwd || !erb_inv) return NULL;
-    if (!erb_inv_is_partition_of_unity(erb_inv, &cfg->grid)) return NULL;
+    if (!dfn2_erb_tables_valid(&cfg->grid, erb_fwd, erb_inv)) return NULL;
     s = layout->self;
 
     s->grid = cfg->grid;

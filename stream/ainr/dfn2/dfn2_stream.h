@@ -114,8 +114,8 @@ typedef struct DFN2Stream DFN2Stream;
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
 /* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost
- * (freq_only: DFN2Prepost alone), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or an erb_inv that
- * is not a partition of unity (a unit band mask must expand to exactly 1.0f in every bin, summed band-ascending in float32). */
+ * (freq_only: DFN2Prepost alone), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or tables that fail
+ * dfn2_erb_tables_valid() (finite erb_fwd >= 0; erb_inv in [0, 1] summing to exactly 1.0f in every bin, band-ascending in float32). */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
 /* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, mode, variant or layout

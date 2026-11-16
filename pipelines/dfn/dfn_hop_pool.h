@@ -90,8 +90,8 @@ static inline size_t dfn_hop_pool_bytes(const DfnHopPoolPlan* p) {
 
 /* Carves the tail at `cur` and wires `hop`; the front end's grid must be the bridge's, or the
  * model's when the host runs the model's grid. `check_finite` applies to the direct path. 0, or -1
- * when an init is refused: a pool or grid that does not match the plan, or an inverse ERB matrix
- * that is not a partition of unity (dfn2_stream.h). */
+ * when an init is refused: a pool or grid that does not match the plan, or ERB matrices
+ * that fail dfn2_erb_tables_valid() (dfn2_process.h). */
 static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur, int n_freqs,
                                      int hop_size, int check_finite, DfnHop* hop) {
     const DFN2Grid* grid = &p->stream_cfg.grid;

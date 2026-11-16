@@ -477,6 +477,21 @@ static int run_rejections(void) {
     make_partition();
     for (k = 0; k < DFN2_N_BINS; ++k)
         if (erb_inv[k] != 1.0f) return 11;
+    /* Tables the library cannot use: a NaN or negative forward entry, and an inverse bin that still sums to exactly
+     * 1.0f with entries outside [0, 1] (1e30 + -1e30 + 1): refused. */
+    cfg = base_config();
+    saved = erb_fwd[3];
+    erb_fwd[3] = NAN;
+    if (!rejects(&cfg)) { erb_fwd[3] = saved; return 12; }
+    erb_fwd[3] = -0.5f;
+    if (!rejects(&cfg)) { erb_fwd[3] = saved; return 13; }
+    erb_fwd[3] = saved;
+    erb_inv[7] = 1.0e30f;
+    erb_inv[(size_t)1 * DFN2_N_BINS + 7] = -1.0e30f;
+    erb_inv[(size_t)2 * DFN2_N_BINS + 7] = 1.0f;
+    if (!rejects(&cfg)) { make_partition(); return 14; }
+    make_partition();
+    if (rejects(&cfg)) return 15;
     return 0;
 }
 

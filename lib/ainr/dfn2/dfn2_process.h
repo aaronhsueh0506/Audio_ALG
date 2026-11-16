@@ -100,6 +100,10 @@ void dfn2_state_reset(DFN2State *st);   /* init values; grid, pointers and borro
 void dfn2_set_erb_matrices(DFN2State *st, const float *erb_fwd,
                              const float *erb_inv);
 
+/* 1 when erb_fwd holds finite values >= 0 and erb_inv finite values in [0, 1] that sum to exactly 1.0f in every bin
+ * (band ascending, the expansion's order, so a unit band mask expands to exactly 1.0f), else 0 (NULL included). */
+int dfn2_erb_tables_valid(const DFN2Grid *grid, const float *erb_fwd, const float *erb_inv);
+
 /* Spectrum -> the network's inputs feat_erb [n_erb] and feat_spec [2*df_bins] as [re..., im...].
  * Takes a normalized=True spectrum; train.py's analysis_scale is applied here. */
 void dfn2_compute_features(DFN2State *st,

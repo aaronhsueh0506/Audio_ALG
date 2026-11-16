@@ -4,7 +4,9 @@
  * -DDFN2_STREAM_NO_STDIO):
  *   - the two partition tables (band 0 owns every bin; every bin split 0.75 / 0.25) are accepted;
  *   - each broken table is refused by init and init_ex with NULL: every band owning every bin, all
- *     zero, one bin summing to 0 / 1 + ulp / 1 - ulp / 1.5, a NaN, an Inf;
+ *     zero, one bin summing to 0 / 1 + ulp / 1 - ulp / 1.5, a NaN, an Inf, and two bins that sum to exactly 1.0f
+ *     with entries outside [0, 1] (1e30 + -1e30 + 1, 2 + -1);
+ *   - a forward table with a NaN, an Inf or a negative entry is refused (memory mode);
  *   - get_mem_size() is the same for a good and a broken table (the table is not part of the pool
  *     ABI), and the pool a refusal left behind takes a good table at once.
  * With arguments `SAMPLE_RATE FFT N_ERB FILE`, loads FILE (the exporter's erb_matrix.bin layout) by
@@ -53,10 +55,11 @@ static DFN2Grid make_grid(int sr, int fft, int n_erb) {
 }
 
 enum { BAD_ALL_ONES, BAD_ALL_ZERO, BAD_BIN_ZERO, BAD_BIN_PLUS_ULP, BAD_BIN_MINUS_ULP, BAD_LAST_BAND_HALF,
-       BAD_NAN, BAD_INF, BAD_COUNT };
+       BAD_NAN, BAD_INF, BAD_HUGE_PAIR, BAD_OUT_OF_RANGE, BAD_COUNT };
 static const char *const BAD_NAME[BAD_COUNT] = {
     "every band owns every bin", "all zero", "last bin sums to 0", "last bin sums to 1 + ulp",
-    "first bin sums to 1 - ulp", "bin 5 gains 0.5 in the last band", "NaN", "Inf" };
+    "first bin sums to 1 - ulp", "bin 5 gains 0.5 in the last band", "NaN", "Inf", "1e30 + -1e30 + 1 in one bin",
+    "2 + -1 in one bin" };
 
 /* inv: band-major [n_erb][n_bins], filled as a unit partition and then broken one way. */
 static void make_bad(float *inv, int n_bins, int n_erb, int kind) {
@@ -70,7 +73,12 @@ static void make_bad(float *inv, int n_bins, int n_erb, int kind) {
     case BAD_BIN_MINUS_ULP: inv[0] = nextafterf(1.0f, 0.0f); break;
     case BAD_LAST_BAND_HALF: inv[(size_t)(n_erb - 1) * (size_t)n_bins + 5u] = 0.5f; break;
     case BAD_NAN: inv[n_bins / 2] = (float)NAN; break;
-    default: inv[n_bins / 2] = (float)INFINITY; break;   /* BAD_INF */
+    case BAD_INF: inv[n_bins / 2] = (float)INFINITY; break;
+    case BAD_HUGE_PAIR:
+        inv[n_bins / 2] = 1e30f; inv[(size_t)n_bins + (size_t)(n_bins / 2)] = -1e30f;
+        inv[2u * (size_t)n_bins + (size_t)(n_bins / 2)] = 1.0f; break;
+    default:   /* BAD_OUT_OF_RANGE */
+        inv[n_bins / 2] = 2.0f; inv[(size_t)n_bins + (size_t)(n_bins / 2)] = -1.0f; break;
     }
 }
 
@@ -147,6 +155,21 @@ static void run_row(const Row *r) {
         cfg = make_cfg(&grid, fwd, good_split);
         CHECK(dfn2_stream_init(&cfg, pool, (size_t)req_good.bytes) != NULL,
               "%d/%d (%s): the pool a refusal left behind is not usable", r->sr, r->fft, BAD_NAME[kind]);
+    }
+
+    {   /* the forward table: finite and non-negative */
+        const float bad_fwd[3] = { (float)NAN, (float)INFINITY, -0.5f };
+        for (kind = 0; kind < 3; ++kind) {
+            float keep = fwd[elems / 2];
+            fwd[elems / 2] = bad_fwd[kind];
+            cfg = make_cfg(&grid, fwd, good_unit);
+            CHECK(dfn2_stream_init(&cfg, pool, (size_t)req_good.bytes) == NULL,
+                  "%d/%d: init accepted a forward table with %g", r->sr, r->fft, (double)bad_fwd[kind]);
+            fwd[elems / 2] = keep;
+        }
+        cfg = make_cfg(&grid, fwd, good_unit);
+        CHECK(dfn2_stream_init(&cfg, pool, (size_t)req_good.bytes) != NULL, "%d/%d: the restored table is refused",
+              r->sr, r->fft);
     }
 
 #ifndef DFN2_STREAM_NO_STDIO

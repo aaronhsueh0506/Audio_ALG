@@ -74,15 +74,15 @@
 <!-- map:stats:begin -->
 | 範圍 | C 函式總數 | 已對應 | 其中 mirror | 其中 partial | C-only | 未能判斷 | Python-only 符號 | 已對應中的推論 |
 |---|---|---|---|---|---|---|---|---|
-| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 279 | 54 | 34 | 20 | 225 | 0 | 55 | 18 |
+| `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 279 | 54 | 33 | 21 | 225 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
 | `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 147 | 49 | 25 | 24 | 98 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 98 | 35 | 14 | 21 | 63 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 877 | 177 | 92 | 85 | 700 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 877 | 177 | 91 | 86 | 700 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：877 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；700 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：877 個 C 函式中，177 個有 Python 對應（mirror 91、partial 86），其中 62 個的配對是推論；700 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -126,7 +126,7 @@
 | `pipelines/dfn/dfn_example_args.h` | all | 10 |
 | `pipelines/dfn/dfn_rate_bridge.c` | all | 26 |
 | `stream/ainr/bridge/ainr_bridge.c` | all | 28 |
-| `pipelines/dfn/dfn_res_stage.c` | all | 27 |
+| `pipelines/dfn/dfn_res_stage.c` | all | 26 |
 | `pipelines/dfn/dfn_unit_partition.h` | all | 1 |
 | `pipelines/mono/aec_dfn_res/main.c` | all | 9 |
 | `pipelines/4ch/array_sample_beam.c` | all | 22 |
@@ -164,7 +164,7 @@
 | `lib/ainr/dfn2/dfn2_model_io_priv.h` | all | 1 |
 | `lib/ainr/dfn2/dfn2_prepost.c` | all | 37 |
 | `lib/ainr/dfn2/dfn2_prepost.h` | all | 6 |
-| `lib/ainr/dfn2/dfn2_process.c` | all | 24 |
+| `lib/ainr/dfn2/dfn2_process.c` | all | 25 |
 | `lib/ainr/gtcrn/gtcrn_process.c` | all | 29 |
 | `lib/ainr/rnnoise_erb/process.c` | all | 31 |
 | `lib/aiaec/ulcnet/ulcnet_model_io.c` | all | 34 |
@@ -193,7 +193,7 @@
 | PL-DFN-01 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_process, dfn_res_stage_begin, dfn_res_stage_infer, dfn_res_stage_end` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.push` | mirror | D-42；S-17 | `pipelines/dfn/tests/test_dfn2_stage_c_parity.py`（C↔Py，驅動 dfn2_process.c）；`pipelines/dfn/tests/test_dfn2_stage.py`（Py 契約） | C 把一個 hop 拆成 begin／callback／end 三段；Python 的 `push` 在內部呼叫 heads。`dfn2_enhance_spectrum_stream` 路徑逐位元相同、特徵在 AINR 容差內（測試驅動的是 dfn2_process.c，不是 dfn_res_stage.c 本體）。 |
 | PL-DFN-02 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_reset` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.reset` | mirror | D-42 | — | 重置 DFN2 類別與計數並呼叫 `model.reset`；fail-open 後的狀態語意不同（D-42）。 |
 | PL-DFN-03 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_set_atten_lim` | `pipelines/dfn/dfn2_stage.py:Dfn2Stage.set_atten_lim` | mirror | — | — | — |
-| PL-DFN-04 | `pipelines/dfn/dfn_res_stage.c: erb_inv_is_partition_of_unity` | `pipelines/dfn/dfn2_stage.py:erb_inv_is_partition_of_unity`<br>`AINR/DeepFilterNet2/export_erb_matrix.py:require_partition_of_unity` | mirror | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | identity（fail-open）路徑的前提：單位 band mask 展開後每個 bin 恰為 1.0。串流層 `stream/ainr/dfn2/dfn2_stream.c` 有同名的同一條規則（不在本表覆蓋範圍）。 |
+| PL-DFN-04 | `lib/ainr/dfn2/dfn2_process.c: dfn2_erb_tables_valid` | `pipelines/dfn/dfn2_stage.py:erb_inv_is_partition_of_unity`<br>`AINR/DeepFilterNet2/export_erb_matrix.py:require_partition_of_unity` | partial | S-21 | `AINR/DeepFilterNet2/tests/test_dfn2_contract.py`（Py 契約） | identity（fail-open）路徑的前提：單位 band mask 展開後每個 bin 恰為 1.0。C 的 `dfn2_erb_tables_valid` 由 `dfn2_prepost_init_ex`、`dfn2_prepost_set_erb_matrices`、`dfn2_stream` 與 `dfn_res_stage` 共用，另外要求 forward 表為有限且不小於 0、inverse 每個元素落在 [0, 1]（Python 的兩個函式只檢查每個 bin 的和）。 |
 | PL-DFN-05 | `pipelines/dfn/dfn_res_stage.c: dfn_res_stage_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput` 欄位。 |
 | PL-DFN-06 | `pipelines/dfn/dfn_res_stage.c: align_up, carve, fnv1a_u32, backend_id, model_valid, resolve, fill_descriptor, dfn_res_stage_default_config, dfn_res_stage_get_mem_requirements, descriptor_matches, dfn_res_stage_init_ex, dfn_res_stage_init, dfn_res_stage_create, dfn_res_stage_destroy, dfn_res_stage_get_counters, dfn_res_stage_grid, dfn_res_stage_state_generation, spectrum_in_range, inputs_valid` | — | C-only | — | — | 描述子、記憶體池、counters；`dfn_res_stage_state_generation` 是模型遞迴狀態的重啟計數（stage 不註冊狀態，持有狀態的模型回呼在值改變時重載零）；`inputs_valid` 在 begin 前掃兩個輸入頻譜：每個 bin 乘 `dfn2_stft_scale` 後必須有限且不超過 2^63（與 `dfn2_stream_pre_process_freq_dual` 同一上限，`spectrum_in_range` 為逐 bin 檢查），超過就整個 block 拒絕、不消耗 frame；Python 的 `Dfn2Stage.push` 只檢查 heads 輸出端（fail-open 的觸發條件），沒有輸入端掃描。 |
 | PL-DFN-07 | `pipelines/dfn/dfn_rate_bridge.c: dfn_rate_bridge_process, dfn_rate_bridge_begin, dfn_rate_bridge_nn_begin, dfn_rate_bridge_nn_end, dfn_rate_bridge_finish`<br>`stream/ainr/bridge/ainr_bridge.c: push_up, ainr_bridge_begin, ainr_bridge_model_begin, ainr_bridge_model_end, ainr_bridge_finish` | `pipelines/dfn/dfn2_rate_adapter.py:Dfn2RateBridge.push` | mirror | D-24 | `pipelines/dfn/tests/test_dfn2_rate_bridge_c_parity.py`（C↔Py） | 兩邊用同一個 C resampler 核心，只剩 FFT 後端差；容差 float32 round-off，prefill／added delay 為相同整數。信號路徑在 `ainr_bridge.c`（不內嵌模型：呼叫端在 `ainr_bridge_model_begin` 與 `ainr_bridge_model_end` 之間跑模型）；`dfn_rate_bridge.c` 是把 `DfnResStage` 接在中間的薄轉接層，輸出與轉接前逐位元相同。`finish_frame` 已併入 `ainr_bridge_model_end`。 |

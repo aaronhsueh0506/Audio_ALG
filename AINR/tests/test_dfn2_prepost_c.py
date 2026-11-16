@@ -768,8 +768,10 @@ static int freqpool_grid_identity(const DFN2PrepostConfig *cfg_freq,
     DFN2PrepostConfig cfg_v;
     DFN2PrepostMemReq req_v[N_VARIANTS], forged;
     uint64_t most = req_freq->bytes;
+    static float variant_fwd[1100 * 64], variant_inv[1100 * 64];
     void *pool;
     unsigned char *before;
+    size_t i;
     int v, w;
 
     for (v = 0; v < N_VARIANTS; ++v) {
@@ -791,8 +793,14 @@ static int freqpool_grid_identity(const DFN2PrepostConfig *cfg_freq,
         DFN2Grid grid;
         CHECK(make_variant(&grid, v) == 0);
         CHECK(dfn2_prepost_config_defaults(&cfg_v, &grid) == 0);
-        cfg_v.erb_fwd = cfg_freq->erb_fwd;
-        cfg_v.erb_inv = cfg_freq->erb_inv;
+        /* tables of the variant's own size: a forward table of 0.01 and an inverse where band 0 owns every bin */
+        CHECK((size_t)grid.n_bins * (size_t)grid.n_erb <= sizeof variant_fwd / sizeof variant_fwd[0]);
+        for (i = 0; i < (size_t)grid.n_bins * (size_t)grid.n_erb; ++i) {
+            variant_fwd[i] = 0.01f;
+            variant_inv[i] = i < (size_t)grid.n_bins ? 1.0f : 0.0f;
+        }
+        cfg_v.erb_fwd = variant_fwd;
+        cfg_v.erb_inv = variant_inv;
         /* accepted for its own grid... */
         CHECK(start_ex(pool, (size_t)most, &cfg_v, &req_v[v]) != NULL);
         memcpy(before, pool, (size_t)most);
@@ -2209,6 +2217,48 @@ static int case_huge_head(void) {
     return 0;
 }
 
+/* Tables the caller lends are checked where the instance takes them: init and set_erb_matrices refuse a forward
+ * table with a NaN, an Inf or a negative entry, and an inverse table with an entry outside [0, 1] even when every
+ * bin still sums to exactly 1.0f; the pool and the tables the instance already holds stay as they were. */
+static int case_erb_tables(void) {
+    static float fwd[DFN2_N_BINS][DFN2_N_ERB];
+    static float inv[DFN2_N_ERB][DFN2_N_BINS];
+    const float bad_fwd[3] = {(float)NAN, (float)INFINITY, -0.25f};
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *p;
+    void *pool;
+    int kind;
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool != NULL);
+    memcpy(fwd, erb_fwd, sizeof fwd);
+    memcpy(inv, erb_inv, sizeof inv);
+    cfg.erb_fwd = &fwd[0][0];
+    cfg.erb_inv = &inv[0][0];
+    p = start(pool, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL);
+    for (kind = 0; kind < 5; ++kind) {
+        float keep_a = fwd[3][2], keep_b = inv[0][5], keep_c = inv[1][5];
+        if (kind < 3) fwd[3][2] = bad_fwd[kind];
+        else if (kind == 3) { inv[0][5] = 1.0e30f; inv[1][5] = -1.0e30f; inv[2][5] += keep_b + keep_c; }
+        else { inv[0][5] = keep_b + 1.0f; inv[1][5] = keep_c - 1.0f; }
+        CHECK(start(pool, (size_t)req.bytes, &cfg) == NULL);
+        CHECK(dfn2_prepost_set_erb_matrices(p, &fwd[0][0], &inv[0][0]) == -1);
+        fwd[3][2] = keep_a;
+        inv[0][5] = keep_b;
+        inv[1][5] = keep_c;
+        if (kind == 3) inv[2][5] = erb_inv[2][5];
+    }
+    CHECK(dfn2_prepost_set_erb_matrices(p, &fwd[0][0], &inv[0][0]) == 0);
+    CHECK(start(pool, (size_t)req.bytes, &cfg) != NULL);
+    printf("erb_tables: 3 forward and 2 inverse breakages refused\n");
+    free(pool);
+    return 0;
+}
+
 /* ---------------------------------------------------------------------- */
 
 /* The recurrent state is ONE buffer per tensor: the input view and the
@@ -2812,6 +2862,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
     else if (strcmp(argv[1], "txn") == 0)       status = case_txn();
     else if (strcmp(argv[1], "huge_head") == 0) status = case_huge_head();
+    else if (strcmp(argv[1], "erb_tables") == 0) status = case_erb_tables();
     else if (strcmp(argv[1], "dual_identity") == 0) status = case_dual_identity();
     else if (strcmp(argv[1], "dual_split") == 0)    status = case_dual_split();
     else if (strcmp(argv[1], "dual_guards") == 0)   status = case_dual_guards();
@@ -2998,6 +3049,12 @@ def test_a_finite_head_beyond_the_bound_is_refused_like_a_non_finite_one(driver)
     restarts the state and leaves the frame open for the bypass; a value exactly at the limit commits; the hop's
     output is finite in every case."""
     assert 'huge_head:' in _run(driver, 'huge_head')
+
+
+def test_erb_tables_are_checked_where_the_instance_takes_them(driver):
+    """init and set_erb_matrices refuse a forward table with a NaN, an Inf or a negative entry and an inverse
+    table with entries outside [0, 1] that still sum to exactly 1.0f per bin; a good table is taken again."""
+    assert 'erb_tables:' in _run(driver, 'erb_tables')
 
 
 def test_dual_entry_with_one_spectrum_is_the_single_entry(driver):

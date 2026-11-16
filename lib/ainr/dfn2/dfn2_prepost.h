@@ -141,7 +141,7 @@ int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
                               DFN2PrepostMemReq *req);
 
 /* Construct in caller memory (16-byte aligned, `bytes` >= the reported size), starting reset. NULL on a bad
- * config or a misaligned or undersized pool (pool and registered buffers untouched). */
+ * config, ERB tables failing dfn2_erb_tables_valid(), or a misaligned or undersized pool (pool and registered buffers untouched). */
 DFN2Prepost *dfn2_prepost_init(void *pool, size_t bytes,
                                const DFN2PrepostConfig *cfg);
 
@@ -169,7 +169,7 @@ unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);
 const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);   /* the grid it runs; NULL for NULL */
 
 /* Point at caller-loaded ERB matrices, borrowed and never copied. Between hops only; a swap consistent per
- * source frame needs a reset first. -1 on NULL or with a frame open. */
+ * source frame needs a reset first. -1 on NULL, tables failing dfn2_erb_tables_valid() or with a frame open. */
 int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
                                   const float *erb_inv);
 

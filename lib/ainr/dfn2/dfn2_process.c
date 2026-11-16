@@ -4,6 +4,7 @@
 
 #include "dfn2_process.h"
 
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -399,6 +400,24 @@ void dfn2_set_erb_matrices(DFN2State* st,
               st->erb_fwd_k0, st->erb_fwd_k1);
     erb_spans(erb_inv, n_erb, n_bins, n_bins, 1,
               st->erb_inv_lo, st->erb_inv_hi);
+}
+
+int dfn2_erb_tables_valid(const DFN2Grid *grid, const float *erb_fwd, const float *erb_inv)
+{
+    const size_t n_bins = grid ? (size_t)grid->n_bins : 0u;
+    const size_t n_erb = grid ? (size_t)grid->n_erb : 0u;
+    size_t i, bin;
+    if (!grid || !erb_fwd || !erb_inv) return 0;
+    for (i = 0; i < n_bins * n_erb; ++i)
+        if (!(erb_fwd[i] >= 0.0f && erb_fwd[i] <= FLT_MAX)) return 0;
+    for (i = 0; i < n_bins * n_erb; ++i)
+        if (!(erb_inv[i] >= 0.0f && erb_inv[i] <= 1.0f)) return 0;
+    for (bin = 0; bin < n_bins; ++bin) {
+        float gain = 0.0f;
+        for (i = 0; i < n_erb; ++i) gain += erb_inv[i * n_bins + bin];
+        if (gain != 1.0f) return 0;
+    }
+    return 1;
 }
 
 /* The linspace seed of one bin: a line from lo to hi held between the two ends, so a span wide enough to

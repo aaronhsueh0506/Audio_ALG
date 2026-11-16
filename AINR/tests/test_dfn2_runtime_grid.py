@@ -301,9 +301,13 @@ static int read_grid(const char *text, DFN2Grid *g, int *used) {
     return dfn2_grid_make(g, &spec);
 }
 
+/* A forward table of 0.01 and an inverse band-major table where band 0 owns every bin (a partition of unity). */
 static void fill_tables(const DFN2Grid *g) {
     size_t i;
-    for (i = 0; i < (size_t)g->n_bins * g->n_erb; ++i) fwd[i] = inv[i] = 0.01f;
+    for (i = 0; i < (size_t)g->n_bins * g->n_erb; ++i) {
+        fwd[i] = 0.01f;
+        inv[i] = i < (size_t)g->n_bins ? 1.0f : 0.0f;
+    }
 }
 
 static int config_for(const DFN2Grid *g, DFN2PrepostConfig *cfg) {
@@ -713,6 +717,7 @@ int main(void) {
             pool = aligned_alloc(16, most);
             copy = malloc(most);
             memset(pool, 0xa5, most);
+            fill_tables(&b);   /* ca and cb share the table arrays: each instance is built over its own grid's tables */
             live = dfn2_prepost_init_ex(pool, most, &cb, &rb);
             state_fill(7.0f);
             memcpy(copy, pool, most);
@@ -736,6 +741,7 @@ int main(void) {
             }
             untouched = memcmp(pool, copy, most) == 0 && state_all(7.0f);
             alive = live != NULL;
+            fill_tables(&a);
             live = dfn2_prepost_init_ex(pool, most, &ca, &ra);
             control = live != NULL && registered_zero() && frame_commits(live, s_gru, s_convp);
             printf("stale %d %d %d %d\n", refused, untouched, alive, control);
