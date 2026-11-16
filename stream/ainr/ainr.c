@@ -266,24 +266,30 @@ static int ainr_pool_layout(AinrFamily family, const AinrDfn2ModelEntry *entry, 
     return 0;
 }
 
+/* The pool size of a resolved model entry and grid. */
+static int ainr_mem_size_resolved(AinrFamily family, const AinrDfn2ModelEntry *entry, int n, const DFN2Grid *grid,
+                                  StreamMemReq *req)
+{
+    AinrLayout lay;
+
+    if (ainr_pool_layout(family, entry, n, grid, (unsigned char *)0, &lay) != 0) return AINR_ERR_POOL;
+    req->alignment = AINR_ALIGNMENT;
+    req->bytes = (uint64_t)lay.total;
+    return AINR_OK;
+}
+
 static int ainr_get_mem_size_family(AinrFamily family, const AinrConfig *cfg, StreamMemReq *req)
 {
     const AinrDfn2ModelEntry *entry;
     int n, status;
     DFN2Grid grid;
-    AinrLayout lay;
 
     if (!req) return AINR_ERR_NULL;
     status = ainr_resolve(cfg, &entry, &n, (const char **)0);
     if (status != AINR_OK) return status;
     status = ainr_build_grid(entry, n, &grid);
     if (status != AINR_OK) return status;
-
-    if (ainr_pool_layout(family, entry, n, &grid, (unsigned char *)0, &lay) != 0) return AINR_ERR_POOL;
-
-    req->alignment = AINR_ALIGNMENT;
-    req->bytes = (uint64_t)lay.total;
-    return AINR_OK;
+    return ainr_mem_size_resolved(family, entry, n, &grid, req);
 }
 
 int ainr_get_mem_size(const AinrConfig *cfg, StreamMemReq *req)
@@ -324,13 +330,12 @@ static int ainr_init_common(AinrFamily family, const AinrConfig *cfg, const char
     }
     if (!pool) return AINR_ERR_NULL;
 
-    status = ainr_get_mem_size_family(family, cfg, &req);
+    status = ainr_build_grid(entry, n, &grid);
+    if (status != AINR_OK) return status;
+    status = ainr_mem_size_resolved(family, entry, n, &grid, &req);
     if (status != AINR_OK) return status;
     if (pool_bytes < (size_t)req.bytes) return AINR_ERR_POOL;
     if (((uintptr_t)pool % (uintptr_t)req.alignment) != 0u) return AINR_ERR_POOL;
-
-    status = ainr_build_grid(entry, n, &grid);
-    if (status != AINR_OK) return status;
 
     memset(pool, 0, (size_t)req.bytes);
     if (ainr_pool_layout(family, entry, n, &grid, (unsigned char *)pool, &lay) != 0 ||
