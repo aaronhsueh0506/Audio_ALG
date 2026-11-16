@@ -55,8 +55,8 @@ TOL_STATE = 1e-4
 class Driver:
     """The packet_driver binary: OPEN / PRE / POST over stdin / stdout."""
 
-    def __init__(self, path):
-        self.proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, path, env=None):
+        self.proc = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
 
     def _send(self, *chunks):
         for chunk in chunks:
@@ -324,6 +324,19 @@ def test_the_n1_stream_does_change_the_generation_on_an_event(driver, model, ses
     """The contrast that makes the previous assertion meaningful: N=1 restarts the state on the host."""
     _c8, c1, edges, _worst = _run_scenario(driver, model, sessions, 'two_in_one_packet')
     assert len(c1.generations) == 1 + sum(edges)
+
+
+def test_a_refused_post_sends_no_heap_bytes(driver_path):
+    """A POST with no block open is refused; the planes that follow the status are zeros, not heap contents."""
+    env = dict(os.environ, MallocScribble='1', MallocPreScribble='1', MALLOC_PERTURB_='170')
+    drv = Driver(driver_path, env)
+    try:
+        slot, _ = drv.open(1)
+        rc, _, enhanced = drv.post(slot, 1, 0, None)
+        assert rc != 0, 'a POST without a PRE must be refused'
+        assert not np.any(enhanced), 'the refused POST sent uninitialised bytes'
+    finally:
+        drv.close()
 
 
 def test_the_packet_layout_constants_equal_the_exporter():

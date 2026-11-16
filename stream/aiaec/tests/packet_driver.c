@@ -53,7 +53,7 @@ int main(void) {
             AiaecInfo info;
             StreamMemReq rq;
             if (rd(&n, sizeof(n)) != 0) return 2;
-            cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = 128 * n;
+            cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = (n >= 1 && n <= MAX_N) ? 128 * n : 128;
             rc = aiaec_get_mem_size_freq(&cfg, &rq);
             if (rc != AIAEC_OK || g_slots >= MAX_SLOTS || n < 1 || n > MAX_N) { wri(rc ? rc : -99); wri(0); wri(-1); fflush(stdout); continue; }
             if (posix_memalign(&g_slot[g_slots].pool, 16, (size_t)rq.bytes) != 0) return 2;
@@ -110,8 +110,9 @@ int main(void) {
             if (me > 0) {
                 if ((size_t)me != s->work.outputs[0].elements || rd(s->work.outputs[0].data, (size_t)me * sizeof(float)) != 0) return 2;
             }
-            re = malloc((size_t)s->n * BINS * sizeof(float));
-            im = malloc((size_t)s->n * BINS * sizeof(float));
+            re = calloc((size_t)s->n * BINS, sizeof(float));
+            im = calloc((size_t)s->n * BINS, sizeof(float));
+            if (!re || !im) return 2;
             rc = aiaec_postprocess_freq(s->ctx, status, re, im);
             wri(rc);
             wri((int)aiaec_state_generation_freq(s->ctx));
