@@ -890,7 +890,7 @@ print-untracked:
 # configuration, so it can never audit a stale signature's leftovers.
 .PHONY: test-fp-contract
 test-fp-contract:
-	@scripts/audit_fp_contract.sh $(BACKEND)
+	@AEC_NO_ARRAY=$(AEC_NO_ARRAY) scripts/audit_fp_contract.sh $(BACKEND)
 
 # audit-no-transform: source gate over the model directories (AINR/, AIAEC/; non-test .c/.h). Framing
 # (AcStft analysis, AcIstft inverse FFT and overlap-add) is the application's, built with audiolib; a

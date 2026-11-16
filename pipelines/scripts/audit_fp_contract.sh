@@ -11,7 +11,7 @@
 # around could pass on an unrelated stale one while saying nothing.
 #
 # Usage:  scripts/audit_fp_contract.sh [BACKEND ...]      (default: ne10, the only backend)
-#         SIMD=0|1 (default 1) and WERROR are honoured and forwarded.
+#         SIMD=0|1 (default 1) and WERROR are honoured and forwarded; AEC_NO_ARRAY=1 skips the array and 4ch rows.
 # Exit 0 if every audited object disassembles free of fma-class instructions, apart from the
 # functions named in EXEMPT_FNS.
 
@@ -51,6 +51,13 @@ ENTRIES='
 4ch:4ch_aec_bf_dfn_res:4ch_aec_bf_dfn_res_main.o:DFN hop glue (dfn_hop.h in the 4-channel example) -- boundary scaling by dfn2_stft_scale()/dfn2_stft_unscale(), spectrum conversion
 4ch:4ch_alignulcnet:ulcnet_model_io.o:Align-ULCNet model I/O (4-channel build) -- front-end features and the complex mask product
 '
+
+# AEC_NO_ARRAY=1 builds the single-channel lib/aec: no aec_array.o and no four-microphone program, so those rows have
+# nothing to audit.
+if [ "${AEC_NO_ARRAY:-0}" = 1 ]; then
+    ENTRIES=$(printf '%s\n' "$ENTRIES" | grep -v '^@AEC@:' | grep -v '^4ch:')
+    echo "test-fp-contract: array and 4ch rows SKIPPED -- AEC_NO_ARRAY=1"
+fi
 
 # An explicit fma() call is deterministic by definition, not a contraction of a*b+c, so a function
 # that rounds a value exactly on purpose is not audited for fma-class instructions: dfn2_norm_alpha
