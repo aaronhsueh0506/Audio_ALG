@@ -204,6 +204,22 @@ build_layer() { # name simd debug extra
   "$CXX" -o "$root/drv/pyc_drv_4ch_replay" "$root/drv/pyc_drv_4ch_replay.o" "$aect" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link 4ch replay ($name) failed"
   "$CXX" -o "$root/drv/pyc_drv_mono" "$root/drv/pyc_drv_mono.o" "$aec" "$nr" "$ac" -lm >> "$log" 2>&1 || die "link mono ($name) failed"
 
+  # A replay seam whose header is not self-consistent (a hop smaller than fft / 2, or more records than the file holds) is
+  # refused with exit 1; the replay drivers must not size a buffer from it.
+  local bad_seam drv_name
+  for bad_seam in "16000 256 129 4 2" "16000 256 129 128 2000000000"; do
+    "${PYRUN[@]}" -c 'import struct, sys
+sr, fft, nf, hop, nh = (int(x) for x in sys.argv[2:7])
+rec = 10 * nf + 2 * hop + 16   # floats per seam record; the file holds every record the header announces, up to 1 Mi floats
+open(sys.argv[1], "wb").write(struct.pack("<10i", 0x53435950, 1, 0, sr, fft, nf, hop, nh, 0, 0) + bytes(4 * min(rec * nh, 1 << 20)))' \
+      "$root/drv/bad.seam" $bad_seam
+    for drv_name in pyc_drv_mono pyc_drv_4ch_replay; do
+      rc=0
+      "$root/drv/$drv_name" replay seam="$root/drv/bad.seam" out="$root/drv/bad.out" >> "$log" 2>&1 || rc=$?
+      [ "$rc" = 1 ] || die "$drv_name ($name) did not refuse the inconsistent seam header '$bad_seam' (exit $rc)"
+    done
+  done
+
   # Build-flag assertion on the compile lines of this run's log (not possible on a reused tree).
   local nr_flags="USE_OPTIMIZED_E1"
   local verdict="not_asserted_reused_tree" d

@@ -154,6 +154,15 @@ static long file_len(FILE* f) {
 /* floats per seam record: E(2nf) Y(2nf) R2 CN Gres Gnr (4nf) far_hop out (2 hop) sc */
 static size_t seam_rec_floats(int nf, int hop) { return (size_t)(6 * nf + 4 * nf + 2 * hop + PYC_SC); }
 
+/* A replay seam header the drivers can trust: a power-of-two fft, nf = fft / 2 + 1, hop = fft / 2 (the chain's own synthesis
+ * hop, which the output buffer is sized for), a known kind and at least one hop. */
+static int seam_header_ok(const int32_t* h) __attribute__((unused));
+static int seam_header_ok(const int32_t* h) {
+    int kind = h[2], sr = h[3], fft = h[4], nf = h[5], hop = h[6], nh = h[7];
+    return (kind == 0 || kind == 1) && sr >= 8000 && sr <= 192000 && fft >= 64 && fft <= 8192 && (fft & (fft - 1)) == 0 &&
+           nf == fft / 2 + 1 && hop == fft / 2 && nh >= 1;
+}
+
 static void write_hdr(FILE* f, int kind, int sr, int fft, int nf, int hop, int nh, int fail_hop, int fail_rc) __attribute__((unused));
 static void write_hdr(FILE* f, int kind, int sr, int fft, int nf, int hop, int nh, int fail_hop, int fail_rc) {
     int32_t h[10];
@@ -513,10 +522,16 @@ static int run_replay(const Args* a) {
     WindowSrc ws;
 #endif
     if (!fs) { fprintf(stderr, "cannot open seam\n"); return 1; }
-    if (fread(h, 4, 10, fs) != 10 || h[0] != PYC_MAGIC) { fprintf(stderr, "bad seam header\n"); return 1; }
+    if (fread(h, 4, 10, fs) != 10 || h[0] != PYC_MAGIC || !seam_header_ok(h)) { fprintf(stderr, "bad seam header\n"); return 1; }
     kind = h[2]; sr = h[3]; fft = h[4]; nf = h[5]; hop = h[6]; nh = h[7];
     rec = seam_rec_floats(nf, hop);
+    {   /* the records the header announces must all be in the file before anything is allocated for them */
+        long here = ftell(fs), end;
+        if (fseek(fs, 0, SEEK_END) != 0 || (end = ftell(fs)) < here || fseek(fs, here, SEEK_SET) != 0 ||
+            (size_t)(end - here) / (sizeof(float) * rec) < (size_t)nh) { fprintf(stderr, "short seam\n"); return 1; }
+    }
     buf = (float*)malloc(rec * sizeof(float) * (size_t)nh);
+    if (!buf) { fprintf(stderr, "out of memory\n"); return 1; }
     if (fread(buf, sizeof(float) * rec, (size_t)nh, fs) != (size_t)nh) { fprintf(stderr, "short seam\n"); return 1; }
     fclose(fs);
     if (a->usable) {
