@@ -339,6 +339,7 @@ static int run_stream_guard(const char *label) {
         for (w = 0; w < 2; ++w) {   /* w = 0: gets the corrupt offers; w = 1: never does */
             DFN2HopIO io;
             int k, v;
+            memset(&io, 0, sizeof(io));
             for (k = 0; k < 4; ++k) gen_block(x[k], nb, blk, k);
             if (w == 0 && blk == BAD_BLOCK) {
                 float *y[4];
@@ -359,17 +360,17 @@ static int run_stream_guard(const char *label) {
                 fprintf(stderr, "%s: block %d preprocess failed (stream %d)\n", label, blk, w);
                 return 1;
             }
-            memcpy(tr[w] + tl[w], io.inputs.erb_window, io.inputs.erb_window_elements * sizeof(float));
-            tl[w] += io.inputs.erb_window_elements;
-            memcpy(tr[w] + tl[w], io.inputs.spec_window, io.inputs.spec_window_elements * sizeof(float));
-            tl[w] += io.inputs.spec_window_elements;
-            if (!all_finite(io.inputs.erb_window, io.inputs.erb_window_elements) ||
-                !all_finite(io.inputs.spec_window, io.inputs.spec_window_elements)) {
-                fprintf(stderr, "%s: block %d window not finite (stream %d)\n", label, blk, w);
-                bad = 1;
-            }
-            {
+            if (io.job_ready) {   /* the views of a hop without a job are not valid */
                 size_t i;
+                memcpy(tr[w] + tl[w], io.inputs.erb_window, io.inputs.erb_window_elements * sizeof(float));
+                tl[w] += io.inputs.erb_window_elements;
+                memcpy(tr[w] + tl[w], io.inputs.spec_window, io.inputs.spec_window_elements * sizeof(float));
+                tl[w] += io.inputs.spec_window_elements;
+                if (!all_finite(io.inputs.erb_window, io.inputs.erb_window_elements) ||
+                    !all_finite(io.inputs.spec_window, io.inputs.spec_window_elements)) {
+                    fprintf(stderr, "%s: block %d window not finite (stream %d)\n", label, blk, w);
+                    bad = 1;
+                }
                 for (i = 0; i < io.outputs.erb_mask_elements; ++i) io.outputs.erb_mask[i] = 0.5f;
 #ifndef DFN2_MASK_ONLY
                 for (i = 0; i < io.outputs.coefs_elements; ++i) io.outputs.coefs[i] = 0.01f;
@@ -392,6 +393,7 @@ static int run_stream_guard(const char *label) {
         DFN2Stream *f = dfn2_stream_init_from_erb_file(&scfg, erb, pool, (size_t)req.bytes);
         float lim = ldexpf(1.0f, 63), over = nextafterf(lim, INFINITY), *z = (float *)calloc(nb, sizeof(float));
         DFN2HopIO io;
+        memset(&io, 0, sizeof(io));
         z[2] = lim;
         if (!f) { fprintf(stderr, "%s: init fail\n", label); return 1; }
         z[3] = over;
