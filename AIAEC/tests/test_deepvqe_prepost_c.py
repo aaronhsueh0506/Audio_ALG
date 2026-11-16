@@ -951,8 +951,7 @@ static int case_reject(void) {
         CHECK(dvl_pre_process_freq(p, specs[0].mr, specs[0].mi,
                                                specs[0].fr, specs[0].fi) == 1);
         CHECK(dvl_frame_open(p, &inputs, &outputs) == 0);
-        /* A partial accelerator write is refused and moves nothing; the
-         * frame stays open so the caller can fail closed. */
+        /* A partial accelerator write is refused: the state restarts. */
         CHECK(fake_run(&inputs, &outputs) == 0);
         outputs.taps[outputs.taps_elements / 3] = NAN;
         /* Teeth: the state is non-zero going in, so "zero" below is the
@@ -1644,8 +1643,8 @@ static int case_whole(void) {
 /* ---- enhanced: a finite batch whose enhanced spectrum overflows ------- */
 
 /* A mic spectrum at the top of the float range and finite taps: every bin with a full set of taps overflows the
- * convolution. The commit is refused like a non-finite tap (generation +1, state zero, the batch stays open for the
- * bypass, which writes silence), and the next frame is a cold start. */
+ * convolution. post_frame returns -2 and the call is closed like a refused one (generation +1 once, state zero, silent
+ * frames), and the next frame is a cold start. */
 static int case_enhanced(void) {
     Inst inst, fresh;
     DeepVqePrepostInputs inputs;
@@ -1667,7 +1666,6 @@ static int case_enhanced(void) {
     CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == before + 1u);
     CHECK(inst_state_zero(&inst));
-    CHECK(dvl_post_process_freq(inst.p, a_re, a_im) == -1);   /* the batch is still open */
     CHECK(dvl_frame_bypass(inst.p) == 0);
     CHECK(dvl_post_process_freq(inst.p, a_re, a_im) == 0);
     CHECK(all_zero(a_re, BINS) && all_zero(a_im, BINS));
@@ -1713,11 +1711,9 @@ static int case_generation(void) {
     dvl_reset(inst.p);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 2u);
 
-    /* A refused commit advances it once; the refused retry does not. */
+    /* A refused commit advances it once. */
     CHECK(open_and_run(inst.p, &inputs, &outputs, 0.25f) == 0);
     outputs.taps[outputs.taps_elements / 2] = NAN;
-    CHECK(dvl_frame_finish(inst.p) == -1);
-    CHECK(deepvqe_prepost_state_generation(inst.p) == 3u);
     CHECK(dvl_frame_finish(inst.p) == -1);
     CHECK(deepvqe_prepost_state_generation(inst.p) == 3u);
     CHECK(dvl_frame_bypass(inst.p) == 0);
@@ -2023,14 +2019,10 @@ static int case_board(void) {
     CHECK(!identical(got[0].re, got[1].re, BINS));
     CHECK(deepvqe_prepost_state_generation(board) == 0u && fences_intact(raw, bytes));
 
-    /* A non-finite tap: refused, the generation moves by exactly one (nothing registered
-     * included), a retry is refused without moving it again, the frame stays open for bypass. */
+    /* A non-finite tap: refused, the generation moves by exactly one (nothing registered included). */
     CHECK(head_hop(board, 2, 1, 1) == -1 && head_hop(twin.p, 2, 0, 1) == -1);
     CHECK(deepvqe_prepost_state_generation(board) == 1u);
     CHECK(deepvqe_prepost_state_generation(twin.p) == 1u);
-    CHECK(dvl_frame_finish(board) == -1);
-    CHECK(deepvqe_prepost_state_generation(board) == 1u);
-    CHECK(dvl_post_process_freq(board, got[2].re, got[2].im) == -1);
     CHECK(dvl_frame_bypass(board) == 0 && dvl_frame_bypass(twin.p) == 0);
     CHECK(dvl_post_process_freq(board, got[2].re, got[2].im) == 0);
     CHECK(all_zero(got[2].re, BINS) && all_zero(got[2].im, BINS));   /* fail closed: silence */
@@ -2442,17 +2434,17 @@ def test_create_destroy_roundtrip_and_pool_init_agree(driver):
 def test_reject_first_validation(driver):
     """_get_mem_size / _init refuse NULLs, an inconsistent grid, a D outside
     [MIN_D, MAX_D], and an undersized or misaligned pool -- leaving *req
-    untouched. The stage calls refuse being run out of order, and a partial
-    accelerator write is refused whether the hole is in the taps or in one
-    state tensor."""
+    untouched. The per-frame calls refuse NULL and a slot outside [0, N) and
+    change nothing, and a partial accelerator write is refused whether the
+    hole is in the taps or in one state tensor."""
     _run(driver, 'reject')
 
 
 def test_reset_clears_state(driver):
     """N hops, reset, the same N hops again -> byte-identical. Asserted
     against a NO-reset second run first, so the test cannot pass by the
-    output being state-independent. A reset mid-frame drops the open frame
-    rather than stranding it."""
+    output being state-independent. A reset mid-call clears state and windows
+    and the next run reproduces the first."""
     _run(driver, 'reset')
 
 
@@ -2489,16 +2481,16 @@ def test_commit_reads_the_whole_of_every_registered_buffer(driver):
 
 
 def test_a_finite_batch_with_an_overflowing_enhanced_spectrum_is_refused(driver):
-    """Finite taps on a mic spectrum near FLT_MAX overflow the CCM sum: frame_finish
-    refuses the batch like a non-finite tap (-1, generation +1, state zero, the batch
-    stays open for frame_bypass, which writes silence) and the next frame is a cold start."""
+    """Finite taps on a mic spectrum near FLT_MAX overflow the CCM sum: post_frame
+    returns -2, the call is refused like a non-finite tap (state zero, generation +1
+    once, N silent frames) and the next frame is a cold start."""
     _run(driver, 'enhanced')
 
 
 def test_state_generation_counts_restarts(driver):
     """0 at init; reset, a refused commit and frame_fail with a started run
     advance it, once each; healthy commits, skips, a frame_fail whose run never
-    started and a refused retry do not. NULL reads 0. A board with a
+    started do not. NULL reads 0. A board with a
     fixed-point accelerator state refills it with quantized zeros when the
     value changes."""
     _run(driver, 'generation')
@@ -2508,8 +2500,8 @@ def test_frame_fail_closes_the_batch_and_restarts_only_a_started_run(driver):
     """frame_fail(p, 0) IS frame_bypass: silence, the state as the accelerator
     left it, the generation unchanged, and the next frame equal to an
     instance that bypassed. frame_fail(p, 1) is the same silence plus a cold
-    state: all sixteen registered buffers zero, the generation advanced once.
-    With no batch open (or NULL) it is refused and moves nothing."""
+    state (zero_state): all sixteen registered buffers zero, the generation
+    advanced once."""
     _run(driver, 'fail')
 
 
@@ -2557,7 +2549,7 @@ def test_board_form_nothing_registered_runs_and_counts_restarts(
         request, build, grid):
     """The board configuration: no state registered, the accelerator owns it.
     All sixteen state views are empty, the generation starts at 0, a commit
-    refused on a non-finite tap moves it by exactly one (a retry does not),
+    refused on a non-finite tap moves it by exactly one,
     bypass emits silence, the next hop commits again and equals a float host's
     output, and the bytes around the pool are never written. Run on the NEON
     and the scalar build, on both grids."""
