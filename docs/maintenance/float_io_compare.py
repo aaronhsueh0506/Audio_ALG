@@ -8,7 +8,8 @@ Inputs are whatever the run left behind; every part is optional and the report o
   --log-a/--log-b       the sample's stdout; numeric "name: value" / "name=value" pairs, the timing buckets
                         (names ending in us/ms or starting with io_, ai3_, conv, wall) and the lines that print
                         scale_ratio / zero_point of the ports are compared
-No tolerance is built in: derive it from the first measurement. --fail-max-abs / --fail-audio-lsb turn the
+A non-finite value must be the same on both sides at the same position (NaN against NaN, +Inf against +Inf); one
+that is finite on only one side, or of another kind, fails a --fail-max-abs limit. No tolerance is built in: derive it from the first measurement. --fail-max-abs / --fail-audio-lsb turn the
 corresponding number into an exit status when a limit has been chosen. Runs that cannot be compared (a different
 length or channel count, an empty WAV, a head dump shorter than one hop) fail such a limit; without a limit they
 are reported only.
@@ -105,7 +106,7 @@ def head_report(pa, pb, elems):
     worst = 0.0
     for name, off, e in ranges:
         mx = se = sa = 0.0
-        bad_a = bad_b = cnt = 0
+        bad_a = bad_b = cnt = moved = 0
         for h in range(max(hops, 1)):
             base = h * per_hop + off
             for i in range(base, min(base + e, n)):
@@ -113,6 +114,8 @@ def head_report(pa, pb, elems):
                 fx, fy = math.isfinite(x), math.isfinite(y)
                 bad_a += not fx
                 bad_b += not fy
+                if fx != fy or (not fx and (math.isnan(x) != math.isnan(y) or (not math.isnan(x) and x != y))):
+                    moved += 1   # finite on one side only, or NaN / +Inf / -Inf of a different kind
                 if fx and fy:
                     d = x - y
                     mx = max(mx, abs(d))
@@ -120,8 +123,9 @@ def head_report(pa, pb, elems):
                     sa += x * x
                     cnt += 1
         rel = math.sqrt(se / sa) if sa > 0 else (0.0 if se == 0 else float("inf"))
-        print("  %-22s hops %d  max|A-B| %.6g  rel RMS %.6g  non-finite A %d B %d" % (name, hops, mx, rel, bad_a, bad_b))
-        worst = max(worst, mx, float("inf") if bad_b > bad_a else 0.0)   # a new non-finite value is never within a limit
+        print("  %-22s hops %d  max|A-B| %.6g  rel RMS %.6g  non-finite A %d B %d  non-finite mismatches %d"
+              % (name, hops, mx, rel, bad_a, bad_b, moved))
+        worst = max(worst, mx, float("inf") if moved else 0.0)   # a non-finite value that is not the same on both sides is never within a limit
     return float("inf") if incomparable else worst
 
 

@@ -58,3 +58,19 @@ def test_heads_identical_passes(tmp_path):
     a = _f32(tmp_path / 'a.f32', [1.0] * 8)
     b = _f32(tmp_path / 'b.f32', [1.0] * 8)
     assert _run('--heads-a', a, '--heads-b', b, '--head-elems', '4', '--fail-max-abs', '0').returncode == 0
+
+
+@pytest.mark.parametrize('a_values, b_values, rc', [
+    ([float('nan'), 1.0], [1.0, float('nan')], 1),            # the NaN moved to another element
+    ([float('nan'), 1.0], [1.0, 1.0], 1),                      # present on one side only
+    ([1.0, 1.0], [float('nan'), 1.0], 1),
+    ([float('nan'), 1.0], [float('inf'), 1.0], 1),             # another kind at the same position
+    ([float('inf'), 1.0], [float('-inf'), 1.0], 1),
+    ([float('nan'), 1.0], [float('nan'), 1.0], 0),             # the same non-finite value in the same place
+    ([float('inf'), -1.0], [float('inf'), -1.0], 0),
+])
+def test_heads_nonfinite_values_must_agree_in_kind_and_position(tmp_path, a_values, b_values, rc):
+    a = _f32(tmp_path / 'a.f32', a_values)
+    b = _f32(tmp_path / 'b.f32', b_values)
+    r = _run('--heads-a', a, '--heads-b', b, '--head-elems', '2', '--fail-max-abs', '0')
+    assert r.returncode == rc, r.stdout
