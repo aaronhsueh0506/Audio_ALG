@@ -21,8 +21,7 @@
 
 - A call is the newest N + 2 input frames and its heads are the frames T - N + 1 - M .. T - M (latency M + D as at N = 1). Every block is a job; the first block's first M heads
   are before the stream start, `post_frame` discards them while the clock is below M, and they come out as silence (only the accelerator's recurrent state has seen M more
-  frames than at N = 1). `dfn2_model_io_ready_frames()` is N for N > 1 and M + 1 for N = 1; `dfn2_prepost_get_mem_size` and `ainr` no longer refuse the combination
-  (`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED` stays in the enum, never returned).
+  frames than at N = 1). `dfn2_model_io_ready_frames()` is N for N > 1 and M + 1 for N = 1; `dfn2_prepost_get_mem_size` and `ainr` no longer refuse the combination.
 - The catalog gives `AINR_MODEL_ID_DFN2_FULL` and `_ALT2` a 48 kHz / 1024 N = 2 graph (`.../dfn2/nvt_model_48k_n2.bin`); `AINR_MODEL_ID_DFN2_FULL_L0` keeps NULL paths and its own file.
 - `stream/ainr/dfn2/tests/lookahead_blocks.c` compares the N > 1 stream with a one-frame reference of the same stateful stand-in, for M = 1, 2, D = 0, 1, N = 2, 3, 8, PCM and spectrum.
 

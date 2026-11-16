@@ -57,7 +57,6 @@ enum {
     AINR_ERR_MODEL_ID = -2,                     /* the bound model is not of this archive variant */
     AINR_ERR_GRID = -3,                         /* no catalog entry for (sr, fft) */
     AINR_ERR_IN_HOP = -4,                       /* hop_in is not a positive multiple of model_hop */
-    AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED = -5,  /* not returned: a lookahead grid runs N > 1 like any other */
     AINR_ERR_FRAMES_PER_CALL = -6,              /* N has no delivered graph */
     AINR_ERR_POOL = -7,                         /* pool too small or misaligned */
     AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short or longer, of another size, a non-finite forward value, or an inverse that is not a partition of unity */

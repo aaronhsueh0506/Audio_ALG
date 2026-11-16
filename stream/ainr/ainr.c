@@ -671,8 +671,6 @@ const char *ainr_status_text(int code)
     case AINR_ERR_MODEL_ID: return "the product's bound model does not belong to this archive variant";
     case AINR_ERR_GRID: return "no catalog entry for (sr, fft)";
     case AINR_ERR_IN_HOP: return "hop_in is not a positive multiple of model_hop";
-    case AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED:
-        return "not returned: frames_per_call > 1 runs at every mask_lookahead";
     case AINR_ERR_FRAMES_PER_CALL: return "no shipped graph for the resolved frames_per_call";
     case AINR_ERR_POOL: return "pool too small or misaligned";
     case AINR_ERR_ERB_FILE: return "ERB file open/header/short-read/dimension mismatch, bytes after the tables, a non-finite forward value, or the inverse is not a partition of unity";
