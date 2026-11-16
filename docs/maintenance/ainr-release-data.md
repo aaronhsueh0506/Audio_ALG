@@ -77,8 +77,8 @@ static const AinrDfn2FramesVariant AINR_DFN2_LITE_48K_1024_N_8X8[] = {
 ## 驗收入口
 
 ```sh
-make -C stream/ainr test                 # full：dfn2、spec-freq、tail、freq-nonfinite、state-generation、pool-gates、atten-lim、product、graph-io、link-only
-make -C stream/ainr MASK_ONLY=1 test     # lite：同上，去掉 dfn2 與 spec-freq
+make -C stream/ainr test                 # full：dfn2、freq、latency、freq-nonfinite、state-generation、pool-gates、atten-lim、product、graph-io、link-only
+make -C stream/ainr MASK_ONLY=1 test     # lite：同上，去掉 dfn2 與 freq
 ```
 
 這些測項以主機與替身加速器執行，不涉及正式 graph、SDK 或目標板。

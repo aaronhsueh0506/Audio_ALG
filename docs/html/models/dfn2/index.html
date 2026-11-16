@@ -133,7 +133,7 @@ while (read_block(pcm_in, hop_in)) {
 <h3><code>_freq</code> 家族的延遲</h3>
 <p>DFN2 以 <code>AC_OLA_ACCUMULATE</code> 合成：一個 hop 的輸出是這個 frame 合成的前半加上前一個 frame 的後半。stream 這邊的佇列（<code>queue_frames</code>）比 PCM 家族的總延遲少一個 hop，外部合成器的 OLA 再多一個 hop，所以 <code>_freq</code> 在呼叫端 ISTFT 之後的延遲與 PCM 家族相同：<code>(queue_frames + 1) × 模型 hop</code>。</p>
 <ul>
-<li>在 <code>stream/ainr/tests/test_ainr_tail.c</code> 的 bypass 測項中，輸入第 1030 個樣本設為 16000，PCM、<code>_freq</code> 兩個家族都在輸入位置加上上表延遲處取回 16000（±3），且那個樣本是整段輸出最大的一個。</li>
+<li>在 <code>stream/ainr/tests/test_ainr_latency.c</code> 的 bypass 測項中，輸入第 1030 個樣本設為 16000，PCM、<code>_freq</code> 兩個家族都在輸入位置加上上表延遲處取回 16000（±3），且那個樣本是整段輸出最大的一個。</li>
 <li><code>_freq</code>：上游分析器與外部 ISTFT 都由呼叫端每 hop 推一次；N 個 frame 的包推 N 次。</li>
 </ul>
 

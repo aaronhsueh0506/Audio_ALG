@@ -2,8 +2,7 @@
  * spectrum out) against the PCM family, with a stand-in accelerator (no NPU) -- same convention as
  * tests/test_ainr_dfn2.c. The analysis and synthesis are the caller's: an audiolib AcStft (default config,
  * scale 1.0, PCM as int16 / 32768) feeds E == P, and an AcIstft (the same config, AC_OLA_ACCUMULATE) turns the
- * enhanced spectra back into PCM. (The file and its make target keep the name of the retired "_spec" family,
- * which did the analysis inside the library; its checks are these, on the AcStft path.) Covers:
+ * enhanced spectra back into PCM. Covers:
  *
  *   1. N=1, both shipped catalog grids (16kHz/256, 48kHz/1024): ainr_preprocess()/ainr_postprocess() (PCM
  *      family) vs ainr_preprocess_freq()/ainr_postprocess_freq() through the test's own AcStft and AcIstft on
@@ -121,7 +120,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
     if (ainr_get_mem_size_freq(&cfg, &req_freq) != AINR_OK) { fprintf(stderr, "%s: get_mem_size_freq fail\n", label); return 1; }
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_erb");
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_erb");
     write_synthetic_erb(erb_path, n_bins, n_erb);
 
     pool_pcm = alloc_aligned((size_t)req_pcm.bytes, req_pcm.alignment);
@@ -220,7 +219,7 @@ static int test_core_ordering_and_bypass(void) {
     float *im2 = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int rc, k, f, same;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_n8_erb");
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_n8_erb");
     write_synthetic_erb(erb_path, n_bins, T2_ERB);
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "test_core_ordering: get_mem_size fail\n"); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
@@ -293,7 +292,7 @@ static int test_freq_core_matches_pcm_core(void) {
     float *out_im_freq = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int block, rc;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_n8f_erb");
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_n8f_erb");
     write_synthetic_erb(erb_path, n_bins, T2_ERB);
     if (ainr_get_mem_size(&cfg, &req_p) != AINR_OK || ainr_get_mem_size_freq(&cfg, &req_f) != AINR_OK) {
         fprintf(stderr, "test_freq_core_matches_pcm_core: get_mem_size fail\n"); return 1;
@@ -361,7 +360,7 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
     cfg.fft = fft;
     cfg.hop_in = n * hop;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_delay_erb");
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_delay_erb");
     write_synthetic_erb(erb_path, n_bins, n_erb);
 
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
@@ -412,6 +411,6 @@ int main(void) {
     rc |= test_delay_labeling();
 
     if (rc) return 1;
-    printf("test_ainr_spec_freq: ALL PASS\n");
+    printf("test_ainr_freq: ALL PASS\n");
     return 0;
 }

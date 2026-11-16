@@ -74,7 +74,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     double v;
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = hop_in;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_tail_erb");
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_latency_erb");
     write_identity_erb(erb, n_bins, n_erb);
 
     /* PCM family: init reports the queue; the internal ISTFT synthesises. */
@@ -176,7 +176,7 @@ int main(void) {
     rc |= run_case(16000, 256, 24, 8, 7, 1024, "latency[full 16k/256 N=8]");
     rc |= run_case(48000, 1024, 32, 1, 2, 1536, "latency[full 48k/1024 N=1]");
 #endif
-    if (rc) { printf("test_ainr_tail: FAIL\n"); return 1; }
-    printf("test_ainr_tail: PASS\n");
+    if (rc) { printf("test_ainr_latency: FAIL\n"); return 1; }
+    printf("test_ainr_latency: PASS\n");
     return 0;
 }

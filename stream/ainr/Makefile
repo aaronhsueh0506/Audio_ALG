@@ -72,7 +72,7 @@ endif
 VPATH := . ../common
 
 .PHONY: all lib print-lib-path print-cflags print-sources test dfn2-lib \
-	test-ainr-dfn2 test-ainr-spec-freq test-ainr-tail test-ainr-freq-nonfinite \
+	test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-freq-nonfinite \
 	test-ainr-state-generation test-ainr-pool-gates test-ainr-product test-ainr-graph-io \
 	test-link-only-ainr work-dumper graph-io-dumper audit-no-stdio clean _cfg_guard
 
@@ -152,29 +152,29 @@ endif
 test-ainr-dfn2: $(AINR_TEST_BIN)
 	"$(AINR_TEST_BIN)"
 
-# Host-only regression suite for the "_freq" family against the PCM family (tests/test_ainr_spec_freq.c's own
-# top comment; the file and target keep their names from the retired "_spec" family) -- same build shape as
-# test-ainr-dfn2 above (full-variant only, same reason: needs real catalog grids to cross-check against). AINR_ERB_MATRIX_DIR is unused by this suite (every init goes through
-# the explicit-path *_from_erb_file entry points) but passed anyway for build-command symmetry.
-AINR_SPEC_FREQ_TEST_BIN := $(OBJ_DIR)/test_ainr_spec_freq
-AINR_SPEC_FREQ_TEST_SOURCES := tests/test_ainr_spec_freq.c $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
+# Host-only regression suite for the "_freq" family against the PCM family (tests/test_ainr_freq.c's own
+# top comment) -- same build shape as test-ainr-dfn2 above (full-variant only, same reason: needs real
+# catalog grids to cross-check against). AINR_ERB_MATRIX_DIR is unused by this suite (every init goes
+# through the explicit-path *_from_erb_file entry points) but passed anyway for build-command symmetry.
+AINR_FREQ_TEST_BIN := $(OBJ_DIR)/test_ainr_freq
+AINR_FREQ_TEST_SOURCES := tests/test_ainr_freq.c $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
 
-$(AINR_SPEC_FREQ_TEST_BIN): $(AINR_SPEC_FREQ_TEST_SOURCES) $(TEST_FIXTURE) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+$(AINR_FREQ_TEST_BIN): $(AINR_FREQ_TEST_SOURCES) $(TEST_FIXTURE) $(CORE_HEADERS) $(STREAM_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 ifeq ($(NO_STDIO),1)
-	$(error test-ainr-spec-freq needs the file-loader entry points; run with NO_STDIO=0)
+	$(error test-ainr-freq needs the file-loader entry points; run with NO_STDIO=0)
 endif
 ifeq ($(MASK_ONLY),1)
-	$(error test-ainr-spec-freq is full-variant only (needs real catalog grids to cross-check \
+	$(error test-ainr-freq is full-variant only (needs real catalog grids to cross-check \
 against) -- run with MASK_ONLY=0)
 endif
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) \
-		$(AINR_SPEC_FREQ_TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
+		$(AINR_FREQ_TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$@"
 
-test-ainr-spec-freq: $(AINR_SPEC_FREQ_TEST_BIN)
-	"$(AINR_SPEC_FREQ_TEST_BIN)"
+test-ainr-freq: $(AINR_FREQ_TEST_BIN)
+	"$(AINR_FREQ_TEST_BIN)"
 
 # Variant-agnostic host suites (they pick the full or the lite catalog rows by DFN2_MASK_ONLY): the
-# stream latency through both families (test_ainr_tail.c) and the other single-purpose suites below.
+# stream latency through both families (test_ainr_latency.c) and the other single-purpose suites below.
 # Never built under NO_STDIO.
 GENERIC_TEST_SOURCES := $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c
 
@@ -186,14 +186,14 @@ endif
 	$$(CC) $$(CFLAGS) $$(SIMD_CPPFLAGS) $$(MASK_CPPFLAGS) tests/$(1).c $$(GENERIC_TEST_SOURCES) \
 		"$$(COMMON_LIB)" $$(LDFLAGS) -lm -o "$$@"
 endef
-$(eval $(call GENERIC_TEST_RULE,test_ainr_tail))
+$(eval $(call GENERIC_TEST_RULE,test_ainr_latency))
 $(eval $(call GENERIC_TEST_RULE,test_ainr_freq_nonfinite))
 $(eval $(call GENERIC_TEST_RULE,test_ainr_state_generation))
 $(eval $(call GENERIC_TEST_RULE,test_ainr_pool_gates))
 $(eval $(call GENERIC_TEST_RULE,test_ainr_atten_lim))
 
-test-ainr-tail: $(OBJ_DIR)/test_ainr_tail
-	"$(OBJ_DIR)/test_ainr_tail"
+test-ainr-latency: $(OBJ_DIR)/test_ainr_latency
+	"$(OBJ_DIR)/test_ainr_latency"
 
 test-ainr-freq-nonfinite: $(OBJ_DIR)/test_ainr_freq_nonfinite
 	"$(OBJ_DIR)/test_ainr_freq_nonfinite"
@@ -309,10 +309,10 @@ endif
 # aborting the whole composite target (test-link-only-ainr always builds/exercises both variants
 # internally regardless of this directory's own MASK_ONLY).
 ifeq ($(MASK_ONLY),1)
-test: test-ainr-tail test-ainr-freq-nonfinite test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim \
+test: test-ainr-latency test-ainr-freq-nonfinite test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim \
 	test-ainr-product test-ainr-graph-io test-link-only-ainr
 else
-test: test-ainr-dfn2 test-ainr-spec-freq test-ainr-tail test-ainr-freq-nonfinite \
+test: test-ainr-dfn2 test-ainr-freq test-ainr-latency test-ainr-freq-nonfinite \
 	test-ainr-state-generation test-ainr-pool-gates test-ainr-atten-lim test-ainr-product test-ainr-graph-io test-link-only-ainr
 endif
 
