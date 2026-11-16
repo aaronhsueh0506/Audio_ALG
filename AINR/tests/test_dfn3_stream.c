@@ -705,6 +705,47 @@ static int board_form_follows_the_documented_generation(void) {
     return 0;
 }
 
+/* A finite head far beyond DFN3_PREPOST_HEAD_LIMIT (an erb_mask or a coefs element) is refused like a NaN: the
+ * registered state is zeroed, the generation moves by one, the frame stays open for the bypass, and a head exactly at
+ * the limit commits. */
+static int huge_head_is_refused(void) {
+    DFN3PrepostConfig cfg;
+    DFN3PrepostMemReq req;
+    DFN3PrepostInputs in;
+    DFN3PrepostOutputs out;
+    DFN3Prepost *p;
+    void *pool;
+    int hop = DELAY;
+    CHECK(config(&cfg, 1) == 0);
+    CHECK(dfn3_prepost_get_mem_size(&cfg, &req) == 0);
+    pool = aligned_alloc(req.alignment, (size_t)req.bytes);
+    CHECK(pool != NULL);
+    p = dfn3_prepost_init(pool, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL && warm_up(p) == 0);
+    for (int which = 0; which < 4; ++which) {
+        const unsigned int gen = dfn3_prepost_state_generation(p);
+        float *head;
+        CHECK(hop_ready(p, hop++) == 0);
+        CHECK(dfn3_prepost_frame_open(p, &in, &out) == 0);
+        identity_heads(&out);
+        head = which & 1 ? out.coefs : out.erb_mask;
+        head[1] = which < 2 ? 3e30f : DFN3_PREPOST_HEAD_LIMIT;
+        fill_state(7.0f);
+        if (which < 2) {
+            CHECK(dfn3_prepost_frame_finish(p) == -1);
+            CHECK(dfn3_prepost_state_generation(p) == gen + 1u && state_is(0.0f));
+            CHECK(dfn3_prepost_frame_finish(p) == -1 && dfn3_prepost_state_generation(p) == gen + 1u);
+            CHECK(dfn3_prepost_frame_bypass(p) == 0);
+        } else {
+            CHECK(dfn3_prepost_frame_finish(p) == 0);
+            CHECK(dfn3_prepost_state_generation(p) == gen && state_is(7.0f));
+        }
+        CHECK(hop_emit(p) == 0);
+    }
+    free(pool);
+    return 0;
+}
+
 static int variant_grid(DFN3Grid *grid, int which) {
     DFN3GridSpec spec = test_spec();
     switch (which) {
@@ -1261,6 +1302,7 @@ int main(int argc, char **argv) {
     CHECK(lifecycle_and_transactions(0) == 0);
     CHECK(registration_is_all_or_none() == 0);
     CHECK(board_form_follows_the_documented_generation() == 0);
+    CHECK(huge_head_is_refused() == 0);
     CHECK(stale_pool_is_refused_untouched() == 0);
     CHECK(registered_state_is_zeroed_and_scanned_whole() == 0);
     CHECK(registered_scan_stops_at_the_registered_count() == 0);

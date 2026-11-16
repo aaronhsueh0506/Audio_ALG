@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### `dfn3_prepost_frame_finish` refuses a head beyond `DFN3_PREPOST_HEAD_LIMIT`
+
+- `frame_finish()` refuses an `erb_mask` or `coefs` element with `|x| > DFN3_PREPOST_HEAD_LIMIT` (1.0e6, the same value and rule as `DFN2_PREPOST_HEAD_LIMIT`), like a non-finite one: the registered state is zeroed, the generation advances and the frame stays open for `frame_bypass()`. A finite head that large no longer reaches the enhanced spectrum. Heads within the limit are unaffected. `test_dfn3_stream` has a case (an `erb_mask` and a `coefs` element at 3e30 refused, one exactly at the limit accepted).
+
 ### The first `mask_lookahead` hops run no accelerator job; the stream has no tail and no trim
 
 - `dfn2_prepost_pre_process_freq{,_dual}` and `dfn3_prepost_pre_process_freq` return 0 for the first `mask_lookahead` hops after init or

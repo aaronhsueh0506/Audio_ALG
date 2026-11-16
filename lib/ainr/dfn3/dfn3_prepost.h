@@ -148,9 +148,12 @@ int dfn3_prepost_pre_process_freq_dual(DFN3Prepost *p, const float *est_re, cons
 int dfn3_prepost_frame_open(DFN3Prepost *p, DFN3PrepostInputs *inputs,
                             DFN3PrepostOutputs *outputs);
 
-/* Check heads and registered state for finiteness, then build the enhanced spectrum; after frame_open(). A non-finite
- * value zeroes the registered state, advances the generation and returns -1, frame left open: frame_bypass() or
- * frame_open() again. */
+/* Largest |value| of an erb_mask or coefs element that frame_finish() accepts (a sigmoid mask is at most 1). */
+#define DFN3_PREPOST_HEAD_LIMIT 1.0e6f
+
+/* Check heads and registered state, then build the enhanced spectrum; after frame_open(). A non-finite value, or an
+ * erb_mask / coefs element beyond DFN3_PREPOST_HEAD_LIMIT, zeroes the registered state, advances the generation and
+ * returns -1, frame left open: frame_bypass() or frame_open() again. */
 int dfn3_prepost_frame_finish(DFN3Prepost *p);
 
 /* Give up on the open frame and pass the noisy spectrum through (unit ERB gains, a unit tap on the raw low bins).
