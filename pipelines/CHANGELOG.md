@@ -3,6 +3,11 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — `stream_saturate_s16()` rounds half away from zero exactly
+
+- **Behaviour change** `stream/common/stream_mem.h` `stream_saturate_s16()` truncates the clipped `v * 32768` into an `int32_t` and compares the exact remainder with 0.5, as audiolib `wav_io.h`'s writer does. Before, it added `+-0.5f` in float, so the input just below 0.5 LSB (`nextafterf(0.5f / 32768.0f, 0)`, bit pattern 0x377fffff) and its negative came out as +-1. Over all 2^32 float bit patterns exactly those two inputs change (by 1 LSB); ties, the int16 limits, the clip, NaN (0) and +-Inf (clip) are unchanged.
+- `stream/common/tests/test_stream_mem.c` checks every tie k +- 0.5 LSB and one float step either side against a double reference. No PCM output pin of `stream/*`, `pipelines` or the AINR / AIAEC C tests moves: 0 differing samples.
+
 ## [Unreleased] — 2026-11-16 — DFN2: the pre/post class stages the application spectrum once; `DFN2HopIO` carries a `StreamWorkAction`
 
 Output (PCM, spectra, every golden hash) is bit-identical; the pool shrinks and one field of `DFN2HopIO` changes name and type.

@@ -47,6 +47,28 @@ int main(void) {
                    stream_saturate_s16(nextafterf(f, x < 0 ? -1.0f : 1.0f)) != x;
         }
         CHECK(bad == 0, "int16 round trip: %d of 65536 values not restored", bad);
+        /* every tie k +- 0.5 LSB and one float step either side, against an exact double reference; the float just below
+         * 0.5 LSB is 0, not 1 */
+        bad = 0;
+        for (x = -32768; x <= 32767; ++x) {
+            int side;
+            for (side = -1; side <= 1; side += 2) {
+                const float f = ((float)x + 0.5f * (float)side) / 32768.0f;
+                const float c[3] = { f, nextafterf(f, -INFINITY), nextafterf(f, INFINITY) };
+                int j;
+                for (j = 0; j < 3; ++j) {
+                    double s = (double)c[j] * 32768.0, r;
+                    if (s > 32767.0) s = 32767.0;
+                    if (s < -32768.0) s = -32768.0;
+                    r = floor(fabs(s) + 0.5);
+                    bad += stream_saturate_s16(c[j]) != (int)(s < 0.0 ? -r : r);
+                }
+            }
+        }
+        CHECK(bad == 0, "round half away from zero: %d tie rows differ from the exact result", bad);
+        CHECK(stream_saturate_s16(nextafterf(0.5f / 32768.0f, 0.0f)) == 0 && stream_saturate_s16(0.5f / 32768.0f) == 1 &&
+              stream_saturate_s16(nextafterf(-0.5f / 32768.0f, 0.0f)) == 0 && stream_saturate_s16(-0.5f / 32768.0f) == -1,
+              "the float just below 0.5 LSB is 0, the tie is +-1");
     }
 
     if (g_fail) { printf("test_stream_mem: %d of %d check(s) FAILED\n", g_fail, g_checks); return 1; }

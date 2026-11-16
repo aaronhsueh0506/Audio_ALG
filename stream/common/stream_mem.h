@@ -34,15 +34,19 @@ static inline uint32_t stream_fnv1a_u32(uint32_t h, uint32_t v) {
     return ac_fnv1a_u32(h, v);
 }
 
-/* float PCM (full scale 1.0f) -> int16: scale by 32768, clip to the asymmetric int16 range, add +-0.5f and truncate (audiolib
- * wav_io.h's writer; the float just below 0.5 LSB rounds to 1, not 0). NaN (an extreme accelerator output) is 0, since the
- * cast would be undefined; +-Inf clip. */
+/* float PCM (full scale 1.0f) -> int16: scale by 32768, clip to the asymmetric int16 range, round half away from zero
+ * exactly (truncate, then compare the exact remainder with 0.5; no float add of 0.5, which would carry the float just
+ * below 0.5 LSB up to 1). Same rule as audiolib wav_io.h's writer. NaN is 0, since the cast would be undefined; +-Inf clip. */
 static inline int16_t stream_saturate_s16(float v) {
+    int32_t t;
+    float d;
     v *= 32768.0f;
     if (isnan(v)) return 0;   /* only NaN is UB here; +-Inf clip below */
     if (v > 32767.0f) v = 32767.0f;
     if (v < -32768.0f) v = -32768.0f;
-    return (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+    t = (int32_t)v;           /* toward zero; v - t is exact for |v| < 2^23 */
+    d = v - (float)t;
+    return (int16_t)(t + (d >= 0.5f) - (d <= -0.5f));
 }
 
 #ifdef __cplusplus
