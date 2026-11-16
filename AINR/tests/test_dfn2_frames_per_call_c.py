@@ -13,9 +13,8 @@ arithmetic and must agree BYTE FOR BYTE. One driver binary takes N as an argumen
   reset        a reset in the middle of a call; both segments agree
   refuse       a call whose head or state comes back non-finite is refused, the state is
                zeroed and the N frames pass as the identity, the same as N one-frame refusals
-  contract     readiness (N == 1: every hop, the first L being warm-up frames whose heads stay
-               NaN and whose state the stand-in scribbles on; N > 1: L + N, then every N;
-               unchanged), the window rows at the grid's stride, the
+  contract     readiness (L + N hops, then every N; N == 1: every hop from hop L, the first L
+               hops open no frame), the window rows at the grid's stride, the
                descriptor's input_frames (N + 2), the latency accessor, element counts, a
                descriptor made for another grid refused before infer() runs, and a pool of the
                one-frame grid or of another grid refused
@@ -24,10 +23,9 @@ arithmetic and must agree BYTE FOR BYTE. One driver binary takes N as an argumen
 
 A stand-in reading the wrong window slice fails the comparison, so it is not vacuous.
 
-The one-frame host (N == 1) runs the warm-up frames of its stream start through the accelerator and
-discards them (the stand-in leaves their heads NaN and overwrites the state: finish must neither
-read the heads nor keep the state), so its output still equals the N-frame host's; N > 1 is
-unchanged and is the regression gate for the older flow (no warm-up frame, no generation step).
+The one-frame host (N == 1) opens no frame for the first L hops of its stream start and the stand-in
+is not called for them, so its output equals the N-frame host's, which is the regression gate
+for the per-hop flow (no generation step before the first call).
 
 The recurrent state is the host's: the driver registers the two buffers. The driver runs the
 grid of ``dfn2_test_grid.h`` (the shipped 48 kHz grid unless ``-DDFN2_GRID_KHZ`` says otherwise)
@@ -188,7 +186,6 @@ typedef struct {
     int poison_kind;              /* 1: a NaN head, 2: a NaN state element */
     int calls;
     int bad_views;
-    int warm_left;                /* warm-up frames of a one-frame grid still to come */
 } Stub;
 
 static int stub_infer(void *user, const DFN2PrepostInputs *in,
@@ -207,11 +204,6 @@ static int stub_infer(void *user, const DFN2PrepostInputs *in,
         in->df_convp_window != host_convp || out->df_convp_window_next != host_convp) {
         ++s->bad_views;
         return -1;
-    }
-    if (s->warm_left > 0) {       /* warm-up frame: heads left NaN, nothing logged, state overwritten */
-        --s->warm_left;
-        for (i = 0; i < (int)in->gru_hidden_elements; ++i) host_gru[i] = 99.0f;
-        return 0;
     }
     for (i = 0; i < NF; ++i) {
         const int at = (i + g_slice_offset) % NF;
@@ -271,7 +263,6 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
     CHECK(p != NULL);
     CHECK(dfn2_model_io_descriptor_default(&g_grid, &descriptor) == 0);
     memset(&stub, 0, sizeof stub);
-    stub.warm_left = NF == 1 ? LA : 0;
     stub.poison_lo = plo;
     stub.poison_hi = phi;
     stub.poison_kind = pkind;
@@ -287,7 +278,6 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
         if (h == reset_hop) {
             dfn2_prepost_reset(p);
             stub.next_head = 0;
-            stub.warm_left = NF == 1 ? LA : 0;
             rec('R', h, 0, 0, NULL, 0);
         }
         for (k = 0; k < DFN2_N_BINS; ++k) {
@@ -408,7 +398,6 @@ static int case_contract(void) {
           dfn2_prepost_grid(p)->frames_per_call == NF);
     memset(&stub, 0, sizeof stub);
     stub.poison_lo = stub.poison_hi = -1;
-    stub.warm_left = NF == 1 ? LA : 0;   /* the warm-up frames' heads stay NaN: finish must not read them */
     model.user = &stub;
     model.infer = stub_infer;
     model.reset = NULL;
@@ -421,7 +410,7 @@ static int case_contract(void) {
             est_im[b] = noise(h, 2 * b + 1);
         }
         rc = dfn2_prepost_pre_process_freq(p, est_re, est_im);
-        want = NF == 1 ? 1 : (h + 1 >= LA + NF && (h + 1 - LA) % NF == 0);
+        want = h + 1 >= LA + NF && (h + 1 - LA) % NF == 0;
         CHECK(rc == want);
         if (rc == 1) {
             int calls = stub.calls;
@@ -452,9 +441,8 @@ static int case_contract(void) {
         if (written && first_written < 0) first_written = h;
     }
     CHECK(first_written == LA + DA + NF - 1);
-    /* one generation step per warm-up frame (N == 1 only); with N > 1 the frames before the first call
-     * open nothing and move nothing */
-    CHECK(dfn2_prepost_state_generation(p) == (unsigned)(1 + (NF == 1 ? LA : 0)));
+    /* the frames before the first call open nothing and move nothing */
+    CHECK(dfn2_prepost_state_generation(p) == 1u);
     dfn2_prepost_destroy(p);
 
     CHECK(dfn2_prepost_config_defaults(&cfg, grid) == 0);
@@ -728,10 +716,10 @@ def test_a_refused_call_is_n_refused_frames(drivers, tmp_path, pair, frames,
     one, many = _segments(one)[0], _segments(many)[0]
     _compare(one, many, frames, poison=poison)
     assert many['final'] == one['final']
-    # N > 1: one refused call, no warm-up frame (unchanged). N == 1: `frames` refused frames and the
-    # pair[0] warm-up frames of the stream start, one step each.
+    # N > 1: one refused call. N == 1: `frames` refused frames, one step each; the first pair[0] hops of the
+    # stream start open no frame and move nothing.
     assert 'generation=2' in out_many
-    assert 'generation=%d' % (1 + frames + pair[0]) in out_one
+    assert 'generation=%d' % (1 + frames) in out_one
     # The identity reached the output: the refused frames differ from a run
     # without the refusal.
     clean, _ = _stream(driver, tmp_path, frames, hops, name='clean')

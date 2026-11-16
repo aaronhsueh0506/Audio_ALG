@@ -26,7 +26,7 @@
 <tr><td>邊界尺度</td><td>入 <code>dfn2_stft_scale(n_fft)</code>、出 <code>dfn2_stft_unscale(n_fft)</code>(= 1/sqrt(n_fft) 與其反數,float32;出貨 grid 為 <code>2^-5</code>/<code>2^5</code>;n_fft 非 4 的冪時是正確捨入的 float):pipeline 頻譜是 audio-scale 未正規化 STFT,DFN2 邊界要 <code>torch.stft(normalized=True)</code>。函式庫不含 FFT／窗:分析與合成是應用端的 audiolib <code>AcStft</code>／<code>AcIstft</code>,<code>spec_scale</code>／<code>ispec_scale</code> 維持 1.0,比例只由 <code>DfnHop</code> 套一次(模型串流的頻譜入口收發的是 model scale:<code>dfn_hop_open_frame()</code> 乘 <code>dfn2_stft_scale()</code>、<code>dfn_hop_close_frame()</code> 乘 <code>dfn2_stft_unscale()</code>)</td><td><code>dfn/dfn_hop.h</code>;<code>dfn2_grid.h</code></td></tr>
 <tr><td>版本</td><td><code>DFN2_STREAM_LAYOUT_VERSION = 5</code>、<code>AINR_BRIDGE_LAYOUT_VERSION = 1</code>;兩者 <code>descriptor_version</code> 皆 1,<code>dfn_hop_pool_build()</code> 把 plan 時查到的 descriptor 交給各自的 <code>_init_ex</code>。規則:pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。<code>dfn_hop</code>／<code>dfn_hop_pool</code> 是範例碼,沒有 layout version 或 descriptor;mono 的 <code>Aec</code> 沒有 descriptor。(舊物件:<code>DFN_RES_STAGE_LAYOUT_VERSION = 6</code>、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 7</code>)</td><td><code>dfn2_stream.h</code>、<code>ainr_bridge.h</code></td></tr>
 </table>
-<p class="note"><b>Fail-open = 傳統鏈的等值(延後)。</b>沒有模型(<code>model.infer == NULL</code>)、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 identity(輸出同 <code>dfn2_prepost_frame_bypass()</code>):unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0,是<b>精確</b>的 identity。遞迴 state 不在函式庫內(model callback／板端持有):輸出未寫或非有限時 commit 被拒,<code>job.state_generation</code>(<code>dfn_hop_state_generation()</code>,即模型串流的 <code>dfn2_stream_state_generation()</code>)加 1(reset 與每個暖機幀也各加 1),板端據此把自己的定點 state 重載成量化後的零(init 後為 1,值變了就重載);真幀 callback 回非 0 同樣走 identity,generation 依執行狀態(<code>stream_run.h</code>)推進：沒有模型與 <code>STREAM_RUN_NOT_STARTED</code>(沒有執行開始)不動，其他非 0 值（<code>STREAM_RUN_FAILED</code> 是 -1）加 1，讓板端重載 state。48 kHz 輸出就是「手寫傳統鏈(<code>conv_chain_mono.h</code>,降噪器關)延後 L = M + D 個 hop」(出貨 pair 1/1 的 L = 2),由 C 測試逐 byte 釘死;8/16 kHz 多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
+<p class="note"><b>Fail-open = 傳統鏈的等值(延後)。</b>沒有模型(<code>model.infer == NULL</code>)、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 identity(輸出同 <code>dfn2_prepost_frame_bypass()</code>):unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0,是<b>精確</b>的 identity。遞迴 state 不在函式庫內(model callback／板端持有):輸出未寫或非有限時 commit 被拒,<code>job.state_generation</code>(<code>dfn_hop_state_generation()</code>,即模型串流的 <code>dfn2_stream_state_generation()</code>)加 1(reset 也加 1),板端據此把自己的定點 state 重載成量化後的零(init 後為 1,值變了就重載);真幀 callback 回非 0 同樣走 identity,generation 依執行狀態(<code>stream_run.h</code>)推進：沒有模型與 <code>STREAM_RUN_NOT_STARTED</code>(沒有執行開始)不動，其他非 0 值（<code>STREAM_RUN_FAILED</code> 是 -1）加 1，讓板端重載 state。48 kHz 輸出就是「手寫傳統鏈(<code>conv_chain_mono.h</code>,降噪器關)延後 L = M + D 個 hop」(出貨 pair 1/1 的 L = 2),由 C 測試逐 byte 釘死;8/16 kHz 多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
 
 <h2>API 用法</h2>
 <p>呼叫順序:<code>derive_lane()</code>(<code>aec_resolve_signal_grid()</code> 加 <code>aec_config_from_level()</code>)→ 參數解析以 <code>dfn2_grid_make()</code> 建模型 grid,再讀 ERB 矩陣(<code>--erb-fwd／--erb-inv</code>)、填 model callback → 各物件 <code>mem_size</code> → 切塊 <code>init</code> → 每 hop 一次(<code>aec_process_linear</code>、<code>aec_process_residual</code>、<code>aec_get_residual</code>、自寫的 P 形成、<code>dfn_hop_process</code>)→ destroy。每次吃<b>剛好一個 host hop</b> 的 mic 與 ref、寫出同樣長度(16 k/256 預設 128、16 k/512 為 256、48 k/1024 為 512)。完整範例、時序圖與參數表收在 <a href="../../reference/dfn2/integration.html">DFN2 pipeline 呼叫與時序</a>、<a href="../../reference/dfn2/integration.html#sequence">DFN2 pipeline 呼叫與時序</a> 與 <a href="../../reference/dfn2/configuration.html">DFN2 pipeline 參數與狀態</a>。每 hop 的核心:</p>
@@ -53,7 +53,7 @@ dfn_hop_process(&amp;hop, v.base_spec, post, out);                      /* (a) �
  └─ dfn_hop_process(&amp;hop, v.base_spec, P, out) = 下面四個呼叫的序列:
 
 dfn_hop_begin(&amp;hop, E, P)          ← mono 範例的 E 參數傳入 B(b.base_spec)
- ├─【48 kHz host】dfn_hop_open_frame(E, P, &amp;job)   每 hop 開一個 job(前 M 個 hop 是暖機幀:模型照跑、heads 丟棄;輸出頻譜到第 L 個 hop 才有)
+ ├─【48 kHz host】dfn_hop_open_frame(E, P, &amp;job)   每 hop 開一個 job(前 M 個 hop 沒有 job:不開 frame、模型不跑;輸出頻譜到第 L 個 hop 才有)
  │      est = E*dfn2_stft_scale(n_fft), app = P*dfn2_stft_scale(n_fft)(hop 的 planar 緩衝)
  │      → dfn2_stream_pre_process_freq_dual()(est 走特徵/[t-(2-M)..t+M] 視窗,app 走 noisy ring;
  │        非有限或 model scale 下超過 2^63 的 bin 整塊拒絕,state 不動)
@@ -81,7 +81,7 @@ dfn_hop_end(&amp;hop, out)
 任一步回負值 → 整合者 reset(aec + rng + hop)後重來(main.c 的 rig_reset())</pre>
 
 <h2>訊號泳道圖</h2>
-<p><b>48 kHz host</b> 的泳道很短:每 hop 一次推論,前 M 幀是暖機幀(heads 丟棄),模型串流前 L 個 hop 輸出全零頻譜(<code>valid</code> = 0),之後第 p 個 hop 的輸出就是「傳統 pipeline 的 hop#(p-L) 輸出」(出貨 pair:M=1、L=2,合計 3 hop 純延遲,見「延遲與 warm-up」)。原生格點則多了 bridge 的兩個時鐘:</p>
+<p><b>48 kHz host</b> 的泳道很短:每 hop 一次推論(前 M 個 hop 沒有 job,模型不跑),模型串流前 L 個 hop 輸出全零頻譜(<code>valid</code> = 0),之後第 p 個 hop 的輸出就是「傳統 pipeline 的 hop#(p-L) 輸出」(出貨 pair:M=1、L=2,合計 3 hop 純延遲,見「延遲與 warm-up」)。原生格點則多了 bridge 的兩個時鐘:</p>
 <h3>原生格點 host + rate bridge(16 kHz / fft 256 / hop 128)</h3>
 <pre>lane \ native hop   #0            #1            #2            #3            #4(週期重複)
 ─────────────────── ───────────── ───────────── ───────────── ───────────── ─────────────
@@ -141,8 +141,8 @@ out: erb_mask -&gt; erb_mask [32]=32 | df_coefs -&gt; coefs [96][5][2]=960(bin �
 <ul>
 <li>added delay = <code>prefill + 升頻群延遲 + (L+1)×512×sr/48000 + 降頻群延遲</code>(整數除法);兩個群延遲在每個支援格點都各是 16 個原生樣本,測試即以此釘死。(L+1)×512 = 48 kHz 格點的 1 個分析/合成 hop 加 L 個 lookahead hop(出貨 pair 為 1536);L+1 不是 3 的倍數時含小數個原生樣本,向下取整。<code>prefill</code> 不是寫死的常數:init 用真正的 resampler 在靜音上走一遍排程,量出「吐出 − 產生」的最大缺口。</li>
 <li><b>原生格點不是逐位元等值</b>:訊號走過兩顆 FIR resampler,通帶響應被套用兩次,測試因此用容差而非 <code>memcmp</code>,<b>延遲本身由脈衝精確釘住</b>。bridge 測試閘 <code>&lt; 5e-3</code>(現查 4.36e-04 / 9.47e-04 / 9.46e-04);<code>test_mono_dfn</code> 把兩路都過 0.35 fs 低通後比對,閘 <code>&lt; 1e-3</code>(現查 8.73e-06 / 8.91e-06 / 1.30e-05)。</li>
-<li><b>Warm-up:開頭的輸出是全零</b>(48 kHz 為 L 個 hop;原生格點為 added delay,來自預填的 out FIFO)。暖機時 <code>dfn2_stream_post_process_freq()</code> 回報 <code>valid</code> = 0,<code>dfn_hop_close_frame()</code> 把輸出頻譜<b>寫滿</b>零,所以 hop 無條件合成。前 M 幀是暖機幀(視窗湊不齊右鄰居:模型照跑,heads 丟棄、state 重置;出貨 M=1 即第 0 幀);48 kHz 每 hop 恰好一次推論,原生格點照泳道圖排程,一個 hop 0、1 或 2 次。</li>
-<li><b>AEC delay 改變不 reset 模型串流/bridge。</b>它們不消費 far-end,兩個輸入仍然連續;reset 會白付暖機並讓遞迴狀態重來。只有整合者的 reset(<code>dfn_hop_reset()</code> 連帶 reset 模型串流、bridge 與 <code>model.reset</code>)。收尾 flush 要再推 L+1 個全零 hop(原生格點推滿 added delay)才吐得出最後的 source frame,<b>那幾拍加速器也要照跑</b>。</li>
+<li><b>Warm-up:開頭的輸出是全零</b>(48 kHz 為 L 個 hop;原生格點為 added delay,來自預填的 out FIFO)。暖機時 <code>dfn2_stream_post_process_freq()</code> 回報 <code>valid</code> = 0,<code>dfn_hop_close_frame()</code> 把輸出頻譜<b>寫滿</b>零,所以 hop 無條件合成。前 M 幀沒有 job(視窗湊不齊右鄰居:模型不跑,state 與 generation 不動;出貨 M=1 即第 0 幀);48 kHz 其餘每 hop 恰好一次推論,原生格點照泳道圖排程,一個 hop 0、1 或 2 次。</li>
+<li><b>AEC delay 改變不 reset 模型串流/bridge。</b>它們不消費 far-end,兩個輸入仍然連續;reset 會讓遞迴狀態重來。只有整合者的 reset(<code>dfn_hop_reset()</code> 連帶 reset 模型串流、bridge 與 <code>model.reset</code>)。收尾 flush 要再推 L+1 個全零 hop(原生格點推滿 added delay)才吐得出最後的 source frame,<b>那幾拍加速器也要照跑</b>。</li>
 </ul>
 
 <h2>參考</h2>

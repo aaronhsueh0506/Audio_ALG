@@ -4,16 +4,16 @@
  * df_lookahead, frames_per_call (as the graph's). The pool is the caller's and holds no recurrent state.
  *
  *     ac_stft_push_planar(stft, in_samples, re, im);
- *     dfn2_prepost_pre_process_freq(p, re, im);        // 1 on every hop when N == 1
- *     dfn2_prepost_frame_open(p, &in, &out);           // views into the pool
- *     my_npu_run(&in, &out);                           // NPU fills `out`
- *     dfn2_prepost_frame_finish(p);                    // or _frame_fail() after a run that did not succeed
+ *     if (dfn2_prepost_pre_process_freq(p, re, im) == 1) {   // 0: no job this hop, nothing is opened
+ *         dfn2_prepost_frame_open(p, &in, &out);       // views into the pool
+ *         my_npu_run(&in, &out);                       // NPU fills `out`
+ *         dfn2_prepost_frame_finish(p);                // or _frame_fail() after a run that did not succeed
+ *     }
  *     dfn2_prepost_post_process_freq(p, out_re, out_im, NULL);
  *     ac_istft_push_planar(istft, out_re, out_im, out_samples);   // every hop (AC_OLA_ACCUMULATE)
  *
- * N == 1 with L >= 1: the first L frames after init or reset are warm-up frames (below); N > 1:
- * pre_process_freq returns 1 at the zero-indexed hop L + N - 1, then every N hops after (L == 0 included,
- * with no warm-up frames). */
+ * pre_process_freq returns 1 at the zero-indexed hop L + N - 1, then every N hops after (N == 1: every hop from
+ * hop L); before that it returns 0 and no frame is opened. */
 
 #ifndef DFN2_PREPOST_H
 #define DFN2_PREPOST_H
@@ -157,13 +157,13 @@ DFN2Prepost *dfn2_prepost_create(const DFN2PrepostConfig *cfg);
 void dfn2_prepost_destroy(DFN2Prepost *p);
 
 /* Back to the start: rings and registered state zeroed, open frame dropped, clocks and normalisers restarted,
- * generation advanced, warm-up frames (N == 1) due again; config, borrowed pointers and pool stay. Reset your
+ * generation advanced; config, borrowed pointers and pool stay. Reset your
  * own AcStft / AcIstft too. */
 void dfn2_prepost_reset(DFN2Prepost *p);
 
 /* Generation of the recurrent state (dfn2_model_io_state_generation()): 1 after init, plus one per reset, per
- * warm-up frame, per refused frame_finish() and per frame_fail() of a started run; 0 for NULL. A runtime with its
- * own state copy reloads quantized zeros on every change. */
+ * refused frame_finish() and per frame_fail() of a started run; 0 for NULL. A runtime with its own state copy
+ * reloads quantized zeros on every change. */
 unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);
 
 const DFN2Grid *dfn2_prepost_grid(const DFN2Prepost *p);   /* the grid it runs; NULL for NULL */
@@ -178,10 +178,9 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
  * applies to the whole next committed call, frames pushed earlier included. */
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
-/* One analysed frame (n_bins bins), no transform. Returns the accelerator invocations needed: N == 1: 1 on every
- * frame, the first L being warm-up frames (their heads describe a frame before the stream start and are
- * discarded by frame_finish / frame_bypass); N > 1: 1 at the zero-indexed hop L + N - 1, then every N hops
- * after (L == 0 included, with no warm-up frames), 0 otherwise. -1 on NULL args or with a frame open. Flush:
+/* One analysed frame (n_bins bins), no transform. Returns the accelerator invocations needed: 1 at the
+ * zero-indexed hop L + N - 1, then every N hops after (N == 1: every hop from hop L), 0 otherwise; on a 0 the
+ * clocks have advanced and no frame is open. -1 on NULL args or with a frame open. Flush:
  * push zero spectra and run the accelerator until the last real frame is emitted. Bins are not checked: each must be
  * finite with |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
@@ -202,19 +201,16 @@ int dfn2_prepost_frame_open(DFN2Prepost *p, DFN2PrepostInputs *inputs,
 
 /* Check the accelerator's output, then build the enhanced spectrum once per frame of the call (oldest
  * first); needs frame_open(). A non-finite head or registered state zeroes the registered tensors, advances
- * the generation, leaves the frame open and returns -1: call frame_bypass() or redo via frame_open().
- * A warm-up frame (N == 1) reads no head: it zeroes the registered state, advances the generation by one,
- * emits nothing and returns 0, so the first real frame starts from zero state. */
+ * the generation, leaves the frame open and returns -1: call frame_bypass() or redo via frame_open(). */
 int dfn2_prepost_frame_finish(DFN2Prepost *p);
 
 /* Give up on the open frame and pass the noisy spectrum through for every frame of the call (unit ERB mask,
- * alpha 0); clocks advance, recurrent state untouched. -1 if no frame is open. A warm-up frame (N == 1)
- * is closed as by frame_finish: state zeroed, generation + 1, nothing emitted. */
+ * alpha 0); clocks advance, recurrent state untouched. -1 if no frame is open. */
 int dfn2_prepost_frame_bypass(DFN2Prepost *p);
 
 /* Close the open frame after a run that did not succeed: the frame_bypass() output. run_started != 0: the
- * accelerator may have moved its state, so the registered state is zeroed and the generation advanced (a warm-up
- * frame does both already); 0: nothing ran, the state and generation stay. -1 if no frame is open. */
+ * accelerator may have moved its state, so the registered state is zeroed and the generation advanced;
+ * 0: nothing ran, the state and generation stay. -1 if no frame is open. */
 int dfn2_prepost_frame_fail(DFN2Prepost *p, int run_started);
 
 /* The enhanced spectrum (n_bins bins) of the frame just emitted, at the input's scale: zeros while `*valid`
@@ -239,8 +235,7 @@ typedef struct DFN2Model {
 
 /* Drive one open frame: open, infer(), finish; a nonzero infer() takes frame_fail() (run_started 0 for
  * STREAM_RUN_NOT_STARTED, else 1), a refused commit frame_bypass() (clocks advance once either way). 1 committed, 0 skipped, -1 contract error (NULL args, no infer,
- * bad io_descriptor, no frame open). A warm-up frame (N == 1) also returns 1 when infer() succeeds, although its
- * heads are discarded. */
+ * bad io_descriptor, no frame open). */
 int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus

@@ -239,8 +239,7 @@ The recurrent state is the application's, not the library's. On a board the acce
 library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
 that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
 and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class a
-caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on every DFN2 warm-up frame (the first `mask_lookahead` hops after a start or reset: the model runs,
-its heads are discarded and the state restarts, so the callback reloads quantized zeros after each, M times in all), on a refused
+caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on a refused
 commit (a non-finite head, and for Align-ULCNet also a finite head whose enhanced spectrum is not finite) of a real frame, and on a run
 status that is neither 0 nor `STREAM_RUN_NOT_STARTED` (`stream/common/stream_run.h`: the callback reports `STREAM_RUN_NOT_STARTED` for a failure before the accelerator
 was started, `STREAM_RUN_FAILED` for one from the start on, 0 only when every head was read back); a committed frame leaves it alone, and so does

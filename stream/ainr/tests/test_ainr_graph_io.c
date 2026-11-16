@@ -112,8 +112,9 @@ static void check_refusals(const char *erb)
     }
 }
 
-/* One pre call of `family` (0 PCM, 1 _freq) on a fresh init; compares the work with the row, then closes the block and compares
- * the next one. */
+/* One pre call of `family` (0 PCM, 1 _freq) on a fresh init: the blocks without a job (the first mask_lookahead after
+ * init, 1 for the 48 kHz rows and 0 for the 16 kHz row of the catalog) must be all-zero BYPASS works that the row
+ * refuses; the first block with a job is compared with the row, then the block is closed and the next one compared. */
 static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoConfig *mc, const char *tag)
 {
     AinrInfo info;
@@ -144,9 +145,26 @@ static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoCo
     if (!pcm_in || !zeros || !out_re || !out_im) exit(2);
     memset(&work, 0, sizeof work);
     if (rc == AINR_OK) {
-        rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
-                         : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
-        CHECK(rc == AINR_OK, "%s preprocess %d", tag, rc);
+        int bypassed = 0, want_bypassed = cfg->sr == 48000 ? 1 : 0;
+        for (;;) {
+            rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
+                             : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
+            CHECK(rc == AINR_OK, "%s preprocess %d", tag, rc);
+            if (rc != AINR_OK || work.action == STREAM_WORK_SUBMIT || bypassed > want_bypassed) break;
+            {
+                int rc3;
+                CHECK(work.input_count == 0 && work.output_count == 0 && work.state_generation == 0u,
+                      "%s BYPASS work is not all zero (%d inputs, %d outputs, generation %u)", tag, work.input_count,
+                      work.output_count, work.state_generation);
+                GRAPH_IO_CHECK_WORK(rc3, mc, &work);
+                CHECK(rc3 != GRAPH_IO_OK, "%s the row accepted a BYPASS work", tag);
+            }
+            rc = family == 0 ? ainr_postprocess(pcm, STREAM_RUN_NOT_STARTED, pcm_in)
+                             : ainr_postprocess_freq(freq, STREAM_RUN_NOT_STARTED, out_re, out_im);
+            CHECK(rc == AINR_OK, "%s postprocess of a BYPASS block %d", tag, rc);
+            ++bypassed;
+        }
+        CHECK(bypassed == want_bypassed, "%s %d BYPASS blocks after init, want %d", tag, bypassed, want_bypassed);
         if (rc == AINR_OK) {
             GraphIoConfig other;
             int other_model = GRAPH_IO_DFN2_PRODUCT == GRAPH_IO_DFN2_LITE ? GRAPH_IO_DFN2_FULL

@@ -256,8 +256,8 @@ static int run_identity(int enable_cng) {
     if (!(min_res < 0.9f)) return 4;          /* RES never cut: A == B */
     if (nonzero_hops < TEST_FRAMES / 2) return 5;
     /* the stream was neither reset (by the delay change, say) nor handed a refused commit: its state
-     * generation is 1 plus one per warm-up frame, and every frame was a bypass (no model set) */
-    if (dfn_hop_state_generation(&dfn->hop) != 1u + (unsigned)DFN2_MASK_LOOKAHEAD)
+     * generation is 1, and every frame was a bypass (no model set) */
+    if (dfn_hop_state_generation(&dfn->hop) != 1u)
         return 6;                             /* a reset would leave a gap */
     if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE) != 0)
         return 7;

@@ -125,7 +125,7 @@ static Result run(const Row *r, int scenario, int inject) {
     for (h = 0; h < HOPS; ++h) {
         DfnResStageJob job; DFN2HopIO io;
         int srb, arb, skip = 0, model_rc = 0, same_ep = (scenario == S_SAME_EP), s_end, a_post, valid = -7;
-        unsigned int gen_s0 = dfn_res_stage_state_generation(st), gen_a0 = dfn2_stream_state_generation(s);
+        unsigned int gen_s0, gen_a0;
         for (k = 0; k < n_bins; ++k) {
             float a = urand(&seed) * 30.0f * (1.0f + (float)(h % 7)), b = urand(&seed) * 30.0f * (1.0f + (float)(h % 7));
             float g = 0.3f + 0.6f * (float)((h * 13 + k) % 17) / 17.0f;
@@ -150,21 +150,34 @@ static Result run(const Row *r, int scenario, int inject) {
         if (scenario == S_RESET && h == 100) { dfn_res_stage_reset(st); if (inject != INJ_ONE_SIDED_RESET) dfn2_stream_reset(s); }
         if (scenario == S_ATTEN_CHANGE && h == 100) { dfn_res_stage_set_atten_lim(st, 9.0f); dfn2_stream_set_atten_lim(s, 9.0f); }
 
+        gen_s0 = dfn_res_stage_state_generation(st); gen_a0 = dfn2_stream_state_generation(s);   /* after a reset or a change of the limit */
         srb = same_ep ? dfn_res_stage_begin(st, E, E, &job) : dfn_res_stage_begin(st, E, P, &job);
         arb = dfn2_stream_pre_process_freq_dual(s, ser, sei, same_ep ? ser : spr, same_ep ? sei : spi, &io);
-        if ((srb == 1) != (arb == 1)) {
+        /* stage: 1 job, 0 accepted without a model frame, < 0 refused; stream: 1 accepted (io.job_ready says whether
+         * there is a job), else refused */
+        if ((srb >= 0) != (arb == 1) || (srb == 1) != (arb == 1 && io.job_ready)) {
             ++mr; if (first < 0) first = h;
-            fprintf(stderr, "  hop %d: begin disagrees (stage %d, stream %d)\n", h, srb, arb);
+            fprintf(stderr, "  hop %d: begin disagrees (stage %d, stream %d, job_ready %d)\n", h, srb, arb, io.job_ready);
             break;
         }
-        if (srb != 1) {   /* both refused the block: nothing may have been consumed */
+        if (srb < 0) {   /* both refused the block: nothing may have been consumed */
             ++res.refused;
             if (dfn_res_stage_state_generation(st) != gen_s0 || dfn2_stream_state_generation(s) != gen_a0) {
                 ++mg; if (first < 0) first = h;
             }
             continue;
         }
-        if (!io.job_ready || io.inputs.erb_window_elements != job.inputs.erb_window_elements ||
+        if (srb == 0) {   /* no model frame: the status is ignored and the generation does not move */
+            s_end = dfn_res_stage_end(st, STREAM_RUN_FAILED, out);
+            a_post = dfn2_stream_post_process_freq(s, STREAM_RUN_FAILED, aor, aoi, &valid);
+            if (s_end < 0 || a_post != 0 || s_end != 0 || valid != 0) { ++mr; if (first < 0) first = h; continue; }
+            if (dfn_res_stage_state_generation(st) != gen_s0 || dfn2_stream_state_generation(s) != gen_a0) {
+                ++mg; if (first < 0) first = h;
+            }
+            ++res.compared;
+            continue;
+        }
+        if (io.inputs.erb_window_elements != job.inputs.erb_window_elements ||
             io.inputs.spec_window_elements != job.inputs.spec_window_elements ||
             memcmp(io.inputs.erb_window, job.inputs.erb_window, job.inputs.erb_window_elements * 4) != 0 ||
             memcmp(io.inputs.spec_window, job.inputs.spec_window, job.inputs.spec_window_elements * 4) != 0 ||

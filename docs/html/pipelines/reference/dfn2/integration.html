@@ -141,7 +141,7 @@ int phased_hop(DfnHop *hop, const AecResidualView *v, const Complex *post, float
     if (dfn_hop_begin(hop, v-&gt;base_spec, post) != 0) return -1;          /* 模型串流 / bridge 收下 B 與 P */
     while ((r = dfn_hop_nn_begin(hop, &amp;job)) &gt; 0) {              /* 每 hop 0..2 次 */
         unsigned int gen = job.state_generation;                 /* = dfn_hop_state_generation(hop);bridge 路徑亦同 */
-        if (gen != g_gen_seen) { board_load_quantized_zero_state(); g_gen_seen = gen; }   /* 每次跑加速器前比對;每個暖機幀後也會變 */
+        if (gen != g_gen_seen) { board_load_quantized_zero_state(); g_gen_seen = gen; }   /* 每次跑加速器前比對 */
         int rc = board_run_dfn2_graph_on_npu(&amp;job);              /* job.inputs -&gt; 加速器 -&gt; job.outputs */
         if (rc != 0) board_load_quantized_zero_state();          /* 失敗的一幀可能寫了一半的 state:當下重載 */
         if (dfn_hop_nn_end(hop, rc) != 0) return -1;             /* rc != 0:該幀走 identity,不是錯誤 */
@@ -302,7 +302,7 @@ int four_dfn_run(void) {
   |-- dfn_hop_begin(&amp;hop, B, P) ------------&gt;|                          |                          |
   |                          |                          | B、P 乘 dfn2_stft_scale;dfn2_stream_pre_process_freq_dual(est, app, &amp;job) |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          | 1、job_ready(每個 hop;前 M 個是暖機幀)| -1(非有限或超過 2^63 的 bin:state 不動) |
+  |                          |                          | 0 = 沒有 job(前 M 個 hop)、1 = job_ready(之後每個 hop)| -1(非有限或超過 2^63 的 bin:state 不動) |
   |                          |                          |&lt;-------------------------|                          |
 -- 路徑 A:dfn_hop_process = begin + 迴圈{ nn_begin; nn_end(dfn_hop_infer(&amp;hop, &amp;job)) } + end -----------------------------
   |                          |                          | dfn_hop_infer(&amp;hop, &amp;job):plan 的 model.infer(user, &amp;job.inputs, &amp;job.outputs)
@@ -318,13 +318,13 @@ int four_dfn_run(void) {
   |-- dfn_hop_nn_end(&amp;hop, rc) ------------------------&gt;|                          |                          |
   |                          |                          | dfn2_stream_post_process_freq(stream, rc, re, im, &amp;valid);valid ? 乘 dfn2_stft_unscale : 全零 |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          |                          | rc != 0 -&gt; dfn2_prepost_frame_bypass()(identity,時鐘照走);輸出未寫或非有限 -&gt; frame_finish 被拒(state generation +1)-&gt; frame_bypass();暖機幀:丟棄 heads、generation +1
+  |                          |                          |                          | rc != 0 -&gt; dfn2_prepost_frame_bypass()(identity,時鐘照走);輸出未寫或非有限 -&gt; frame_finish 被拒(state generation +1)-&gt; frame_bypass()
 -- 收尾(兩條路徑相同) ----------------------------------------------------------------------------------------------------
   |-- dfn_hop_end(&amp;hop, out) --------------------------&gt;|                          |                          |
   |                          |                          | 沒被取走或沒關的 job 走 identity;ac_istft_push(istft, out_spec, out) -&gt; 剛好一個 hop
   | 0 | DFN_HOP_INVALID(-1)| DFN_HOP_SEQUENCE_ERROR(-2) |                          |                          |
   |&lt;----------------------------------------------------|                          |                          |</pre>
-<p>48 kHz 時前 M 幀(<code>grid.mask_lookahead</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),是暖機幀:<code>dfn_hop_nn_begin()</code> 照回 1、模型照跑,<code>nn_end()</code> 時 heads 被丟棄、state generation 加 1(板端重載量化零);前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 是暖機幀,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="configuration.html#details">DFN2 pipeline 參數與狀態</a>。</p>
+<p>48 kHz 時前 M 幀(<code>grid.mask_lookahead</code>)還沒有右鄰居(graph 視窗為 <code>[t-(2-M)..t+M]</code>),沒有 job:<code>dfn_hop_nn_begin()</code> 回 0、模型不跑,state generation 不動;前 L = M + D 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統鏈的 hop#(p-L)」。出貨 pair 1/1(M = 1、L = 2):只有第 0 個 hop 沒有 job,合計 3 hop = 1536 samples 的純延遲;其他 pair 見 <a href="configuration.html#details">DFN2 pipeline 參數與狀態</a>。</p>
 
 <h2 id="section-7">3. 穩態 hop:8／16 kHz host(經 <code>AinrBridge</code>)</h2>
 <pre>App(main.c)               DfnHop                  AinrBridge                  DFN2Stream(由 DfnHop 驅動) model | NPU
@@ -344,7 +344,7 @@ int four_dfn_run(void) {
   |                          |&lt;- 1:frame.estimate_spec(B48)/ apply_spec(P48)/ out_spec | 0:本 hop 沒有幀 |
   |                          | B48、P48 乘 dfn2_stft_scale;dfn2_stream_pre_process_freq_dual(est, app, &amp;job)     |
   |                          |----------------------------------------------------&gt;|                          |
-  |                          | 1、job_ready(前 M 個 48 kHz 幀是暖機幀,模型照跑)|                          |
+  |                          | 0 或 1(前 M 個 48 kHz 幀沒有 job,模型不跑)|                          |
   |                          |&lt;----------------------------------------------------|                          |
   |&lt;- 1 = job 已開 | 0 = 本 hop 沒有幀 | -1 ------------|                          |                          |
   |-- job.inputs -&gt; 加速器 -&gt; job.outputs -------------------------------------------------------------------&gt;|

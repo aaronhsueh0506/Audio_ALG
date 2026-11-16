@@ -140,29 +140,22 @@ int main(int argc, char **argv) {
         const float *frame_re = spec + (size_t)t * 2 * DFN2_N_BINS;
         const float *frame_im = frame_re + DFN2_N_BINS;
         const unsigned int generation = dfn2_prepost_state_generation(p);
-        int warm = t < DFN2_MASK_LOOKAHEAD;
-        size_t i;
-        /* every hop opens a frame; the first DFN2_MASK_LOOKAHEAD are warm-up frames */
-        CHECK(dfn2_prepost_pre_process_freq(p, frame_re, frame_im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
-        CHECK(inputs.gru_hidden == gru_hidden &&
-              inputs.gru_hidden_elements == DFN2_TEST_GRU_ELEMENTS);
-        CHECK(outputs.gru_hidden_next == gru_hidden);
-        CHECK(outputs.erb_mask_elements == DFN2_N_ERB);
-        if (warm) {
-            /* the head stays NaN and the accelerator scribbles on the state: finish reads
-             * no head and leaves the state zero, the generation advances once */
-            for (i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i) gru_hidden[i] = 99.0f;
+        const int no_job = t < DFN2_MASK_LOOKAHEAD;
+        /* the first DFN2_MASK_LOOKAHEAD hops carry no job: no frame opens and nothing moves */
+        CHECK(dfn2_prepost_pre_process_freq(p, frame_re, frame_im) == (no_job ? 0 : 1));
+        if (no_job) {
+            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == -1);
+            CHECK(dfn2_prepost_state_generation(p) == generation);
         } else {
+            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(inputs.gru_hidden == gru_hidden &&
+                  inputs.gru_hidden_elements == DFN2_TEST_GRU_ELEMENTS);
+            CHECK(outputs.gru_hidden_next == gru_hidden);
+            CHECK(outputs.erb_mask_elements == DFN2_N_ERB);
             memcpy(outputs.erb_mask,
                    mask + (size_t)(t - DFN2_MASK_LOOKAHEAD) * DFN2_N_ERB,
                    DFN2_N_ERB * sizeof(float));
-        }
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
-        if (warm) {
-            for (i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i) CHECK(gru_hidden[i] == 0.0f);
-            CHECK(dfn2_prepost_state_generation(p) == generation + 1u);
-        } else {
+            CHECK(dfn2_prepost_frame_finish(p) == 0);
             CHECK(dfn2_prepost_state_generation(p) == generation);
         }
         valid = -1;

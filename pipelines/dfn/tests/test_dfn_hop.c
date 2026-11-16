@@ -192,7 +192,8 @@ static int twin_init(Twin* t) {
     return t->stream ? 0 : -1;
 }
 
-/* One model frame by the documented recipe: scale, pre, model, post, unscale. Zero when no spectrum is due. */
+/* One model frame by the documented recipe: scale, pre, model (only when the hop has a job), post, unscale.
+ * Zero when no spectrum is due. */
 static int twin_frame(Twin* t, const Complex* e, const Complex* p, DFN2Model model, Complex* out) {
     float *er = t->w, *ei = t->w + t->n, *pr = t->w + 2 * t->n, *pi_ = t->w + 3 * t->n;
     float *or_ = t->w + 4 * t->n, *oi = t->w + 5 * t->n;
@@ -203,8 +204,10 @@ static int twin_frame(Twin* t, const Complex* e, const Complex* p, DFN2Model mod
         pr[k] = p[k].r * t->scale; pi_[k] = p[k].i * t->scale;
     }
     if (dfn2_stream_pre_process_freq_dual(t->stream, er, ei, pr, pi_, &io) != 1) return -1;
-    if (dfn2_stream_post_process_freq(t->stream, model.infer(model.user, &io.inputs, &io.outputs), or_, oi,
-                                      &valid) != 0)
+    if (dfn2_stream_post_process_freq(t->stream,
+                                      io.job_ready ? model.infer(model.user, &io.inputs, &io.outputs)
+                                                   : STREAM_RUN_NOT_STARTED,
+                                      or_, oi, &valid) != 0)
         return -1;
     for (k = 0; k < t->n; ++k) {
         out[k].r = valid ? or_[k] * t->unscale : 0.0f;
@@ -435,22 +438,21 @@ static void test_path(int bridge_mode) {
               "run / fail / left open / never fetched all equal the identity on the unit partition");
         CHECK(max_frames >= 1 && max_frames <= (bridge_mode ? 2 : 1),
               "a hop carries at most one frame (two through the bridge)");
-        /* the direct path opens a model frame on every hop, the first (a warm-up frame) included */
-        CHECK(bridge_mode || (first_hop_frames == 1 && max_frames == 1),
-              "direct path: exactly one model frame per hop, from the first hop");
-        CHECK(run_calls == run_frames && run_frames > 0,
-              "the model runs once per frame it is shown, warm-up frames included");
-        CHECK(bridge_mode || run_frames == N_BEH, "direct path: one model run per hop");
-        CHECK(gens[B_RUN] == 1u + (unsigned)DFN2_MASK_LOOKAHEAD || bridge_mode,
-              "direct path: the state generation is 1 plus one per warm-up frame (no reset, no refused commit)");
+        /* the direct path opens one model frame per hop from hop mask_lookahead on, none before */
+        CHECK(bridge_mode || (first_hop_frames == (DFN2_MASK_LOOKAHEAD > 0 ? 0 : 1) && max_frames == 1),
+              "direct path: one model frame per hop, from hop mask_lookahead");
+        CHECK(run_calls == run_frames && run_frames > 0, "the model runs once per frame it is shown");
+        CHECK(bridge_mode || run_frames == N_BEH - DFN2_MASK_LOOKAHEAD, "direct path: one model run per hop with a frame");
+        CHECK(gens[B_RUN] == 1u,
+              "the state generation stays 1 (no reset, no refused commit, no run that failed)");
         /* the run status decides the generation: a failed run (STREAM_RUN_FAILED) and a frame left open move it
          * once per real frame, a frame never fetched (STREAM_RUN_NOT_STARTED) not at all */
         CHECK(gens[B_UNFETCHED] == gens[B_RUN],
               "a frame never fetched is STREAM_RUN_NOT_STARTED: the generation is the run behaviour's");
         CHECK(gens[B_FAIL] > gens[B_RUN] && gens[B_OPEN] > gens[B_RUN],
               "a reported failure and a frame left open advance the generation");
-        CHECK(bridge_mode || (gens[B_FAIL] == 1u + (unsigned)N_BEH && gens[B_OPEN] == gens[B_FAIL]),
-              "direct path: one step per frame, the warm-up frames included, for a failure and a frame left open");
+        CHECK(bridge_mode || (gens[B_FAIL] == 1u + (unsigned)(N_BEH - DFN2_MASK_LOOKAHEAD) && gens[B_OPEN] == gens[B_FAIL]),
+              "direct path: one step per model frame for a failure and for a frame left open");
 
         /* a model that changes the spectrum: only the run behaviour commits its heads */
         bad = run_behaviours(bridge_mode, dfn_fixture_half_mask_infer, seq_half, &rf2, &rc2, gens2, &mf2, &fh2);
@@ -583,10 +585,14 @@ static void test_model_hooks(void) {
     g_lcg = 3u;
     make_frame(e, p, r.n);
     CHECK(dfn_hop_process(&r.h, e, p, out) == 0 && g_reset_calls == 0, "processing does not call model.reset");
-    {   /* the first frame is a warm-up frame when the grid has a mask lookahead: the generation moves with it */
-        const unsigned after_first = 1u + (DFN2_MASK_LOOKAHEAD > 0 ? 1u : 0u);
+    {   /* the first mask_lookahead hops carry no model frame and do not move the generation */
         DfnHopJob job;
-        CHECK(dfn_hop_state_generation(&r.h) == after_first, "the state generation moves once per warm-up frame");
+        int hh;
+        for (hh = 1; hh < DFN2_MASK_LOOKAHEAD; ++hh) {
+            make_frame(e, p, r.n);
+            CHECK(dfn_hop_process(&r.h, e, p, out) == 0, "a hop without a model frame closes");
+        }
+        CHECK(dfn_hop_state_generation(&r.h) == 1u, "the state generation does not move on hops without a model frame");
         make_frame(e, p, r.n);
         CHECK(dfn_hop_begin(&r.h, e, p) == 0 && dfn_hop_nn_begin(&r.h, &job) == 1 &&
               job.state_generation == dfn_hop_state_generation(&r.h),
@@ -618,8 +624,8 @@ static void test_model_hooks(void) {
                 CHECK(dfn_hop_process(&r.h, e, p, out) == 0, "a hop with a failing or absent model still closes");
             }
             CHECK(dfn_hop_state_generation(&r.h) ==
-                  1u + (unsigned)DFN2_MASK_LOOKAHEAD + (k == 2 ? (unsigned)(HOPS - DFN2_MASK_LOOKAHEAD) : 0u),
-                  "model status: absent and not-started leave the generation, a failed run advances it per real frame");
+                  1u + (k == 2 ? (unsigned)(HOPS - DFN2_MASK_LOOKAHEAD) : 0u),
+                  "model status: absent and not-started leave the generation, a failed run advances it per model frame");
             make_frame(e, p, r.n);
             CHECK(dfn_hop_begin(&r.h, e, p) == 0 && dfn_hop_nn_begin(&r.h, &job) == 1, "status rig: a frame opens");
             CHECK(dfn_hop_infer(&r.h, &job) == (k == 0 ? STREAM_RUN_NOT_STARTED : k == 1 ? STREAM_RUN_NOT_STARTED

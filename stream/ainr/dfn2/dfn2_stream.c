@@ -38,8 +38,8 @@ struct DFN2Stream {
 
     int open;    /* 0 closed, 1: a DFN2Prepost frame is open, post_process must finish/bypass it */
     int pending; /* 0 closed, 1: pre_process succeeded and post_process is due (every hop,
-                  * independent of `open` -- frames_per_call > 1 opens a frame on only one hop in
-                  * every N, but post_process is still due every hop to drain the previous one) */
+                  * independent of `open` -- a hop without a job opens no frame, but post_process is
+                  * still due to deliver its output) */
 };
 
 typedef struct DFN2StreamLayout {
@@ -397,7 +397,7 @@ unsigned int dfn2_stream_state_generation(const DFN2Stream *s) {
 }
 
 int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db) {
-    if (!s) return -1;
+    if (!s || s->pending) return -1;   /* between hops: a hop without a job has no open frame, pending covers it */
     return dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db) != 0 ? -1 : 0;
 }
 
@@ -430,9 +430,9 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
 
     ac_stft_push_planar(s->stft, s->hop_in, s->spec_re, s->spec_im);
 
-    /* frames_per_call == 1: rc is 1 on every hop, warm-up included, same as before. N > 1: rc is
-     * 1 only once every N hops (a job for the accelerator), 0 the other N-1 (push only, nothing
-     * to run) -- io->job_ready carries that to the caller; -1 is still a genuine contract error. */
+    /* rc is 1 when the hop has a job for the accelerator: every hop from hop L when frames_per_call == 1,
+     * once every N hops otherwise; 0 for the others (nothing to run) -- io->job_ready carries that to the
+     * caller; -1 is a genuine contract error. */
     rc = dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im);
     return open_hop(s, rc, io);
 }

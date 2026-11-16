@@ -75,12 +75,12 @@ the same lifecycle and per-hop shape as the AIAEC classes, described once in `..
 Specific to this one:
 
 - the `DFN2Grid` in its config decides everything that depends on the signal grid or the lookahead pair;
-- with `frames_per_call` 1, `pre_process_freq` returns 1 on every hop. The first `mask_lookahead` hops (M) are warm-up frames (the graph's
-  right-hand neighbours are not there yet): the accelerator runs on them, `frame_finish()` / `frame_bypass()` / `frame_fail()` discard their heads,
-  zero the registered state, advance the state generation by one and return 0, so the first real frame starts from zero state and
-  the audio is as if the accelerator had not run. `dfn2_model_run_frame()` still returns 1 for a warm-up frame whose `infer()`
-  succeeded. For N > 1 frames per call it keeps the older flow, see [Multi-frame export](reference/multiframe.md); with M = 0 there is no
-  warm-up frame;
+- with `frames_per_call` 1, `pre_process_freq` returns 1 on every hop from hop `mask_lookahead` (M) on. The first M hops (the graph's
+  right-hand neighbours are not there yet) return 0: no frame is opened (`frame_open()`, `frame_finish()`, `frame_bypass()` and
+  `frame_fail()` are refused), the framing and compose clocks advance with no heads, nothing is emitted, and the registered state and
+  the state generation stay as they were, so the first frame with a job starts from the state the stream began with and the accelerator
+  is not called for the first M hops. `dfn2_model_run_frame()` refuses them like any call without an open frame. For N > 1 frames per
+  call it keeps the older flow, see [Multi-frame export](reference/multiframe.md); with M = 0 every hop has a job;
 - the spectra are `torch.stft(normalized=True)` on the instance's grid (`dfn2_stft_scale(grid.n_fft)` = 1/sqrt(n_fft); 1024 points on
   the shipped 48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`dfn2_stft_unscale(grid.n_fft)`, 32x on
   the shipped grid; see `dfn2_prepost.h`);
@@ -97,8 +97,8 @@ Specific to this one:
 - a run that did not succeed closes the frame with `dfn2_prepost_frame_fail(p, run_started)`: the same noisy-spectrum output as
   `frame_bypass()`; `run_started != 0` (the accelerator may have rewritten its state) zeroes the registered tensors and advances the
   state generation, `0` (nothing ran) leaves both. `dfn2_model_run_frame()` with a failing `infer()` is `frame_fail(p, 1)`, with `infer()` returning `STREAM_RUN_NOT_STARTED` (it ran nothing) `frame_fail(p, 0)`;
-- `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every warm-up frame, every refused
-  commit of a real frame and every `frame_fail(p, 1)` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
+- `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every refused
+  commit and every `frame_fail(p, 1)` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
   runtime that sees a different value than at the previous frame refills its state tensors with quantized zeros.
 
 Its gate is `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in `libainr_prepost.a` (`make -C .. print-lib-path` prints
@@ -139,8 +139,8 @@ Specific to DFN2:
   ranges by `DFN2_GRID_ERR_MASK_LOOKAHEAD` / `DFN2_GRID_ERR_DF_LOOKAHEAD`.
 - DFN2 is a cascade: the deep filter reads the ERB-masked spectrum, so the
   output is `M + D` frames behind the input and the end-to-end latency is
-  `1 + M + D` hops (three for the shipped pair). The first M hops are warm-up
-  frames (the accelerator runs, its heads are discarded and the state restarts); the first M + D hops emit nothing (`valid` 0).
+  `1 + M + D` hops (three for the shipped pair). The first M hops carry no job
+  (the accelerator does not run for them); the first M + D hops emit nothing (`valid` 0).
 - The rings hold `grid.ring = max(df_order, M + D + 1)` frames: five up to
   `M + D = 4`, six for `M + D = 5` (1/4, 2/3), seven for `M + D = 6` (2/4). The state is carved to that ring at init, so a
   deeper pair only makes the pool larger (92,608 bytes at 1/1, 104,640 at 2/3, 116,672 at 2/4 on the 48 kHz grid; 64-bit host).

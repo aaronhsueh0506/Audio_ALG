@@ -109,8 +109,8 @@ int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
 /* One native hop: the two native spectra in (n_freqs each), one native hop out.
  * Returns 0, or -1 on NULL arguments or a stage contract error (reset required).
  * Phased use, for a caller that runs the model itself (a hop carries 0, 1 or 2
- * stage frames; the first mask_lookahead model frames are warm-up frames, run like any other
- * and discarded):
+ * stage frames; the first mask_lookahead stage frames after a start need no model frame and
+ * are closed inside nn_begin):
  *     dfn_rate_bridge_begin(b, E, P);                  // WOLA + resample up
  *     while (dfn_rate_bridge_nn_begin(b, &job) > 0) {  // 48 kHz frame open
  *         rc = run_model(&job);                        // run status (stream_run.h): 0 = every output written
@@ -145,7 +145,7 @@ int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);   /* floor of t
 int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
                                       int *denominator);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);
-/* The stage's state generation (dfn_res_stage_state_generation(): resets, warm-up frames, refused
+/* The stage's state generation (dfn_res_stage_state_generation(): resets, refused
  * commits and dirty run statuses advance it); 0 for NULL. */
 unsigned int dfn_rate_bridge_state_generation(const DfnRateBridge *b);
 /* Frame counters for diagnostics: 48 kHz frames run in total and in the last hop. */

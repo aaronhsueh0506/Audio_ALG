@@ -147,15 +147,20 @@ static int run_smoke(int frames_per_call) {
             return 1;
         }
 
-        /* Same cadence as dfn2_prepost_pre_process_freq()/AINR/DeepFilterNet2/reference/
-         * multiframe.md: N == 1 keeps the old per-hop warm-up flow (ready every hop); N > 1 has
-         * no warm-up at all -- ready once mask_lookahead + N hops have been pushed, then every N. */
-        ready_expected = frames_per_call == 1 ? 1 :
-                        (i + 1 >= grid.mask_lookahead + frames_per_call) &&
-                        (i + 1 - grid.mask_lookahead) % frames_per_call == 0;
+        /* Same cadence as dfn2_prepost_pre_process_freq(): ready once mask_lookahead + N hops have been
+         * pushed, then every N (N == 1: every hop from hop mask_lookahead). */
+        ready_expected = (i + 1 >= grid.mask_lookahead + frames_per_call) &&
+                         (i + 1 - grid.mask_lookahead) % frames_per_call == 0;
         if (io.job_ready != ready_expected) {
             fprintf(stderr, "job_ready=%d at hop %d, expected %d (N=%d)\n",
                    io.job_ready, i, ready_expected, frames_per_call);
+            return 1;
+        }
+
+        /* between hops only: refused while this hop awaits its post_process, whether it has a job or not */
+        if (dfn2_stream_set_atten_lim(s, 6.0f) != -1) {
+            fprintf(stderr, "set_atten_lim accepted inside hop %d (job_ready %d, N=%d)\n",
+                   i, io.job_ready, frames_per_call);
             return 1;
         }
 
@@ -171,9 +176,13 @@ static int run_smoke(int frames_per_call) {
                    post_rc, i, frames_per_call);
             return 1;
         }
+        if (dfn2_stream_set_atten_lim(s, 0.0f) != 0) {
+            fprintf(stderr, "set_atten_lim refused between hops (after hop %d, N=%d)\n", i, frames_per_call);
+            return 1;
+        }
     }
 
-    jobs_expected = frames_per_call == 1 ? hops : (hops - grid.mask_lookahead) / frames_per_call;
+    jobs_expected = (hops - grid.mask_lookahead) / frames_per_call;
     if (jobs_run != jobs_expected) {
         fprintf(stderr, "ran %d accelerator jobs over %d hops, expected %d (N=%d)\n",
                jobs_run, hops, jobs_expected, frames_per_call);
@@ -194,7 +203,7 @@ static int run_smoke(int frames_per_call) {
 
 int main(void) {
     check_saturate_s16_nonfinite();
-    if (run_smoke(1) != 0) return 1;   /* every hop is a job, as before frames_per_call was accepted */
+    if (run_smoke(1) != 0) return 1;   /* a job on every hop from hop mask_lookahead */
     if (run_smoke(4) != 0) return 1;   /* one job every 4 hops */
     return 0;
 }

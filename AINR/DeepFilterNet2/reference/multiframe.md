@@ -36,8 +36,8 @@ with the lookahead pair:
 - the window holds `N + 2` frames; the first call is ready after `M + N`
   pushed frames, every later one after N more (`pre_process_freq` returns 1 on hops
   `M+N-1`, `M+2N-1`, ...); `dfn2_model_io_frame_slot()` names the slot of the
-  last pushed frame. With N > 1 nothing of the one-flow-per-hop behaviour applies: the earlier hops return 0, there are no warm-up
-  frames, and `frame_open()` is called only after a 1 (as are the model and `frame_finish()`);
+  last pushed frame. With N > 1 the earlier hops return 0 (as the first M hops do for N == 1) and
+  `frame_open()` is called only after a 1 (as are the model and `frame_finish()`);
 - `frame_open()` publishes N heads per tensor, `frame_finish()` builds the N enhanced frames
   in one burst, and `post_process_freq` returns one hop per call from that burst,
   so the output trails by N - 1 more hops: latency `1 + M + D + N - 1` hops

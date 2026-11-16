@@ -101,8 +101,8 @@ Pass conditions:
 - [ ] The stimulus actually engages RES (`min G_res < 0.9`), so an
       estimate/apply swap cannot pass unnoticed.
 - [ ] The model stream's state generation shows no mid-stream reset
-      (`dfn_hop_state_generation()` is `1 + M` at the end of the identity run: 1 plus one per
-      warm-up frame, i.e. 2 for the shipped 1/1 pair; a reset, a refused commit or a run that started and failed would add to it;
+      (`dfn_hop_state_generation()` is 1 at the end of the identity run: the first M hops carry no model frame and
+      move nothing; a reset, a refused commit or a run that started and failed would add to it;
       the stub model and the identity path report `STREAM_RUN_NOT_STARTED`, which does not).
 - [ ] `erb_inv` that is not a bitwise partition of unity is refused at
       `get_mem_requirements()` (stage) and at `init` (`dfn2_stream_init*`, `ainr_init*`); the two
@@ -196,8 +196,8 @@ Pass conditions:
       delayed by exactly two hops (`M + D` for the build's pair), with comfort
       noise OFF and ON, across an AEC delay change.
 - [ ] The stimulus actually engages the post-beam RES (a run without the array's gain stage differs).
-- [ ] The model stream's state generation shows no mid-stream reset (1 plus one per warm-up
-      frame at the end of the run: the hop is not reset by a delay change of the shared aligner).
+- [ ] The model stream's state generation shows no mid-stream reset (1 at
+      the end of the run: the hop is not reset by a delay change of the shared aligner).
       The mono test asserts the same.
 - [ ] A rate the array does not offer is refused at
       `aec_get_mem_requirements()`, and a non-partition-of-unity

@@ -23,6 +23,7 @@
 #define EXPECT_N_ERB        32
 #define EXPECT_INPUT_COUNT  2
 #define EXPECT_OUTPUT_COUNT 1
+#define EXPECT_BYPASS       1     /* blocks without a job after init (mask_lookahead) */
 #else
 #define EXPECT_SR           16000
 #define EXPECT_FFT          256
@@ -30,6 +31,7 @@
 #define EXPECT_N_ERB        24
 #define EXPECT_INPUT_COUNT  2
 #define EXPECT_OUTPUT_COUNT 3
+#define EXPECT_BYPASS       0
 #endif
 
 static void *alloc_aligned(size_t bytes, unsigned int alignment) {
@@ -67,6 +69,16 @@ static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
     free(inv_bin_major);
 }
 
+/* A block without a job: action BYPASS and an all-zero work. */
+static int check_bypass_work(const StreamWork *io) {
+    if (io->action != STREAM_WORK_BYPASS || io->input_count != 0 || io->output_count != 0 || io->state_generation != 0u) {
+        fprintf(stderr, "link_only_ainr: block without a job: action %d, %d inputs, %d outputs, generation %u\n",
+                (int)io->action, io->input_count, io->output_count, io->state_generation);
+        return 1;
+    }
+    return 0;
+}
+
 /* Every tensor of the work has data, a non-zero shape and elements equal to the product of its axes. */
 static int check_work_tensors(const StreamWork *io) {
     int i;
@@ -97,7 +109,7 @@ static int run_round_trip(void) {
     int hop = EXPECT_FFT / 2;
     int16_t pcm_in[EXPECT_FFT / 2], pcm_out[EXPECT_FFT / 2];
     StreamWork io;
-    int rc, i;
+    int rc, i, b;
 
     snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_erb_%d.bin", (int)getpid());
     write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
@@ -117,6 +129,12 @@ static int run_round_trip(void) {
         return 1;
     }
     for (i = 0; i < hop; ++i) pcm_in[i] = (int16_t)((i * 13) % 211 - 100);
+    for (b = 0; b < EXPECT_BYPASS; ++b) {
+        rc = ainr_preprocess(ctx, pcm_in, &io);
+        if (rc != AINR_OK || check_bypass_work(&io) != 0) { fprintf(stderr, "ainr_preprocess rc=%d\n", rc); return 1; }
+        rc = ainr_postprocess(ctx, STREAM_RUN_NOT_STARTED, pcm_out);
+        if (rc != AINR_OK) { fprintf(stderr, "ainr_postprocess rc=%d\n", rc); return 1; }
+    }
     rc = ainr_preprocess(ctx, pcm_in, &io);
     if (rc != AINR_OK) { fprintf(stderr, "ainr_preprocess rc=%d\n", rc); return 1; }
 
@@ -153,7 +171,7 @@ static int run_round_trip_freq(void) {
     float in_re[EXPECT_N_BINS], in_im[EXPECT_N_BINS];
     float out_re[EXPECT_N_BINS], out_im[EXPECT_N_BINS];
     StreamWork io;
-    int rc, i;
+    int rc, i, b;
 
     snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_freq_erb_%d.bin", (int)getpid());
     write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
@@ -167,6 +185,12 @@ static int run_round_trip_freq(void) {
     if (ainr_init_freq_from_erb_file(&cfg, erb_path, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "ainr_init_freq_from_erb_file fail\n"); return 1; }
 
     for (i = 0; i < EXPECT_N_BINS; ++i) { in_re[i] = 0.01f * (float)i; in_im[i] = -0.005f * (float)i; }
+    for (b = 0; b < EXPECT_BYPASS; ++b) {
+        rc = ainr_preprocess_freq(ctx, in_re, in_im, in_re, in_im, &io);
+        if (rc != AINR_OK || check_bypass_work(&io) != 0) { fprintf(stderr, "ainr_preprocess_freq rc=%d\n", rc); return 1; }
+        rc = ainr_postprocess_freq(ctx, STREAM_RUN_NOT_STARTED, out_re, out_im);
+        if (rc != AINR_OK) { fprintf(stderr, "ainr_postprocess_freq rc=%d\n", rc); return 1; }
+    }
     rc = ainr_preprocess_freq(ctx, in_re, in_im, in_re, in_im, &io);
     if (rc != AINR_OK) { fprintf(stderr, "ainr_preprocess_freq rc=%d\n", rc); return 1; }
 

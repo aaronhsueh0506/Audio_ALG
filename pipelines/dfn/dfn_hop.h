@@ -16,16 +16,15 @@
  *         dfn_hop_nn_end(&h, run_model(&job));      // run status (stream_run.h): 0 = every output written
  *     dfn_hop_end(&h, out);                         // one host hop
  *
- * The direct path opens exactly one model frame per hop (the first mask_lookahead are warm-up
- * frames: the model runs, its heads are discarded), the bridge path 0, 1 or 2 by its schedule.
- * A frame the model refuses or leaves unwritten, a frame left open and a frame never fetched all
+ * The direct path opens one model frame per hop from hop mask_lookahead on (the first mask_lookahead hops after
+ * a start have none: nn_begin returns 0 and the model does not run), the bridge path 0, 1 or 2 by its
+ * schedule. A frame the model refuses or leaves unwritten, a frame left open and a frame never fetched all
  * take the identity through the cascade.
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
  * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing; a warm-up frame also advances
- * it. A frame left open reports STREAM_RUN_FAILED, a frame never fetched and the identity model
- * STREAM_RUN_NOT_STARTED.
+ * accelerator's state when the generation differs from the value at the last zeroing. A frame left open reports
+ * STREAM_RUN_FAILED, a frame never fetched, a hop with no model frame and the identity model STREAM_RUN_NOT_STARTED.
  *
  * dfn_hop_process() does the same with the model callback of the pool plan. The pointers are not
  * owned; the stream, bridge, synthesis and spectra come from the caller's pool (dfn_hop_pool.h).
@@ -100,7 +99,7 @@ static inline unsigned int dfn_hop_state_generation(const DfnHop* h) {
     return h ? dfn2_stream_state_generation(h->stream) : 0u;
 }
 
-/* Between hops only; 0, or -1 on NULL, a non-finite value or an open frame. */
+/* Between hops only; 0, or -1 on NULL, a non-finite value or (direct path) a hop begun and not yet ended. */
 static inline int dfn_hop_set_atten_lim(DfnHop* h, float atten_lim_db) {
     return h ? dfn2_stream_set_atten_lim(h->stream, atten_lim_db) : -1;
 }
@@ -166,18 +165,16 @@ static inline void dfn_hop_reset(DfnHop* h) {
     memset(h->out_spec, 0, (size_t)h->n_bins * sizeof(Complex));
 }
 
-/* Opens one model frame on the audio-scale spectra e and p (n_bins bins each): scaled to the model's
- * normalised spectra, estimated on e and applied on p. A bin that is non-finite or beyond 2^63 at
- * model scale refuses the block whole and leaves the stream untouched. 0, or -1. */
+/* Takes the audio-scale spectra e and p (n_bins bins each), scaled to the model's normalised spectra, estimated
+ * on e and applied on p. job->job_ready says whether a model frame is open (0 for the first mask_lookahead hops
+ * after a start). A bin that is non-finite or beyond 2^63 at model scale refuses the block whole and leaves the
+ * stream untouched. 0, or -1. */
 static inline int dfn_hop_open_frame(DfnHop* h, const Complex* e, const Complex* p, DfnHopJob* job) {
     float* w = h->planar;
     const int n = h->n_bins;
     skn_deinterleave_scale_cf32(e, w, w + n, n, h->scale);
     skn_deinterleave_scale_cf32(p, w + 2 * n, w + 3 * n, n, h->scale);
-    if (dfn2_stream_pre_process_freq_dual(h->stream, w, w + n, w + 2 * n, w + 3 * n, job) != 1 ||
-        !job->job_ready)
-        return -1;
-    return 0;
+    return dfn2_stream_pre_process_freq_dual(h->stream, w, w + n, w + 2 * n, w + 3 * n, job) == 1 ? 0 : -1;
 }
 
 /* Closes the open frame into `out` (n_bins bins, audio scale; zeros while no spectrum is due):
@@ -202,7 +199,7 @@ static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
         if (ainr_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
     } else {
         if (dfn_hop_open_frame(h, e, p, &h->job) != 0) return DFN_HOP_INVALID;
-        h->job_pending = 1;
+        h->job_pending = h->job.job_ready;
     }
     h->phase = 1;
     return 0;
@@ -211,12 +208,19 @@ static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
 /* Opens the bridge's next model frame: 1, 0 when the hop has no further frame, or -1. */
 static inline int dfn_hop_bridge_frame(DfnHop* h) {
     AinrBridgeFrame frame;
-    int r = ainr_bridge_model_begin(h->bridge, &frame);
-    if (r != 1) return r;
-    if (dfn_hop_open_frame(h, frame.estimate_spec, frame.apply_spec, &h->job) != 0) return -1;
-    h->frame_out = frame.out_spec;
-    h->frame_open = 1;
-    return 1;
+    for (;;) {
+        int r = ainr_bridge_model_begin(h->bridge, &frame);
+        if (r != 1) return r;
+        if (dfn_hop_open_frame(h, frame.estimate_spec, frame.apply_spec, &h->job) != 0) return -1;
+        if (h->job.job_ready) {
+            h->frame_out = frame.out_spec;
+            h->frame_open = 1;
+            return 1;
+        }
+        /* a frame the model does not see (the first mask_lookahead): closed here, the next one is fetched */
+        if (dfn_hop_close_frame(h, STREAM_RUN_NOT_STARTED, frame.out_spec) != 0 || ainr_bridge_model_end(h->bridge) != 0)
+            return -1;
+    }
 }
 
 static inline int dfn_hop_bridge_frame_end(DfnHop* h, int model_rc) {
@@ -264,7 +268,7 @@ static inline int dfn_hop_nn_end(DfnHop* h, int model_rc) {
 }
 
 /* Emits one host hop into out. A frame left open (STREAM_RUN_FAILED: the caller may have run it) or never fetched
- * (STREAM_RUN_NOT_STARTED) is the identity. */
+ * (STREAM_RUN_NOT_STARTED) is the identity; a hop with no model frame needs no nn_begin or nn_end. */
 static inline int dfn_hop_end(DfnHop* h, float* out) {
     int k;
     if (!h || !out) return DFN_HOP_INVALID;
@@ -279,7 +283,8 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
         return ainr_bridge_finish(h->bridge, out) != 0 ? DFN_HOP_INVALID : 0;
     }
     if (!h->frame_ended &&
-        dfn_hop_close_frame(h, h->job_pending ? STREAM_RUN_NOT_STARTED : STREAM_RUN_FAILED, h->out_spec) != 0) {
+        dfn_hop_close_frame(h, h->job_pending || !h->job.job_ready ? STREAM_RUN_NOT_STARTED : STREAM_RUN_FAILED,
+                            h->out_spec) != 0) {
         h->phase = 0;
         return DFN_HOP_INVALID;
     }

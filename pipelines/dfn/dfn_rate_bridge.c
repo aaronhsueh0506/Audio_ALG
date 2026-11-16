@@ -188,13 +188,22 @@ int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job) {
     AinrBridgeFrame frame;
     int r;
     if (!b || !job) return -1;
-    r = ainr_bridge_model_begin(b->bridge, &frame);
-    if (r != 1) return r;
-    if (dfn_res_stage_begin(b->stage, frame.estimate_spec, frame.apply_spec, job) != 1)
-        return -1;
-    b->out_spec = frame.out_spec;
-    b->frame_open = 1;
-    return 1;
+    for (;;) {
+        int begun;
+        r = ainr_bridge_model_begin(b->bridge, &frame);
+        if (r != 1) return r;
+        begun = dfn_res_stage_begin(b->stage, frame.estimate_spec, frame.apply_spec, job);
+        if (begun < 0) return -1;
+        if (begun == 1) {
+            b->out_spec = frame.out_spec;
+            b->frame_open = 1;
+            return 1;
+        }
+        /* a frame the model does not see (the first mask_lookahead): closed here, the next one is fetched */
+        if (dfn_res_stage_end(b->stage, STREAM_RUN_NOT_STARTED, frame.out_spec) < 0 ||
+            ainr_bridge_model_end(b->bridge) != 0)
+            return -1;
+    }
 }
 
 int dfn_rate_bridge_nn_end(DfnRateBridge *b, int model_rc) {

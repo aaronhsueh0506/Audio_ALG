@@ -269,9 +269,9 @@ static int run_identity(int enable_cng) {
     if (delay_changes < 1) return 3;          /* the contract was never exercised */
     if (!(min_res < 0.9f)) return 9;          /* RES never cut: A == B */
     if (nonzero_hops < TEST_FRAMES / 2) return 4;
-    /* neither reset (by the delay change, say) nor handed a refused commit: the state generation is 1
-     * plus one per warm-up frame, and every frame was a bypass (no model set) */
-    if (dfn_hop_state_generation(&dfn->hop) != 1u + (unsigned)DFN2_MASK_LOOKAHEAD)
+    /* neither reset (by the delay change, say) nor handed a refused commit: the state generation is 1,
+     * and every frame was a bypass (no model set) */
+    if (dfn_hop_state_generation(&dfn->hop) != 1u)
         return 5;                             /* a reset would leave a gap */
     if (aec_set_level(dfn->aec, AEC_LEVEL_AGGRESSIVE) != 0 ||
         aec_set_level(dfn->aec, (AecLevel)77) != -1)
@@ -462,8 +462,8 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
     /* DFN2 kept running through the event: its frame count is the whole stream's, with no gap */
     ainr_bridge_get_counters(dfn->hop.bridge, &stage_frames, NULL);
     if (stage_frames != ((long long)frames * hop * DFN2_SR / sample_rate) / DFN2_HOP_LEN) return 8;
-    /* ... and the model stream was not reset either: 1 plus one per warm-up frame, every frame a bypass */
-    if (dfn_hop_state_generation(&dfn->hop) != 1u + (unsigned)DFN2_MASK_LOOKAHEAD) return 8;
+    /* ... and the model stream was not reset either: generation 1, every frame a bypass */
+    if (dfn_hop_state_generation(&dfn->hop) != 1u) return 8;
     free(probe_mem);
     conv_destroy(conventional);
     fdfn_destroy(dfn);
@@ -691,7 +691,7 @@ int main(void) {
         rc = run_array_reset_direct(0, &diff, &resets, &generation, &clears, &clear_hop);
         /* the event is on hop 81: exactly one clear, on hop 81 + lookahead; DFN2's generation has no gap */
         if (rc || diff != 0 || resets != 1 || clears != 1 || clear_hop != 81 + DFN_TEST_LOOKAHEAD_FRAMES ||
-            generation != 1u + (unsigned)DFN2_MASK_LOOKAHEAD) {
+            generation != 1u) {
             fprintf(stderr, "4ch DFN array reset 48 kHz: rc %d, %ld hops differ, %ld reset hop(s), %ld clear(s) at hop %ld, generation %u\n",
                     rc, diff, resets, clears, clear_hop, generation);
             return 1;

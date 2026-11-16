@@ -137,13 +137,13 @@
 <p>不經模型串流、直接用 <code>&lt;pfx&gt;_prepost</code> 類別時（板端 sample 的寫法），framing 由應用端用 audiolib 做，類別只收發頻譜；遞迴 state 由應用端登錄（float host）或留在加速器（板端）。各類別的引數差異見 <a href="../../models/reference/onnx.html">ONNX 邊界與 calibration</a>。</p>
 <pre>應用            AcStft/AcIstft(audiolib)   prepost 類別(頻域)         加速器
  │── ac_stft_push_planar(stft,hop_in,re,im) ►│
- │── pre_process_freq(p,re,im…) ───────────────────────►│ 1 = 這一 hop 要推論(DFN2 N=1 與 DFN3 每 hop 都是 1,前 M 幀是暖機幀)
+ │── pre_process_freq(p,re,im…) ───────────────────────►│ 1 = 這一 hop 要推論(DFN2 N=1 從第 M 個 hop 起每 hop 是 1,前 M 個 hop 是 0:沒有 job;DFN3 每 hop 都是 1,前 M 幀是暖機幀)
  │── frame_open(p,&amp;in,&amp;out) ───────────────────────────►│ view:特徵視窗 + 登錄的 state(板端 NULL);heads 預填 NaN
  │── 推論(in,out) ─────────────────────────────────────────────────────►│ 每個 state 輸出寫回同名輸入的位址
- │── frame_finish(p) ──────────────────────────────────►│ 0 = 提交(暖機幀:丟棄 heads、state 歸零、generation+1);−1 = 登錄 state 歸零、generation+1、幀維持開啟 → frame_bypass(p)
+ │── frame_finish(p) ──────────────────────────────────►│ 0 = 提交(DFN3 暖機幀:丟棄 heads、state 歸零、generation+1);−1 = 登錄 state 歸零、generation+1、幀維持開啟 → frame_bypass(p)
  │── post_process_freq(p,out_re,out_im…) ──────────────►│ 增強後頻譜(DFN2/DFN3:valid = 0 時為零頻譜,可每 hop 照 push)
  │── ac_istft_push_planar(istft,out_re,out_im,hop_out) ►│ hop_out[hop]
- │ state_generation 與上次不同(reset、DFN2/DFN3 的暖機幀、被拒的 frame_finish)⇒ 板端以量化後的零重填加速器的 state 輸入</pre>
+ │ state_generation 與上次不同(reset、DFN3 的暖機幀、被拒的 frame_finish)⇒ 板端以量化後的零重填加速器的 state 輸入</pre>
 </main>
 </body>
 </html>

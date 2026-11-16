@@ -19,11 +19,6 @@
 #define PP_FRAME_COEFS(grid)  ((size_t)(grid)->df_bins * (size_t)(grid)->df_order * 2u)
 #endif
 
-/* The open frame is one of the first mask_lookahead frames after init or reset: its heads belong to a
- * frame before the stream start and are never used (N == 1 only; stable from pre_process to finish). */
-#define PP_IN_WARMUP(p) \
-    ((p)->grid.frames_per_call == 1 && dfn2_model_io_frame_slot((p)->io) < 0)
-
 struct DFN2Prepost {
     DFN2State        *dsp;
     DFN2ModelIOState *io;
@@ -283,8 +278,7 @@ static void pp_reset_states(DFN2Prepost *p) {
     dfn2_model_io_reset(p->io);
 }
 
-/* Bookkeeping only: the staging buffers are zero from init/reset, the warm-up frames return
- * before writing them and every later frame writes them wholesale. */
+/* Bookkeeping only: the staging buffers are zero from init/reset and every committed frame writes them wholesale. */
 static void pp_clear_frame(DFN2Prepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -453,10 +447,10 @@ static void pp_deliver(DFN2Prepost *p, int slot) {
     if (p->have_output) p->output_frame = p->slot_frame[slot];
 }
 
-/* Features and graph window, shared by every pre_process entry point; with N > 1 the first
- * L frames also advance the enhance clock here. `est_*` is read only inside this call; the hop's
- * source is already in enhanced_*[slot]. Returns the accelerator invocations this hop needs
- * (0 or 1; N == 1: always 1, the first L frames are warm-up frames). */
+/* Features and graph window, shared by every pre_process entry point. `est_*` is read only inside this call;
+ * the hop's source is already in enhanced_*[slot]. Returns the accelerator invocations this hop needs (0 or 1):
+ * 0 while the graph window is incomplete (the first L frames after init or reset) and, with N > 1, on the hops
+ * between two calls. The first L frames advance the enhance clock here and open no frame. */
 static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
                           const float *est_im, int slot) {
     int heads_needed;
@@ -467,9 +461,9 @@ static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
     heads_needed = dfn2_model_io_push_features(p->io, p->feat_erb, p->feat_spec);
     if (heads_needed < 0) return -1;
 
-    if (heads_needed == 0 && p->grid.frames_per_call > 1) {
+    if (heads_needed == 0) {
         if (dfn2_model_io_frame_slot(p->io) < 0) {
-            /* N > 1 warm-up: the clock advances with heads_valid=0, which
+            /* before the first window: the clock advances with heads_valid=0, which
              * dfn2_enhance_spectrum_stream() accepts exactly while current < mask_lookahead. */
             if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[slot],
                                     p->enhanced_im[slot], 0, NULL, NULL, 0.0f,
@@ -575,8 +569,7 @@ static const float pp_skip_alpha[1];
 
 /* Run the enhance stage per frame of the call in order: frame i reads its heads at i * stride
  * frames into the arrays (stride 0 repeats one frame's heads). Closes the frame on success only;
- * the clock advances once per frame, here or (N > 1 warm-up) in pp_begin_frame. A warm-up frame
- * (N == 1) advances the clock without heads, zeroes the registered state and emits nothing. */
+ * the clock advances once per frame, here or (before the first window) in pp_begin_frame. */
 static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                           const float *coefs, const float *alpha,
                           int stride) {
@@ -586,16 +579,6 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
     (void)coefs;   /* no deep filter: only the ERB mask head exists */
     (void)alpha;
 #endif
-    if (PP_IN_WARMUP(p)) {
-        if (dfn2_enhance_spectrum_stream(p->dsp, p->enhanced_re[0], p->enhanced_im[0], 0,
-                                         NULL, NULL, 0.0f, p->atten_lim_db, p->enh_re,
-                                         p->enh_im, NULL) != 0)
-            return -1;
-        dfn2_model_io_zero_recurrent(p->io);
-        p->frame_open = 0;   /* have_output stays 0 from pp_begin_frame, output_frame untouched */
-        p->prepared = 0;
-        return 0;
-    }
     for (i = 0; i < p->grid.frames_per_call; ++i) {
         const size_t head = (size_t)i * (size_t)stride;
         float *enh_re = p->enh_re + (size_t)i * (size_t)p->grid.n_bins;
@@ -621,7 +604,7 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
                                       enh_im, &frame);
 #endif
         if (emitted < 0) return -1;
-        p->slot_emitted[i] = emitted;   /* 0: still inside the lookahead warm-up */
+        p->slot_emitted[i] = emitted;   /* 0: the cascade has not reached a source frame yet */
         p->slot_frame[i] = frame;
     }
     p->frame_open = 0;
@@ -634,7 +617,6 @@ int dfn2_prepost_frame_finish(DFN2Prepost *p) {
     int heads_finite;
     int state_finite;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
-    if (PP_IN_WARMUP(p)) return dfn2_prepost_frame_bypass(p);   /* heads never read */
 
     /* The accelerator overwrote the recurrent state in place: a non-finite head or state element
      * zeroes both registered tensors, advances the state generation and disarms the transaction;
@@ -679,8 +661,7 @@ int dfn2_prepost_frame_bypass(DFN2Prepost *p) {
 
 int dfn2_prepost_frame_fail(DFN2Prepost *p, int run_started) {
     if (!p || !p->frame_open) return -1;
-    /* A warm-up frame is closed by pp_close_frame, which zeroes the state and advances the generation itself. */
-    if (run_started && !PP_IN_WARMUP(p)) dfn2_model_io_zero_recurrent(p->io);
+    if (run_started) dfn2_model_io_zero_recurrent(p->io);
     return dfn2_prepost_frame_bypass(p);
 }
 

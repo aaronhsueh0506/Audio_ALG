@@ -8,21 +8,24 @@
  *     ...open info.graph_path, check its ports against the sample's model config for the same graph,
  *        seed the state sync from ainr_state_generation()...
  *     for each block of hop_in samples:
- *         ainr_preprocess(ctx, pcm_in, &work);          // always carries one job
- *         ...run the accelerator on work (state sync and readback recovery are the sample's)...
- *         ainr_postprocess(ctx, run_status, pcm_out);   // hop_in valid samples
+ *         ainr_preprocess(ctx, pcm_in, &work);          // work.action: SUBMIT or BYPASS
+ *         ...SUBMIT: run the accelerator on work (state sync and readback recovery are the sample's);
+ *            BYPASS: no accelerator call...
+ *         ainr_postprocess(ctx, run_status, pcm_out);   // hop_in valid samples, BYPASS block included
  *     after the last real block (zero-padded to hop_in): info.tail_zero_blocks all-zero blocks through
  *         the same sequence, then drop info.trim_samples from the start of the output
  *
  * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
  * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing. Each of the first
- * mask_lookahead blocks after init or reset also advances it (the warm-up job's heads are discarded).
+ * accelerator's state when the generation differs from the value at the last zeroing; the accelerator's state is
+ * zero when the generation is seeded after init. The status of a BYPASS block is not read.
  *
  * A block whose run did not succeed still calls ainr_postprocess() with its run status. An unregistered
- * config is refused before any SDK call. Every successful preprocess pairs with one run and one
- * postprocess. StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
+ * config is refused before any SDK call. Every successful preprocess pairs with one postprocess, a SUBMIT block
+ * also with one run. A BYPASS block is N == 1 with mask_lookahead > 0 and only one of the first mask_lookahead
+ * blocks after init or reset: no job, its work is all zero (state_generation included), its output is silence.
+ * StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
  * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
  * File mode only: the pool size assumes the ERB tables load from a file. Under -DDFN2_STREAM_NO_STDIO
  * no init function is compiled in; use dfn2_stream_init() (dfn2/dfn2_stream.h) directly. */
@@ -105,6 +108,7 @@ unsigned int ainr_state_generation(const AinrCtx *ctx);
 
 /* One block in: exactly cfg->hop_in samples. AINR_OK: work (action SUBMIT) holds the block's one job (inputs: ERB
  * window, spec window; outputs: erb_mask, then coefs and alpha in the full archive); run it, then ainr_postprocess().
+ * Work with action BYPASS holds no job: skip the accelerator and call ainr_postprocess() all the same.
  * AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no block is open. */
 int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work);
 

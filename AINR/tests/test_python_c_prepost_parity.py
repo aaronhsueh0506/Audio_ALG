@@ -712,9 +712,11 @@ def test_pcm_through_audiolib_stft_matches_torch_stft_features(
             np.testing.assert_allclose(
                 spec[:, first:], py_spec[0, :, t - 2 + first:t + 1].numpy(),
                 rtol=2e-5, atol=3e-6)
-    # Every hop opens a frame (one frame per call): the first mask_lookahead are warm-up frames
-    # whose windows are compared above like any other (zero rows before the stream start).
-    assert counts == [1] * _FRAMING_HOPS
+    # DeepFilterNet2 opens no frame for the first mask_lookahead hops (the compare above starts at the first
+    # window); DeepFilterNet3 opens them as frames whose windows are compared like any other (zero
+    # rows before the stream start).
+    no_job = pair[0] if ref.n == 2 else 0
+    assert counts == [0] * no_job + [1] * (_FRAMING_HOPS - no_job)
 
 
 @pytest.mark.parametrize('family,sr,n_fft,n_erb,df_bins,pair', FRAMING_CASES)

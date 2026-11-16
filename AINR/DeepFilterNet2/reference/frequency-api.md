@@ -13,8 +13,8 @@ the application gives it one, so step 1 comes first and its `DFN2Grid` goes to e
    is refused).
 5. `dfn2_model_io_descriptor_default(&grid, &d)`: the graph contract of this build for the grid, to compare with what the accelerator
    runtime reports (`dfn2_model_io_descriptor_validate(&grid, &d)`); a model exported for another grid or lookahead pair fails it.
-6. Per hop, the same flow on every hop (`frames_per_call` 1): `ac_stft_push_planar()`, `dfn2_prepost_pre_process_freq()` (returns 1),
-   `dfn2_prepost_frame_open()`, the model, `dfn2_prepost_frame_finish()` (`dfn2_prepost_frame_bypass()` when the commit was refused, `dfn2_prepost_frame_fail(p, run_started)`
+6. Per hop (`frames_per_call` 1): `ac_stft_push_planar()`, `dfn2_prepost_pre_process_freq()` (returns 0 on the first M hops: no job, skip to the post;
+   1 from hop M on), `dfn2_prepost_frame_open()`, the model, `dfn2_prepost_frame_finish()` (`dfn2_prepost_frame_bypass()` when the commit was refused, `dfn2_prepost_frame_fail(p, run_started)`
    when the run did not succeed); then `dfn2_prepost_post_process_freq()` and `ac_istft_push_planar()`; `valid` is informational (the spectrum
    is all zero while it is 0) and the argument may be NULL. `dfn2_model_run_frame(&model, p)` does the middle three for a `DFN2Model`
    that carries the descriptor. With `frames_per_call` > 1 the flow is the older one, see [Multi-frame export](multiframe.md#multi-frame-export).
@@ -129,23 +129,26 @@ static int run_dfn2(const char *erb_path, RunModel run_model, const float *in, f
     if (dfn2_model_io_descriptor_default(&grid, &desc) != 0 ||
         dfn2_model_io_descriptor_validate(&grid, &desc) != 0) goto done;
 
-    /* 6. the same flow on every hop (N == 1): analysis, pre_process_freq, frame_open -> model ->
-     *    frame_finish, post_process_freq, synthesis. The first mask_lookahead hops are warm-up frames:
-     *    the model runs, its heads are discarded, the state restarts. dfn2_model_run_frame() does the
-     *    middle three for a DFN2Model that carries the descriptor. */
+    /* 6. per hop (N == 1): analysis, pre_process_freq, frame_open -> model -> frame_finish, post_process_freq,
+     *    synthesis. The first mask_lookahead hops return 0 from pre_process_freq: no frame, no model run, the
+     *    state and the generation stay. dfn2_model_run_frame() does the middle three for a DFN2Model that
+     *    carries the descriptor. */
     rc = 0;
     for (long h = 0; h < hops && rc == 0; ++h) {
         ac_stft_push_planar(stft, in + h * grid.hop, re, im);
-        if (dfn2_prepost_pre_process_freq(p, re, im) != 1) { rc = -1; break; }   /* 1 on every hop */
-        DFN2PrepostInputs xin;
-        DFN2PrepostOutputs xout;
-        if (dfn2_prepost_frame_open(p, &xin, &xout) != 0) { rc = -1; break; }
-        /* dfn2_prepost_state_generation(p) changed since the last frame (a reset, a warm-up frame, a
-         * refused commit or a failed run zeroed the state): an accelerator with its own state copy refills it first. */
-        if (run_model(&xin, &xout) != 0)
-            dfn2_prepost_frame_fail(p, 1);             /* the noisy spectrum, state zeroed, generation + 1 */
-        else if (dfn2_prepost_frame_finish(p) != 0)
-            dfn2_prepost_frame_bypass(p);              /* refused commit (already zeroed): the noisy spectrum, clocks advance */
+        int need = dfn2_prepost_pre_process_freq(p, re, im);   /* 0 on the first M hops, 1 after */
+        if (need < 0) { rc = -1; break; }
+        if (need == 1) {
+            DFN2PrepostInputs xin;
+            DFN2PrepostOutputs xout;
+            if (dfn2_prepost_frame_open(p, &xin, &xout) != 0) { rc = -1; break; }
+            /* dfn2_prepost_state_generation(p) changed since the last frame (a reset, a refused commit or a
+             * failed run zeroed the state): an accelerator with its own state copy refills it first. */
+            if (run_model(&xin, &xout) != 0)
+                dfn2_prepost_frame_fail(p, 1);             /* the noisy spectrum, state zeroed, generation + 1 */
+            else if (dfn2_prepost_frame_finish(p) != 0)
+                dfn2_prepost_frame_bypass(p);              /* refused commit (already zeroed): the noisy spectrum, clocks advance */
+        }
         if (dfn2_prepost_post_process_freq(p, out_re, out_im, NULL) != 0) { rc = -1; break; }   /* zeros for the first M + D hops */
         ac_istft_push_planar(istft, out_re, out_im, out + h * grid.hop);                         /* every hop: AC_OLA_ACCUMULATE */
     }

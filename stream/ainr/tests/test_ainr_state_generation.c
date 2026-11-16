@@ -3,7 +3,8 @@
  * ainr_state_generation*() at the moment it is read (the seed read right after init included), and
  * the counter must move exactly where ainr.h says:
  *
- *   +1 on ainr_reset(); +1 after each of the first mask_lookahead warm-up blocks (48 kHz);
+ *   +1 on ainr_reset(); unchanged by the first mask_lookahead blocks after init or reset (48 kHz): they carry no job
+ *   (action BYPASS, an all-zero work, generation 0) and ignore the status posted for them;
  *   +1 on a refused commit (postprocess status 0 with the heads left NaN, or one NaN/Inf element in any head);
  *   +1 on a run status that is neither STREAM_RUN_OK nor STREAM_RUN_NOT_STARTED (the device state may be dirty);
  *   unchanged on STREAM_RUN_NOT_STARTED (no run started).
@@ -95,16 +96,31 @@ static void fill_heads(StreamWork *io) {
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "%s/%s: ", label, fam_name(f->family)); \
     fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); return 1; } } while (0)
 
-/* `warm` = mask_lookahead of the grid (hops after init/reset that advance the generation). */
+static int is_bypass_work(const StreamWork *io) {
+    return io->action == STREAM_WORK_BYPASS && io->input_count == 0 && io->output_count == 0 && io->state_generation == 0u;
+}
+
+/* `warm` = mask_lookahead of the grid (blocks after init/reset that carry no job). */
 static int run_family(Fam *f, int warm, const char *label) {
     StreamWork io;
     unsigned int g, seed;
     int blk = 0, w;
 
-    /* The seed a sample reads right after init is what the first block reports. */
+    /* The first `warm` blocks after init are BYPASS, whatever status closes them, and leave the generation at the seed. */
     seed = fam_gen(f);
-    CHECK(fam_pre(f, blk, &io) == AINR_OK, "first pre after init failed");
-    CHECK(io.state_generation == seed, "first block: io %u != seed %u read after init", io.state_generation, seed);
+    for (w = 0; w < warm; ++w) {
+        CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre after init failed");
+        CHECK(is_bypass_work(&io), "block %d after init is not an all-zero BYPASS work", w);
+        CHECK(fam_post(f, w == 0 ? STREAM_RUN_FAILED : STREAM_RUN_NOT_STARTED) == AINR_OK, "BYPASS post failed");
+        CHECK(fam_gen(f) == seed, "BYPASS block %d after init: %u -> %u, want unchanged", w, seed, fam_gen(f));
+    }
+    /* The seed a sample reads right after init is what the first block with a job reports. */
+    CHECK(fam_pre(f, blk++, &io) == AINR_OK, "first pre with a job failed");
+    CHECK(io.action == STREAM_WORK_SUBMIT, "first block after the BYPASS ones is not SUBMIT");
+    CHECK(io.state_generation == seed, "first job: io %u != seed %u read after init", io.state_generation, seed);
+    fill_heads(&io);
+    CHECK(fam_post(f, 0) == AINR_OK, "first job post failed");
+    CHECK(fam_gen(f) == seed, "first job moved the generation %u -> %u", seed, fam_gen(f));
 
     /* Reset moves the counter off its initial value; everything below is compared against a live
      * value that is not zero. */
@@ -113,14 +129,13 @@ static int run_family(Fam *f, int warm, const char *label) {
     CHECK(fam_gen(f) == g + 1u, "reset: %u -> %u, want +1", g, fam_gen(f));
     CHECK(fam_gen(f) != 0u, "reset: generation still 0");
 
-    /* Warm-up blocks: the sample sees the live generation, +1 per warm-up hop once it commits. */
+    /* The first `warm` blocks after the reset are BYPASS again and leave the generation where the reset put it. */
     for (w = 0; w < warm; ++w) {
         g = fam_gen(f);
-        CHECK(fam_pre(f, blk++, &io) == AINR_OK, "warm-up pre failed");
-        CHECK(io.state_generation == fam_gen(f), "warm-up pre: io %u != live %u", io.state_generation, fam_gen(f));
-        fill_heads(&io);
-        CHECK(fam_post(f, 0) == AINR_OK, "warm-up post failed");
-        CHECK(fam_gen(f) == g + 1u, "warm-up block %d: %u -> %u, want +1", w, g, fam_gen(f));
+        CHECK(fam_pre(f, blk++, &io) == AINR_OK, "pre after reset failed");
+        CHECK(is_bypass_work(&io), "block %d after reset is not an all-zero BYPASS work", w);
+        CHECK(fam_post(f, w == 0 ? STREAM_RUN_FAILED : STREAM_RUN_NOT_STARTED) == AINR_OK, "BYPASS post failed");
+        CHECK(fam_gen(f) == g, "BYPASS block %d after reset: %u -> %u, want unchanged", w, g, fam_gen(f));
     }
 
     /* Steady state: commit leaves it alone; io carries the live value. */
@@ -208,7 +223,7 @@ static int run_status_one(Fam *f, Fam *twin, int warm, int status, const char *l
     unsigned int g, tg;
     int blk = 0, w, k;
 
-    for (w = 0; w < warm + 2; ++w) {   /* the warm-up blocks, then two committed ones */
+    for (w = 0; w < warm + 2; ++w) {   /* the blocks without a job, then two committed ones */
         CHECK(fam_pre(f, blk, &io) == AINR_OK && fam_pre(twin, blk, &tio) == AINR_OK, "lead-in pre failed");
         fill_heads(&io);
         fill_heads(&tio);

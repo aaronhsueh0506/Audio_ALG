@@ -1,6 +1,7 @@
 /* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and DFN2Prepost around int16
- * PCM, one hop in and one hop out per call, grid.frames_per_call N in [1, 64]. N == 1: the accelerator runs
- * every hop. N > 1: once every N hops (io.job_ready); pre/post are still called every hop.
+ * PCM, one hop in and one hop out per call, grid.frames_per_call N in [1, 64]. The accelerator runs when
+ * io.job_ready: every hop from hop L when N == 1 (the first L = mask_lookahead hops after init or reset have no
+ * job), once every N hops from hop L + N - 1 otherwise; pre/post are still called every hop.
  *
  *     ctx = dfn2_stream_init_from_erb_file(&cfg, erb_path, pool, pool_bytes);
  *     while (have a hop of int16 pcm_in) {
@@ -20,7 +21,7 @@
  * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
  * accelerator's state when the generation differs from the value at the last zeroing.
- * Warm-up (N == 1: mask_lookahead hops after init/reset; N > 1: none) runs the same loop and emits silence.
+ * A hop without a job (io.job_ready 0) emits silence and the status passed to post_process is ignored.
  * Tail: push mask_lookahead + df_lookahead + N zero hops after the last real one.
  *
  * A caller with its own analysis and synthesis uses dfn2_stream_pre_process_freq_dual() /
@@ -134,15 +135,14 @@ DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const
                                               const DFN2StreamMemReq *expected);
 
 /* Back to the start: HPF, STFT/ISTFT (when the context has them) and DFN2Prepost reset (state zeroed, generation
- * advanced, warm-up due again); ERB tables kept. */
+ * advanced); ERB tables kept. */
 void dfn2_stream_reset(DFN2Stream *s);
 
 /* Generation of the recurrent state (dfn2_prepost_state_generation()); 0 for NULL. */
 unsigned int dfn2_stream_state_generation(const DFN2Stream *s);
 
 /* Attenuation limit of |atten_lim_db| dB (sign ignored; 0 disables), between hops only; 0, or -1 on NULL, a
- * non-finite value or an open
- * frame. Kept by reset. */
+ * non-finite value or a hop awaiting its post_process (a hop without a job included). Kept by reset. */
 int dfn2_stream_set_atten_lim(DFN2Stream *s, float atten_lim_db);
 
 int dfn2_stream_hop_size(const DFN2Stream *s);           /* samples per PCM hop; -1 on NULL */
@@ -150,7 +150,7 @@ int dfn2_stream_hop_size(const DFN2Stream *s);           /* samples per PCM hop;
 /* The tensor views of one open hop and the generation the accelerator's state must match; valid until
  * dfn2_stream_post_process(). */
 typedef struct DFN2HopIO {
-    int                job_ready;   /* 1: run the accelerator. 0 (N > 1 only): no job, inputs/outputs stale */
+    int                job_ready;   /* 1: run the accelerator. 0: no job this hop, inputs/outputs not set */
     DFN2PrepostInputs  inputs;      /* valid only when job_ready */
     DFN2PrepostOutputs outputs;     /* valid only when job_ready */
     /* Sampled every hop; reload the accelerator's state with quantized zero if it differs. */
@@ -158,7 +158,7 @@ typedef struct DFN2HopIO {
 } DFN2HopIO;
 
 /* One PCM hop in (dfn2_stream_hop_size(s) samples): int16 -> float, HPF, STFT, pre_process_freq, frame_open
- * when io->job_ready. 1 with *io filled (warm-up included), or -1 on NULL args, no preceding post_process or a
+ * when io->job_ready. 1 with *io filled (inputs/outputs only with a job), or -1 on NULL args, no preceding post_process or a
  * freq_only context. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 

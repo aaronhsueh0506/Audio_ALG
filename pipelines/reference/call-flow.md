@@ -283,8 +283,7 @@ an alignment boundary and `ulcnet_stream_reset()` advance the state generation i
 registers no state keeps it in the accelerator and reloads quantized zeros at start and whenever the
 state generation changes (`job.state_generation` / `dfn_hop_state_generation()`, the model stream's `dfn2_stream_state_generation()`,
 for DFN2, `io.state_generation` / `ulcnet_stream_state_generation()` for ULCNet); a refused commit (a
-non-finite output) advances the counter as a reset does. DFN2's first `mask_lookahead` hops are warm-up frames: the model runs, the model stream
-drops its heads, and each one advances the counter (a failing model on such a frame is a bypass that does the same); on a real frame a
+non-finite output) advances the counter as a reset does. DFN2's first `mask_lookahead` hops carry no model frame: the model does not run and the counter stays; on a real frame a
 nonzero model result does not advance it.
 
 ### How do the 4-channel applications split the hop?

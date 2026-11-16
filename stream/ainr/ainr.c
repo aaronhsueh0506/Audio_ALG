@@ -502,11 +502,22 @@ static void ainr_fill_work(const DFN2Grid *grid, const DFN2PrepostInputs *in,
     work->state_generation = generation;
 }
 
+/* The block's work: the tensors when the hop opened a job, else a BYPASS work (all zero, generation 0). */
+static void ainr_prepare_work(const DFN2Grid *grid, const DFN2HopIO *hio, StreamWork *work)
+{
+    if (hio->job_ready) {
+        ainr_fill_work(grid, &hio->inputs, &hio->outputs, hio->state_generation, work);
+        return;
+    }
+    memset(work, 0, sizeof(*work));
+    work->action = STREAM_WORK_BYPASS;
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Block loops. Each drains the first n - 1 hops of a block into the stash (they never carry a real
  * job for any catalog entry: the lookahead/N>1 rule in ainr_resolve() guarantees this), then opens
- * the real Nth hop. AINR_OK with *hio filled (job_ready == 1), AINR_ERR_SEQUENCE on a contract
- * error.
+ * the real Nth hop. AINR_OK with *hio filled (job_ready == 1; with n == 1 also job_ready == 0, the
+ * first mask_lookahead hops), AINR_ERR_SEQUENCE on a contract error.
  * ------------------------------------------------------------------------------------------- */
 
 static int ainr_open_pcm(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
@@ -521,7 +532,7 @@ static int ainr_open_pcm(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
             return AINR_ERR_SEQUENCE;
     }
     if (dfn2_stream_pre_process(c->inner, pcm_in + (size_t)(c->n - 1) * (size_t)hop, hio) != 1 ||
-        !hio->job_ready)
+        (c->n > 1 && !hio->job_ready))
         return AINR_ERR_SEQUENCE;
     return AINR_OK;
 }
@@ -563,7 +574,7 @@ static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
             int valid = 0;
             if (hio->job_ready) return AINR_ERR_SEQUENCE;
             if (dfn2_stream_post_process_freq(c->inner, 0, sre, sim, &valid) < 0) return AINR_ERR_SEQUENCE;
-        } else if (!hio->job_ready) {
+        } else if (c->n > 1 && !hio->job_ready) {
             return AINR_ERR_SEQUENCE;
         }
     }
@@ -614,7 +625,7 @@ int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work)
     if (c->block_open) return AINR_ERR_SEQUENCE;
     if (ainr_open_pcm(c, pcm_in, &hio) != AINR_OK) return AINR_ERR_SEQUENCE;
 
-    ainr_fill_work(&c->grid, &hio.inputs, &hio.outputs, hio.state_generation, work);
+    ainr_prepare_work(&c->grid, &hio, work);
     c->block_open = 1;
     return AINR_OK;
 }
@@ -668,7 +679,7 @@ int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est
     if (!ainr_freq_block_in_range(c, est_re, est_im, app_re, app_im)) return AINR_ERR_NONFINITE_INPUT;
     if (ainr_open_freq(c, est_re, est_im, app_re, app_im, &hio) != AINR_OK) return AINR_ERR_SEQUENCE;
 
-    ainr_fill_work(&c->grid, &hio.inputs, &hio.outputs, hio.state_generation, work);
+    ainr_prepare_work(&c->grid, &hio, work);
     c->block_open = 1;
     return AINR_OK;
 }

@@ -1,10 +1,10 @@
-/* Run-status table of dfn2_stream_post_process(): each status x warm-up / steady frame at N == 1, and the per-hop
- * path of N > 1. A stand-in accelerator keeps its own state and follows the documented protocol (zero it when
+/* Run-status table of dfn2_stream_post_process(): each status x the first job after a start and a steady job at
+ * N == 1 (the first mask_lookahead hops have no job), and the per-hop path of N > 1. A stand-in accelerator keeps its own state and follows the documented protocol (zero it when
  * io.state_generation changed); the test compares that state with the one the status rules predict:
  *   STREAM_RUN_OK            the run advanced the state;
  *   STREAM_RUN_NOT_STARTED   nothing ran: the state and the generation stay;
  *   any other value          the run may have corrupted the state: it is zeroed before the next run, generation + 1.
- * A warm-up frame (N == 1, mask_lookahead hops after init or reset) zeroes the state whatever the status.
+ * A hop without a job ignores the status and moves neither the state nor the generation.
  * The failed hop's PCM is the bypass output, identical to a NOT_STARTED hop's. */
 
 #include <limits.h>
@@ -90,7 +90,7 @@ static void run_case(const DFN2GridSpec *spec, const char *label, int fail_statu
     DFN2Grid grid;
     Stream a, b;   /* a: the status under test; b: STREAM_RUN_NOT_STARTED at the same job */
     float *fwd, *inv;
-    int L, N, fail_job, hops, h, jobs_a = 0, jobs_b = 0, warm_jobs;
+    int L, N, fail_job, hops, h, jobs_a = 0, jobs_b = 0;
     int16_t pcm_a[1024], pcm_b[1024];
     int differs_after = 0;
 
@@ -104,18 +104,17 @@ static void run_case(const DFN2GridSpec *spec, const char *label, int fail_statu
         erb_fixture_unit_inv(inv, grid.n_bins, grid.n_erb);
     }
     if (stream_open(&a, &grid, fwd, inv) != 0 || stream_open(&b, &grid, fwd, inv) != 0) { CHECK(0, "[%s] open", label); return; }
-    warm_jobs = N == 1 ? L : 0;
     hops = L + 6 * N + 4;
-    /* Fail the first warm-up job when there is one (the other pass), else a steady one after two good runs. */
-    for (int pass = 0; pass < (warm_jobs ? 2 : 1); ++pass) {
-        fail_job = pass == 0 ? warm_jobs + 2 : 0;
-        if (pass == 1) {   /* back to the start: warm-up again */
+    /* Fail a steady job after two good runs, then (after a reset) the first job. */
+    for (int pass = 0; pass < 2; ++pass) {
+        fail_job = pass == 0 ? 2 : 0;
+        if (pass == 1) {   /* back to the start: the first L hops have no job again */
             dfn2_stream_reset(a.s); dfn2_stream_reset(b.s);
             a.expect = b.expect = 0; jobs_a = jobs_b = 0;
         }
         for (h = 0; h < hops; ++h) {
             unsigned int ga0, ga1, gb0, gb1;
-            int ja, jb, fail_hop, in_warm;
+            int ja, jb, fail_hop;
             ja = hop_once(&a, &grid, h, jobs_a, fail_job, fail_status, pcm_a, &ga0, &ga1);
             jb = hop_once(&b, &grid, h, jobs_b, fail_job, STREAM_RUN_NOT_STARTED, pcm_b, &gb0, &gb1);
             CHECK((ja >= 0) == (jb >= 0), "[%s] job cadence differs", label);
@@ -124,12 +123,8 @@ static void run_case(const DFN2GridSpec *spec, const char *label, int fail_statu
                 continue;
             }
             fail_hop = (ja == fail_job);
-            in_warm = ja < warm_jobs;
             /* the rules */
-            if (in_warm) {
-                CHECK(ga1 == ga0 + 1u && gb1 == gb0 + 1u, "[%s] warm-up job %d: generation %u -> %u / %u -> %u, want +1", label, ja, ga0, ga1, gb0, gb1);
-                a.expect = b.expect = 0;
-            } else if (fail_hop) {
+            if (fail_hop) {
                 int dirty = fail_status != 0 && fail_status != STREAM_RUN_NOT_STARTED;
                 CHECK(ga1 == ga0 + (dirty ? 1u : 0u), "[%s] status %d: generation %u -> %u, want %s", label, fail_status, ga0, ga1, dirty ? "+1" : "unchanged");
                 CHECK(gb1 == gb0, "[%s] NOT_STARTED: generation %u -> %u, want unchanged", label, gb0, gb1);
@@ -148,7 +143,7 @@ static void run_case(const DFN2GridSpec *spec, const char *label, int fail_statu
     /* A dirty status zeroes the state and NOT_STARTED keeps it, so the runs after the failed one differ. */
     {
         int dirty = fail_status != 0 && fail_status != STREAM_RUN_NOT_STARTED;
-        if (dirty && warm_jobs == 0) CHECK(differs_after, "[%s] status %d: later output equals the NOT_STARTED stream's", label, fail_status);
+        if (dirty) CHECK(differs_after, "[%s] status %d: later output equals the NOT_STARTED stream's", label, fail_status);
     }
     free(a.pool); free(b.pool); free(fwd); free(inv);
 }
@@ -160,7 +155,7 @@ int main(void) {
     size_t i;
     memset(&n1, 0, sizeof n1); memset(&w1, 0, sizeof w1); memset(&n4, 0, sizeof n4);
     n1.sample_rate = 16000; n1.n_fft = 256; n1.n_erb = 24; n1.df_bins = 96; n1.frames_per_call = 1;       /* L0, N1 */
-    w1.sample_rate = 48000; w1.n_fft = 1024; w1.n_erb = 32; w1.df_bins = 96; w1.mask_lookahead = 1; w1.frames_per_call = 1;  /* warm-up */
+    w1.sample_rate = 48000; w1.n_fft = 1024; w1.n_erb = 32; w1.df_bins = 96; w1.mask_lookahead = 1; w1.frames_per_call = 1;  /* L1 */
     n4 = n1; n4.frames_per_call = 4;                                                                       /* per-hop path */
 #ifdef DFN2_MASK_ONLY
     n1.df_order = n4.df_order = w1.df_order = 0; w1.df_lookahead = 0;
@@ -172,7 +167,7 @@ int main(void) {
         run_case(&w1, "48k N=1 L=1", statuses[i]);
         run_case(&n4, "16k N=4 L=0", statuses[i]);
     }
-    printf("fail_table: %zu statuses x 3 grids (steady, warm-up, N > 1) -- %s\n", sizeof statuses / sizeof statuses[0],
+    printf("fail_table: %zu statuses x 3 grids (N = 1 L = 0, N = 1 L = 1, N > 1) -- %s\n", sizeof statuses / sizeof statuses[0],
            g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
 }

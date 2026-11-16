@@ -35,12 +35,12 @@ are compiled once for the module):
             the same address on every frame
   inplace_nan    a NaN injected through the in-place pointer makes commit refuse
             and leaves both tensors zero
-  generation     the state generation is 1 after init and advances once per reset,
-            once per warm-up frame and once per refused commit, never on commit or
-            skip of a real frame
-  warmup    the first mask_lookahead frames are opened like any other; their heads
-            are discarded, the registered state is zeroed, the generation advances
-            by one each and nothing is emitted
+  generation     the state generation is 1 after init and advances once per reset
+            and once per refused commit, never on commit or skip of a frame nor on
+            the first mask_lookahead hops
+  warmup    the first mask_lookahead hops carry no job: pre_process returns 0, no
+            frame is opened, the registered state and the generation stay and
+            nothing is emitted; the first hop with a job reads its heads
   warmup_synthesis  the synthesis may be pushed on every hop
 
 The recurrent state belongs to the application: the driver registers two float buffers per
@@ -56,8 +56,8 @@ against the grid and against the library's ``dfn2_prepost_*_elements()``.
 
 The driver is built for the shipped (mask, df) lookahead pair with no override
 and, in the last tests, for every other pair in ``dfn_pairs.c_build_pairs`` with
--DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD: every warm-up length,
-readiness count and delay-line length in it follows the pair in the grid. The
+-DDFN2_MASK_LOOKAHEAD / -DDFN2_DF_LOOKAHEAD: every length of the
+hops without a job, readiness count and delay-line length in it follows the pair in the grid. The
 pool identity (build_flags_hash) is checked to differ between pairs, and a pool
 of another pair is refused by _init_ex. Inside one binary the same refusal is
 checked for grids that differ in any single value (frequency, frame size, band
@@ -109,11 +109,10 @@ _DRIVER = r'''
 #define TEST_COEFS_ELEMENTS \
     (1 * DFN2_DF_BINS * DFN2_DF_ORDER * 2)
 
-/* What pre_process returns on stream hop t of a cold instance: 1 on every hop. The first
- * DFN2_MASK_LOOKAHEAD hops are warm-up frames (their heads belong to a frame before the
- * stream start and are discarded); the window of heads[0] is complete on hop
- * DFN2_MASK_LOOKAHEAD. */
-#define PRE_RET(t)  1
+/* What pre_process returns on stream hop t of a cold instance: 0 for the first DFN2_MASK_LOOKAHEAD
+ * hops (no job: the window of heads[0] is not complete, nothing is opened, the clocks advance), 1 on
+ * every hop from DFN2_MASK_LOOKAHEAD on. */
+#define PRE_RET(t)  ((t) >= DFN2_MASK_LOOKAHEAD ? 1 : 0)
 
 /* skip: frames driven purely on frame_bypass, then five more for the freeze. */
 #define SKIP_FRAMES 24
@@ -289,15 +288,12 @@ static int state_all_zero(const DFN2PrepostInputs *in) {
                     in->df_convp_window_elements);
 }
 
-/* One warm-up frame through the stand-in, on an open frame: the stand-in writes the state, finish
- * discards the heads and leaves the registered state zero. 0 when both held. */
-static int run_warm_frame(DFN2Prepost *p) {
+/* A hop that pre_process answered 0 for opened no frame: the frame-level calls refuse. 0 when they do. */
+static int check_no_frame(DFN2Prepost *p) {
     DFN2PrepostInputs in;
     DFN2PrepostOutputs out;
-    if (dfn2_prepost_frame_open(p, &in, &out) != 0) return -1;
-    fake_run(&in, &out);
-    if (!any_nonzero(in.gru_hidden, in.gru_hidden_elements)) return -1;
-    return dfn2_prepost_frame_finish(p) == 0 && state_all_zero(&in) ? 0 : -1;
+    return dfn2_prepost_frame_open(p, &in, &out) == -1 && dfn2_prepost_frame_finish(p) == -1 &&
+           dfn2_prepost_frame_bypass(p) == -1 && dfn2_prepost_frame_fail(p, 1) == -1 ? 0 : -1;
 }
 
 /* One of the five accelerator output tensors, by index, for the txn sweep. */
@@ -480,8 +476,8 @@ static int written_log[HOPS];
 static long long frame_log[HOPS];
 
 /* ---- the canonical per-hop loop from dfn2_prepost.h -------------------
- * `n` is 1 on every hop, the first DFN2_MASK_LOOKAHEAD of a cold instance being warm-up
- * frames -- never 0 or 2 -- so that is asserted per hop rather than merely looped over. */
+ * `n` is 0 on the first DFN2_MASK_LOOKAHEAD hops of a cold instance and 1 on every hop after
+ * -- never 2 -- so that is asserted per hop rather than merely looped over. */
 static int drive_time_ex(DFN2Prepost *p, const float *in, float *out,
                          int hops, int cold, int *written_out,
                          long long *frame_out) {
@@ -514,15 +510,15 @@ static int drive_time(DFN2Prepost *p, const float *in, float *out, int hops) {
     return drive_time_ex(p, in, out, hops, 1, NULL, NULL);
 }
 
-/* Drive a cold instance, through the host framing, through its warm-up hops (frames whose heads
- * are discarded) and the first hop with usable heads, left open. Returns the index of the
- * next hop, or -1 if the instance disagreed. */
+/* Drive a cold instance, through the host framing, through its first hops (no job) and the first
+ * hop with usable heads, left open. Returns the index of the next hop, or -1 if the instance
+ * disagreed. */
 static int open_first_frame_time(DFN2Prepost *p) {
     int t;
     for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
         float hop_out[DFN2_HOP_LEN];
-        if (tpre(p, pcm_in + (size_t)t * DFN2_HOP_LEN) != 1) return -1;
-        if (run_warm_frame(p) != 0 || tpost(p, hop_out, NULL) != 0) return -1;
+        if (tpre(p, pcm_in + (size_t)t * DFN2_HOP_LEN) != 0) return -1;
+        if (check_no_frame(p) != 0 || tpost(p, hop_out, NULL) != 0) return -1;
     }
     if (tpre(p, pcm_in + (size_t)t * DFN2_HOP_LEN) != 1)
         return -1;
@@ -535,8 +531,8 @@ static int open_first_frame_freq(DFN2Prepost *p, const float *re,
     int t;
     for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
         float out_re[DFN2_N_BINS], out_im[DFN2_N_BINS];
-        if (dfn2_prepost_pre_process_freq(p, re, im) != 1) return -1;
-        if (run_warm_frame(p) != 0 ||
+        if (dfn2_prepost_pre_process_freq(p, re, im) != 0) return -1;
+        if (check_no_frame(p) != 0 ||
             dfn2_prepost_post_process_freq(p, out_re, out_im, NULL) != 0) return -1;
     }
     return dfn2_prepost_pre_process_freq(p, re, im) == 1 ? t + 1 : -1;
@@ -1019,16 +1015,13 @@ static int case_dual_guards(void) {
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, NULL, re, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, NULL, im) == -1);
     CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, NULL) == -1);
-    /* The warm-up hops open a frame like any other: a second pre-stage of either kind is refused
-     * with it open, the bypass closes it, and the hop emits nothing. */
+    /* The first mask_lookahead hops carry no job: nothing is opened, the frame-level calls are refused, and the
+     * hop emits nothing. */
     {
         int w, valid = -1;
         for (w = 0; w < DFN2_MASK_LOOKAHEAD; ++w) {
-            CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 1);
-            CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == -1);
-            CHECK(dfn2_prepost_pre_process_freq(pf, re, im) == -1);
-            CHECK(dfn2_prepost_post_process_freq(pf, got_re, got_im, NULL) == -1);
-            CHECK(dfn2_prepost_frame_bypass(pf) == 0);
+            CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 0);
+            CHECK(check_no_frame(pf) == 0);
             CHECK(dfn2_prepost_post_process_freq(pf, got_re, got_im, &valid) == 0 && valid == 0);
         }
     }
@@ -1119,11 +1112,11 @@ static int case_model_run(void) {
     /* Contract errors: no frame open, NULL model, no infer callback. */
     CHECK(dfn2_model_run_frame(&model, p) == -1);
     for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
-        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-        CHECK(dfn2_model_run_frame(&model, p) == 1);   /* warm-up frame: the model runs, the heads are discarded */
+        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 0);
+        CHECK(dfn2_model_run_frame(&model, p) == -1);   /* no frame is open: the model does not run */
         CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0 && valid == 0);
     }
-    CHECK(stub.calls == DFN2_MASK_LOOKAHEAD);
+    CHECK(stub.calls == 0);
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_model_run_frame(NULL, p) == -1);
     CHECK(dfn2_model_run_frame(&model, NULL) == -1);
@@ -1152,11 +1145,11 @@ static int case_model_run(void) {
         bad.io_descriptor = &other;
         CHECK(dfn2_model_run_frame(&bad, p) == -1);
     }
-    CHECK(stub.calls == DFN2_MASK_LOOKAHEAD);
+    CHECK(stub.calls == 0);
     /* A full write commits and steps the recurrent state. */
     snapshot_state(p, gru0, convp0);
     CHECK(dfn2_model_run_frame(&model, p) == 1);
-    CHECK(stub.calls == DFN2_MASK_LOOKAHEAD + 1);
+    CHECK(stub.calls == 1);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == (t >= LOOKAHEAD));   /* the lookahead warm-up emits nothing */
     /* Committed hops until the next hop emits, so the refused ones below are
@@ -2294,8 +2287,8 @@ static int case_inplace_nan(void) {
 /* ---- generation: the counter that tells a runtime to refill its state -- */
 
 /* Advances by exactly one for every event that zeroes the recurrent tensors
- * behind the accelerator's back (reset, each warm-up frame, a commit refused over a bad state, a
- * commit refused over a bad head), and never for a commit or a skip of a real frame. */
+ * behind the accelerator's back (reset, a commit refused over a bad state, a commit refused over a bad
+ * head), and never for a commit or a skip of a frame, nor for the first mask_lookahead hops (no frame). */
 static int case_generation(void) {
     DFN2PrepostConfig cfg;
     DFN2Prepost *p;
@@ -2312,29 +2305,19 @@ static int case_generation(void) {
     g = dfn2_prepost_state_generation(p);
     CHECK(g == 1u);
 
-    /* Each warm-up frame: exactly one, whatever the heads hold. */
+    /* The first mask_lookahead hops open no frame and move nothing. */
     for (hop = 0; hop < DFN2_MASK_LOOKAHEAD; ++hop) {
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_state_generation(p) == g);   /* analysis moves nothing */
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        fake_run(&in, &out);
-        out.alpha[0] = (float)NAN;   /* a warm-up frame does not read its heads */
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
-        CHECK(state_all_zero(&in));
-        ++g;
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
-    /* After a reset the warm-up frames are due again; closed by frame_bypass they count the same. */
+    /* After a reset they are due again. */
     treset(p);
     ++g;
     CHECK(dfn2_prepost_state_generation(p) == g);
     for (hop = 0; hop < DFN2_MASK_LOOKAHEAD; ++hop) {
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        fake_run(&in, &out);
-        CHECK(dfn2_prepost_frame_bypass(p) == 0);
-        CHECK(state_all_zero(&in));
-        ++g;
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
     CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
@@ -2387,7 +2370,7 @@ static int case_generation(void) {
     return 0;
 }
 
-/* ---- warmup: the first mask_lookahead frames are frames like any other, minus their heads -- */
+/* ---- warmup: the first mask_lookahead hops carry no job -- */
 
 /* A registered-state instance, or an unregistered one when `registered` is 0. */
 static DFN2Prepost *warm_instance(int registered) {
@@ -2396,41 +2379,30 @@ static DFN2Prepost *warm_instance(int registered) {
     return registered ? make_class(&cfg) : dfn2_prepost_create(&cfg);
 }
 
-/* Set every element of the registered recurrent state through the accelerator's in-place views. */
-static void state_set(const DFN2PrepostOutputs *out, float v) {
-    size_t i;
-    for (i = 0; i < out->gru_hidden_elements; ++i) out->gru_hidden_next[i] = v;
-    for (i = 0; i < out->df_convp_window_elements; ++i) out->df_convp_window_next[i] = v;
-}
-
-static int state_is(const DFN2PrepostInputs *in, float v) {
-    size_t i;
-    for (i = 0; i < in->gru_hidden_elements; ++i) if (in->gru_hidden[i] != v) return 0;
-    for (i = 0; i < in->df_convp_window_elements; ++i) if (in->df_convp_window[i] != v) return 0;
-    return 1;
-}
-
 /* The row `back` rows before the newest of an input window of rows of `width` elements. */
 static const float *window_row(const float *window, size_t width, int back) {
     return window + (size_t)(DFN2_MODEL_INPUT_FRAMES - 1 - back) * width;
 }
 
-/* Warm-up frame t: opened like a real one (window [0, .., 0, x0..xt], heads NaN), closed without
- * reading its heads, state zero afterwards, generation exactly +1, nothing emitted. Every run
- * of this case is for N == 1; with mask_lookahead == 0 there is no warm-up frame and the loops
- * below are empty, while the real-frame checks still hold. */
+/* The first mask_lookahead hops after init or reset: pre_process returns 0, no frame is opened (the frame-level calls
+ * are refused), the registered state and the generation stay, nothing is emitted, and the graph window grows as the
+ * hand-driven reference's does. The first hop with a job: its windows are byte-identical to the reference's, its heads
+ * ARE read (a NaN head is refused). A reset starts the count again, a frame open at the reset is dropped. Every run of
+ * this case is for N == 1; with mask_lookahead == 0 there are no such hops and the loops below are empty, while the
+ * checks of the first hop with a job still hold. */
 static int case_warmup(void) {
     DFN2PrepostInputs in;
     DFN2PrepostOutputs out;
+    DFN2PrepostConfig cfg;
     DFN2Prepost *p;
+    StateBufs *bufs;
     float re[DFN2_N_BINS], im[DFN2_N_BINS], hop_re[DFN2_N_BINS], hop_im[DFN2_N_BINS];
     unsigned int g;
     long long frame = -1;
-    int t, k, valid = -1;
+    int t, valid = -1;
     const int m = DFN2_MASK_LOOKAHEAD;
     const DFN2Grid *grid = dfn2_test_grid();
-    /* the hand-driven reference: the feature front end and the graph windows only, as before the
-     * warm-up frames were opened (dfn2_prepost.c not involved) */
+    /* the hand-driven reference: the feature front end and the graph windows only (dfn2_prepost.c not involved) */
     static DFN2State ref_st;
     static DFN2ModelIOState ref_io;
     static float ref_gru[DFN2_TEST_GRU_ELEMENTS], ref_convp[DFN2_TEST_CONVP_ELEMENTS];
@@ -2443,183 +2415,120 @@ static int case_warmup(void) {
     CHECK(dfn2_model_io_init(&ref_io, io_block, dfn2_model_io_mem_size(grid), grid, ref_gru,
                              DFN2_TEST_GRU_ELEMENTS, ref_convp, DFN2_TEST_CONVP_ELEMENTS) == 0);
 
-    /* The warm-up frame as a frame: pre returns 1, the window holds the frames seen so far with
-     * zeros before them, the heads are NaN; garbage heads and garbage state do not matter. */
-    p = warm_instance(1);
+    /* Hops without a job: pre returns 0 and opens nothing; garbage the host put in its registered state is left alone
+     * (only init and reset zero it) and the generation stays; the post is a defined all-zero spectrum. */
+    config_freq(&cfg);
+    bufs = next_bufs();
+    register_state(&cfg, bufs);
+    p = dfn2_prepost_create(&cfg);
     CHECK(p != NULL);
     g = dfn2_prepost_state_generation(p);
     CHECK(g == 1u);
+    memset(bufs->gru, 0, sizeof bufs->gru);
+    memset(bufs->convp, 0, sizeof bufs->convp);
+    bufs->gru[0] = 123.0f;
+    bufs->convp[0] = 123.0f;
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
         dfn2_compute_features(&ref_st, re, im, feat_erb, feat_spec);
         CHECK(dfn2_model_io_push_features(&ref_io, feat_erb, feat_spec) == 0);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        CHECK(identical(in.erb_window, ref_io.erb_window, in.erb_window_elements));
-        CHECK(identical(in.spec_window, ref_io.spec_window, in.spec_window_elements));
-        CHECK(heads_all_nan(&out));
-        CHECK(any_nonzero(window_row(in.erb_window, DFN2_N_ERB, 0), DFN2_N_ERB));
-        CHECK(any_nonzero(window_row(in.spec_window, DFN2_DF_BINS, 0), DFN2_DF_BINS));
-        for (k = t + 1; k < DFN2_MODEL_INPUT_FRAMES; ++k) {
-            CHECK(all_zero(window_row(in.erb_window, DFN2_N_ERB, k), DFN2_N_ERB));
-            CHECK(all_zero(window_row(in.spec_window, DFN2_DF_BINS, k), DFN2_DF_BINS));
-        }
-        state_set(&out, 123.0f);                       /* the accelerator wrote the state in place */
-        CHECK(state_is(&in, 123.0f));
-        CHECK(dfn2_prepost_frame_finish(p) == 0);       /* heads still NaN: not looked at */
-        CHECK(state_all_zero(&in));
-        CHECK(dfn2_prepost_state_generation(p) == g + 1u);
-        ++g;
-        /* the frame is closed: a second finish or bypass is refused and moves nothing */
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
-        CHECK(dfn2_prepost_frame_bypass(p) == -1);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
+        CHECK(bufs->gru[0] == 123.0f && bufs->convp[0] == 123.0f);
         CHECK(dfn2_prepost_state_generation(p) == g);
         CHECK(dfn2_prepost_post_process_freq(p, hop_re, hop_im, &valid) == 0);
         CHECK(valid == 0 && all_zero(hop_re, DFN2_N_BINS) && all_zero(hop_im, DFN2_N_BINS));
         CHECK(dfn2_prepost_output_frame_index(p, &frame) == -1);
     }
-    /* The first real frame: its windows are byte-identical to the hand-driven reference's, its
-     * state is zero (as it was before the warm-up frames were opened), its heads ARE read and it
-     * is not a warm-up frame (a NaN head is refused). */
+    /* The first hop with a job: its windows are byte-identical to the hand-driven reference's (zeros before the
+     * stream, then the frames seen so far), the host's state is as it left it, and its heads are read: a NaN head
+     * is refused. */
     frame_spectrum(m, re, im);
     dfn2_compute_features(&ref_st, re, im, feat_erb, feat_spec);
     CHECK(dfn2_model_io_push_features(&ref_io, feat_erb, feat_spec) == 1);
     CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
     CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-    CHECK(state_all_zero(&in));
+    CHECK(in.gru_hidden[0] == 123.0f && in.df_convp_window[0] == 123.0f);
     CHECK(identical(in.erb_window, ref_io.erb_window, in.erb_window_elements));
     CHECK(identical(in.spec_window, ref_io.spec_window, in.spec_window_elements));
+    CHECK(heads_all_nan(&out));
     CHECK(any_nonzero(window_row(in.erb_window, DFN2_N_ERB, 0), DFN2_N_ERB));
-    CHECK(dfn2_prepost_frame_finish(p) == -1);        /* heads NaN: a real frame reads them */
+    CHECK(dfn2_prepost_frame_finish(p) == -1);        /* heads NaN: a frame with a job reads them */
     CHECK(dfn2_prepost_state_generation(p) == g + 1u);
+    CHECK(state_all_zero(&in));
     ++g;
     CHECK(dfn2_prepost_frame_bypass(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);
     stop(p);
 
-    /* The warm-up frame closed by frame_bypass, and through dfn2_model_run_frame. */
-    p = warm_instance(1);
-    CHECK(p != NULL);
-    g = dfn2_prepost_state_generation(p);
-    for (t = 0; t < m; ++t) {
-        frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        state_set(&out, 7.0f);
-        CHECK(dfn2_prepost_frame_bypass(p) == 0);
-        CHECK(state_all_zero(&in));                     /* bypass of a real frame leaves the state */
-        CHECK(dfn2_prepost_state_generation(p) == ++g);
-        CHECK(dfn2_prepost_post_process_freq(p, hop_re, hop_im, &valid) == 0 && valid == 0);
-    }
-    stop(p);
-    {
-        StubModel stub;
-        DFN2Model model;
-        DFN2ModelIoDescriptor descriptor;
-        memset(&stub, 0, sizeof stub);
-        memset(&model, 0, sizeof model);
-        CHECK(dfn2_model_io_descriptor_default(dfn2_test_grid(), &descriptor) == 0);
-        model.user = &stub;
-        model.infer = stub_infer;
-        model.io_descriptor = &descriptor;
-        p = warm_instance(1);
-        CHECK(p != NULL);
-        g = dfn2_prepost_state_generation(p);
-        for (t = 0; t < m; ++t) {
-            frame_spectrum(t, re, im);
-            stub.mode = (t & 1) ? 1 : 0;                /* alternate: infer ok (1) / infer failed (0) */
-            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-            CHECK(dfn2_model_run_frame(&model, p) == ((t & 1) ? 0 : 1));
-            CHECK(stub.calls == t + 1);                 /* one accelerator call per warm-up frame */
-            CHECK(dfn2_prepost_state_generation(p) == ++g);
-            CHECK(dfn2_prepost_post_process_freq(p, hop_re, hop_im, &valid) == 0 && valid == 0);
-        }
-        stop(p);
-    }
-
-    /* Nothing registered: only the generation moves; a non-finite registered state still counts once. */
+    /* Nothing registered: no view of the state, and the generation moves for nothing before the first job. */
     p = warm_instance(0);
     CHECK(p != NULL);
     g = dfn2_prepost_state_generation(p);
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        CHECK(in.gru_hidden == NULL && in.gru_hidden_elements == 0u);
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
-        CHECK(dfn2_prepost_state_generation(p) == ++g);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
+        CHECK(dfn2_prepost_state_generation(p) == g);
     }
-    stop(p);
-    p = warm_instance(1);
-    CHECK(p != NULL);
-    g = dfn2_prepost_state_generation(p);
-    for (t = 0; t < m; ++t) {
-        frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        state_set(&out, 1.0f);
-        out.gru_hidden_next[0] = (float)NAN;
-        out.df_convp_window_next[out.df_convp_window_elements - 1] = (float)INFINITY;
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
-        CHECK(state_all_zero(&in));
-        CHECK(dfn2_prepost_state_generation(p) == ++g);   /* +1, not +2 */
-    }
+    frame_spectrum(m, re, im);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(in.gru_hidden == NULL && in.gru_hidden_elements == 0u);
+    CHECK(dfn2_prepost_frame_bypass(p) == 0);
     stop(p);
 
-    /* A reset restarts the warm-up: M frames again, each +1, the state of a frame after them is kept. A reset in
-     * the middle of a warm-up frame drops it: its finish and bypass are refused. */
+    /* A reset starts the count again: m hops without a job, the state a frame with a job left is kept until the
+     * next reset. A reset with a frame open drops it: its finish and bypass are refused. */
     p = warm_instance(1);
     CHECK(p != NULL);
     for (t = 0; t < m + 3; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == PRE_RET(t));
+        if (t < m) continue;
         CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
         fake_run(&in, &out);
         CHECK(dfn2_prepost_frame_finish(p) == 0);
-        CHECK(t < m ? state_all_zero(&in) : !state_all_zero(&in));
+        CHECK(!state_all_zero(&in));
     }
     g = dfn2_prepost_state_generation(p);
     treset(p);
     CHECK(dfn2_prepost_state_generation(p) == ++g);
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        fake_run(&in, &out);
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
-        CHECK(state_all_zero(&in));
-        CHECK(dfn2_prepost_state_generation(p) == ++g);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
+        CHECK(dfn2_prepost_state_generation(p) == g);
     }
     frame_spectrum(m, re, im);
     CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
     CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(state_all_zero(&in));
     fake_run(&in, &out);
     CHECK(dfn2_prepost_frame_finish(p) == 0);
     CHECK(!state_all_zero(&in));
     CHECK(dfn2_prepost_state_generation(p) == g);
+    frame_spectrum(m + 1, re, im);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    fake_run(&in, &out);
     treset(p);
     ++g;
-    if (m > 0) {
-        frame_spectrum(0, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-        fake_run(&in, &out);
-        treset(p);
-        ++g;
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
-        CHECK(dfn2_prepost_frame_bypass(p) == -1);
+    CHECK(dfn2_prepost_frame_finish(p) == -1);
+    CHECK(dfn2_prepost_frame_bypass(p) == -1);
+    CHECK(dfn2_prepost_state_generation(p) == g);
+    /* the stream starts over: the hops without a job are due in full again */
+    for (t = 0; t < m; ++t) {
+        frame_spectrum(t, re, im);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
-        /* the stream starts over: the warm-up is due in full again */
-        for (t = 0; t < m; ++t) {
-            frame_spectrum(t, re, im);
-            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-            CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-            fake_run(&in, &out);
-            CHECK(dfn2_prepost_frame_finish(p) == 0);
-            CHECK(state_all_zero(&in));
-            CHECK(dfn2_prepost_state_generation(p) == ++g);
-        }
     }
+    frame_spectrum(m, re, im);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(state_all_zero(&in));
+    CHECK(dfn2_prepost_frame_bypass(p) == 0);
     stop(p);
     free(state_block);
     free(io_block);
@@ -2629,7 +2538,7 @@ static int case_warmup(void) {
 /* ---- frame_fail: closing a frame after a run that did not succeed -------- */
 
 /* Output = frame_bypass()'s, bit for bit. run_started != 0 zeroes the registered state and advances the generation
- * by one (a warm-up frame already does both: still one); run_started == 0 leaves state and generation. */
+ * by one; run_started == 0 leaves state and generation. A hop without a job has no frame to fail. */
 static int case_frame_fail(void) {
     static float re[DFN2_N_BINS], im[DFN2_N_BINS];
     static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS], ref_re[DFN2_N_BINS], ref_im[DFN2_N_BINS];
@@ -2656,17 +2565,25 @@ static int case_frame_fail(void) {
         treset(p);
         treset(q);
         g = dfn2_prepost_state_generation(p);
-        for (t = 0; t < m + 6; ++t) {   /* m warm-up frames, then steady ones; every frame closes on frame_fail */
-            const int warm = t < m;
+        for (t = 0; t < m + 6; ++t) {   /* m hops without a job, then steady ones; every frame closes on frame_fail */
             frame_spectrum(t, re, im);
-            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-            CHECK(dfn2_prepost_pre_process_freq(q, re, im) == 1);
+            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == PRE_RET(t));
+            CHECK(dfn2_prepost_pre_process_freq(q, re, im) == PRE_RET(t));
+            if (t < m) {   /* no frame: frame_fail is refused and nothing moves; the hop is the same silence */
+                CHECK(dfn2_prepost_frame_fail(p, started) == -1);
+                CHECK(dfn2_prepost_state_generation(p) == g);
+                CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid_p) == 0);
+                CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
+                CHECK(valid_p == 0 && valid_q == 0);
+                CHECK(identical(got_re, ref_re, DFN2_N_BINS) && identical(got_im, ref_im, DFN2_N_BINS));
+                continue;
+            }
             CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
             fake_run(&in, &out);                              /* the accelerator moved the state in place */
             memcpy(gru_before, in.gru_hidden, sizeof gru_before);
             memcpy(convp_before, in.df_convp_window, sizeof convp_before);
             CHECK(dfn2_prepost_frame_fail(p, started) == 0);
-            if (warm || started) {
+            if (started) {
                 CHECK(state_all_zero(&in));
                 CHECK(dfn2_prepost_state_generation(p) == g + 1u);
                 ++g;
@@ -2692,7 +2609,7 @@ static int case_frame_fail(void) {
     return 0;
 }
 
-/* The caller pushes the synthesis on every hop, valid or not: the warm-up hops carry a zero
+/* The caller pushes the synthesis on every hop, valid or not: the hops without a job carry a zero
  * spectrum, which plain overlap-add turns into zeros, so the stream equals the one that pushes
  * only valid hops. */
 static int case_warmup_synthesis(void) {
@@ -2715,10 +2632,12 @@ static int case_warmup_synthesis(void) {
         float *slot = out_b + (size_t)hop * DFN2_HOP_LEN;
         int valid = -1;
         ainr_test_hop_analysis(&caller_hop, pcm_in + (size_t)hop * DFN2_HOP_LEN, enh_re, enh_im);
-        CHECK(dfn2_prepost_pre_process_freq(p_all, enh_re, enh_im) == 1);
-        CHECK(dfn2_prepost_frame_open(p_all, &inputs, &outputs) == 0);
-        fake_run(&inputs, &outputs);
-        CHECK(dfn2_prepost_frame_finish(p_all) == 0);
+        CHECK(dfn2_prepost_pre_process_freq(p_all, enh_re, enh_im) == PRE_RET(hop));
+        if (hop >= DFN2_MASK_LOOKAHEAD) {
+            CHECK(dfn2_prepost_frame_open(p_all, &inputs, &outputs) == 0);
+            fake_run(&inputs, &outputs);
+            CHECK(dfn2_prepost_frame_finish(p_all) == 0);
+        }
         CHECK(dfn2_prepost_post_process_freq(p_all, enh_re, enh_im, &valid) == 0);
         CHECK(valid == (hop >= LOOKAHEAD));
         ainr_test_hop_synthesis(&caller_hop, enh_re, enh_im, slot);   /* no valid test */
@@ -3087,23 +3006,20 @@ def test_nan_through_the_in_place_pointer_is_refused_and_zeroes_the_state(driver
 
 def test_state_generation_counts_every_zeroing_and_nothing_else(driver):
     """The generation is 1 after init and advances by exactly one for each
-    reset, each warm-up frame (finish or bypass) and each refused commit (bad
-    state element or bad head); commit and skip of a real frame never move it.
+    reset and each refused commit (bad state element or bad head); commit and
+    skip of a frame never move it, and neither do the first mask_lookahead hops.
     A runtime refills its fixed-point state from it."""
     _run(driver, 'generation')
 
 
-def test_warmup_frames_are_opened_and_their_heads_discarded(driver):
-    """pre_process returns 1 on the first mask_lookahead hops too (window
-    [0, .., 0, x0..xt], heads NaN, windows byte-identical to a hand-driven
-    feature front end). frame_finish of such a frame never reads its heads (NaN
-    heads, garbage or non-finite state: still 0), leaves the registered state
-    zero, advances the generation by exactly one (also unregistered, also via
-    frame_bypass and dfn2_model_run_frame, which calls the accelerator once per
-    warm-up frame) and emits nothing; a second finish or bypass is refused and
-    moves nothing. The first real frame starts from zero state, reads its heads
-    (a NaN head is refused) and a reset makes the warm-up due again; a reset
-    inside a warm-up frame drops it. With mask_lookahead 0 nothing changes."""
+def test_warmup_hops_carry_no_job_and_move_nothing(driver):
+    """pre_process returns 0 on the first mask_lookahead hops: no frame is
+    opened (frame_open, finish, bypass and fail are refused), the registered
+    state the host holds and the generation stay, the hop emits an all-zero
+    spectrum with valid 0, and the graph window grows byte-identically to a
+    hand-driven feature front end. The first hop with a job reads its heads (a
+    NaN head is refused); a reset starts the count again and drops a frame open
+    at that moment. With mask_lookahead 0 there are no such hops."""
     _run(driver, 'warmup')
 
 
@@ -3111,23 +3027,23 @@ def test_frame_fail_closes_as_bypass_and_zeroes_only_a_started_run(driver):
     """dfn2_prepost_frame_fail: -1 for NULL or no open frame, moving nothing; the
     output is frame_bypass()'s bit for bit; run_started 1 zeroes both registered
     tensors and advances the generation by one, run_started 0 leaves the state
-    and the generation; a warm-up frame steps the generation by exactly one
-    either way. Dropping the zeroing or the generation step fails it."""
+    and the generation; a hop without a job has no frame to fail. Dropping the
+    zeroing or the generation step fails it."""
     _run(driver, 'frame_fail')
 
 
 def test_synthesis_may_be_pushed_on_every_hop(driver):
     """Pushing the post_process spectrum into an AC_OLA_ACCUMULATE AcIstft on
-    every hop, the warm-up hops included, gives the stream that pushes only the
-    valid hops, sample for sample: the warm-up spectrum is all zero."""
+    every hop, the hops without a job included, gives the stream that pushes only
+    the valid hops, sample for sample: their spectrum is all zero."""
     _run(driver, 'warmup_synthesis')
 
 
 @pytest.mark.parametrize('case', _CASES)
 def test_every_case_holds_for_every_other_lookahead_pair(pair_driver, case):
     """The whole driver, rebuilt for each non-shipped (mask, df) lookahead
-    pair: warm-up length, delay-line length, readiness and the frame clocks
-    all follow the compiled constants rather than the shipped 1/1."""
+    pair: the number of hops without a job, delay-line length, readiness and the
+    frame clocks all follow the compiled constants rather than the shipped 1/1."""
     _run(pair_driver, case)
 
 

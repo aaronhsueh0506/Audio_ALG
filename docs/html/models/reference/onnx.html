@@ -103,11 +103,12 @@ p = &lt;pfx&gt;_prepost_init(pool, req.bytes, &amp;cfg);       /* 或 _init_ex(p
 
 <p><b>一 hop = 一次推論</b>：<code>pre_process_freq</code> 回傳這一 hop 需要的加速器呼叫次數（−1 = 引數為 NULL 或上一幀還開著）。
 Align-ULCNet（引數 <code>err_re, err_im, far_re, far_im</code>）與 DeepVQE-S（<code>mic_re, mic_im, far_re, far_im</code>）<b>從 hop 0 起恆為 1</b>，<code>post_process_freq</code> 不帶 <code>valid</code>；
-DFN2（N = 1）與 DFN3（引數 <code>re, im</code>）<b>也每 hop 回 1</b>；前 M 個 hop（M = <code>mask_lookahead</code>；graph 的視窗是
-<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到；出貨 M = 1 即第一個 hop）是暖機幀：加速器照跑，heads 由 <code>frame_finish</code>／<code>frame_bypass</code> 丟棄、登錄 state 歸零，音訊不變。<code>post_process_freq</code> 的 <code>valid</code> 為 0 時輸出是零頻譜。
+DFN3（引數 <code>re, im</code>）<b>也每 hop 回 1</b>，前 M 個 hop 是暖機幀（M = <code>mask_lookahead</code>；graph 的視窗是
+<code>[t−(2−M), …, t+M]</code>，右鄰居還沒到）：加速器照跑，heads 由 <code>frame_finish</code>／<code>frame_bypass</code> 丟棄、登錄 state 歸零，音訊不變。
+DFN2（N = 1）前 M 個 hop（出貨 M = 1 即第一個 hop）沒有 job：<code>pre_process_freq</code> 回 0、不開 frame、加速器不跑，登錄 state 與 generation 不動，之後每 hop 回 1。<code>post_process_freq</code> 的 <code>valid</code> 為 0 時輸出是零頻譜。
 M 與 <code>df_lookahead</code> D 是 <code>DFN2GridSpec</code>／<code>DFN3GridSpec</code> 的欄位（15 組合法 pair，出貨 1/1；圖本身與 pair 無關，metadata 記錄 pair；見 <a href="../dfn2/reference/core.html#memory">DeepFilterNet2 頻域與模型契約</a>）。
 DFN2 另可匯出每次 invocation N 個 frame 的 graph（<code>--frames-per-call N</code>，輸入 N+2 個 feature frame、輸出 N 個 frame 的 heads）：
-N 是 <code>DFN2GridSpec.frames_per_call</code>（1..64），<code>pre_process_freq</code> 改為每 N 個 hop 回 1 一次（N&gt;1 無暖機幀），<code>dfn2_prepost_latency_frames()</code> = M + D + N − 1；pipelines 固定 N=1。</p>
+N 是 <code>DFN2GridSpec.frames_per_call</code>（1..64），<code>pre_process_freq</code> 改為每 N 個 hop 回 1 一次，<code>dfn2_prepost_latency_frames()</code> = M + D + N − 1；pipelines 固定 N=1。</p>
 
 <p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成開幀 → 取張量 → 呼叫端在 NPU 上推論 → 回報 rc → 收幀。
 DFN2 應用用 <code>dfn/dfn_hop.h</code>：<code>dfn_hop_begin()</code> → <code>while (dfn_hop_nn_begin() &gt; 0) { 推論; dfn_hop_nn_end(rc) }</code> → <code>dfn_hop_end()</code>，job 是 <code>DfnHopJob</code>（模型串流的 <code>DFN2HopIO</code>：<code>DFN2PrepostInputs/Outputs</code> 視圖與 <code>state_generation</code>）。
@@ -142,7 +143,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉�
 並為每個 window 宣告丟哪一端（AINR 的 <code>state_slicing</code> 內 <code>drop</code>、AIAEC 的 <code>state_window_drop</code>：time-ordered window 為 <code>first</code>，newest-first ring 為 <code>last</code>），驗證器只接受那一端的 Slice 範圍。RNNoise-ERB 的匯出器只寫 <code>state_layout_version</code>，不寫 <code>state_binding</code>，也不跑這項檢查。</p>
 
 <p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 依同一規則）、
-<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN2／DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate（DeepVQE-S 另有已啟動的 <code>frame_fail</code>）各加一，有沒有登錄 state 都照算。
+<code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate（DeepVQE-S 另有已啟動的 <code>frame_fail</code>）各加一，有沒有登錄 state 都照算。
 pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>；舊的 <code>dfn_res_stage_state_generation()</code>／<code>dfn_rate_bridge_state_generation()</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
 板端 sample 比較這個值，與上次看到的不同就用量化後的 0 重填 state 輸入。
 起始值不同（DFN2、DFN3、GTCRN、RNNoise-ERB 的 init 後為 1，Align-ULCNet、DeepVQE-S 為 0），所以只比較「是否變動」，不假設起始值。</p>

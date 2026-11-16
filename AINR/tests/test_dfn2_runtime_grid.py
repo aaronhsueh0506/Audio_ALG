@@ -390,37 +390,14 @@ static int hop_out(DFN2Prepost *p) {
     float re[MAX_BINS], im[MAX_BINS];
     return dfn2_prepost_post_process_freq(p, re, im, NULL);
 }
-/* The state views of an open frame, every registered element set to `v` (NULL views: nothing to set). */
-static void scribble_state(const DFN2PrepostInputs *in, const DFN2PrepostOutputs *out, float v) {
-    size_t i;
-    (void)in;
-    for (i = 0; out->gru_hidden_next != NULL && i < out->gru_hidden_elements; ++i) out->gru_hidden_next[i] = v;
-#ifndef DFN2_MASK_ONLY
-    for (i = 0; out->df_convp_window_next != NULL && i < out->df_convp_window_elements; ++i)
-        out->df_convp_window_next[i] = v;
-#endif
-}
-static int views_zero(const DFN2PrepostInputs *in) {
-    size_t i;
-    for (i = 0; in->gru_hidden != NULL && i < in->gru_hidden_elements; ++i) if (in->gru_hidden[i] != 0.0f) return 0;
-#ifndef DFN2_MASK_ONLY
-    for (i = 0; in->df_convp_window != NULL && i < in->df_convp_window_elements; ++i)
-        if (in->df_convp_window[i] != 0.0f) return 0;
-#endif
-    return 1;
-}
-/* Hops of a cold or reset instance until the heads of a real frame are due: the first mask_lookahead hops are
- * warm-up frames (pre 1, open, the stand-in writes heads and scribbles on the registered state, finish discards
- * them and leaves that state zero, the hop closes); the last hop's pre_process result (1) is returned, else -1. */
+/* Hops of a cold or reset instance until the heads of a real frame are due: the first mask_lookahead hops carry
+ * no job (pre 0, no frame opens, the hop closes); the last hop's pre_process result (1) is returned, else -1. */
 static int to_ready(DFN2Prepost *p) {
     int i;
     for (i = 0; i < dfn2_prepost_grid(p)->mask_lookahead; ++i) {
         DFN2PrepostInputs in;
         DFN2PrepostOutputs out;
-        if (hop_in(p) != 1 || dfn2_prepost_frame_open(p, &in, &out) != 0) return -1;
-        infer_ok(NULL, &in, &out);
-        scribble_state(&in, &out, 9.0f);
-        if (dfn2_prepost_frame_finish(p) != 0 || !views_zero(&in) || hop_out(p) != 0) return -1;
+        if (hop_in(p) != 0 || dfn2_prepost_frame_open(p, &in, &out) == 0 || hop_out(p) != 0) return -1;
     }
     return hop_in(p);
 }
@@ -503,7 +480,7 @@ int main(void) {
                 continue;
             }
             p = dfn2_prepost_create(&cb);
-            ready = to_ready(p);   /* past the warm-up frames: a real frame is open */
+            ready = to_ready(p);   /* past the hops without a job: a real frame is open */
             if (dfn2_model_io_descriptor_default(&a, &desc) != 0) {
                 printf("%s nodesc\n", verb);
                 continue;
@@ -1101,7 +1078,7 @@ def test_a_descriptor_of_one_grid_is_refused_by_the_host_of_another(pools, pool_
     lines += ['runframe %d %d %d %d %d %d  %d %d %d %d %d %d' % (*other, *base)
               for other in others]
     results = pool.run(lines)
-    # The control: past the warm-up frames the host's own descriptor drives the accelerator and the frame is
+    # The control: past the hops without a job the host's own descriptor drives the accelerator and the frame is
     # committed.
     assert results[0].split() == ['runframe', '1', '1', '1'], results[0]
     # No descriptor at all is refused as well.
@@ -1167,22 +1144,20 @@ def test_registration_is_all_or_none(state_pool):
 
 def test_board_form_moves_the_generation_as_documented(state_pool):
     """Nothing registered, on a pool an earlier instance used with registered state: the views hold NULL and
-    0, the generation is 1 after init and moves by one per reset, per warm-up frame, per refused finish and per
-    failing model (not on a commit, a bypass or a second finish of a refused frame), every status is the
+    0, the generation is 1 after init and moves by one per reset, per refused finish and per
+    failing model (not on a commit, a bypass, a second finish of a refused frame or a hop without a job), every status is the
     documented one, and no buffer the library was not handed is touched. Every lookahead pair of the build, and
     the shipped grid."""
     variant, pool = state_pool
     pairs = MASK_PAIRS if variant == 'mask' else FULL_PAIRS
     grids = [(16000, 256, 24, 96, *pair) for pair in pairs] + [(48000, 1024, 32, 96, *pairs[0])]
     # generation after init, empty views, then after: commit, bypass, refusal, second finish, bypass, reset,
-    # failing model, NaN head, committing model; all statuses right; no foreign byte changed. With
-    # m = mask_lookahead, each warm-up frame is one step (also with nothing registered), twice: after init
-    # and after the reset; the real frames move it as before:
-    #   init 1 | warm-up m -> 1+m | commit 1+m | bypass 1+m | refused finish 2+m | second finish 2+m |
-    #   bypass 2+m | reset 3+m | warm-up m + failing model 4+2m | NaN head 5+2m | commit 5+2m
+    # failing model, NaN head, committing model; all statuses right; no foreign byte changed. The first
+    # mask_lookahead hops after init and after the reset carry no job and move nothing:
+    #   init 1 | commit 1 | bypass 1 | refused finish 2 | second finish 2 | bypass 2 | reset 3 |
+    #   failing model 4 | NaN head 5 | commit 5
     for grid, line in zip(grids, pool.run(['board %s' % _Pool.grid_text(g) for g in grids])):
-        m = grid[4]
-        steps = (1, 1, 1 + m, 1 + m, 2 + m, 2 + m, 2 + m, 3 + m, 4 + 2 * m, 5 + 2 * m, 5 + 2 * m, 1, 1)
+        steps = (1, 1, 1, 1, 2, 2, 2, 3, 4, 5, 5, 1, 1)
         want = ['board'] + [str(n) for n in steps]
         assert line.split() == want, (variant, grid, line)
 

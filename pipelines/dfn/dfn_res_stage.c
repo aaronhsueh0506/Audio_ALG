@@ -32,7 +32,7 @@ struct DfnResStage {
     long long frames_in;
     long long commits;
     long long skips;
-    int phase;                /* 0 idle, 2 model frame open */
+    int phase;                /* 0 idle, 1 hop begun with no model frame, 2 model frame open */
     void *owned_heap;
 };
 
@@ -259,7 +259,7 @@ void dfn_res_stage_reset(DfnResStage *s) {
 }
 
 int dfn_res_stage_set_atten_lim(DfnResStage *s, float atten_lim_db) {
-    if (!s || !isfinite(atten_lim_db)) return -1;
+    if (!s || s->phase != 0 || !isfinite(atten_lim_db)) return -1;
     return dfn2_prepost_set_atten_lim(s->prepost, atten_lim_db);
 }
 
@@ -326,9 +326,12 @@ int dfn_res_stage_begin(DfnResStage *s,
 
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
-    if (need_heads != 1 ||
-        dfn2_prepost_frame_open(s->prepost, &job->inputs, &job->outputs) != 0)
-        return -1;
+    if (need_heads < 0) return -1;
+    if (need_heads == 0) {   /* the first mask_lookahead hops: the clocks advanced, no frame is open */
+        s->phase = 1;
+        return 0;
+    }
+    if (dfn2_prepost_frame_open(s->prepost, &job->inputs, &job->outputs) != 0) return -1;
     s->phase = 2;
     return 1;
 }
@@ -337,20 +340,20 @@ int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
     int valid = 0;
     int committed;
     const DFN2Grid *grid;
-    if (!s || !out_spec || s->phase != 2) return -1;
+    if (!s || !out_spec || s->phase == 0) return -1;
     grid = dfn2_prepost_grid(s->prepost);
-    /* A warm-up frame (the first mask_lookahead hops) discards its heads and is not counted. A
+    /* A hop with no model frame (phase 1: the first mask_lookahead hops) ignores model_rc and is not counted. A
      * run that did not succeed or an unwritten/non-finite output takes the frame as the identity;
      * the clocks advance once. A refused commit has zeroed the state and advanced the generation
      * inside frame_finish(); a failing status closes through frame_fail(). */
-    committed = model_rc == STREAM_RUN_OK && dfn2_prepost_frame_finish(s->prepost) == 0;
-    if (!committed &&
-        (model_rc == STREAM_RUN_OK ? dfn2_prepost_frame_bypass(s->prepost)
-                                   : dfn2_prepost_frame_fail(s->prepost, model_rc != STREAM_RUN_NOT_STARTED)) != 0) {
-        s->phase = 0;
-        return -1;
-    }
-    if (s->frames_in >= (long long)grid->mask_lookahead) {
+    if (s->phase == 2) {
+        committed = model_rc == STREAM_RUN_OK && dfn2_prepost_frame_finish(s->prepost) == 0;
+        if (!committed &&
+            (model_rc == STREAM_RUN_OK ? dfn2_prepost_frame_bypass(s->prepost)
+                                       : dfn2_prepost_frame_fail(s->prepost, model_rc != STREAM_RUN_NOT_STARTED)) != 0) {
+            s->phase = 0;
+            return -1;
+        }
         if (committed) ++s->commits;
         else ++s->skips;
     }
@@ -379,8 +382,9 @@ int dfn_res_stage_process(DfnResStage *s,
                           const Complex *apply_spec,
                           Complex *out_spec) {
     DfnResStageJob job;
-    if (!out_spec ||
-        dfn_res_stage_begin(s, estimate_spec, apply_spec, &job) != 1)
-        return -1;
-    return dfn_res_stage_end(s, dfn_res_stage_infer(s, &job), out_spec);
+    int begun;
+    if (!out_spec) return -1;
+    begun = dfn_res_stage_begin(s, estimate_spec, apply_spec, &job);
+    if (begun < 0) return -1;
+    return dfn_res_stage_end(s, begun == 1 ? dfn_res_stage_infer(s, &job) : STREAM_RUN_NOT_STARTED, out_spec);
 }

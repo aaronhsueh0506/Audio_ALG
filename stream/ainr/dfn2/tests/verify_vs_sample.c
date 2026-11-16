@@ -105,22 +105,26 @@ static int board_init(BoardDriver *d, const DFN2Grid *grid, const float *erb_fwd
     return 0;
 }
 
+/* 1: the hop has a job (frame open, views in *in / *out); 0: no job this hop (nothing open); -1: error. */
 static int board_pre(BoardDriver *d, const int16_t *pcm_in, DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
-    int hop = d->grid.hop, k;
+    int hop = d->grid.hop, k, need;
     for (k = 0; k < hop; ++k) d->hop_in[k] = (float)pcm_in[k] / 32768.0f;
     if (d->hpf) hpf_process(d->hpf, d->hop_in, hop);
     ac_stft_push_planar(d->stft, d->hop_in, d->spec_re, d->spec_im);
-    if (dfn2_prepost_pre_process_freq(d->prepost, d->spec_re, d->spec_im) != 1) return -1;
+    need = dfn2_prepost_pre_process_freq(d->prepost, d->spec_re, d->spec_im);
+    if (need != 1) return need;
     if (dfn2_prepost_frame_open(d->prepost, in, out) != 0) return -1;
     return 1;
 }
 
-static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *valid_out) {
+static int board_post(BoardDriver *d, int job, int ai_rc, int16_t *pcm_out, int *valid_out) {
     int prc, valid = 0, hop = d->grid.hop, k;
-    if (ai_rc == STREAM_RUN_OK) {
-        if (dfn2_prepost_frame_finish(d->prepost) != 0) dfn2_prepost_frame_bypass(d->prepost);
-    } else {
-        dfn2_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+    if (job) {
+        if (ai_rc == STREAM_RUN_OK) {
+            if (dfn2_prepost_frame_finish(d->prepost) != 0) dfn2_prepost_frame_bypass(d->prepost);
+        } else {
+            dfn2_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
+        }
     }
     prc = dfn2_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im, &valid);
     if (prc == 0) {
@@ -233,10 +237,10 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
     pcm_out_b = calloc((size_t)hop, sizeof(int16_t));
     prev_pcm_out_b = calloc((size_t)hop, sizeof(int16_t));
 
-    warm_hops = L + 5;          /* warm-up (if any) + 5 steady hops, one of them fault-injected */
-    fault_hop_index = L + 2;    /* a steady hop, well past warm-up */
+    warm_hops = L + 5;          /* the first L hops (no job) + 5 steady hops, one of them fault-injected */
+    fault_hop_index = L + 2;    /* a steady hop, well past the first L */
     no_start_hop_index = L + 3; /* the next one: the state must survive it */
-    post_reset_hops = L + 4;    /* after reset: warm-up again + 4 steady hops */
+    post_reset_hops = L + 4;    /* after reset: L hops without a job again + 4 steady hops */
     drain_hops = L + D + 1;     /* documented tail-drain length */
 
     {
@@ -251,11 +255,12 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                 DFN2HopIO io_b;
                 DFN2PrepostInputs in_a;
                 DFN2PrepostOutputs out_a;
-                int pre_rc_a, pre_rc_b, post_rc_a, post_rc_b, ai_rc;
+                int pre_rc_a, pre_rc_b, job_a, job_b, post_rc_a, post_rc_b, ai_rc = STREAM_RUN_NOT_STARTED;
                 int valid_a = 0, valid_b = 0;
                 int force_fail = (phase == 0 && hop_in_phase == fault_hop_index) ? STREAM_RUN_FAILED :
                                  (phase == 0 && hop_in_phase == no_start_hop_index) ? STREAM_RUN_NOT_STARTED : 0;
                 int zero_hop = (phase == 2);
+                long long since_start = phase == 2 ? post_reset_hops + hop_in_phase : hop_in_phase;
                 int k;
                 gen_prev = board_generation(&A);
 
@@ -265,12 +270,15 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
 
                 pre_rc_a = board_pre(&A, pcm_in, &in_a, &out_a);
                 pre_rc_b = dfn2_stream_pre_process(B, pcm_in, &io_b);
-
-                if (pre_rc_a != pre_rc_b) {
-                    fprintf(stderr, "[%s] hop %lld: pre_rc mismatch A=%d B=%d\n", label, ghop, pre_rc_a, pre_rc_b);
+                job_a = pre_rc_a == 1;
+                job_b = pre_rc_b == 1 && io_b.job_ready;
+                /* the hop has a job exactly from hop L on (after the start or a reset), on both sides */
+                if (pre_rc_a < 0 || pre_rc_b != 1 || job_a != job_b || job_a != (since_start >= L)) {
+                    fprintf(stderr, "[%s] hop %lld: pre mismatch A=%d B=%d job_ready B=%d (expected job %d)\n", label,
+                            ghop, pre_rc_a, pre_rc_b, pre_rc_b == 1 ? io_b.job_ready : -1, since_start >= L);
                     st.mismatches++;
                 }
-                if (pre_rc_a == 1 && pre_rc_b == 1) {
+                if (job_a && job_b) {
                     if (in_a.erb_window_elements != io_b.inputs.erb_window_elements ||
                         !cmp_floats_exact(in_a.erb_window, io_b.inputs.erb_window, in_a.erb_window_elements)) {
                         fprintf(stderr, "[%s] hop %lld: feature window (erb_window) mismatch A vs B\n", label, ghop);
@@ -278,16 +286,17 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                     }
                 }
 
-                /* Same fake, called once per side, both with the identical (ghop, force_fail). */
-                ai_rc = shared_fake(ghop, force_fail, &out_a);
-                {
+                /* Same fake, called once per side, both with the identical (ghop, force_fail); a hop
+                 * without a job runs nothing and posts STREAM_RUN_NOT_STARTED. */
+                if (job_a && job_b) {
+                    ai_rc = shared_fake(ghop, force_fail, &out_a);
                     /* Re-run the identical deterministic fake against B's own output views too --
                      * same ghop/force_fail, so both sides get field-for-field identical values. */
                     int ai_rc_b = shared_fake(ghop, force_fail, &io_b.outputs);
                     if (ai_rc_b != ai_rc) { fprintf(stderr, "[%s] hop %lld: fake rc mismatch\n", label, ghop); st.mismatches++; }
                 }
 
-                post_rc_a = board_post(&A, ai_rc, pcm_out_a, &valid_a);
+                post_rc_a = board_post(&A, job_a, ai_rc, pcm_out_a, &valid_a);
                 post_rc_b = dfn2_stream_post_process(B, ai_rc, pcm_out_b);
                 valid_b = (post_rc_b == 1);
 
@@ -313,9 +322,9 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                            label, ghop, board_generation(&A), dfn2_stream_state_generation(B));
                     st.mismatches++;
                 }
-                /* absolute generation steps: a started failure +1, a never-started run 0 */
-                if ((force_fail == STREAM_RUN_FAILED && board_generation(&A) != gen_prev + 1u) ||
-                    (force_fail == STREAM_RUN_NOT_STARTED && board_generation(&A) != gen_prev)) {
+                /* absolute generation steps: a started failure +1, a never-started run 0, a hop without a job 0 */
+                if ((job_a && force_fail == STREAM_RUN_FAILED && board_generation(&A) != gen_prev + 1u) ||
+                    ((!job_a || force_fail == STREAM_RUN_NOT_STARTED) && board_generation(&A) != gen_prev)) {
                     fprintf(stderr, "[%s] hop %lld: generation step %u -> %u wrong for run status %d\n",
                             label, ghop, gen_prev, board_generation(&A), force_fail);
                     st.mismatches++;

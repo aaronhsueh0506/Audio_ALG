@@ -251,23 +251,26 @@ static int run_absolute_scale(void) {
     if (rc) return 20 + rc;
 
     if (via_stage.bad || via_ref.bad) return 2;
-    /* Both clocks run the model on every hop, the first mask_lookahead hops being warm-up frames. */
-    if (via_stage.frames != SCALE_FRAMES || via_ref.frames != via_stage.frames) return 3;
-    /* Hop 0 shows the zero-initialised window with the first hop's features in its newest slot:
-     * every earlier time slot of both windows is zero, the newest is not. */
+    /* Both clocks run the model on every hop from hop mask_lookahead on: the first mask_lookahead hops carry no
+     * model frame. */
+    if (via_stage.frames != SCALE_FRAMES - DFN2_MASK_LOOKAHEAD || via_ref.frames != via_stage.frames) return 3;
+    /* The first window shows the zero-initialised slots that precede the stream start, then the features of hops
+     * 0 .. mask_lookahead (the newest slot is the hop mask_lookahead's): the slots before them are zero, the
+     * newest is not. */
     {
         const int past = DFN2_MODEL_INPUT_FRAMES - 1;
+        const int zero_slots = past - DFN2_MASK_LOOKAHEAD;
         int newest_erb = 0, newest_spec = 0, ch, t;
         for (i = 0; i < via_stage.want_erb; ++i) {
             const int slot = (int)(i / DFN2_N_ERB);
-            if (slot < past && via_stage.erb[0][i] != 0.0f) return 7;
+            if (slot < zero_slots && via_stage.erb[0][i] != 0.0f) return 7;
             if (slot == past && via_stage.erb[0][i] != 0.0f) newest_erb = 1;
         }
         for (ch = 0; ch < 2; ++ch)
             for (t = 0; t < DFN2_MODEL_INPUT_FRAMES; ++t)
                 for (i = 0; i < DFN2_DF_BINS; ++i) {
                     const float v = via_stage.spec[0][((size_t)ch * DFN2_MODEL_INPUT_FRAMES + (size_t)t) * DFN2_DF_BINS + i];
-                    if (t < past && v != 0.0f) return 8;
+                    if (t < zero_slots && v != 0.0f) return 8;
                     if (t == past && v != 0.0f) newest_spec = 1;
                 }
         if (!newest_erb || !newest_spec) return 9;
@@ -290,7 +293,7 @@ static int run_absolute_scale(void) {
             }
         }
     }
-    printf("dfn_res_stage: absolute scale -- %d frames (warm-up frames included) of ERB (%zu) and "
+    printf("dfn_res_stage: absolute scale -- %d frames of ERB (%zu) and "
            "complex (%zu) features bit-identical to the library fed an AcStft with "
            "spec_scale = dfn2_stft_scale(n_fft)\n", via_stage.frames, via_stage.want_erb, via_stage.want_spec);
     return 0;
@@ -569,8 +572,8 @@ static int run_stage_on_grid(const DFN2Grid *grid, int expect_lookahead, int *me
     dfn_res_stage_get_counters(s, &frames, &commits, &skips);
     if (frames != TG_HOPS || commits != TG_HOPS - grid->mask_lookahead || skips != 0) return 41;
     if (first < 0) return 42;
-    /* Each warm-up frame advances the generation once; committed frames leave it alone. */
-    if (dfn_res_stage_state_generation(s) != 1u + (unsigned int)grid->mask_lookahead) return 43;
+    /* The first mask_lookahead hops carry no model frame and committed frames leave the generation alone. */
+    if (dfn_res_stage_state_generation(s) != 1u) return 43;
     *measured = first - first_source;
     if (req_out) *req_out = req;
     dfn_res_stage_destroy(s);
@@ -872,10 +875,10 @@ static int run_large_bin_refused(void) {
     return rc;
 }
 
-/* Generation of the model's recurrent state: 1 after init, plus one per reset, one per warm-up frame
- * (whatever the model wrote or reported), one per refused commit of a real frame (a head the commit
- * finds non-finite) and one per real frame whose run status is neither STREAM_RUN_OK nor
- * STREAM_RUN_NOT_STARTED; a committed real frame and a model that ran nothing leave it alone. */
+/* Generation of the model's recurrent state: 1 after init, plus one per reset, one per refused commit of a
+ * frame (a head the commit finds non-finite) and one per frame whose run status is neither STREAM_RUN_OK nor
+ * STREAM_RUN_NOT_STARTED; a committed frame and a model that ran nothing leave it alone, and so do the first
+ * mask_lookahead hops, which carry no model frame. */
 static int run_state_generation(void) {
     DFN2ModelIoDescriptor descriptor;
     DfnResStageConfig cfg = base_config();
@@ -898,9 +901,8 @@ static int run_state_generation(void) {
         for (frame = 0; frame < FRAMES; ++frame) {
             fill_frame(estimate, apply, frame);
             if (dfn_res_stage_process(s, estimate, apply, out) < 0) return 5;
-            /* a warm-up frame discards its heads, whatever they and the status say: exactly one; a real frame:
-             * a refusal or a failed run */
-            if (frame < M_FRAMES || kind == 1 || kind == 2) ++expect;
+            /* a hop without a model frame: nothing moves; a frame with one: a refusal or a failed run */
+            if (frame >= M_FRAMES && (kind == 1 || kind == 2)) ++expect;
             if (dfn_res_stage_state_generation(s) != expect) return 6 + kind;
         }
         dfn_res_stage_get_counters(s, NULL, &commits, &skips);
@@ -971,9 +973,12 @@ static int run_phased_case(int mode) {
             else if (mode == 4) model_rc = half_mask_then_fail(NULL, &job.inputs, &job.outputs);
             else if (mode == 5) model_rc = STREAM_RUN_NOT_STARTED;   /* nothing ran */
             else model_rc = 0;   /* nothing was written: the NaN heads refuse the commit */
+            if (frame < M_FRAMES) return 16;   /* no model frame in the first mask_lookahead hops */
             if (dfn_res_stage_end(ph, model_rc, a) != rc_b) return 4;
         } else {
-            return 5;   /* one model frame on every hop */
+            if (frame >= M_FRAMES) return 5;   /* a model frame on every hop from hop mask_lookahead */
+            /* a hop with no model frame ignores the status the caller posts */
+            if (dfn_res_stage_end(ph, STREAM_RUN_FAILED, a) != rc_b) return 15;
         }
         if (memcmp(a, b, sizeof(a)) != 0) return 10 + frame;
         if (frame >= L_FRAMES) {
@@ -991,7 +996,7 @@ static int run_phased_case(int mode) {
      * callback without a model is NOT_STARTED (no step) */
     if (mode != 3 && dfn_res_stage_state_generation(ph) != dfn_res_stage_state_generation(cb)) return 13;
     if (mode == 3 && dfn_res_stage_state_generation(ph) <= dfn_res_stage_state_generation(cb)) return 14;
-    if (opened != FRAMES + 4) return 12;
+    if (opened != FRAMES + 4 - M_FRAMES) return 12;
     if (!any) return 7;
     if (mode == 0 && (ca == 0 || !differs)) return 8;   /* the model really shaped it */
     if (mode != 0 && ca != 0) return 9;                 /* every other row is the identity */
@@ -1005,24 +1010,30 @@ static int run_phased_sequence(void) {
     DfnResStage *s = dfn_res_stage_create(&cfg);
     static Complex est[DFN2_N_BINS], app[DFN2_N_BINS], out[DFN2_N_BINS];
     DfnResStageJob job;
-    int frame;
+    int frame, first;
     if (!s) return 1;
     fill_frame(est, app, 0);
     if (dfn_res_stage_end(s, 0, out) != -1) return 2;           /* end before begin */
     if (dfn_res_stage_begin(NULL, est, app, &job) != -1 ||
         dfn_res_stage_begin(s, est, app, NULL) != -1)
         return 3;
-    /* the first hop opens a model frame whatever the mask lookahead (a warm-up frame when it is > 0) */
-    if (dfn_res_stage_begin(s, est, app, &job) != 1 || job.inputs.erb_window == NULL ||
-        job.outputs.erb_mask == NULL)
-        return 4;
-    if (dfn_res_stage_begin(s, est, app, &job) != -1) return 5; /* a hop is already begun */
+    /* the first mask_lookahead hops need no model frame (begin returns 0); with no lookahead the first hop has one */
+    first = dfn_res_stage_begin(s, est, app, &job);
+    if (first != (M_FRAMES > 0 ? 0 : 1)) return 4;
+    if (first == 1 && (job.inputs.erb_window == NULL || job.outputs.erb_mask == NULL)) return 4;
+    if (dfn_res_stage_begin(s, est, app, &job) != -1) return 5; /* a hop is already begun, with a model frame or not */
+    if (dfn_res_stage_set_atten_lim(s, 6.0f) != -1) return 15;  /* between hops only, a hop without a model frame included */
     if (dfn_res_stage_end(s, 0, NULL) != -1) return 6;
     if (dfn_res_stage_end(s, 0, out) != (L_FRAMES > 0 ? 0 : 1)) return 7;
     if (dfn_res_stage_end(s, 0, out) != -1) return 8;          /* already closed */
+    if (dfn_res_stage_set_atten_lim(s, 0.0f) != 0) return 16;
     for (frame = 1; frame < 4; ++frame) {
         fill_frame(est, app, frame);
-        if (dfn_res_stage_begin(s, est, app, &job) != 1) return 9;
+        if (dfn_res_stage_begin(s, est, app, &job) != (frame >= M_FRAMES ? 1 : 0)) return 9;
+        if (frame < M_FRAMES) {   /* no model frame: end ignores the status */
+            if (dfn_res_stage_end(s, STREAM_RUN_FAILED, out) != 0) return 17;
+            continue;
+        }
         if (job.inputs.erb_window == NULL || job.outputs.erb_mask == NULL) return 10;
         /* The stage registers no state: the model callback owns it. */
         if (job.inputs.gru_hidden != NULL || job.inputs.gru_hidden_elements != 0 ||
@@ -1036,20 +1047,20 @@ static int run_phased_sequence(void) {
     }
     dfn_res_stage_reset(s);
     fill_frame(est, app, 0);
-    /* reset restarts the warm-up: the next hop opens a model frame again */
-    if (dfn_res_stage_begin(s, est, app, &job) != 1) return 12;
+    /* reset restarts the count: the next hop has no model frame again when the grid has a mask lookahead */
+    if (dfn_res_stage_begin(s, est, app, &job) != (M_FRAMES > 0 ? 0 : 1)) return 12;
     dfn_res_stage_destroy(s);
     return 0;
 }
 
-/* ---- warm-up frames ------------------------------------------------------------------
- * The first mask_lookahead hops run the model like any other, discard its heads and leave the
- * model state to restart, so the audio equals a stream whose model starts at its first real frame.
+/* ---- hops without a model frame ------------------------------------------------------
+ * The first mask_lookahead hops after a start do not run the model, so the audio equals a stream whose
+ * model starts at its first real frame and the generation does not move for them.
  * A mock model with state that shapes the ERB mask stands for a board accelerator:
  *   mode 1  reloads zero whenever dfn_res_stage_state_generation() changes (the contract)
- *   mode 2  reloads zero only at its start (breaks the contract: warm-up frames leak into the state)
- *   mode 3  ignores the generation and zeroes exactly when its first real frame arrives (the
- *           reference: a model that never saw a warm-up frame)
+ *   mode 2  reloads zero only at its start (breaks the contract: a reset leaves its state in place)
+ *   mode 3  ignores the generation and zeroes exactly when its first call arrives (the reference: a model
+ *           that starts at its first real frame)
  * `garbage_calls` first calls write a NaN and an enormous head and still report success. */
 #define WARM_HOPS 12
 
@@ -1070,7 +1081,7 @@ static int warm_infer(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutput
     if (m->mode == 1) {
         const unsigned int generation = dfn_res_stage_state_generation(m->stage);
         if (generation != m->seen_generation) { m->state = 0.0f; m->seen_generation = generation; }
-    } else if (m->mode == 3 && m->calls == M_FRAMES) {
+    } else if (m->mode == 3 && m->calls == 0) {
         m->state = 0.0f;
     }
     mask = 0.5f - 0.25f * m->state;
@@ -1091,7 +1102,7 @@ static int run_warm_stream(int mode, int garbage_calls, int passes, Complex out[
     DfnResStage *s;
     Complex estimate[DFN2_N_BINS], apply[DFN2_N_BINS], again[DFN2_N_BINS];
     long long frames, commits, skips;
-    int pass, hop;
+    int pass, hop, moved = 0;
 
     memset(&m, 0, sizeof(m));
     m.mode = mode;
@@ -1109,15 +1120,19 @@ static int run_warm_stream(int mode, int garbage_calls, int passes, Complex out[
         for (hop = 0; hop < WARM_HOPS; ++hop) {
             fill_frame(estimate, apply, hop);
             if (dfn_res_stage_process(s, estimate, apply, pass == 0 ? out[hop] : again) < 0) return 3;
-            if (pass > 0 && memcmp(again, out[hop], sizeof(again)) != 0 && mode == 1) return 4;
+            if (pass > 0 && memcmp(again, out[hop], sizeof(again)) != 0) {
+                if (mode == 1) return 4;
+                moved = 1;
+            }
             dfn_res_stage_get_counters(s, &frames, &commits, &skips);
-            /* the model runs on every hop; a warm-up hop counts as a frame pushed and as nothing else */
-            if (m.calls - calls_before != hop + 1 || frames != hop + 1) return 5;
+            /* the model runs on every hop from hop mask_lookahead; the others count as a frame pushed and as nothing else */
+            if (m.calls - calls_before != (hop + 1 > M_FRAMES ? hop + 1 - M_FRAMES : 0) || frames != hop + 1) return 5;
             if (hop < M_FRAMES && (commits != 0 || skips != 0)) return 6;
             if (commits + skips != (hop + 1 > M_FRAMES ? hop + 1 - M_FRAMES : 0)) return 7;
         }
         if (pass + 1 < passes) dfn_res_stage_reset(s);   /* the mock notices it by the generation alone */
     }
+    if (mode == 2 && passes > 1 && !moved) return 8;   /* a model that ignores the generation must show it */
     *generation = dfn_res_stage_state_generation(s);
     *calls = m.calls;
     dfn_res_stage_destroy(s);
@@ -1131,29 +1146,31 @@ static int run_warmup_frames(void) {
     unsigned int gen;
     int calls, rc;
 
-    /* The contract (mode 1) with garbage heads on every warm-up call: the heads are discarded, no
-     * refusal (generation exactly +1 per warm-up frame, never +2), one model call per hop. */
-    rc = run_warm_stream(1, M_FRAMES, 1, g_warm_a, &gen, &calls);
+    /* The contract (mode 1): the model runs on the hops from hop mask_lookahead only and the generation does not
+     * move for the others. */
+    rc = run_warm_stream(1, 0, 1, g_warm_a, &gen, &calls);
     if (rc) return 10 + rc;
-    if (gen != 1u + M_FRAMES || calls != WARM_HOPS) return 20;
-    /* The same model with valid heads on every call: identical audio (the heads never mattered). */
-    rc = run_warm_stream(1, 0, 1, g_warm_b, &gen, &calls);
+    if (gen != 1u || calls != WARM_HOPS - M_FRAMES) return 20;
+    /* A first call that writes garbage heads is a refused commit: one step, and the hop is the identity. */
+    rc = run_warm_stream(1, 1, 1, g_warm_b, &gen, &calls);
     if (rc) return 30 + rc;
-    if (gen != 1u + M_FRAMES || calls != WARM_HOPS) return 40;
-    if (memcmp(g_warm_a, g_warm_b, sizeof(g_warm_a)) != 0) return 41;
-    /* The reference: a model that starts at its first real frame. */
+    if (gen != 2u || calls != WARM_HOPS - M_FRAMES) return 40;
+    /* The reference: a model that starts at its first real frame; the stage's audio equals it. */
     rc = run_warm_stream(3, 0, 1, g_warm_c, &gen, &calls);
     if (rc) return 50 + rc;
     if (memcmp(g_warm_a, g_warm_c, sizeof(g_warm_a)) != 0) return 51;
-    /* A model that reloads only at its start sees its warm-up frames in its state. */
+    /* A model that reloads only at its start sees no state of the hops that do not run it: the same audio. */
     rc = run_warm_stream(2, 0, 1, g_warm_b, &gen, &calls);
     if (rc) return 60 + rc;
-    if ((memcmp(g_warm_b, g_warm_c, sizeof(g_warm_b)) != 0) != (M_FRAMES > 0)) return 61;
-    /* A reset restarts the warm-up: the second pass reproduces the first through the generation. */
+    if (memcmp(g_warm_b, g_warm_c, sizeof(g_warm_b)) != 0) return 61;
+    /* A reset restarts the count: the second pass reproduces the first through the generation (mode 1), while
+     * a model that does not follow the generation carries its state across the reset (mode 2). */
     rc = run_warm_stream(1, 0, 2, g_warm_b, &gen, &calls);
     if (rc) return 70 + rc;
-    if (gen != 2u + 2u * M_FRAMES || calls != 2 * WARM_HOPS) return 71;
+    if (gen != 2u || calls != 2 * (WARM_HOPS - M_FRAMES)) return 71;
     if (memcmp(g_warm_b, g_warm_c, sizeof(g_warm_b)) != 0) return 72;
+    rc = run_warm_stream(2, 0, 2, g_warm_b, &gen, &calls);
+    if (rc) return 80 + rc;
     return 0;
 }
 
@@ -1195,7 +1212,7 @@ int main(void) {
     rc = run_phased_sequence();
     if (rc) { fprintf(stderr, "phased sequence row failed: %d\n", rc); return 1; }
     rc = run_warmup_frames();
-    if (rc) { fprintf(stderr, "warm-up row failed: %d\n", rc); return 1; }
+    if (rc) { fprintf(stderr, "hops-without-a-model-frame row failed: %d\n", rc); return 1; }
     {   /* the pair this program was built with, as the stage measures it (make test-pairs reads it) */
         int measured = -1;
         rc = run_stage_on_grid(dfn_test_grid(), DFN_TEST_LOOKAHEAD_FRAMES, &measured, NULL);

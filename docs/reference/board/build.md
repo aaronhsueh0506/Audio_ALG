@@ -221,8 +221,8 @@ The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_histor
 stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run
 (`dfn2_prepost_state_generation()`; `dfn_res_stage_state_generation()` or `dfn_rate_bridge_state_generation()` when a stage or bridge
 hosts the model; `ulcnet_prepost_state_generation()`; `deepvqe_prepost_state_generation()`) and, when it differs from the last value it
-saw, reloads quantized zeros into the accelerator's state input buffers (DFN2 with `mask_lookahead` M >= 1: once more after each of the first M
-warm-up frames, so a stream start makes M extra NPU runs whose heads are discarded). The start value differs per library (1 for DFN2 and the
+saw, reloads quantized zeros into the accelerator's state input buffers (the first M blocks of DFN2 with `mask_lookahead` M >= 1 carry no job and do not move it; the
+accelerator's state is quantized zero when the generation is first read). The start value differs per library (1 for DFN2 and the
 stage / bridge, 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
 
 The DFN2 stream loads the ERB matrices of the resolved grid from the board's release-asset directory during `ainr_init()`; a sample

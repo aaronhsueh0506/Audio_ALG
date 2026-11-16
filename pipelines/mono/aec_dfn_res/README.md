@@ -145,7 +145,7 @@ from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../../dfn/README.md
 skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
 `--erb-inv`, `--sample-rate` (default 16000), `--ai-sample-rate` / `--ai-fft-size` (the model grid, default 48000 / 1024), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
 stub to replace with the runtime call (the recurrent state is the accelerator's: it reloads quantized zeros when
-`job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, each warm-up frame, a
+`job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, a
 refused commit or a run that started and failed; a callback that ran nothing returns `STREAM_RUN_NOT_STARTED` and moves
 nothing). Numbers are parsed by `example_cli.h`
 (`example_cli_parse_int` / `example_cli_parse_float`): empty strings, leading spaces, trailing characters,

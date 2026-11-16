@@ -8,10 +8,9 @@
  *
  * Timing: the emitted spectrum belongs to source frame t - L, L = dfn_res_stage_lookahead_frames()
  * (grid.mask_lookahead + grid.df_lookahead, 2 for the shipped 1/1 pair); the first L hops return 0
- * with an all-zero spectrum, so the caller synthesises unconditionally. Every hop runs the same
- * begin, model, end flow: the first grid.mask_lookahead hops are warm-up frames (the model runs, its
- * heads are discarded, its state restarts), so the audio equals a stream whose model starts at its
- * first real frame.
+ * with an all-zero spectrum, so the caller synthesises unconditionally. Every hop runs begin, model, end,
+ * except that the first grid.mask_lookahead hops after a start need no model frame (begin returns 0, the
+ * model does not run): the audio is that of a stream whose model starts at its first real frame.
  *
  * Fail-open: no model (model.infer == NULL), a nonzero run status, or an unwritten/non-finite
  * output takes the frame as an identity through the cascade (clocks advance either way); the
@@ -20,7 +19,7 @@
  * value = it may be dirty. The library advances the state generation whenever the device state may no longer be
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
  * accelerator's state when the generation differs from the value at the last zeroing. An unwritten/non-finite
- * output is a refused commit (frame_finish()'s own finite check); a warm-up frame advances it too.
+ * output is a refused commit (frame_finish()'s own finite check).
  *
  * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the
  * DFN2Grid in the config (dfn2_grid_make(); the shipped one is 48 kHz / 1024 / 512, hop 512, 513
@@ -106,13 +105,13 @@ void dfn_res_stage_destroy(DfnResStage *s);   /* frees only create()'s heap */
  * Whole-pipeline resets only. */
 void dfn_res_stage_reset(DfnResStage *s);
 
-/* Between hops only; -1 on NULL or a non-finite value. */
+/* Between hops only; -1 on NULL, a non-finite value or a hop in progress (begun, not yet ended). */
 int dfn_res_stage_set_atten_lim(DfnResStage *s, float atten_lim_db);
 
 /* The grid the stage runs (the config's, as the library holds it); NULL for NULL. */
 const DFN2Grid *dfn_res_stage_grid(const DfnResStage *s);
 
-/* Generation of the model's recurrent state (rule above): 1 after init, plus one per reset, warm-up frame, refused
+/* Generation of the model's recurrent state (rule above): 1 after init, plus one per reset, refused
  * commit and dirty run status; 0 for NULL. The stage registers no state: the model callback zeroes its own when it
  * changes. */
 unsigned int dfn_res_stage_state_generation(const DfnResStage *s);
@@ -120,8 +119,8 @@ unsigned int dfn_res_stage_state_generation(const DfnResStage *s);
 /* Source frame of the last emitted spectrum; -1 before the first emission. */
 int dfn_res_stage_output_frame_index(const DfnResStage *s, long long *frame);
 
-/* Hop counters: frames pushed, head evaluations committed, frames taken as identity; the warm-up
- * frames count in frames_in only. */
+/* Hop counters: frames pushed, head evaluations committed, frames taken as identity; the hops with no
+ * model frame count in frames_in only. */
 void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
                                 long long *commits, long long *skips);
 
@@ -132,7 +131,7 @@ typedef struct DfnResStageJob {
     DFN2PrepostOutputs outputs;
 } DfnResStageJob;
 
-/* One hop in two calls around the model. `estimate_spec` is the pre-RES spectrum (E), `apply_spec` the post-RES spectrum (P); both are borrowed for the begin call only. begin returns 1 with the open frame's views in *job (run the model, then call end), or -1 on a contract error (NULL arguments, a bin that is non-finite or whose product with dfn2_stft_scale(n_fft) exceeds 2^63 -- the block is refused whole and the stage is untouched --, a hop already begun, a frame the DFN2 class refuses). end closes the hop: model_rc is the run status (stream_run.h: STREAM_RUN_OK = every output written, STREAM_RUN_NOT_STARTED = nothing ran, any other value a started run that failed); anything but STREAM_RUN_OK, or an unwritten or non-finite output, takes the frame as the identity. `out_spec` is always fully written (zeros while no spectrum is due). end returns 1 when out_spec carries an emitted frame, 0 when none is due yet (the first L hops), -1 on a contract error. One frame per call: frames_per_call > 1 is refused; with mask_lookahead 0 there is no warm-up frame. */
+/* One hop in two calls around the model. `estimate_spec` is the pre-RES spectrum (E), `apply_spec` the post-RES spectrum (P); both are borrowed for the begin call only. begin returns 1 with the open frame's views in *job (run the model, then call end), 0 when the hop needs no model frame (the first mask_lookahead hops after a start; call end all the same, its model_rc is ignored), or -1 on a contract error (NULL arguments, a bin that is non-finite or whose product with dfn2_stft_scale(n_fft) exceeds 2^63 -- the block is refused whole and the stage is untouched --, a hop already begun, a frame the DFN2 class refuses). end closes the hop: model_rc is the run status (stream_run.h: STREAM_RUN_OK = every output written, STREAM_RUN_NOT_STARTED = nothing ran, any other value a started run that failed); anything but STREAM_RUN_OK, or an unwritten or non-finite output, takes the frame as the identity. `out_spec` is always fully written (zeros while no spectrum is due). end returns 1 when out_spec carries an emitted frame, 0 when none is due yet (the first L hops), -1 on a contract error. One frame per call: frames_per_call > 1 is refused; with mask_lookahead 0 every hop has a model frame. */
 int dfn_res_stage_begin(DfnResStage *s,
                         const Complex *estimate_spec,
                         const Complex *apply_spec,

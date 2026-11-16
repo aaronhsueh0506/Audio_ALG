@@ -26,7 +26,7 @@
 
 #define MAX_FFT 512
 #define MAX_HOPS 200
-#define M_FRAMES DFN2_MASK_LOOKAHEAD   /* warm-up stage frames after a start or reset */
+#define M_FRAMES DFN2_MASK_LOOKAHEAD   /* stage frames after a start or reset that need no model frame */
 
 static float erb_fwd[DFN2_N_BINS * DFN2_N_ERB];
 static float erb_inv[DFN2_N_ERB * DFN2_N_BINS];
@@ -421,7 +421,7 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     static float est[MAX_HOPS * (MAX_FFT / 2)], app[MAX_HOPS * (MAX_FFT / 2)];
     static float oa[MAX_FFT / 2], ob[MAX_FFT / 2];
     int hop = g->fft / 2, hops = 120, t, k, max_frames = 0, nonzero = 0;
-    long long first_frame = 0, stage_frames = 0, failed_real = 0;   /* real frames closed with STREAM_RUN_FAILED */
+    long long stage_frames = 0, failed_real = 0;   /* model frames closed with STREAM_RUN_FAILED */
     DfnResStageJob job;
 
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
@@ -437,7 +437,6 @@ static int run_phased_grid(const Grid *g, int behaviour) {
     for (k = 0; k < hops * hop; ++k) app[k] = 0.7f * est[k];
     for (t = 0; t < hops; ++t) {
         int r, frames_this_hop = 0;
-        first_frame = stage_frames;
         analyzer_push(&ae, est + t * hop, se);
         analyzer_push(&ap, app + t * hop, sa);
         if (dfn_rate_bridge_process(cb, se, sa, ob) != 0) return 3;
@@ -447,10 +446,10 @@ static int run_phased_grid(const Grid *g, int behaviour) {
                 int rc = 0;
                 ++frames_this_hop;
                 if (behaviour == BP_OPEN) {            /* left open: finish closes it as STREAM_RUN_FAILED */
-                    if (first_frame >= M_FRAMES) ++failed_real;
+                    ++failed_real;
                     break;
                 }
-                if (behaviour == BP_FAIL && first_frame + frames_this_hop - 1 >= M_FRAMES) ++failed_real;
+                if (behaviour == BP_FAIL) ++failed_real;   /* nn_begin hands out model frames only */
                 if (behaviour == BP_RUN)
                     rc = dfn_fixture_half_mask_infer(NULL, &job.inputs, &job.outputs);
                 else rc = STREAM_RUN_FAILED;
@@ -705,11 +704,10 @@ static int run_phased_sequence(void) {
 }
 
 /* The bridge reports its stage's state generation: 1 after create, plus one per reset, one per
- * warm-up frame (the first mask_lookahead stage frames, whatever the model wrote or reported), one per
- * refused commit of a real frame (a head the commit finds non-finite, closed through nn_end) and one per
- * real frame closed with a run status that is neither STREAM_RUN_OK nor STREAM_RUN_NOT_STARTED; a frame
- * that ran nothing leaves it alone. A caller that holds the model's state refills it when the value
- * changes. */
+ * refused commit of a model frame (a head the commit finds non-finite, closed through nn_end) and one per
+ * model frame closed with a run status that is neither STREAM_RUN_OK nor STREAM_RUN_NOT_STARTED; a frame
+ * that ran nothing leaves it alone, and so do the first mask_lookahead stage frames, which need no model
+ * frame. A caller that holds the model's state refills it when the value changes. */
 static int run_state_generation(void) {
     DfnRateBridgeConfig cfg = bridge_config(16000, 256);
     DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
@@ -718,7 +716,7 @@ static int run_state_generation(void) {
     static float hopbuf[128], out[128];
     DfnResStageJob job;
     unsigned int expect = 1u;
-    int pass, t, refused = 0, failed = 0, warm = 0, seen = 0, r;
+    int pass, t, refused = 0, failed = 0, r;
 
     if (dfn_rate_bridge_state_generation(NULL) != 0u) return 1;
     if (!b || analyzer_init(&ae, 256) != 0 || analyzer_init(&ap, 256) != 0) return 2;
@@ -731,7 +729,7 @@ static int run_state_generation(void) {
             if (dfn_rate_bridge_begin(b, se, sa) != 0) return 4;
             while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1) {
                 int rc = pass == 1 ? STREAM_RUN_FAILED : STREAM_RUN_NOT_STARTED;
-                if (pass == 1) {                       /* the warm-up frames are over by now: a failed run is +1 */
+                if (pass == 1) {                       /* a failed run is +1 */
                     ++expect;
                     ++failed;
                 }
@@ -739,11 +737,9 @@ static int run_state_generation(void) {
                     dfn_fixture_half_mask_infer(NULL, &job.inputs, &job.outputs);
                     job.outputs.erb_mask[3] = (float)NAN;
                     rc = 0;
-                    ++expect;                          /* a warm-up frame discards its heads: +1 */
-                    if (seen < M_FRAMES) ++warm;       /* a real frame refuses them: +1 */
-                    else ++refused;
+                    ++expect;                          /* the commit refuses them: +1 */
+                    ++refused;
                 }
-                ++seen;
                 if (dfn_rate_bridge_nn_end(b, rc) != 0) return 5;
                 if (dfn_rate_bridge_state_generation(b) != expect) return 6 + pass;
             }
@@ -752,9 +748,9 @@ static int run_state_generation(void) {
                 dfn_res_stage_state_generation(dfn_rate_bridge_stage(b))) return 9;
         }
     }
-    if (refused < 1) return 10;   /* the NaN pass must have refused commits of real frames */
-    if (failed < 1) return 13;    /* the failure pass must have run real frames */
-    if (warm != M_FRAMES || expect != 1u + (unsigned int)M_FRAMES + (unsigned int)refused + (unsigned int)failed) return 12;
+    if (refused < 1) return 10;   /* the NaN pass must have refused commits */
+    if (failed < 1) return 13;    /* the failure pass must have run model frames */
+    if (expect != 1u + (unsigned int)refused + (unsigned int)failed) return 12;
     dfn_rate_bridge_reset(b);
     if (dfn_rate_bridge_state_generation(b) != expect + 1u) return 11;
     dfn_rate_bridge_destroy(b);
@@ -763,10 +759,10 @@ static int run_state_generation(void) {
     return 0;
 }
 
-/* One model call per stage frame, warm-up frames included: the calls of each host hop equal the
- * hop's stage frames (the schedule 0,1,1,1 at 16 kHz / 128 and 1,2 elsewhere), their total the
- * 48 kHz frame count, and the generation is 1 + calls while the first mask_lookahead calls go by,
- * 1 + mask_lookahead after. The added delay does not depend on any of it. */
+/* One model call per stage frame from stage frame mask_lookahead on: the calls of each host hop equal the
+ * hop's stage frames (the schedule 0,1,1,1 at 16 kHz / 128 and 1,2 elsewhere) less those among the first
+ * mask_lookahead, their total the 48 kHz frame count less mask_lookahead, and the generation stays 1. The
+ * added delay does not depend on any of it. */
 static int counting_calls(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
     ++*(int *)user;
     return dfn_fixture_identity_infer(NULL, in, out);
@@ -780,7 +776,7 @@ static int run_model_calls(const Grid *g, int pinned_delay) {
     static Complex se[MAX_FFT / 2 + 1], sa[MAX_FFT / 2 + 1];
     static float hopbuf[MAX_FFT / 2], out[MAX_FFT / 2];
     long long frames = 0;
-    int calls = 0, t, last = 0, first_call_hop = -1, rc = 0;
+    int calls = 0, t, last = 0, first_call_hop = -1, first_call_expected = -1, rc = 0;
 
     if (dfn2_model_io_descriptor_default(dfn_test_grid(), &descriptor) != 0) return 1;
     cfg.stage.model.infer = counting_calls;
@@ -792,20 +788,22 @@ static int run_model_calls(const Grid *g, int pinned_delay) {
     if (pinned_delay >= 0 && dfn_rate_bridge_added_delay_samples(b) != pinned_delay) rc = 3;
     for (t = 0; !rc && t < 24; ++t) {
         const int before = calls;
-        unsigned int want_generation;
+        const long long frames_before = frames;
+        long long skipped;
         analyzer_push(&ae, hopbuf, se);
         analyzer_push(&ap, hopbuf, sa);
         if (dfn_rate_bridge_process(b, se, sa, out) != 0) { rc = 4; break; }
         dfn_rate_bridge_get_counters(b, &frames, &last);
-        if (calls - before != last) rc = 5;
+        skipped = frames_before >= M_FRAMES ? 0 : (M_FRAMES - frames_before < last ? M_FRAMES - frames_before : last);
+        if (calls - before != last - skipped) rc = 5;
         else if (last != (g->sr == 16000 && g->fft == 256 ? (t % 4 == 0 ? 0 : 1) : (t % 2 == 0 ? 1 : 2)))
             rc = 6;
         if (calls > 0 && first_call_hop < 0) first_call_hop = t;
-        want_generation = 1u + (unsigned int)(calls < M_FRAMES ? calls : M_FRAMES);
-        if (dfn_rate_bridge_state_generation(b) != want_generation) rc = 7;
-        if (calls != frames) rc = 8;
+        if (first_call_expected < 0 && frames > M_FRAMES) first_call_expected = t;
+        if (dfn_rate_bridge_state_generation(b) != 1u) rc = 7;
+        if (calls != (frames > M_FRAMES ? frames - M_FRAMES : 0)) rc = 8;
     }
-    if (!rc && first_call_hop != (g->sr == 16000 && g->fft == 256 ? 1 : 0)) rc = 9;
+    if (!rc && first_call_hop != first_call_expected) rc = 9;
     dfn_rate_bridge_destroy(b);
     fft_destroy(ae.fft);
     fft_destroy(ap.fft);

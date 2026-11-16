@@ -52,9 +52,9 @@
 
 /* Replace with the board runtime call. `inputs` carries the feature windows; the recurrent state
  * is the accelerator's own (its views are NULL/0 here), bound input to output in place and
- * refilled with quantized zeros whenever job.state_generation (dfn_hop_state_generation()) changes,
- * which includes the end of each warm-up frame (the first mask_lookahead hops run the model like
- * any other; their heads are discarded). Fill the heads in `outputs` and return 0. Any other return takes the frame
+ * refilled with quantized zeros whenever job.state_generation (dfn_hop_state_generation()) changes.
+ * The first mask_lookahead hops after a start have no model frame and do not call this. Fill the heads
+ * in `outputs` and return 0. Any other return takes the frame
  * as the identity (dfn_hop.h): STREAM_RUN_NOT_STARTED when no run began (the device state is untouched),
  * STREAM_RUN_FAILED, or any other nonzero value, once it did (the library then advances the state generation). */
 static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,

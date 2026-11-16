@@ -67,7 +67,7 @@ P 的形成(main.c 的 dfn_form(),自寫):
 dfn_hop_begin(&amp;hop, E, P)                                    (phase 0 → 1)
  ├─【48 kHz】dfn_hop_open_frame(E, P, &amp;job):換尺度 + dfn2_stream_pre_process_freq_dual()   ← 與 mono 同一份
  │      est = E*dfn2_stft_scale(n_fft), app = P*dfn2_stft_scale(n_fft) → 範圍檢查(非有限或超過 2^63 整塊拒絕)→ pre_process_freq_dual()
- │      每 hop 回 1 = job 已開(前 M 個 hop 是暖機幀:模型照跑、heads 丟棄;輸出頻譜到第 L 個 hop 才有)
+ │      每 hop 回 1 = job 已開(前 M 個 hop 回 0,沒有 job:不開 frame、模型不跑;輸出頻譜到第 L 個 hop 才有)
  └─【16 kHz】ainr_bridge_begin(bridge, E, P)
         原生 AcIstft(E、P 各一個)→ 兩顆 audio_resampler 升到 48 kHz(×3)→ 48 kHz FIFO
 
@@ -88,7 +88,7 @@ dfn_hop_process(&amp;hop, E, P, out) = 上面四個呼叫的序列,模型由 pla
 任一步失敗 → 整合者 reset(helper(含 array)+ hop)後重來(main.c 的 dfn_reset())</pre>
 
 <h2>訊號泳道圖</h2>
-<p><b>48 kHz 核心</b>的泳道與 mono 完全相同:每 hop 一次推論,前 M 幀是暖機幀(heads 丟棄),模型串流前 L 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統核心的 hop#(p-L)」(出貨 pair:M=1、L=2,合計 3 hop = 1536 samples);四聲道前級不加延遲。<b>16 kHz 核心</b>多了 bridge 的第二個時鐘:</p>
+<p><b>48 kHz 核心</b>的泳道與 mono 完全相同:每 hop 一次推論(前 M 個 hop 沒有 job,模型不跑),模型串流前 L 個 hop 輸出全零頻譜,之後第 p 個 hop 輸出「傳統核心的 hop#(p-L)」(出貨 pair:M=1、L=2,合計 3 hop = 1536 samples);四聲道前級不加延遲。<b>16 kHz 核心</b>多了 bridge 的第二個時鐘:</p>
 <pre>lane \ native hop   #0            #1            #2            #3            #4(週期重複)
 ─────────────────── ───────────── ───────────── ───────────── ───────────── ─────────────
 前端(16 kHz)        array_sample_beam_process → array_sample_beam_fuse → dfn_hop_begin;每 hop 交出 E,P [129]
@@ -128,7 +128,7 @@ bridge 原生 WOLA    e0,p0(各 128) e1,p1         e2,p2         e3,p3         e
 <tr><td>comfort-noise 產生器</td><td>array 內(不在應用的 state 中)</td><td>array pool</td><td>種子 <code>AEC_CNG_SEED</code>(42),由 array 在硬重置與 <code>aec_reset()</code> 時重設;CNG 在 <code>dfn_form()</code> 產生並已包在 P 裡,模型串流與 bridge <b>沒有 comfort-noise 程式碼</b></td></tr>
 <tr><td>相位與 job 狀態(<code>DfnHop</code>)</td><td>純量與 <code>DfnHopJob</code></td><td>C struct(非擁有)</td><td>phased API 的序列閘,違反回非 0</td></tr>
 <tr><td>模型串流 <code>DFN2Stream</code> pool(記憶體模式,不含遞迴狀態)與 6 × 513 float 換算緩衝(12,312 B)</td><td>與 mono 變體同一份:串流 92,688 B(48 kHz／1024、1/1,ne10 現查;<code>freq_only</code>,其中 <code>DFN2Prepost</code> 92,528 B,<code>DFN2_PREPOST_CARVE_VERSION = 12</code>;<code>DFN2_STREAM_LAYOUT_VERSION = 5</code>)</td><td>DFN2 尾段</td><td>逐項組成見 <a href="../../mono/dfn2/index.html">Mono · DFN2</a> 的 State 表與 <a href="../../../models/dfn2/reference/core.html">DeepFilterNet2 頻域與模型契約</a></td></tr>
-<tr><td>遞迴狀態 <code>h_gru</code>、<code>df_convp_history</code></td><td>出貨 graph 128,000 B(32,000 float)</td><td>板端 runtime(定點副本)</td><td>模型串流登錄 NULL／0,不在任何 pool;<code>job.state_generation</code>(<code>dfn_hop_state_generation()</code>)init 後為 1,reset、每個暖機幀、被拒的 commit 與執行已開始卻失敗的幀（<code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 狀態）各加 1,板端與上次歸零時的值不同就把 state 重載成量化後的零</td></tr>
+<tr><td>遞迴狀態 <code>h_gru</code>、<code>df_convp_history</code></td><td>出貨 graph 128,000 B(32,000 float)</td><td>板端 runtime(定點副本)</td><td>模型串流登錄 NULL／0,不在任何 pool;<code>job.state_generation</code>(<code>dfn_hop_state_generation()</code>)init 後為 1,reset、被拒的 commit 與執行已開始卻失敗的幀（<code>STREAM_RUN_NOT_STARTED</code> 以外的非 0 狀態）各加 1,板端與上次歸零時的值不同就把 state 重載成量化後的零</td></tr>
 <tr><td><b>只在 16 kHz 存在:<code>AinrBridge</code> pool</b></td><td><b>117,856 B(ne10;fft 256,<code>ainr_bridge_get_mem_requirements()</code>)</b>,不含模型串流;DFN2 尾段合計 222,864 B(骨架 <code>pool</code> 行減去 array、helper 與 P 緩衝)</td><td>helper 與 P 緩衝之後</td><td>E、P 各一顆升頻器與自己的 FIFO,降頻器共用一顆;out FIFO 預填 <code>prefill</code> 個零(fft 256 → 128、fft 512 → 85)。逐項見 <a href="../../reference/dfn2/configuration.html#details">DFN2 pipeline 參數與狀態</a></td></tr>
 <tr><td>NN 權重</td><td>—</td><td><b>不在本 pool 內</b></td><td>屬於板端 runtime</td></tr>
 <tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:1,683,088 B(ne10)</b><br>48 kHz:5,591,248 B(ne10)<br>16 kHz 核心 + 16000/256 模型(模型串流直接在核心格點):1,523,536 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值(骨架印出的 <code>pool</code> 行,為 array、helper、P 緩衝與 DFN2 尾段各塊對齊後的和);換 rate/backend/編譯選項/相依庫 一律以各自的大小查詢重查</td></tr>
@@ -147,7 +147,7 @@ bridge 原生 WOLA    e0,p0(各 128) e1,p1         e2,p2         e3,p3         e
 <ul>
 <li>added delay 的組成與 prefill 的 init 校正和 mono 相同,見 <a href="../../mono/dfn2/index.html">Mono · DFN2</a>;8 kHz 不在 array 的格點內,範例拒絕。</li>
 <li><b>16 kHz 不是逐位元等值</b>:訊號走過兩顆 FIR resampler,測試用容差(0.35 fs 低通後閘 <code>&lt; 1e-3</code>,現查 8.70e-06 / 8.91e-06),<b>延遲本身由近端脈衝精確釘住</b>。</li>
-<li><b>Warm-up:開頭的輸出是全零</b>(長度見上),<code>DfnHop</code> 寫滿零頻譜並無條件合成。前 M 幀是暖機幀(模型照跑,heads 丟棄、state 重置);48 kHz 每 hop 恰好一次推論,16 kHz 照泳道圖排程。</li>
+<li><b>Warm-up:開頭的輸出是全零</b>(長度見上),<code>DfnHop</code> 寫滿零頻譜並無條件合成。前 M 幀沒有 job(模型不跑,state 與 generation 不動);48 kHz 其餘每 hop 恰好一次推論,16 kHz 照泳道圖排程。</li>
 <li><b>AEC delay 改變不 reset 模型串流/bridge。</b><code>front.delay.changed</code>(<code>AecArrayView.delay</code>)仍回報給外部 far-end 消費者,但模型串流與 bridge 不消費 far-end,輸入在 delay 改變後仍然連續。只有整合者的 reset(<code>dfn_hop_reset()</code>,連帶 <code>model.reset</code>)才重置它們;<code>array_sample_beam_fuse()</code> 的 DSP 類拒絕只重置 helper 與 array,範例在任何失敗處再把 <code>DfnHop</code> 一起 reset。收尾 flush 再推 L+1 個全零 hop(16 kHz 推滿 added delay),<b>那幾拍加速器也要照跑</b>。</li>
 </ul>
 

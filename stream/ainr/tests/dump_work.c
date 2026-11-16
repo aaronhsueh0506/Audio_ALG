@@ -1,10 +1,11 @@
 /* Prints, for one {sr, fft, hop_in} of the variant this binary is built for (full, or lite under
- * -DDFN2_MASK_ONLY), the init result and the StreamWork views of the first block, one line per fact, for the
+ * -DDFN2_MASK_ONLY), the init result and the StreamWork views of the first block with a job (the blocks before it, which
+ * carry no job on a grid with a mask lookahead, are closed unrun), one line per fact, for the
  * Python pins and the sample model-config check to compare against the exporter. Built by `make work-dumper`.
  *
  *   dump_work <sr> <fft> <hop_in> [family]        family 0 PCM (default), 2 _freq (1 was the retired _spec)
- *     rc <int>                                    status of ainr_get_mem_size*() / ainr_init*() / the first
- *                                                 preprocess (a refused config prints this line only)
+ *     rc <int>                                    status of ainr_get_mem_size*() / ainr_init*() / the
+ *                                                 preprocess calls (a refused config prints this line only)
  *     graph <path>                                AinrInfo.graph_path
  *     info trim <int> queue <int> tail <int>      AinrInfo trim_samples / queue_frames / tail_zero_blocks
  *     counts inputs <int> outputs <int>           StreamWork input_count / output_count
@@ -46,7 +47,7 @@ int main(int argc, char **argv) {
     AinrCtx *pcm = NULL;
     AinrFreqCtx *freq = NULL;
     void *pool = NULL;
-    int16_t *pcm_in = NULL;
+    int16_t *pcm_in = NULL, *pcm_out = NULL;
     float *zeros = NULL;
     char erb[96];
     int rc, i, family, n_erb, hop, bins;
@@ -70,13 +71,21 @@ int main(int argc, char **argv) {
     }
     if (rc == AINR_OK) {
         pcm_in = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));
-        zeros = (float *)calloc((size_t)(cfg.hop_in / hop) * (size_t)bins, sizeof(float));
-        if (!pcm_in || !zeros) return 2;
-        rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
-                         : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
+        pcm_out = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));
+        zeros = (float *)calloc(3u * (size_t)(cfg.hop_in / hop) * (size_t)bins, sizeof(float));   /* input, out_re, out_im */
+        if (!pcm_in || !pcm_out || !zeros) return 2;
+        for (i = 0; rc == AINR_OK; ++i) {   /* a block without a job is closed unrun; its status is not read */
+            rc = family == 0 ? ainr_preprocess(pcm, pcm_in, &work)
+                             : ainr_preprocess_freq(freq, zeros, zeros, zeros, zeros, &work);
+            if (rc != AINR_OK || work.action == STREAM_WORK_SUBMIT) break;
+            rc = family == 0 ? ainr_postprocess(pcm, STREAM_RUN_NOT_STARTED, pcm_out)
+                             : ainr_postprocess_freq(freq, STREAM_RUN_NOT_STARTED, zeros + (size_t)(cfg.hop_in / hop) * (size_t)bins,
+                                                     zeros + 2u * (size_t)(cfg.hop_in / hop) * (size_t)bins);
+            if (i >= 8) rc = AINR_ERR_SEQUENCE;
+        }
     }
     printf("rc %d\n", rc);
-    if (rc != AINR_OK) { free(pool); free(pcm_in); free(zeros); return 0; }
+    if (rc != AINR_OK) { free(pool); free(pcm_in); free(pcm_out); free(zeros); return 0; }
     printf("graph %s\n", info.graph_path);
     printf("info trim %d queue %d tail %d\n", info.trim_samples, info.queue_frames, info.tail_zero_blocks);
     printf("counts inputs %d outputs %d\n", work.input_count, work.output_count);
@@ -86,6 +95,6 @@ int main(int argc, char **argv) {
     for (i = 0; i < work.output_count; ++i)
         printf("out %d %u %u %u %u %zu\n", i, work.outputs[i].b, work.outputs[i].c, work.outputs[i].h, work.outputs[i].w,
                work.outputs[i].elements);
-    free(pool); free(pcm_in); free(zeros);
+    free(pool); free(pcm_in); free(pcm_out); free(zeros);
     return 0;
 }

@@ -1,10 +1,9 @@
 /* Whole-chain digests of the DeepFilterNet2 and GTCRN pre/post chains.
  *
- * DeepFilterNet2 returns 1 from pre_process_freq on every hop; its first mask_lookahead hops are warm-up
- * frames whose heads are discarded. The DFN2 chain below drives each as a discarded frame (garbage over the
- * state, heads left NaN, finish must return 0, state zero, generation +1 exactly), draws no random number
- * for it and hashes none of it (pre_process result 0, generation less the warm-up steps), so its digests
- * are those of a stream without warm-up frames.
+ * DeepFilterNet2 returns 0 from pre_process_freq on its first mask_lookahead hops: no frame opens, the
+ * generation and the registered state stay as they were. The DFN2 chain below checks that for each of them,
+ * draws no random number for it and hashes nothing but the 0, so its digests are those of a stream that
+ * starts at its first real frame.
  *
  * Each chain runs HOPS hops through its public frequency-domain API with a
  * seeded generator: spectra in, stand-in model outputs back (plausible values
@@ -127,7 +126,7 @@ static uint64_t run_dfn2(void)
     if (!p) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int v, valid = 0, kind = hop_kind(h);
-        const int warm = h < grid->mask_lookahead;
+        const int no_frame = h < grid->mask_lookahead;
         if (h == HOPS / 3)
             hash_u32(&d.status, (uint32_t)dfn2_prepost_set_atten_lim(p, 12.0f));
         if (h == HOPS / 2)
@@ -141,17 +140,12 @@ static uint64_t run_dfn2(void)
         } else {
             v = dfn2_prepost_pre_process_freq(p, re, im);
         }
-        if (warm && v != 1) exit(2);
-        hash_u32(&d.status, warm ? 0u : (uint32_t)v);
-        if (warm) {
+        if (no_frame != (v == 0) || (v != 0 && v != 1)) exit(2);
+        hash_u32(&d.status, (uint32_t)v);
+        if (no_frame) {
             DFN2PrepostInputs in;
             DFN2PrepostOutputs out;
-            const unsigned generation = dfn2_prepost_state_generation(p);
-            if (dfn2_prepost_frame_open(p, &in, &out) != 0) exit(2);
-            for (size_t i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i) dfn_gru[i] = 99.0f;
-            for (size_t i = 0; i < DFN2_TEST_CONVP_ELEMENTS; ++i) dfn_convp[i] = -99.0f;
-            if (dfn2_prepost_frame_finish(p) != 0 ||
-                dfn2_prepost_state_generation(p) != generation + 1u) exit(2);
+            if (dfn2_prepost_frame_open(p, &in, &out) == 0 || dfn2_prepost_state_generation(p) != 1u) exit(2);
             for (size_t i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i)
                 if (dfn_gru[i] != 0.0f) exit(2);
             for (size_t i = 0; i < DFN2_TEST_CONVP_ELEMENTS; ++i)
@@ -198,8 +192,7 @@ static uint64_t run_dfn2(void)
             if (rc != 0 && kind != K_SKIP) skipped = dfn2_prepost_frame_bypass(p);
             hash_u32(&d.status, (uint32_t)rc);
             hash_u32(&d.status, (uint32_t)skipped);
-            hash_u32(&d.status, dfn2_prepost_state_generation(p) -
-                                    (unsigned)grid->mask_lookahead);
+            hash_u32(&d.status, dfn2_prepost_state_generation(p));
             hash_f32(&d.state, gru, in.gru_hidden_elements);
             hash_f32(&d.state, convp, in.df_convp_window_elements);
         }
