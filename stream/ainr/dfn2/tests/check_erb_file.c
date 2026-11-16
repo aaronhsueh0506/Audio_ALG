@@ -130,7 +130,7 @@ static void run_hops(DFN2Stream *s, int hops, int16_t *digest_out) {
         int ai_rc;
         for (k = 0; k < hop; ++k) pcm_in[k] = (int16_t)((k * 13 + i * 5) % 211 - 100);
         if (dfn2_stream_pre_process(s, pcm_in, &io) != 1) { fprintf(stderr, "pre fail hop %d\n", i); exit(1); }
-        ai_rc = io.job_ready ? zero_accel(&io.outputs) : 0;
+        ai_rc = io.action == STREAM_WORK_SUBMIT ? zero_accel(&io.outputs) : 0;
         if (dfn2_stream_post_process(s, ai_rc, pcm_out) < 0) { fprintf(stderr, "post fail hop %d\n", i); exit(1); }
         for (k = 0; k < hop; ++k) acc = (int16_t)(acc * 31 + pcm_out[k]);
     }

@@ -71,7 +71,7 @@ static void run_reference_hops(DFN2Stream *s, const int16_t *pcm_in, int hops, i
             fprintf(stderr, "reference pre_process fail at hop %d\n", i);
             exit(1);
         }
-        if (io.job_ready) ai_rc = raw_fill_accel(&io.outputs);
+        if (io.action == STREAM_WORK_SUBMIT) ai_rc = raw_fill_accel(&io.outputs);
         if (dfn2_stream_post_process(s, ai_rc, pcm_out + (size_t)i * (size_t)hop) < 0) {
             fprintf(stderr, "reference post_process fail at hop %d\n", i);
             exit(1);

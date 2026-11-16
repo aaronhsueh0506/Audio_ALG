@@ -108,8 +108,8 @@ DFN2 grid. Neither the DFN2 library nor the pipeline units hold a grid (see [`AI
 pair is refused with the list, exit 2) and hands it to `DfnHopPoolPlan.stream_cfg.grid` (`dfn_hop_pool_plan_init()`). The model stream takes its rate and FFT size from that grid, and
 `DfnHop` its input and output scales (1/sqrt(n_fft) and its inverse). A host at the model's rate needs no bridge:
 `--ai-sample-rate 16000 --ai-fft-size 256` with the 16 kHz host runs straight through the model stream (hop 128, algorithmic latency 128
-samples for the 0/0 row, pool 304,112 B), against 800 samples and
-463,664 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
+samples for the 0/0 row, pool 302,992 B), against 800 samples and
+459,472 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
 48 kHz / 1024 model (`dfn_hop_pool_plan()` returns -1 on any other model grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
 grid and whether the model stream runs on the host grid or through the bridge. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; `dfn/tests/test_dfn_hop.c` holds the hop to a hand-written recipe on the model stream, and `make test-dfn-grids` runs it on the 16 and 32 kHz test grids.
@@ -200,13 +200,13 @@ resampler count and must be included in the board measurement.
 
 Pool printed by the skeleton (`mono_aec_dfn_res`, matched delay, five-filter bank, NE10; the sum
 of `aec_get_mem_size()`, the post spectrum buffer of the RES path and the DFN tail of
-`dfn_hop_pool_bytes()`, each part 16-byte aligned): 463,664 bytes at the 16 kHz default (the AEC and the RES post spectrum plus a
-DFN tail of 222,864 bytes: the model stream 92,688, the six conversion buffers 12,312 and the bridge 117,856),
-932,128 bytes at 48 kHz (a DFN tail of 151,952 bytes: the stream and the buffers as above, the synthesis 42,832 and the
+`dfn_hop_pool_bytes()`, each part 16-byte aligned): 459,472 bytes at the 16 kHz default (the AEC and the RES post spectrum plus a
+DFN tail of 218,672 bytes: the model stream 88,496, the six conversion buffers 12,312 and the bridge 117,856),
+927,936 bytes at 48 kHz (a DFN tail of 147,760 bytes: the stream and the buffers as above, the synthesis 42,832 and the
 output spectrum 4,104; the conventional MMSE-LSA chain on the 48 kHz
-grid needs 959,312 bytes) and 436,928 bytes at 8 kHz (tail 224,496). The 16 kHz / 256 model on a 16 kHz host: 304,112 bytes
-(tail 63,312: stream 47,824, buffers 3,096, synthesis 11,344, spectrum 1,032). The stream is a `freq_only` one
-(`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`): its pool is the `DFN2Prepost` (92,528 of the 92,688 bytes), with no
+grid needs 959,312 bytes) and 432,736 bytes at 8 kHz (tail 220,304). The 16 kHz / 256 model on a 16 kHz host: 302,992 bytes
+(tail 62,192: stream 46,704, buffers 3,096, synthesis 11,344, spectrum 1,032). The stream is a `freq_only` one
+(`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`): its pool is the `DFN2Prepost` (88,336 of the 88,496 bytes), with no
 analysis, synthesis or PCM buffer, since the hop uses the spectrum entries only. Model weights, accelerator activation/
 workspace memory and the recurrent state are external to this descriptor (the state of the shipped graph is
 1,280 + 30,720 float32 values, registered by a float host or held by the accelerator); adding int8 weights alone

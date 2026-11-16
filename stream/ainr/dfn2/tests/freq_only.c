@@ -113,8 +113,8 @@ static int post_freq(DFN2Stream *s, const DFN2Grid *g, int rc, float *re, float 
 }
 
 static int same_job(const DFN2HopIO *a, const DFN2HopIO *b) {
-    if (a->job_ready != b->job_ready || a->state_generation != b->state_generation) return 0;
-    if (!a->job_ready) return 1;
+    if (a->action != b->action || a->state_generation != b->state_generation) return 0;
+    if (a->action != STREAM_WORK_SUBMIT) return 1;
     return a->inputs.erb_window_elements == b->inputs.erb_window_elements &&
            a->inputs.spec_window_elements == b->inputs.spec_window_elements &&
            memcmp(a->inputs.erb_window, b->inputs.erb_window, a->inputs.erb_window_elements * sizeof(float)) == 0 &&
@@ -163,7 +163,7 @@ static int run_pair(DFN2Stream *slim, DFN2Stream *full, const DFN2Grid *g, const
         src = pre_freq(slim, g, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &sio);
         frc = pre_freq(full, g, er, ei, (t % 5) == 2 ? er : pr, (t % 5) == 2 ? ei : pi_, &fio);
         if (src != 1 || frc != 1 || !same_job(&sio, &fio)) { ++bad; break; }
-        if (sio.job_ready) { srm = fill_heads(&sio.outputs, t, kind); frm = fill_heads(&fio.outputs, t, kind); }
+        if (sio.action == STREAM_WORK_SUBMIT) { srm = fill_heads(&sio.outputs, t, kind); frm = fill_heads(&fio.outputs, t, kind); }
         if (t == 150 || t == 300) {   /* reset with the hop open: the hop is dropped */
             dfn2_stream_reset(slim); dfn2_stream_reset(full);
             if (post_freq(slim, g, 0, sre, sim, &sv) != -1 || post_freq(full, g, 0, fre, fim, &fv) != -1) ++bad;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### `DFN2Prepost` stages the application spectrum once; `DFN2HopIO.action` replaces the integer job flag
+
+- `spec_re` / `spec_im` hold the frames of a call (one slot per frame) and are what the enhance stage reads on every entry: the single entry, the dual entry and the block entry. The separate `apply_re` / `apply_im` arrays are gone. `dfn2_prepost_block_input()` returns the `spec_*` slots. Pool (host, bytes): 48 kHz / 1024 N=1 92,480 -> 88,336 (mask-only 32,096 -> 27,952); 16 kHz / 256 N=1 47,616 -> 46,544; 32 kHz / 512 62,656 -> 60,560; 16 kHz / 256 N=8 and 48 kHz N=4 shrink by one frame as well (131,680 -> 127,536 at 48 kHz N=4, pair 0/0). Output is bit-identical (the pool, grid, stream and `ainr` golden hashes did not change). `DFN2_PREPOST_CARVE_VERSION` stays 13 and `DFN2_STREAM_LAYOUT_VERSION` 6: this release already moves both.
+- `DFN2HopIO.action` is a `StreamWorkAction` (`STREAM_WORK_SUBMIT` on a hop that opened a frame, `STREAM_WORK_BYPASS` on a hop with no job). The full text is in `pipelines/CHANGELOG.md`.
+
 ### DFN2 with `frames_per_call` > 1 takes one block per call, with no N - 1 hops of delay (`mask_lookahead` 0 only)
 
 - `dfn2_prepost_pre_process_block_dual()` takes the N frames of a call at once (est and app, N * `n_bins` per plane), pushes them, opens one frame and returns 1; one job follows each block and `dfn2_prepost_post_process_block()` hands the N enhanced frames out with `*valid_frames` (the last ones of the block carry a spectrum; the first `D` frames of a stream do not). `dfn2_prepost_block_input()` / `_block_output()` expose the block's staging planes for zero-copy framing. The graph reads the call's N frames and the two before them (N + 2) and returns their N heads; head i is read from window slice i, as before.
@@ -107,8 +112,8 @@ No numerics changed (the `test_c_prepost`, `test_nn_chains`, `test_dfn3_stream` 
   `dfn2_grid_make()` already allowed at the grid level. No struct layout changed (the pool
   already scaled with N through `dfn2_prepost_get_mem_size()`, and `build_flags_hash` already
   folded `frames_per_call` in), so no version bump.
-- `DFN2HopIO` gains `job_ready`: 1 means `inputs`/`outputs` are open and the accelerator must run
-  this hop (always true when N == 1, matching every prior hop exactly); 0 means N > 1 and this
+- `DFN2HopIO` gains a job flag (now `action`, `STREAM_WORK_SUBMIT`): SUBMIT means `inputs`/`outputs` are open and the accelerator must run
+  this hop (always true when N == 1, matching every prior hop exactly); BYPASS means N > 1 and this
   hop has no job -- `inputs`/`outputs` are stale, skip straight to `post_process`. `pre_process`
   now reads whatever `dfn2_prepost_pre_process_freq()` actually returns (0 or 1) instead of
   treating any non-1 return as a contract error, and only opens a frame on 1.
@@ -117,15 +122,14 @@ No numerics changed (the `test_c_prepost`, `test_nn_chains`, `test_dfn3_stream` 
   only when a frame is actually open. `DFN2Stream` splits what used to be one `open` flag into
   `open` (a `DFN2Prepost` frame needs finishing) and `pending` (a `pre_process` without its
   matching `post_process` is outstanding) -- for N == 1 the two always flip together, so this is
-  not a behavior change for existing N == 1 callers beyond adding the always-true `job_ready`
-  check at their call site.
+  not a behavior change for existing N == 1 callers beyond adding the always-true job check at their call site.
 - One function body each (`pre_process`/`post_process`), no `#ifdef`, no separate N-aware file:
   the N == 1 case is a strict special case of the general N-hop cadence, not a different code
   path. `frames_per_call` is a run-time `DFN2Grid` field everywhere else in this codebase (unlike
   `DFN2_MASK_ONLY`, a real build-time variant); gating it with a stream-level build macro would
   have been the one inconsistent case.
 - `tests/smoke_dfn2_stream.c` now runs the full init/hop-loop/reset cycle twice per build
-  (N=1, N=4), cross-checking `io.job_ready` against the documented cadence
+  (N=1, N=4), cross-checking `io.action` against the documented cadence
   (`AINR/DeepFilterNet2/reference/multiframe.md`) and the total accelerator-job count, not just
   that it doesn't crash.
 - Docs: `docs/html/models/dfn2/index.html` and `reference/core.html` updated (the per-hop

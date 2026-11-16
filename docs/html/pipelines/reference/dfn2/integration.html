@@ -302,7 +302,7 @@ int four_dfn_run(void) {
   |-- dfn_hop_begin(&amp;hop, B, P) ------------&gt;|                          |                          |
   |                          |                          | B、P 乘 dfn2_stft_scale;dfn2_stream_pre_process_freq_dual(est, app, &amp;job) |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          | 0 = 沒有 job(前 M 個 hop)、1 = job_ready(之後每個 hop)| -1(非有限或超過 2^63 的 bin:state 不動) |
+  |                          |                          | 0 = 沒有 job(前 M 個 hop)、1 = SUBMIT(之後每個 hop)| -1(非有限或超過 2^63 的 bin:state 不動) |
   |                          |                          |&lt;-------------------------|                          |
 -- 路徑 A:dfn_hop_process = begin + 迴圈{ nn_begin; nn_end(dfn_hop_infer(&amp;hop, &amp;job)) } + end -----------------------------
   |                          |                          | dfn_hop_infer(&amp;hop, &amp;job):plan 的 model.infer(user, &amp;job.inputs, &amp;job.outputs)

@@ -90,7 +90,7 @@ int main(void) {
         int ai_rc;
         for (k = 0; k < hop; ++k) pcm_in[k] = (int16_t)((k * 11 + i * 7) % 151 - 75);
         if (dfn2_stream_pre_process(s, pcm_in, &io) != 1) { fprintf(stderr, "pre fail\n"); return 1; }
-        ai_rc = io.job_ready ? fake_accelerator(&io.outputs) : 0;
+        ai_rc = io.action == STREAM_WORK_SUBMIT ? fake_accelerator(&io.outputs) : 0;
         if (dfn2_stream_post_process(s, ai_rc, pcm_out) < 0) { fprintf(stderr, "post fail\n"); return 1; }
     }
 

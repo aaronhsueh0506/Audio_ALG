@@ -38,13 +38,13 @@ typedef struct Row {
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 103872, 235200, 156576, 287904, 32256, 163584, 0xa46d74b9f5cac26eull, 0 },
+    { 48000, 1024, 32, 1, 0, 1, 99728, 231056, 152432, 283760, 28112, 159440, 0xa46d74b9f5cac26eull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 66400, 91168, 80704, 105472, 47776, 72544, 0x2f7313027241b827ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 114512, 139280, 128816, 153584, 95888, 120656, 0x2e1edf1fefe3f177ull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 164256, 295584, 216960, 348288, 92640, 223968, 0xe0a89c487b7e4ad5ull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 65328, 90096, 79632, 104400, 46704, 71472, 0x2f7313027241b827ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 113440, 138208, 127744, 152512, 94816, 119584, 0x2e1edf1fefe3f177ull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 160112, 291440, 212816, 344144, 88496, 219824, 0xe0a89c487b7e4ad5ull, 0 },
 };
 #endif
 
@@ -178,7 +178,7 @@ static void run_row(const Row *r, int idx) {
             CHECK(0, "row %d: pre_process at call %zu", idx, i);
             break;
         }
-        if (io.job_ready) fake_heads(&io.outputs, (int)i);
+        if (io.action == STREAM_WORK_SUBMIT) fake_heads(&io.outputs, (int)i);
         if ((r->n == 1 ? dfn2_stream_post_process(s, ai_rc, pcm_out) : dfn2_stream_post_process_packet(s, ai_rc, pcm_out)) < 0) {
             CHECK(0, "row %d: post_process at call %zu", idx, i);
             break;

@@ -164,9 +164,9 @@ static void run_hop(DFN2Stream *s, const Spec *sp, int mode, HopOut *o, DFN2HopI
         DFN2HopIO second;
         *dup_rc = dfn2_stream_pre_process_freq_dual(s, sp->est_re, sp->est_im, sp->app_re, sp->app_im, &second);
     }
-    if (!io->job_ready) status = STREAM_RUN_FAILED;   /* a hop without a job ignores the status */
-    if (io->job_ready && mode == 1) { write_identity(&io->outputs); status = 0; }
-    if (io->job_ready && mode == 2) { write_window_heads(io, &io->outputs); status = 0; }
+    if (io->action != STREAM_WORK_SUBMIT) status = STREAM_RUN_FAILED;   /* a hop without a job ignores the status */
+    if (io->action == STREAM_WORK_SUBMIT && mode == 1) { write_identity(&io->outputs); status = 0; }
+    if (io->action == STREAM_WORK_SUBMIT && mode == 2) { write_window_heads(io, &io->outputs); status = 0; }
     *post_rc = dfn2_stream_post_process_freq(s, status, o->re, o->im, &o->valid);
 }
 
@@ -195,7 +195,7 @@ static void row_latency(const GridRow *g, int m, int d, int mode, DFN2StreamMemR
         memcpy(hist_re + (size_t)h * (size_t)nb, sp.app_re, (size_t)nb * sizeof(float));
         memcpy(hist_im + (size_t)h * (size_t)nb, sp.app_im, (size_t)nb * sizeof(float));
         run_hop(c.s, &sp, mode, &o, &io, &pre, &post, NULL);
-        if (pre != 1 || post != 0 || io.job_ready != (h >= m)) ++bad;
+        if (pre != 1 || post != 0 || (io.action == STREAM_WORK_SUBMIT) != (h >= m)) ++bad;
         if (io.state_generation != gen0 || dfn2_stream_state_generation(c.s) != gen0) ++bad;   /* not started and identity runs keep the state */
         if (h < lat) {
             for (k = 0; k < nb; ++k) if (o.re[k] != 0.0f || o.im[k] != 0.0f) { ++bad; break; }
@@ -270,7 +270,7 @@ static void row_gate(int freq_only) {
         o.re = (float *)malloc((size_t)grid.n_bins * 2u * sizeof(float)); o.im = o.re + grid.n_bins;
         spec_fill(&sp, &rng);
         run_hop(c.s, &sp, 1, &o, &io, &pre, &post, NULL);
-        CHECK(pre == 1 && post == 0 && io.job_ready, "gate %s: the first hop after the refusals", kind);
+        CHECK(pre == 1 && post == 0 && io.action == STREAM_WORK_SUBMIT, "gate %s: the first hop after the refusals", kind);
         free(o.re); free(sp.est_re);
     }
     free(snap);
@@ -318,8 +318,8 @@ static void row_refusal(void) {
                 if (pre != 1 || post != 0 || (h == at && which >= 4 && dup != -1)) ++bad;
                 run_hop(b.s, &sp, 2, &ob, &ib, &pre, &post, NULL);
                 if (pre != 1 || post != 0) ++bad;
-                if (ia.job_ready != ib.job_ready || ia.state_generation != ib.state_generation || oa.valid != ob.valid) ++bad;
-                if (ia.job_ready &&
+                if (ia.action != ib.action || ia.state_generation != ib.state_generation || oa.valid != ob.valid) ++bad;
+                if (ia.action == STREAM_WORK_SUBMIT &&
                     (ia.inputs.erb_window_elements != ib.inputs.erb_window_elements ||
                      ia.inputs.spec_window_elements != ib.inputs.spec_window_elements ||
                      memcmp(ia.inputs.erb_window, ib.inputs.erb_window, ia.inputs.erb_window_elements * sizeof(float)) != 0 ||
@@ -381,8 +381,8 @@ static int drive(Ctx *c, Device *dv, int hops, int fail_first, int reset_at, flo
         g0 = dfn2_stream_state_generation(c->s);
         pre = dfn2_stream_pre_process_freq_dual(c->s, sp.est_re, sp.est_im, sp.app_re, sp.app_im, &io);
         if (pre != 1) { ++bad; continue; }
-        if (io.job_ready != (since_reset >= m) || io.state_generation != g0) ++bad;
-        if (io.job_ready) {
+        if ((io.action == STREAM_WORK_SUBMIT) != (since_reset >= m) || io.state_generation != g0) ++bad;
+        if (io.action == STREAM_WORK_SUBMIT) {
             int fail = fail_first && jobs == 0;
             device_run(dv, &io, fail);
             status = fail ? STREAM_RUN_FAILED : 0;
@@ -394,8 +394,8 @@ static int drive(Ctx *c, Device *dv, int hops, int fail_first, int reset_at, flo
         post = dfn2_stream_post_process_freq(c->s, status, o.re, o.im, &o.valid);
         if (post != 0) ++bad;
         g1 = dfn2_stream_state_generation(c->s);
-        if (!io.job_ready && g1 != g0) ++bad;                  /* a hop without a job never moves the generation */
-        if (io.job_ready && g1 != g0 + (status != 0 ? 1u : 0u)) ++bad;
+        if (io.action != STREAM_WORK_SUBMIT && g1 != g0) ++bad;                  /* a hop without a job never moves the generation */
+        if (io.action == STREAM_WORK_SUBMIT && g1 != g0 + (status != 0 ? 1u : 0u)) ++bad;
         if (g1 != g0) ++*gen_moves;
         ++since_reset;
     }

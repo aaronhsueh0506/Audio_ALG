@@ -161,8 +161,8 @@ static inline void dfn_hop_reset(DfnHop* h) {
 }
 
 /* Takes the audio-scale spectra e (estimated on) and p (applied on), n_bins bins each, scaled to the model's spectra;
- * job->job_ready is 0 for the first mask_lookahead hops. A bin non-finite or beyond 2^63 at model scale refuses the
- * block whole and leaves the stream untouched. 0, or -1. */
+ * job->action is STREAM_WORK_BYPASS for the first mask_lookahead hops. A bin non-finite or beyond 2^63 at model scale
+ * refuses the block whole and leaves the stream untouched. 0, or -1. */
 static inline int dfn_hop_open_frame(DfnHop* h, const Complex* e, const Complex* p, DfnHopJob* job) {
     float* w = h->planar;
     const int n = h->n_bins;
@@ -196,7 +196,7 @@ static inline int dfn_hop_begin(DfnHop* h, const Complex* e, const Complex* p) {
         if (ainr_bridge_begin(h->bridge, e, p) != 0) return DFN_HOP_INVALID;
     } else {
         if (dfn_hop_open_frame(h, e, p, &h->job) != 0) return DFN_HOP_INVALID;
-        h->job_pending = h->job.job_ready;
+        h->job_pending = h->job.action == STREAM_WORK_SUBMIT;
     }
     h->phase = 1;
     return 0;
@@ -209,7 +209,7 @@ static inline int dfn_hop_bridge_frame(DfnHop* h) {
         int r = ainr_bridge_model_begin(h->bridge, &frame);
         if (r != 1) return r;
         if (dfn_hop_open_frame(h, frame.estimate_spec, frame.apply_spec, &h->job) != 0) return -1;
-        if (h->job.job_ready) {
+        if (h->job.action == STREAM_WORK_SUBMIT) {
             h->frame_out = frame.out_spec;
             h->frame_open = 1;
             return 1;
@@ -279,7 +279,9 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
         return ainr_bridge_finish(h->bridge, out) != 0 ? DFN_HOP_INVALID : 0;
     }
     if (!h->frame_ended &&
-        dfn_hop_close_frame(h, h->job_pending || !h->job.job_ready ? STREAM_RUN_NOT_STARTED : STREAM_RUN_FAILED,
+        dfn_hop_close_frame(h,
+                            h->job_pending || h->job.action != STREAM_WORK_SUBMIT ? STREAM_RUN_NOT_STARTED
+                                                                                  : STREAM_RUN_FAILED,
                             h->out_spec) != 0) {
         h->phase = 0;
         return DFN_HOP_INVALID;

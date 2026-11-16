@@ -1,6 +1,6 @@
 /* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and DFN2Prepost around int16
- * PCM, grid.frames_per_call N in [1, 64]. N == 1: one hop per call, a job on every hop from hop L (io.job_ready; the first
- * mask_lookahead hops after init or reset have none). N > 1 (L == 0 only): one packet of N hops per call and one job
+ * PCM, grid.frames_per_call N in [1, 64]. N == 1: one hop per call, a job on every hop from hop L (io.action ==
+ * STREAM_WORK_SUBMIT; the first mask_lookahead hops after init or reset are STREAM_WORK_BYPASS). N > 1 (L == 0 only): one packet of N hops per call and one job
  * (dfn2_stream_{pre,post}_process_packet, below); the per-hop entries refuse it.
  *
  *     ctx = dfn2_stream_init_from_erb_file(&cfg, erb_path, pool, pool_bytes);
@@ -8,7 +8,7 @@
  *         DFN2HopIO io;
  *         if (dfn2_stream_pre_process(ctx, pcm_in, &io) != 1) break;   // -1 is a contract error
  *         int ai_rc = 0;
- *         if (io.job_ready) {
+ *         if (io.action == STREAM_WORK_SUBMIT) {
  *             device_state_sync(io.state_generation);      // zero the accelerator state when the generation changed
  *             ai_rc = run_accelerator(&io.inputs, &io.outputs);
  *         }
@@ -18,7 +18,7 @@
  * device_state_sync is the caller's code on accelerator memory this stream never touches; skipping it leaves
  * stale or garbage state live. io.state_generation is sampled every hop.
  * Run status and state generation: STREAM_RUN_* in stream_run.h.
- * A hop without a job (io.job_ready 0) emits silence and the status passed to post_process is ignored.
+ * A BYPASS hop emits silence and the status passed to post_process is ignored.
  * The output trails the input by mask_lookahead + df_lookahead hops for every N; there is nothing to flush.
  *
  * A caller with its own analysis and synthesis uses dfn2_stream_pre_process_freq_dual() /
@@ -32,7 +32,7 @@
 #include <string.h>
 
 #include "dfn2_prepost.h"   /* DFN2Grid, DFN2PrepostInputs/Outputs */
-#include "stream_run.h"     /* STREAM_RUN_OK, STREAM_RUN_NOT_STARTED, STREAM_RUN_FAILED */
+#include "stream_run.h"     /* StreamWorkAction, STREAM_RUN_OK, STREAM_RUN_NOT_STARTED, STREAM_RUN_FAILED */
 
 #ifdef __cplusplus
 extern "C" {
@@ -151,19 +151,19 @@ int dfn2_stream_hop_size(const DFN2Stream *s);           /* samples per PCM hop;
 /* The tensor views of one open hop and the generation the accelerator's state must match; valid until
  * dfn2_stream_post_process(). */
 typedef struct DFN2HopIO {
-    int                job_ready;   /* 1: run the accelerator. 0 (N == 1, the first mask_lookahead hops): no job, inputs/outputs not set */
-    DFN2PrepostInputs  inputs;      /* valid only when job_ready */
-    DFN2PrepostOutputs outputs;     /* valid only when job_ready */
+    StreamWorkAction   action;      /* SUBMIT: run the accelerator. BYPASS (N == 1, the first mask_lookahead hops): no job, inputs/outputs not set */
+    DFN2PrepostInputs  inputs;      /* valid only on SUBMIT */
+    DFN2PrepostOutputs outputs;     /* valid only on SUBMIT */
     /* Sampled every hop; reload the accelerator's state with quantized zero if it differs. */
     unsigned int       state_generation;
 } DFN2HopIO;
 
 /* One PCM hop in (dfn2_stream_hop_size(s) samples), frames_per_call == 1: int16 -> float, HPF, STFT, pre_process_freq,
- * frame_open when io->job_ready. 1 with *io filled (inputs/outputs only with a job), or -1 on NULL args, no preceding
+ * frame_open on a SUBMIT hop. 1 with *io filled (inputs/outputs only on SUBMIT), or -1 on NULL args, no preceding
  * post_process, a freq_only context or frames_per_call > 1. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
-/* Closes the hop, once per pre_process: with io->job_ready ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other
+/* Closes the hop, once per pre_process: on a SUBMIT hop ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other
  * value bypasses and advances the generation (otherwise ai_rc is ignored); one hop is then drained to pcm_out through
  * the ISTFT. Returns the spectral-validity flag (1/0) of dfn2_prepost_post_process_freq(), -1 on error (a freq_only
  * context included); it is not an alignment: count L + D hops. */

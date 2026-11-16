@@ -393,7 +393,7 @@ int dfn2_stream_hop_size(const DFN2Stream *s) {
 static int open_hop(DFN2Stream *s, int rc, DFN2HopIO *io) {
     if (rc < 0) return -1;
     io->state_generation = dfn2_prepost_state_generation(s->prepost);
-    io->job_ready = rc;
+    io->action = rc == 1 ? STREAM_WORK_SUBMIT : STREAM_WORK_BYPASS;
     if (rc == 1) {
         if (dfn2_prepost_frame_open(s->prepost, &io->inputs, &io->outputs) != 0) return -1;
         s->open = 1;
@@ -414,7 +414,7 @@ int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io)
     ac_stft_push_planar(s->stft, s->hop_in, s->spec_re, s->spec_im);
 
     /* rc is 1 once the graph's window is complete (every hop from hop L), 0 before (nothing to run) --
-     * io->job_ready carries that to the caller; -1 is a genuine contract error. */
+     * io->action carries that to the caller; -1 is a genuine contract error. */
     rc = dfn2_prepost_pre_process_freq(s->prepost, s->spec_re, s->spec_im);
     return open_hop(s, rc, io);
 }

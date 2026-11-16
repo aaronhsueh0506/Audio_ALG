@@ -48,7 +48,7 @@ cfg.gru_hidden = gru;  cfg.gru_hidden_elements = 5 * 256;                    /* 
 cfg.df_convp_history = convp;  cfg.df_convp_history_elements = 64 * 5 * 96;  /* 板端:四個欄位留 NULL／0 */
 
 DFN2PrepostMemReq req;
-dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* 48 kHz 1/1: 92,480 bytes */
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* 48 kHz 1/1: 88,336 bytes */
 DFN2Prepost *p = dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req);
 unsigned seen = dfn2_prepost_state_generation(p); /* 上次看到的 state generation */
 my_npu_fill_state_with_quantized_zero();          /* 板端:啟動時先填量化後的零 */
@@ -119,7 +119,7 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 只作用在餵給正規化器的那份拷貝,從不碰 masking/ISTFT 路徑上的頻譜。</p>
 
 <h3>記憶體、callback 邊界與建置</h3>
-<p>pool 大小(出貨 grid 與 pair:92,480 bytes;應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的遞迴 state 都不在 pool 內)與所有權規則、<code>DFN2PrepostMemReq</code>、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 <code>DFN2ModelIoDescriptor</code>、建置,收在 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a>;grid 的規則與各 grid 的 pool 大小在 <a href="grid.html">DFN2 grid 與 ERB</a>。</p>
+<p>pool 大小(出貨 grid 與 pair:88,336 bytes;應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的遞迴 state 都不在 pool 內)與所有權規則、<code>DFN2PrepostMemReq</code>、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 <code>DFN2ModelIoDescriptor</code>、建置,收在 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a>;grid 的規則與各 grid 的 pool 大小在 <a href="grid.html">DFN2 grid 與 ERB</a>。</p>
 <p class="note"><b>延遲:類別不改變模型自己的 M+D hop lookahead。</b>出貨 pair 1/1 的 identity 路徑(unit mask、alpha 0)實測輸出落後輸入
 <b>3 hops = 1536 samples = 32.0 ms @48 kHz</b>(WOLA 1 hop + 模型 2 hops);見下「延遲與 warm-up」。</p>
 
@@ -220,7 +220,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <tr><td><code>h_gru</code></td><td>(1,5,1,256)</td><td>5,120</td><td>應用端:浮點 host 登錄 pointer + 元素數,板端由加速器持有</td><td>顯式 graph I/O,<code>h_gru_out</code> 與輸入同位址;列 0 encoder、列 1–2 ERB decoder、列 3–4 DF decoder</td></tr>
 <tr><td><code>df_convp_history</code></td><td>(1,64,5,96)</td><td>122,880</td><td>同上</td><td>顯式 graph I/O,完整 5 幀 window,<code>df_convp_history_out</code> 與輸入同位址;erb_conv0/df_conv0 的 3 幀輸入 window 由 host 位移,不在此</td></tr>
 </table></div>
-<p class="note">陣列按 grid 精確配置,較小的 grid 配置較少(state 區塊:16 kHz 256 點 32,448、32 kHz 512 點 44,320 bytes);表為出貨 grid(ring = <code>grid.ring</code> = max(df_order, M+D+1) = 5)。pool 92,480 = state 區塊 67,904 + io 區塊 2,688 + 標頭與逐框暫存 21,888。各 grid 的 pool 見 <a href="grid.html">DFN2 grid 與 ERB</a>(本機量測)。</p>
+<p class="note">陣列按 grid 精確配置,較小的 grid 配置較少(state 區塊:16 kHz 256 點 32,448、32 kHz 512 點 44,320 bytes);表為出貨 grid(ring = <code>grid.ring</code> = max(df_order, M+D+1) = 5)。pool 88,336 = state 區塊 67,904 + io 區塊 2,688 + 標頭與逐框暫存 17,744。各 grid 的 pool 見 <a href="grid.html">DFN2 grid 與 ERB</a>(本機量測)。</p>
 
 <h2 id="section-7">延遲與 warm-up</h2>
 <ul>
@@ -241,7 +241,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <li><b>建立 grid</b>：把模型的值填成 <code>DFN2GridSpec</code>，<code>dfn2_grid_make(&amp;grid, &amp;spec)</code>（欄位見 <a href="grid.html">DFN2 grid 與 ERB</a>），回 <code>DFN2_GRID_OK</code> 才往下，同一個 grid 交給每個物件。</li>
 <li><b>準備應用端的物件</b>：ERB 矩陣由應用端載入並持有，<code>erb_fwd</code>（bin-major）、<code>erb_inv</code>（band-major），各 <code>n_bins × n_erb</code> 個 float32（48 kHz 為 65,664 bytes；函式庫不讀檔、不複製）；框化：<code>ac_stft_config_default(&amp;sc, grid.n_fft)</code>，設 <code>spec_scale = dfn2_stft_scale(grid.n_fft)</code>、<code>ispec_scale = dfn2_stft_unscale(grid.n_fft)</code>，建 <code>AcStft</code>／<code>AcIstft</code>（大小見 <a href="grid.html">DFN2 grid 與 ERB</a>）；浮點 host 另備兩塊遞迴 state buffer。</li>
 <li><code>dfn2_prepost_config_defaults(&amp;cfg, &amp;grid)</code> 後填 <code>erb_fwd</code>／<code>erb_inv</code>（必填）與 <code>atten_lim_db</code>；浮點 host 再登錄遞迴 state（<code>gru_hidden</code>／<code>df_convp_history</code> 與各自的 <code>*_elements</code>，出貨模型 1,280 與 30,720 個 float），板端四欄留 NULL／0，由加速器持有。</li>
-<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；48 kHz 1/1 為 92,480 bytes（本機量測；不含應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的 state；其他 grid 見 <a href="grid.html">DFN2 grid 與 ERB</a>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
+<li><code>dfn2_prepost_get_mem_size(&amp;cfg, &amp;req)</code>：<code>req.bytes</code> 是整個 pool，<code>req.alignment</code> = 16；48 kHz 1/1 為 88,336 bytes（本機量測；不含應用端的 <code>AcStft</code>／<code>AcIstft</code>、ERB 矩陣與登錄的 state；其他 grid 見 <a href="grid.html">DFN2 grid 與 ERB</a>）。板端把 pool 放進靜態 arena，host 工具可改用 <code>dfn2_prepost_create(&amp;cfg)</code>／<code>_destroy()</code>。</li>
 <li><code>dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;req)</code>：起始即 reset，<code>state_generation</code> = 1。傳入查詢時的 <code>req</code> 可擋下「別的 build／grid 查出來的陳舊 pool 大小」。</li>
 <li>每個 hop 同一條流程（<code>frames_per_call</code> N = 1）：<code>ac_stft_push_planar</code> → <code>pre_process_freq</code>（前 M 個 hop 回 0：沒有 job，跳到 post；之後回 1）→ <code>frame_open</code> → 加速器 → <code>frame_finish</code>（或 <code>frame_bypass</code>）→ <code>post_process_freq</code> → <code>ac_istft_push_planar</code>；<code>valid</code> 只是資訊（可傳 NULL），<code>AC_OLA_ACCUMULATE</code> 下每 hop 都 push，零頻譜得零 hop。前 M 個 hop <b>沒有 job</b>：不開 frame、加速器不跑，登錄 state 與 generation 不動，首個有 job 的 hop 從啟動時的 state 開始；M = 0 每個 hop 都有 job，N &gt; 1 維持舊流程（見 <a href="core.html#memory">DeepFilterNet2 頻域與模型契約</a>）。</li>
 <li>加速器那份定點 state 在啟動時填成量化後的 0，之後每次 <code>state_generation</code> 變了就重填（reset、被拒的 commit、失敗的執行；串流開頭的 M 個 hop 沒有 job，不呼叫加速器，見時序圖）。輸出落後輸入 M+D+1 個 hop（含 ISTFT 重疊 1 個；出貨 pair 3 個；identity 實跑確認），沒有排尾。</li>
@@ -309,7 +309,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
-<p>以下流程圖、泳道圖與下面兩表都是 <code>frames_per_call</code> N=1 的情形（加速器每拍都跑）。N&gt;1 時 <code>pre_process</code>／<code>post_process</code> 仍是每拍各呼叫一次，但只有 <code>io.job_ready</code> 為真的那一拍才會真的開 frame、需要呼叫加速器；<code>post_process</code> 不論該拍有無 job 都要呼叫，從上一批算好的 N 個 frame 逐拍吐 PCM。細節與公式見 <a href="../index.html">DeepFilterNet2</a> 頁與 <a href="../../../../../AINR/DeepFilterNet2/reference/multiframe.md">Multi-frame export</a>。</p>
+<p>以下流程圖、泳道圖與下面兩表都是 <code>frames_per_call</code> N=1 的情形（加速器每拍都跑）。N&gt;1 時 <code>pre_process</code>／<code>post_process</code> 仍是每拍各呼叫一次，但只有 <code>io.action</code> 為 <code>STREAM_WORK_SUBMIT</code> 的那一拍才會真的開 frame、需要呼叫加速器。<code>io.action</code> 是 <code>StreamWorkAction</code>（<code>stream_run.h</code>）：<code>STREAM_WORK_SUBMIT</code> 時 <code>inputs</code>／<code>outputs</code> 有效；<code>STREAM_WORK_BYPASS</code> 表示這一拍沒有 job（N=1 的前 M 個 hop），views 不設，<code>post_process</code> 的狀態參數被忽略；<code>post_process</code> 不論該拍有無 job 都要呼叫，從上一批算好的 N 個 frame 逐拍吐 PCM。細節與公式見 <a href="../index.html">DeepFilterNet2</a> 頁與 <a href="../../../../../AINR/DeepFilterNet2/reference/multiframe.md">Multi-frame export</a>。</p>
 <h3>流程圖（block diagram）</h3>
 <pre>
 PCM in (int16)
@@ -354,7 +354,7 @@ PCM out (int16, 永遠完整一個 hop)
 <pre>
 hop   caller                    dfn2_stream                       NPU
 0     pcm_in -> pre_process --> STFT, pre_process_freq ---------  (不呼叫:前 M 個 hop 沒有 job)
-      <-- 1 (job_ready 0, 不開 frame) -----------------------
+      <-- 1 (BYPASS, 不開 frame) -----------------------
       post_process(任何狀態) -> 時鐘前進, state 與 generation 不動 -->
       <-- 0 (靜音, 排水中) ------ ISTFT push, 飽和 -------------
 1     pcm_in -> pre_process --> STFT, pre_process_freq, open -->  (正式幀) 跑一次
@@ -396,7 +396,7 @@ hop   caller                    dfn2_stream                       NPU
 <h2 id="memory">Pool、callback 與多幀時序</h2><h3>記憶體與所有權</h3>
 <div class="tbl"><table>
 <tr><th>物件</th><th>誰持有</th><th>說明</th></tr>
-<tr><td>pool</td><td>呼叫端記憶體,16 bytes 對齊</td><td><code>get_mem_size</code> 給大小(48 kHz 1/1:92,480 bytes,隨 grid 與 pair 變,各 grid 的數字見 <a href="grid.html">DFN2 grid 與 ERB</a>);內含 <code>DFN2State</code> 的陣列、feature window 與逐框暫存</td></tr>
+<tr><td>pool</td><td>呼叫端記憶體,16 bytes 對齊</td><td><code>get_mem_size</code> 給大小(48 kHz 1/1:88,336 bytes,隨 grid 與 pair 變,各 grid 的數字見 <a href="grid.html">DFN2 grid 與 ERB</a>);內含 <code>DFN2State</code> 的陣列、feature window 與逐框暫存</td></tr>
 <tr><td><code>AcStft</code>／<code>AcIstft</code>、<code>FftHandle</code>、窗表</td><td>應用端(audiolib)</td><td>函式庫不持有、不建立、不銷毀;<code>reset</code> 時應用端另外 reset 它們</td></tr>
 <tr><td>ERB 矩陣</td><td>應用端,借用</td><td>兩者必填,不複製;函式庫不讀檔,載入與壽命由應用端負責(檔案與版面見 <a href="grid.html">DFN2 grid 與 ERB</a>)</td></tr>
 <tr><td>遞迴 state <code>h_gru</code>／<code>df_convp_history</code></td><td>應用端</td><td>浮點 host 登錄 pointer 與元素數;板端不登錄,由加速器持有</td></tr>

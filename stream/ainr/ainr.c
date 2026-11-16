@@ -476,7 +476,6 @@ static void ainr_fill_work(const DFN2Grid *grid, const DFN2PrepostInputs *in,
     StreamTensorIn *ti = work->inputs;
     StreamTensorOut *to = work->outputs;
 
-    work->action = STREAM_WORK_SUBMIT;
     ti[0].data = in->erb_window;
     ti[0].elements = in->erb_window_elements;
     ti[0].w = (unsigned int)grid->n_erb;
@@ -522,19 +521,18 @@ static void ainr_fill_work(const DFN2Grid *grid, const DFN2PrepostInputs *in,
     work->state_generation = generation;
 }
 
-/* The block's work: the tensors when the hop opened a job, else a BYPASS work (all zero, generation 0). */
+/* The block's work: the hop's action, with the tensors on SUBMIT, else an all-zero work (generation 0). */
 static void ainr_prepare_work(const DFN2Grid *grid, const DFN2HopIO *hio, StreamWork *work)
 {
-    if (hio->job_ready) {
+    if (hio->action == STREAM_WORK_SUBMIT)
         ainr_fill_work(grid, &hio->inputs, &hio->outputs, hio->state_generation, work);
-        return;
-    }
-    memset(work, 0, sizeof(*work));
-    work->action = STREAM_WORK_BYPASS;
+    else
+        memset(work, 0, sizeof(*work));
+    work->action = hio->action;
 }
 
 /* ---------------------------------------------------------------------------------------------
- * Block entries. N == 1 is the per-hop stream (job_ready 0 on the first mask_lookahead hops); N > 1 is one packet
+ * Block entries. N == 1 is the per-hop stream (BYPASS on the first mask_lookahead hops); N > 1 is one packet
  * of N hops and one job. AINR_OK with *hio filled, AINR_ERR_SEQUENCE on a contract error.
  * ------------------------------------------------------------------------------------------- */
 

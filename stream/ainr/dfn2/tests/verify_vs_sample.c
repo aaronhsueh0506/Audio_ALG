@@ -271,11 +271,11 @@ static int run_matrix(const DFN2GridSpec *spec, const char *label, int inject_sh
                 pre_rc_a = board_pre(&A, pcm_in, &in_a, &out_a);
                 pre_rc_b = dfn2_stream_pre_process(B, pcm_in, &io_b);
                 job_a = pre_rc_a == 1;
-                job_b = pre_rc_b == 1 && io_b.job_ready;
+                job_b = pre_rc_b == 1 && io_b.action == STREAM_WORK_SUBMIT;
                 /* the hop has a job exactly from hop L on (after the start or a reset), on both sides */
                 if (pre_rc_a < 0 || pre_rc_b != 1 || job_a != job_b || job_a != (since_start >= L)) {
-                    fprintf(stderr, "[%s] hop %lld: pre mismatch A=%d B=%d job_ready B=%d (expected job %d)\n", label,
-                            ghop, pre_rc_a, pre_rc_b, pre_rc_b == 1 ? io_b.job_ready : -1, since_start >= L);
+                    fprintf(stderr, "[%s] hop %lld: pre mismatch A=%d B=%d action B=%d (expected job %d)\n", label,
+                            ghop, pre_rc_a, pre_rc_b, pre_rc_b == 1 ? (int)io_b.action : -1, since_start >= L);
                     st.mismatches++;
                 }
                 if (job_a && job_b) {

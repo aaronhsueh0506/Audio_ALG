@@ -143,7 +143,7 @@ Specific to DFN2:
   (the accelerator does not run for them); the first M + D hops emit nothing (`valid` 0).
 - The rings hold `grid.ring = max(df_order, M + D + 1)` frames: five up to
   `M + D = 4`, six for `M + D = 5` (1/4, 2/3), seven for `M + D = 6` (2/4). The state is carved to that ring at init, so a
-  deeper pair only makes the pool larger (92,480 bytes at 1/1, 104,512 at 2/3, 116,544 at 2/4 on the 48 kHz grid; 64-bit host).
+  deeper pair only makes the pool larger (88,336 bytes at 1/1, 100,368 at 2/3, 112,400 at 2/4 on the 48 kHz grid; 64-bit host).
   Mask-only keeps only the noisy ring, `M + 1` frames.
 
 ## Integration reference

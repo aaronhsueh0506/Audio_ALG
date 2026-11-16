@@ -77,7 +77,7 @@ static int hop_once(Stream *st, const DFN2Grid *grid, int hop_index, int job_ord
     *gen_before = dfn2_stream_state_generation(st->s);
     CHECK((packet ? dfn2_stream_pre_process_packet(st->s, pcm_in, &io) : dfn2_stream_pre_process(st->s, pcm_in, &io)) == 1,
           "pre_process at hop %d", hop_index);
-    is_job = io.job_ready;
+    is_job = io.action == STREAM_WORK_SUBMIT;
     if (is_job) {
         int fail = (job_ordinal == fail_job);
         if (io.state_generation != st->dev.seen) { st->dev.state = 0; st->dev.seen = io.state_generation; }

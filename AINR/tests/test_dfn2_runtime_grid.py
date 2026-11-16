@@ -896,7 +896,7 @@ class _PoolMirror:
         return self._struct_size(fields)[0]
 
     def _prepost_header(self, mask):
-        fields = ['ptr', 'ptr', self._grid(), 'float', 'ptr', 'ptr'] + ['ptr'] * 4 + ['ptr'] * 2
+        fields = ['ptr', 'ptr', self._grid(), 'float', 'ptr', 'ptr'] + ['ptr'] * 2 + ['ptr'] * 2
         fields += ['ptr'] * 4 + ['ptr']
         if not mask:
             fields += ['ptr', 'ptr']
@@ -936,13 +936,13 @@ class _PoolMirror:
         io = [4 * g['input_frames'] * ne, 4 * 2 * g['input_frames'] * db]
         sizes = [self._prepost_header(mask), self._state_header(mask), self._carve(state),
                  self._io_header(mask), self._carve(io),
-                 4 * nb, 4 * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
+                 4 * n * nb, 4 * n * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
         if not mask:
             sizes += [4 * n * db * order * 2, 4 * n]
         sizes += [4 * ne]
         if not mask:
             sizes += [4 * db * order * 2]
-        sizes += [P * n, P * n, 4 * n * nb, 4 * n * nb]
+        sizes += [P * n, P * n]
         return self._carve(sizes)
 
     @staticmethod

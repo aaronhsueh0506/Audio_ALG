@@ -202,7 +202,7 @@ static int twin_frame(Twin* t, const Complex* e, const Complex* p, DFN2Model mod
     }
     if (dfn2_stream_pre_process_freq_dual(t->stream, er, ei, pr, pi_, &io) != 1) return -1;
     if (dfn2_stream_post_process_freq(t->stream,
-                                      io.job_ready ? model.infer(model.user, &io.inputs, &io.outputs)
+                                      io.action == STREAM_WORK_SUBMIT ? model.infer(model.user, &io.inputs, &io.outputs)
                                                    : STREAM_RUN_NOT_STARTED,
                                       or_, oi, &valid) != 0)
         return -1;

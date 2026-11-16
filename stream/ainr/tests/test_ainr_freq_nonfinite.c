@@ -360,7 +360,7 @@ static int run_stream_guard(const char *label) {
                 fprintf(stderr, "%s: block %d preprocess failed (stream %d)\n", label, blk, w);
                 return 1;
             }
-            if (io.job_ready) {   /* the views of a hop without a job are not valid */
+            if (io.action == STREAM_WORK_SUBMIT) {   /* the views of a hop without a job are not valid */
                 size_t i;
                 memcpy(tr[w] + tl[w], io.inputs.erb_window, io.inputs.erb_window_elements * sizeof(float));
                 tl[w] += io.inputs.erb_window_elements;

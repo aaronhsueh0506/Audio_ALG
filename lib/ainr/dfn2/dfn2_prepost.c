@@ -29,12 +29,10 @@ struct DFN2Prepost {
     const float *erb_fwd;   /* borrowed, never created or destroyed here */
     const float *erb_inv;
 
-    /* Single-frame staging (N == 1); a block (N > 1) stages its frames in apply_*. */
-    float *spec_re;     /* [n_bins]  frame, original scale */
+    /* Staging, one slot per frame of the call: the single entry's frame, or the dual entry's application
+     * spectrum; enhanced_* point at the slot the enhance stage reads. */
+    float *spec_re;     /* [N][n_bins]  original scale */
     float *spec_im;
-    /* apply_*: the dual entry point's application spectrum; enhanced_* point at what the enhance stage reads */
-    float *apply_re;    /* [N][n_bins]                                      */
-    float *apply_im;
     const float **enhanced_re;   /* [N]                                      */
     const float **enhanced_im;
     float *feat_erb;    /* [n_erb]                                          */
@@ -152,8 +150,8 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
     const size_t frames = (size_t)g->frames_per_call;
     const size_t frame_bins = frames * (size_t)g->n_bins;
     const size_t float_counts[] = {
-        (size_t)g->n_bins,   /* spec_re, spec_im: the single-frame entries (N == 1); a block stages in apply_* */
-        (size_t)g->n_bins,
+        frame_bins,   /* spec_re, spec_im */
+        frame_bins,
         (size_t)g->n_erb,
         2u * (size_t)g->df_bins,
         frame_bins,
@@ -211,11 +209,6 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base,
     if (base && p) p->enhanced_re = (const float **)ptr;
     if (pp_carve(base, &cursor, frames, sizeof(const float *), &ptr) != 0) return -1;
     if (base && p) p->enhanced_im = (const float **)ptr;
-
-    if (pp_carve(base, &cursor, frame_bins, sizeof(float), &ptr) != 0) return -1;
-    if (base && p) p->apply_re = (float *)ptr;
-    if (pp_carve(base, &cursor, frame_bins, sizeof(float), &ptr) != 0) return -1;
-    if (base && p) p->apply_im = (float *)ptr;
 
     *total = ck_align16_size(cursor);
     return MEM_SIZE_INVALID(*total) ? -1 : 0;
@@ -479,10 +472,10 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
     if (p->frame_open || p->grid.frames_per_call != 1) return -1;
     bins = (size_t)p->grid.n_bins * sizeof(float);
     /* the application spectrum is read again at commit, so it is copied */
-    memcpy(p->apply_re, app_re, bins);
-    memcpy(p->apply_im, app_im, bins);
-    p->enhanced_re[0] = p->apply_re;
-    p->enhanced_im[0] = p->apply_im;
+    memcpy(p->spec_re, app_re, bins);
+    memcpy(p->spec_im, app_im, bins);
+    p->enhanced_re[0] = p->spec_re;
+    p->enhanced_im[0] = p->spec_im;
     return pp_begin_frame(p, est_re, est_im);
 }
 
@@ -495,8 +488,8 @@ int dfn2_prepost_pre_process_block_dual(DFN2Prepost *p, const float *est_re, con
     if (p->frame_open || frames < 2) return -1;
     pp_clear_frame(p);
     for (i = 0; i < frames; ++i) {
-        float *re = p->apply_re + (size_t)i * n_bins;
-        float *im = p->apply_im + (size_t)i * n_bins;
+        float *re = p->spec_re + (size_t)i * n_bins;
+        float *im = p->spec_im + (size_t)i * n_bins;
         /* the application spectrum is read again at commit, so it is staged unless the caller wrote it there */
         if (re != app_re + (size_t)i * n_bins) memcpy(re, app_re + (size_t)i * n_bins, n_bins * sizeof(float));
         if (im != app_im + (size_t)i * n_bins) memcpy(im, app_im + (size_t)i * n_bins, n_bins * sizeof(float));
@@ -676,8 +669,8 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float *re, float *im,
 
 int dfn2_prepost_block_input(DFN2Prepost *p, float **re, float **im) {
     if (!p || !re || !im || p->frame_open || p->grid.frames_per_call < 2) return -1;
-    *re = p->apply_re;
-    *im = p->apply_im;
+    *re = p->spec_re;
+    *im = p->spec_im;
     return 0;
 }
 

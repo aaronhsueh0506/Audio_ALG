@@ -166,7 +166,7 @@ static int run(const DFN2Grid *g, const float *fwd, const float *inv, int block,
                 input_pcm(pcm_in, N, pk * N, hop);
                 CHECK(dfn2_stream_pre_process_packet(s, pcm_in, &io) == 1, "pre packet %d", pk);
             }
-            CHECK(io.job_ready == 1, "packet %d has no job", pk);
+            CHECK(io.action == STREAM_WORK_SUBMIT, "packet %d has no job", pk);
             rc = device_run(&dev, &io, &cfg.grid, ev == 1 ? 1 : ev == 2 ? 2 : 0);
             if (freq) {
                 CHECK(dfn2_stream_post_process_packet_freq(s, rc, ore, oim, &valid) == 0, "post packet %d", pk);
@@ -191,7 +191,7 @@ static int run(const DFN2Grid *g, const float *fwd, const float *inv, int block,
                     input_pcm(pcm_in, 1, h, hop);
                     CHECK(dfn2_stream_pre_process(s, pcm_in, &io) == 1, "pre hop %d", h);
                 }
-                if (io.job_ready) rc = device_run(&dev, &io, &cfg.grid, ev == 1 ? 1 : ev == 2 ? 2 : 0);
+                if (io.action == STREAM_WORK_SUBMIT) rc = device_run(&dev, &io, &cfg.grid, ev == 1 ? 1 : ev == 2 ? 2 : 0);
                 if (freq) {
                     CHECK(dfn2_stream_post_process_freq(s, rc, ore, oim, &valid) == 0, "post hop %d", h);
                     memcpy(out->spec + (size_t)h * 2u * (size_t)nb, ore, (size_t)nb * sizeof(float));

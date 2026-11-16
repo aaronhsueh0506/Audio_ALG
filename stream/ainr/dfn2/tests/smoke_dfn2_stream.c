@@ -55,8 +55,8 @@ static void check_saturate_s16_nonfinite(void) {
 }
 
 /* Runs the full init/hop-loop/reset cycle of the per-hop entries (frames_per_call N == 1). Every hop calls
- * pre_process, calls the fake accelerator only when io.job_ready (as the header's usage example does), then
- * always calls post_process. Cross-checks io.job_ready against the documented cadence (a job on every hop from
+ * pre_process, calls the fake accelerator only on STREAM_WORK_SUBMIT (as the header's usage example does), then
+ * always calls post_process. Cross-checks io.action against the documented cadence (a job on every hop from
  * hop mask_lookahead): a job on the wrong hop, or the wrong number of jobs total, fails the test instead of just
  * not crashing. */
 static int run_smoke(int frames_per_call) {
@@ -148,21 +148,21 @@ static int run_smoke(int frames_per_call) {
 
         /* Same cadence as dfn2_prepost_pre_process_freq(): every hop from hop mask_lookahead. */
         ready_expected = i >= grid.mask_lookahead;
-        if (io.job_ready != ready_expected) {
-            fprintf(stderr, "job_ready=%d at hop %d, expected %d (N=%d)\n",
-                   io.job_ready, i, ready_expected, frames_per_call);
+        if ((io.action == STREAM_WORK_SUBMIT) != ready_expected) {
+            fprintf(stderr, "action=%d at hop %d, expected %d (N=%d)\n",
+                   (int)io.action, i, ready_expected, frames_per_call);
             return 1;
         }
 
         /* between hops only: refused while this hop awaits its post_process, whether it has a job or not */
         if (dfn2_stream_set_atten_lim(s, 6.0f) != -1) {
-            fprintf(stderr, "set_atten_lim accepted inside hop %d (job_ready %d, N=%d)\n",
-                   i, io.job_ready, frames_per_call);
+            fprintf(stderr, "set_atten_lim accepted inside hop %d (action %d, N=%d)\n",
+                   i, (int)io.action, frames_per_call);
             return 1;
         }
 
         ai_rc = 0;
-        if (io.job_ready) {
+        if (io.action == STREAM_WORK_SUBMIT) {
             ai_rc = fake_accelerator(&io.outputs);
             ++jobs_run;
         }
@@ -262,7 +262,7 @@ static int run_smoke_packet(int sample_rate, int n_fft, int n_erb, int frames_pe
         DFN2HopIO io;
         int valid;
         for (k = 0; k < hop * frames_per_call; ++k) pcm_in[k] = (int16_t)((k * 7 + i * 3) % 101 - 50);
-        if (dfn2_stream_pre_process_packet(s, pcm_in, &io) != 1 || !io.job_ready) {
+        if (dfn2_stream_pre_process_packet(s, pcm_in, &io) != 1 || io.action != STREAM_WORK_SUBMIT) {
             fprintf(stderr, "pre_process_packet: no job at packet %d (N=%d)\n", i, frames_per_call);
             return 1;
         }
