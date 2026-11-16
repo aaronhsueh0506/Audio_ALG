@@ -112,9 +112,7 @@ samples for the 0/0 row, pool 304,112 B), against 800 samples and
 463,664 B for the shipped 48 kHz model with the same 16 kHz host through the bridge. The bridge exists only for the shipped
 48 kHz / 1024 model (`dfn_hop_pool_plan()` returns -1 on any other model grid) and its hosts stay 8 kHz and 16 kHz, so a 16 kHz model
 refuses a host of another rate ("pool query rejected", exit 1), and the 48 kHz host needs the 48 kHz model. The banner prints the model
-grid and whether the model stream runs on the host grid or through the bridge. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; the stage test
-(`dfn/tests/test_dfn_res_stage.c`) runs the 16, 32 and 48 kHz grids, and `dfn/tests/test_dfn_stream_equivalence.c` holds the
-model stream to the stage bit for bit on six grids.
+grid and whether the model stream runs on the host grid or through the bridge. `tests/test_mono_dfn.c` and the Python reference cover the shipped grid; `dfn/tests/test_dfn_hop.c` holds the hop to a hand-written recipe on the model stream, and `make test-dfn-grids` runs it on the 16 and 32 kHz test grids.
 
 Lookahead pair. The DFN2 mask and deep-filter lookaheads M (0..2) and D (0..4) are two fields of the model grid
 (a row of the table above, not a build setting) and must equal the pair the model was trained for;
@@ -127,18 +125,16 @@ Build and test from `pipelines/` (the Makefile that owns the rules):
 
 ```sh
 make WERROR=1 libaudio_pipeline_dfn.a mono_aec_dfn_res
-make WERROR=1 test        # includes test_dfn_res_stage, test_dfn_rate_bridge,
-                          # test_dfn_hop, test_mono_dfn and the skeleton
+make WERROR=1 test        # includes test_dfn_hop, test_mono_dfn and the skeleton
 ```
 
 The `Makefile` in this directory is a thin forwarder: `make -C pipelines/mono/aec_dfn_res test`
-builds and runs `test_dfn_res_stage`, `test_dfn_rate_bridge` and `test_mono_dfn`, then the
+builds and runs `test_dfn_hop` and `test_mono_dfn`, then the
 skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`, `--sample-rate 48000`,
 `--sample-rate 8000`, `--ai-sample-rate 16000 --ai-fft-size 256`) and checks that malformed numbers such as `16000Hz` and `12dB`, and a model grid outside the table, exit with 2, and that a model grid the bridge cannot serve is a rejected pool query (exit 1).
 
 `libaudio_pipeline_dfn.a` holds the DFN2 model stream (`dfn2_stream.o`), the sample-rate bridge
-(`ainr_bridge.o`), the DFN2 host pre/post objects, and the older stage and rate bridge adapter
-(`dfn_res_stage.o`, `dfn_rate_bridge.o`), which this example no longer calls. The example links it with `libaec` and
+(`ainr_bridge.o`), the DFN2 host pre/post objects. The example links it with `libaec` and
 `libaudio_common` (no denoiser, so no `libanr`); the board supplies the stateless model callback
 (`DFN2Model`) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../../dfn/README.md`](../../dfn/README.md)). `main.c` is the board

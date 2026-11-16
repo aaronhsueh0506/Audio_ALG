@@ -163,7 +163,7 @@ mono 的設定分成兩份：lib/aec 的 `AecConfig`（格點與接縫欄位由�
 | NR 強度 | `ANR_LEVEL_BALANCED`（= 2） | `--nr-level 0..3`（0 mild／1 moderate／2 balanced／3 aggressive，其他文字 exit 2；舊旗標 `--nr-preset` 為別名）：交給 `anr_config_for_level_grid(sr, fft_size, level)`，四級都可用；最小值追蹤視窗 `L` 為函式庫預設，不覆寫 |
 | `use_r2` | 用 | `--legacy-amin`：`use_r2 = 0`，`mono_nr_gain()` 不把 R² 摺進 noise floor（noise-only NR）。只用於比對，新整合請保持用 R² |
 | CNG | 開，與 `aec_cfg.enable_cng`（AEC level 自己的值）取 AND | `--no-cng`：不呼叫 `aec_apply_cng()`。位準再乘該 bin 的 NR gain、下限 −10 dB（`aec.h` 的 `AEC_CNG_NR_GAIN_FLOOR`，由 `aec_apply_cng()` 內部套用；NR 看不到 comfort noise，在此補套）；沒有 RES gain 時也不填 |
-| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 的 stage 經 rate bridge 時由 bridge 自己合成、不建 `AcIstft`；stage 直接跑在主機格點時仍由應用建 `AcIstft`（見 `mono/aec_dfn_res`） |
+| 合成 | 用 | 範例是 `ac_istft_push()` 之後直接輸出；DFN2 經 rate bridge 時由 bridge 自己合成、不建 `AcIstft`；模型串流直接跑在主機格點時仍由應用建 `AcIstft`（見 `mono/aec_dfn_res`） |
 
 `--aec-only` 不建任何後級，lane 以 `AEC_RESIDUAL_STATE` 建立（殘留階段照跑）、輸出取 `AecLinearView.linear_hop`（[§1.2](integration.md#12---aec-only)）。
 

@@ -39,36 +39,36 @@ Pass conditions:
 
 ### 8.1 Mono DeepFilterNet2 variant (`mono_aec_dfn_res`)
 
-`make -C pipelines test` also builds and runs the shared post-RES DFN2
-stage, the rate bridge that takes that stage to its 48 kHz grid from a
-product-rate host (`dfn/dfn_rate_bridge.c`, a thin adapter over `stream/ainr/bridge`'s
-model-free `AinrBridge`; `make -C stream/ainr/bridge test` is the bridge's own gate), and the mono example that composes lib/aec's `Aec` (its own RES
+`make -C pipelines test` also builds and runs the hop glue of the DFN2 model stream
+(`dfn/dfn_hop.h`; for a product-rate host it takes the model to its 48 kHz grid through
+`stream/ainr/bridge`'s model-free `AinrBridge`; `make -C stream/ainr/bridge test` is the bridge's own gate), and the mono example that composes lib/aec's `Aec` (its own RES
 gain, formed into P in the example's `rig_process`; no denoiser; the host synthesis is
 the example's `AcIstft` on the direct path and the bridge's own otherwise) and
 `dfn/dfn_hop.h`. The example and `dfn_hop.h` run the model through the model stream
-(`dfn2_stream_*_freq` of `stream/ainr/dfn2`, memory mode, `freq_only`) and `AinrBridge`, not through the stage;
-`test_dfn_hop` holds the hop to the stage and the rate bridge bit for bit, `test_dfn_stream_equivalence` the stream to the stage:
+(`dfn2_stream_*_freq` of `stream/ainr/dfn2`, memory mode, `freq_only`) and `AinrBridge`;
+`test_dfn_hop` holds the hop to a hand-written recipe on the stream and the bridge bit for bit, and
+`make -C stream/ainr/dfn2 test` (`freq_rows`) runs the spectrum entries over the table grids and lookahead pairs:
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
-# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_dfn_stream_equivalence, test_mono_dfn, test_dfn_hop,
+# adds: test_mono_dfn, test_dfn_hop,
 #       test_array_sample_post, mono_aec_dfn_res (board skeleton at its 16 kHz default,
 #       also run with --delay-num-filters 1 --cng --atten-lim 12, and with
 #       --sample-rate 48000 and 8000, and with --ai-sample-rate 16000
 #       --ai-fft-size 256, the model grid the model stream runs directly on the host grid)
-make -C pipelines/mono/aec_dfn_res test   # scoped: test_dfn_res_stage,
-#       test_dfn_rate_bridge, test_mono_dfn and the skeleton runs (16 kHz,
+make -C pipelines/mono/aec_dfn_res test   # scoped: test_dfn_hop,
+#       test_mono_dfn and the skeleton runs (16 kHz,
 #       48 kHz, 8 kHz, the model-grid flags, the malformed-number and
 #       model-grid refusals); the top-level target
 #       above is the one that gates a release (it also runs test_dfn_hop,
 #       test_array_sample_post and the rest of the pipelines/ set).
 ```
 
-The stage runs the DeepFilterNet2 grid its config carries, lookahead pair included (a row of
+The model stream runs the DeepFilterNet2 grid its config carries, lookahead pair included (a row of
 the example's table, `--ai-sample-rate` / `--ai-fft-size`, default 48 kHz / 1024 / 1/1; 15 legal
 pairs); the `DFN2_MASK_LOOKAHEAD` / `DFN2_DF_LOOKAHEAD` make variables (default 1/1) choose only
 the pair the test programs run. The delays quoted in the pass conditions below are for the
-shipped 1/1 pair. Other pairs, and the stage tests at the 16 and 32 kHz grids:
+shipped 1/1 pair. Other pairs, and the hop test at the 16 and 32 kHz grids:
 
 ```bash
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-pairs
@@ -76,15 +76,14 @@ make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-pairs
 #       DFN_TEST_PAIRS="0/1 2/4" (mask/df pairs from 0..2/0..4); an empty list is an
 #       error, and make -n / -q / -t only print the plan
 make -C pipelines BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test-dfn-grids
-#       test_dfn_res_stage, test_dfn_rate_bridge and test_dfn_hop built for the
+#       test_dfn_hop built for the
 #       16 and 32 kHz test grids (DFN2_TEST_GRID_KHZ), with the test header's
 #       pair 1/1 -- not the 0/0 of those rows in the example table
 ```
 
-`test-pairs` rebuilds and runs `test_dfn_res_stage`, `test_dfn_rate_bridge`,
-`test_dfn_hop`, `test_mono_dfn`, `test_readme_flow` and `mono_aec_dfn_res` for
-each listed pair only. Every one of them prints the pair it was built with and, for the stage test and
-the mono composition, the stage latency it measured, and `dfn/tests/check_pair_report.sh` fails the
+`test-pairs` rebuilds and runs `test_dfn_hop`, `test_mono_dfn`, `test_readme_flow` and `mono_aec_dfn_res` for
+each listed pair only. Every one of them prints the pair it was built with and, for the hop test and
+the mono composition, the latency it measured, and `dfn/tests/check_pair_report.sh` fails the
 target when the pair or the latency (`mask + df` hops, `(mask + df + 1) * hop` samples) is not the one
 asked for -- a pair flag that never reached the test build prints 1/1 and is red. The other pairs are not built or run by this target
 (the AINR C hosts have their own pair tests, section 11.4), and no checkpoint
@@ -105,7 +104,7 @@ Pass conditions:
       move nothing; a reset, a refused commit or a run that started and failed would add to it;
       the stub model and the identity path report `STREAM_RUN_NOT_STARTED`, which does not).
 - [ ] `erb_inv` that is not a bitwise partition of unity is refused at
-      `get_mem_requirements()` (stage) and at `init` (`dfn2_stream_init*`, `ainr_init*`); the two
+      `init` (`dfn2_stream_init*`, `ainr_init*`); the two
       example mains run the model stream, so they report it as `pipeline init failed` (exit 1),
       from `dfn_hop_pool_build()`.
 - [ ] `--erb-fwd FILE` and `--erb-inv FILE` take the two raw float32 ERB matrices of the
@@ -119,14 +118,14 @@ Pass conditions:
       pass-band tolerance against the conventional NR-off output through the
       same 0.35 fs low-pass. The native path is a tolerance, NOT a memcmp:
       the signal crosses two FIR resamplers.
-- [ ] `test_dfn_rate_bridge` passes on all three native grids standalone
+- [ ] `make -C stream/ainr/bridge test` passes on all three native grids
       (schedule, prefill/added-delay table, impulse, tolerance identity,
       E-only silence, reset parity, rejection row).
 - [ ] The board skeleton runs at `--sample-rate 16000` (default),
       `8000` and `48000`, and prints a pool size, hop and algorithmic latency
       for each.
 - [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (carrying
-      `dfn_rate_bridge.o`, built from `dfn/dfn_rate_bridge.c`, `ainr_bridge.o`, built from
+      `ainr_bridge.o`, built from
       `stream/ainr/bridge/ainr_bridge.c`, and `dfn2_stream.o`, built from `stream/ainr/dfn2/dfn2_stream.c`) and the `mono_aec_dfn_res` board skeleton alongside
       the other artifacts.
 
@@ -181,8 +180,8 @@ make -C pipelines/4ch BACKEND=ne10 SIMD=<0-or-1> WERROR=1 test
 #       with --sample-rate 48000 and with --ai-sample-rate 16000 --ai-fft-size 256)
 make -C pipelines/4ch/aec_bf_dfn_res test   # scoped: test_4ch_dfn and the
 #       skeleton runs (16 kHz, 48 kHz, the model-grid flags, the malformed-number,
-#       8 kHz and model-grid refusals); the rate bridge's own unit test lives under the mono target
-#       (`make -C pipelines test`, section 8.1). Run both before a release.
+#       8 kHz and model-grid refusals); the rate bridge's own unit test is `make -C stream/ainr/bridge test`
+#       (section 8.1). Run both before a release.
 #       The 4-channel Makefile takes the same DFN2_MASK_LOOKAHEAD /
 #       DFN2_DF_LOOKAHEAD variables (for test_4ch_dfn alone) and has no test-pairs target.
 ```
@@ -201,7 +200,7 @@ Pass conditions:
       The mono test asserts the same.
 - [ ] A rate the array does not offer is refused at
       `aec_get_mem_requirements()`, and a non-partition-of-unity
-      `erb_inv` at `dfn_res_stage_get_mem_requirements()` (`test_dfn_res_stage`) and by the model
+      `erb_inv` by the model
       stream's init, that is by `dfn_hop_pool_build()` (`test_dfn_hop`; `make -C stream/ainr/dfn2 erb-partition`).
       8 kHz in particular must be refused: the array has no 8 kHz grid, so the
       4-channel DFN2 example cannot offer one either.
@@ -211,7 +210,7 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `libdfn_res_stage.a` (carrying
-      `dfn_rate_bridge.o`, `ainr_bridge.o` and `dfn2_stream.o`); `AEC_LAYOUT_VERSION` is 4 (the `Aec` pool, array included).
+      `ainr_bridge.o` and `dfn2_stream.o`); `AEC_LAYOUT_VERSION` is 4 (the `Aec` pool, array included).
 
 ### 9.1 Real four-microphone validation
 

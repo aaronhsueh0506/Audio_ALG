@@ -199,7 +199,7 @@ capture spectrum of the same frame); calling it
 twice in a hop, or skipping a hop, breaks the overlap-add. Applications that end in
 a neural stage call it after `ulcnet_stream_post_process_freq()` (the stream's spectrum entry returns a spectrum) or inside `dfn_hop_end()`. The neural libraries
 (`AINR`, `AIAEC`) are frequency domain only: they take and return spectra, and the framing, FFT and
-window come from audiolib in the application (the ULCNet examples frame around the stream's spectrum entries; the DFN2 stage still carries its own).
+window come from audiolib in the application (the examples frame around the streams' spectrum entries; the rate bridge carries its own framing for a host below the model rate).
 
 ### What memory do I provide?
 
@@ -239,7 +239,7 @@ AcIstft* istft = ac_istft_init(pool + ALIGN16(aec_b) + ALIGN16(nr_b), sy_b, &sy_
   its own buffers, a board's accelerator holds it.
 - Re-query the descriptor after any library, backend, build-option or config
   change; `aec_init_ex()` refuses a stale one. `Aec` (`AecMemReq`, single-channel and 4-channel array alike), the
-  DFN stage and bridge and the model streams carry descriptors; the example headers do not.
+  DFN2 model stream, the rate bridge and the other model streams carry descriptors; the example headers do not.
 
 ### How do I run the NN stage on the NPU?
 

@@ -144,7 +144,7 @@ Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉�
 
 <p><b>state generation</b>：<code>&lt;pfx&gt;_prepost_state_generation()</code>（DFN2、DFN3、Align-ULCNet 的 <code>*_model_io_state_generation()</code> 依同一規則）、
 <code>gtcrn_process_state_generation()</code>、<code>rnnoise_state_generation()</code> 數 C 端把 state 重啟的次數：<code>reset</code>、DFN3 的每個暖機幀與被拒絕的 <code>frame_finish</code>／validate（DeepVQE-S 另有已啟動的 <code>frame_fail</code>）各加一，有沒有登錄 state 都照算。
-pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>；舊的 <code>dfn_res_stage_state_generation()</code>／<code>dfn_rate_bridge_state_generation()</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
+pipelines 的 <code>dfn_hop_state_generation()</code>（<code>job.state_generation</code>）同理（模型串流不登錄 state，state 在模型 callback 手上）。
 板端 sample 比較這個值，與上次看到的不同就用量化後的 0 重填 state 輸入。
 起始值不同（DFN2、DFN3、GTCRN、RNNoise-ERB 的 init 後為 1，Align-ULCNet、DeepVQE-S 為 0），所以只比較「是否變動」，不假設起始值。</p>
 

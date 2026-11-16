@@ -17,12 +17,12 @@
 <li><a href="#section-3">契約</a></li>
 <li><a href="#section-4">延遲</a></li>
 <li><a href="#section-5">記憶體與版號</a></li>
-<li><a href="#section-6">與 DfnRateBridge 的關係</a></li>
+<li><a href="#section-6">呼叫端</a></li>
 <li><a href="#section-7">限制</a></li>
 </ul></details>
 <h2 id="section-1">用途與位置</h2>
 <p>主機（AEC、RES、波束、舒適噪聲）跑在 8 或 16 kHz，模型跑在 48 kHz／1024／hop 512 的 grid 時，<code>AinrBridge</code>（<code>stream/ainr/bridge/ainr_bridge.{h,c}</code>）負責兩個格點之間的來回：主機的 estimate／apply 兩路頻譜經原生 WOLA 還原成時域、升頻到 48 kHz、做 sqrt-Hann 1024/512 分析，交給<b>呼叫端的模型</b>，再把模型回的 48 kHz 頻譜做 WOLA、降頻，每個主機 hop 剛好吐出一個 hop。</p>
-<p><b>橋接器不內嵌模型。</b>呼叫端在「取出 48 kHz 頻譜」與「放回」之間自己跑：模型可以是 <code>dfn2_stream_*_freq</code>（記憶體模式）或 <code>ainr_*_freq</code>，DFN3（同為 48 kHz／1024）也能接；兩支桌面 DFN2 pipeline 經 <code>pipelines/dfn/dfn_hop.h</code> 接的是 <code>dfn2_stream_*_freq</code>，板端 sample <code>alg_ai3_aec_dfn.c</code>、<code>uvc_audio_live2a.c</code> 接的是 <code>ainr_*_freq</code>，舊的 <code>DfnRateBridge</code> 轉接層接的是 <code>DfnResStage</code>。它放在 <code>stream/</code> 而不在 <code>lib/</code>：橋接器本身用 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>／resampler，<code>lib/</code> 的模型核心不含框化（<code>pipelines/scripts/audit_no_transform_in_models.sh</code> 把關，它不掃 <code>stream/</code>）。</p>
+<p><b>橋接器不內嵌模型。</b>呼叫端在「取出 48 kHz 頻譜」與「放回」之間自己跑：模型可以是 <code>dfn2_stream_*_freq</code>（記憶體模式）或 <code>ainr_*_freq</code>，DFN3（同為 48 kHz／1024）也能接；兩支桌面 DFN2 pipeline 經 <code>pipelines/dfn/dfn_hop.h</code> 接的是 <code>dfn2_stream_*_freq</code>，板端 sample <code>alg_ai3_aec_dfn.c</code>、<code>uvc_audio_live2a.c</code> 接的是 <code>ainr_*_freq</code>。它放在 <code>stream/</code> 而不在 <code>lib/</code>：橋接器本身用 audiolib 的 <code>AcStft</code>／<code>AcIstft</code>／resampler，<code>lib/</code> 的模型核心不含框化（<code>pipelines/scripts/audit_no_transform_in_models.sh</code> 把關，它不掃 <code>stream/</code>）。</p>
 <h2 id="section-2">呼叫順序</h2>
 <pre>AinrBridgeConfig cfg = ainr_bridge_default_config(host_rate, lookahead_frames);   /* 8000 或 16000 */
 AinrBridgeMemReq req;
@@ -51,14 +51,14 @@ ainr_bridge_finish(b, out_hop);                          /* 剛好一個主機 h
 <h2 id="section-4">延遲</h2>
 <p>增加的延遲 = prefill + 升頻群延遲 + (L + 1)×512×sr/48000 + 降頻群延遲，單位是主機 sample，L = <code>lookahead_frames</code>（模型把 frame t − L 的頻譜交回；橋接器看不到，由呼叫端在 config 給）。<code>ainr_bridge_added_delay_samples()</code> 取整，<code>ainr_bridge_added_delay_exact()</code> 回精確的分子（分母固定為 6）。L = 2：16 kHz／hop 128 為 672、16 kHz／hop 256 為 629、8 kHz／hop 128 為 330；L = 0..3 的全部數字由 <code>test_ainr_bridge</code> 現查（例如 L = 1 在 16 kHz／hop 128 為 501 2/6）。兩顆 FIR resampler 往返不是恆等，通帶內的容差見測試。</p>
 <h2 id="section-5">記憶體與版號</h2>
-<p>靜態 pool 加 32 位元組 descriptor（<code>AinrBridgeMemReq</code>），16 byte 對齊，init 之後沒有 heap、沒有 stdio。16 kHz／fft 256 的 pool 約 117,856 B（本機現查；不含模型：pipeline 範例另配 <code>freq_only</code> 的模型串流 92,688 B 與換算緩衝 12,312 B，舊的 <code>DfnRateBridge</code> 則另含 stage）。<code>AINR_BRIDGE_LAYOUT_VERSION</code> 在 pool 大小、carve 順序或 descriptor 內容任一改變時加一；descriptor 的雜湊折入主機格點、lookahead、FIFO 容量與兩個 resampler 的 pool 大小，其他格點或 lookahead 的 pool 會被 <code>init_ex</code> 拒絕。</p>
-<h2 id="section-6">與 DfnRateBridge 的關係</h2>
-<p><code>pipelines/dfn/dfn_rate_bridge.{h,c}</code> 保留原路徑與 API，是 <code>AinrBridge</code> 加 <code>DfnResStage</code> 的薄轉接層：<code>nn_begin</code> 把橋接器的兩路頻譜交給 stage，<code>nn_end</code> 把 stage 的輸出放回。仍用這個轉接層的呼叫端以 <code>dfn_rate_bridge_get_mem_requirements()</code> 取 pool 大小，連結 <code>libaudio_pipeline_dfn.a</code>（含 <code>ainr_bridge.o</code>）即可；直接編 <code>dfn_rate_bridge.c</code> 時要加 <code>ainr_bridge.c</code> 與 <code>-I stream/ainr/bridge</code>。兩支板端 sample 不經轉接層：它們編 <code>stream/ainr/bridge/ainr_bridge.c</code>（<code>-I stream/ainr/bridge</code>），在 <code>ainr_bridge_model_begin()</code>／<code>ainr_bridge_model_end()</code> 之間呼叫 <code>ainr_preprocess_freq()</code>、AI3 執行、<code>ainr_postprocess_freq()</code>，<code>lookahead_frames</code> 給 <code>AinrInfo.queue_frames</code>。兩支桌面 pipeline 範例（<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）不再經這個轉接層：<code>pipelines/dfn/dfn_hop.h</code> 直接在 <code>ainr_bridge_model_begin()</code>／<code>ainr_bridge_model_end()</code> 之間跑模型串流，輸出與轉接層逐位元一致（<code>pipelines/dfn/tests/test_dfn_hop.c</code>）。pool 的逐項與大小見 <a href="../../../pipelines/reference/dfn2/configuration.html#section-9">AinrBridge pool 逐項</a>。</p>
+<p>靜態 pool 加 32 位元組 descriptor（<code>AinrBridgeMemReq</code>），16 byte 對齊，init 之後沒有 heap、沒有 stdio。16 kHz／fft 256 的 pool 約 117,856 B（本機現查；不含模型：pipeline 範例另配 <code>freq_only</code> 的模型串流 92,688 B 與換算緩衝 12,312 B）。<code>AINR_BRIDGE_LAYOUT_VERSION</code> 在 pool 大小、carve 順序或 descriptor 內容任一改變時加一；descriptor 的雜湊折入主機格點、lookahead、FIFO 容量與兩個 resampler 的 pool 大小，其他格點或 lookahead 的 pool 會被 <code>init_ex</code> 拒絕。</p>
+<h2 id="section-6">呼叫端</h2>
+<p>兩支板端 sample 編 <code>stream/ainr/bridge/ainr_bridge.c</code>（<code>-I stream/ainr/bridge</code>），在 <code>ainr_bridge_model_begin()</code>／<code>ainr_bridge_model_end()</code> 之間呼叫 <code>ainr_preprocess_freq()</code>、AI3 執行、<code>ainr_postprocess_freq()</code>，<code>lookahead_frames</code> 給 <code>AinrInfo.queue_frames</code>。兩支桌面 pipeline 範例（<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）經 <code>pipelines/dfn/dfn_hop.h</code>，直接在 <code>ainr_bridge_model_begin()</code>／<code>ainr_bridge_model_end()</code> 之間跑模型串流（<code>pipelines/dfn/tests/test_dfn_hop.c</code> 把它與手寫的配方逐位元對拍）。pool 的逐項與大小見 <a href="../../../pipelines/reference/dfn2/configuration.html#section-9">AinrBridge pool 逐項</a>。</p>
 <h2 id="section-7">限制</h2>
 <ul>
 <li>模型格點寫死為 48 kHz／1024；主機只有 8／16 kHz。</li>
 <li>板端 RAM、板端執行未驗。</li>
-<li>模型無法回覆一個已開的 frame 時（例如 stage 拒絕該 frame），橋接器停在該 frame，直到 <code>ainr_bridge_reset()</code>。</li>
+<li>模型無法回覆一個已開的 frame 時（例如模型串流拒絕該 frame），橋接器停在該 frame，直到 <code>ainr_bridge_reset()</code>。</li>
 </ul>
 </main>
 </body>

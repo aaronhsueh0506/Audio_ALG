@@ -207,8 +207,7 @@ against the row; tested by `make -C stream/common test-graph-io`). `stream/commo
 `stream/common/stream_bind.c` for the checker; the stream libraries do not. The AI3 samples carry compile-time `#define FLOAT_IN 0` / `FLOAT_OUT 0` (default off) that let the NPU quantize the inputs and dequantize the heads; set both alike (a mixed setting only warns), see `docs/maintenance/graph-wiring.md`. The pool comes from the stream's `*_get_mem_size()` (`StreamMemReq`: `bytes`, `alignment`, declared in
 `stream/common/stream_mem.h`), and a
 configuration, model or pool that is not registered or is too small is refused at run time, before any SDK call. The one DFN2 variant flag is
-`-DDFN2_MASK_ONLY`; every DFN2 unit of a build must share it (mixed units do not link). The pipeline units (`dfn_res_stage.c`,
-`dfn_rate_bridge.c`, over `stream/ainr/bridge/ainr_bridge.c`, which needs `-I stream/ainr/bridge` when `dfn_rate_bridge.c` is compiled from source and is a member of `libaudio_pipeline_dfn.a`) hold no grid and no pair either: the application puts its `DFN2Grid` in `DfnResStageConfig.grid`. The analysis and
+`-DDFN2_MASK_ONLY`; every DFN2 unit of a build must share it (mixed units do not link). The pipeline units (`dfn_hop.h` over `stream/ainr/dfn2/dfn2_stream.c` and `stream/ainr/bridge/ainr_bridge.c`, which needs `-I stream/ainr/bridge` when compiled from source and is a member of `libaudio_pipeline_dfn.a`) hold no grid and no pair either: the application puts its `DFN2Grid` in `DFN2StreamConfig.grid`. The analysis and
 synthesis scales and the overlap-add mode are part of each library's framing contract (see its header or README): the model streams take
 and return audio-scale spectra (the default `AcStft` / `AcIstft` scales of 1) and convert to the model scale internally, and the
 DFN2, Align-ULCNet and DeepVQE-S samples synthesize with `AC_OLA_ACCUMULATE`.
@@ -219,11 +218,10 @@ configuration without a delivered graph is refused by `*_get_mem_size()` / `*_in
 
 The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_history` pairs and the Align-ULCNet and DeepVQE-S state views
 stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run
-(`dfn2_prepost_state_generation()`; `dfn_res_stage_state_generation()` or `dfn_rate_bridge_state_generation()` when a stage or bridge
-hosts the model; `ulcnet_prepost_state_generation()`; `deepvqe_prepost_state_generation()`) and, when it differs from the last value it
+(`dfn2_prepost_state_generation()`, or `dfn_hop_state_generation()` through the hop glue; `ulcnet_prepost_state_generation()`; `deepvqe_prepost_state_generation()`) and, when it differs from the last value it
 saw, reloads quantized zeros into the accelerator's state input buffers (the first M blocks of DFN2 with `mask_lookahead` M >= 1 carry no job and do not move it; the
-accelerator's state is quantized zero when the generation is first read). The start value differs per library (1 for DFN2 and the
-stage / bridge, 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
+accelerator's state is quantized zero when the generation is first read). The start value differs per library (1 for DFN2,
+0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
 
 The DFN2 stream loads the ERB matrices of the resolved grid from the board's release-asset directory during `ainr_init()`; a sample
 neither names nor opens that file, and a missing file, a header or size mismatch, bytes after the two matrices, a forward value that is not finite or is negative, or an inverse matrix that is not a partition of unity (every entry in [0, 1] and every bin's band weights sum to exactly 1.0f, as `export_erb_matrix.py` checks before it writes) returns `AINR_ERR_ERB_FILE`. The file has the layout

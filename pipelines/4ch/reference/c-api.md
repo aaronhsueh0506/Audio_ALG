@@ -249,8 +249,8 @@ make NO_STDIO=1 audit-no-stdio
 "$(make -s print-bin-dir)/4ch_static" --print-mem-size --sample-rate 48000
 ```
 
-`DFN2_MASK_LOOKAHEAD` (0..2) and `DFN2_DF_LOOKAHEAD` (0..4) default to the shipped pair 1/1. The DFN2 stage, the bridge and the
-example main hold no pair (the application puts a `DFN2Grid` in the hop's pool plan, `DfnHopPoolPlan.stream_cfg.grid`, or in `DfnResStageConfig.grid` for the stage; the main reads it from `--ai-sample-rate` /
+`DFN2_MASK_LOOKAHEAD` (0..2) and `DFN2_DF_LOOKAHEAD` (0..4) default to the shipped pair 1/1. The DFN2 model stream, the bridge and the
+example main hold no pair (the application puts a `DFN2Grid` in the hop's pool plan, `DfnHopPoolPlan.stream_cfg.grid`; the main reads it from `--ai-sample-rate` /
 `--ai-fft-size`), so a different pair is passed as `-D` flags to the test unit `test_4ch_dfn` alone. The pair is part of the build
 signature, so pairs never share an object directory. Only the 1/1 pair has a trained checkpoint, and the audio quality of the other pairs is not measured.
 

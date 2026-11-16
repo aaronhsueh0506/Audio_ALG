@@ -36,8 +36,8 @@
   hop is not finite, reset the `Aec` (`aec_reset()`: for the array also the four lanes, the estimator and the gain stage; the level setting survives), the
   denoiser, the synthesis and any neural stage together
   (`aec_reset()`, `anr_reset()`, `ac_istft_reset()`, `ulcnet_stream_reset()`), and refresh the `post_reset_serial` you track.
-  An `AEC_ERR_DSP` from an array has already reset the array itself. The DFN2 stage is not reset by an AEC delay change. A model
-  that keeps its own recurrent state (the DFN2 stage and rate bridge register none) follows the state generation (a reset and a refused commit advance it), see
+  An `AEC_ERR_DSP` from an array has already reset the array itself. The DFN2 model stream is not reset by an AEC delay change. A model
+  that keeps its own recurrent state (the DFN2 stream and rate bridge register none) follows the state generation (a reset and a refused commit advance it), see
   ["Running the model on the NPU"](sequence.md#running-the-model-on-the-npu-nn-applications).
 
 ## Descriptor semantics (`AecMemReq`)
@@ -46,7 +46,7 @@ Every field is a fixed-width integer
 (`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
 pinned to a stable **32-byte** layout (the AEC library's `test_memory_layout` checks it at run time) — see
 "Serializing the descriptor" below for what that does (and does not) buy
-you. One `Aec` descriptor covers the single-channel instance and the whole 4-channel array pool alike. The DFN stage and the rate bridge use the same shape with their
+you. One `Aec` descriptor covers the single-channel instance and the whole 4-channel array pool alike. The DFN2 model stream and the rate bridge use the same shape with their
 own version counters.
 
 | Field | Meaning |
@@ -109,7 +109,7 @@ need for a caller-side blanket `memset(pool, 0, bytes)` before `init`.
 
 The array instance prints nothing at all on any path (no stdio symbol is linked), and the example
 header `array_sample_post.h` uses none. lib/aec, lib/nr and audiolib compile their init-time diagnostics out under
-`NO_STDIO=1`; the DFN2 stage and rate bridge archive is audited for stdio symbols. Every failure is
+`NO_STDIO=1`; the DFN2 model stream and rate bridge archive is audited for stdio symbols. Every failure is
 signalled through the return value (`NULL`/`-1`/`0` size), so a board image that cannot or will not
 link libc's stdio (no console, or a policy that forbids the stdio symbol set
 outright) loses only the human-readable "why" the producers would otherwise write to `stderr`.
@@ -120,8 +120,8 @@ make BACKEND=ne10 audit-no-stdio   # PASS/FAIL, non-zero exit on FAIL
 make BACKEND=ne10 audit-no-stdio-stack
 ```
 
-`audit-no-stdio` (in `pipelines/`) builds the DFN2 stage archive with `NO_STDIO=1` and asserts with
-`nm` that it holds the stage, bridge and DFN2 pre/post members and none of
+`audit-no-stdio` (in `pipelines/`) builds the DFN2 archive with `NO_STDIO=1` and asserts with
+`nm` that it holds the model stream, bridge and DFN2 pre/post members and none of
 `fprintf`/`printf`/`puts`/`fputs`/`stderr`/`__stderrp` (pattern/style follows
 `audiolib/common/scripts/audit_alloc_symbols.sh`); the same target in
 `4ch/` (run with `NO_STDIO=1`) scans the 4-channel build: the DFN archive, the producers (including the spatial archives) and the sample object `array_sample_beam.o`. `audit-no-stdio-stack` also builds

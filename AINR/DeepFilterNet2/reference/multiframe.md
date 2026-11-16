@@ -50,8 +50,8 @@ with the lookahead pair:
   another N, and a descriptor made for the one-frame graph (`input_frames` = 3)
   is refused by a grid of N > 1;
 - N is folded into the pool hash (a pool of another N is refused) and into the pool
-  size (144,112 bytes at N = 4 on the shipped grid against 92,608 at N = 1; 64-bit host). The pipelines DFN stage and its Python twin are
-  one-frame units, and the stage refuses N > 1.
+  size (144,112 bytes at N = 4 on the shipped grid against 92,608 at N = 1; 64-bit host). The pipelines' `dfn_hop` and the Python twin are
+  one-frame units, and they refuse N > 1.
 
 `DFN2_MODEL_IO_LAYOUT_VERSION` stays 8: it names the state tensors, which N
 does not change, and the window and head shapes carry N through `input_frames` in

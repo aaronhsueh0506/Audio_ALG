@@ -166,7 +166,7 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
             // aec_init() is init_ex(..., NULL): no descriptor check.
             // array_sample_unit_init() (array_sample_unit.h) does this sequence for the array and the helper.
 
-   (The beamformer, post-beam NR and synthesis, the neural stage or DFN2 stage and bridge are separate
+   (The beamformer, post-beam NR and synthesis, the neural stage or the DFN2 model stream and bridge are separate
     objects with their own size queries and inits: the sample helper array_sample_beam_get_mem_size /
     array_sample_beam_init (SRP-PHAT, BF), anr_get_mem_size / anr_init,
     ac_istft_get_mem_size / ac_istft_init (the 4ch_static sample synthesis carries its own window table; optionally borrow aec_synthesis_window(a) as in mono),
@@ -174,9 +174,7 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
     for DFN2 the example tail of dfn/dfn_hop_pool.h: dfn_hop_pool_plan_init(&plan, &model_grid) / dfn_hop_pool_plan /
     dfn_hop_pool_bytes / dfn_hop_pool_build (the model stream dfn2_stream in memory mode with freq_only, the conversion buffers, then the
     AinrBridge, or the synthesis when the host rate equals the model grid's; model_grid from dfn2_grid_make;
-    plan.stream_cfg.erb_fwd / erb_inv point into the application's ERB data. A caller written against the older objects uses
-    dfn_rate_bridge_default_config(host_rate, &model_grid) / dfn_rate_bridge_get_mem_requirements / dfn_rate_bridge_init, or
-    dfn_res_stage_default_config(&model_grid) / dfn_res_stage_get_mem_requirements / dfn_res_stage_init on the model's own rate);
+    plan.stream_cfg.erb_fwd / erb_inv point into the application's ERB data);
     the gain stage is inside the array)
 
 4. process  aec_process_linear(a, mics, far);  aec_get_array(a, &front);   // shared delay + 4 lanes
@@ -204,11 +202,11 @@ no `infer` callback; Align-ULCNet: `ulcnet_stream_pre_process_freq` and `ulcnet_
 Both are fed the error (or beam) spectrum; the Align-ULCNet
 stream's spectrum entries take spectra only (the error or beam spectrum and the spectrum of the raw far hop, which
 the application analyses with its own `AcStft`) and return one output spectrum for the
-application's `AcIstft`; the DFN2 stage emits one hop of samples. The model
+application's `AcIstft`; the DFN2 hop glue emits one hop of samples. The model
 libraries behind them hold no framing, FFT or window (audiolib's `AcStft` / `AcIstft` do that).
 The ULCNet stream restarts the model state (its state generation advances) on its own reset and on an alignment
 event (a delay change, or the first transition to a solid alignment after the first hop);
-the DFN2 stage and bridge call `model.reset` (when present) on their own reset only, and an
+the DFN2 hop glue and bridge call `model.reset` (when present) on their own reset only, and an
 AEC delay change does not reset them:
 
 ```
@@ -237,7 +235,7 @@ alignment state (`info.delay`). `array_sample_beam_process_with_activity(b, mics
 
 The recurrent state is the application's, not the library's. On a board the accelerator keeps it and nothing is registered with the
 library; the model callback reloads quantized zeros into the accelerator's state inputs at start and whenever the generation of the object
-that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`), `dfn_res_stage_state_generation()` (a stage driven directly), `dfn_rate_bridge_state_generation()` (the rate bridge adapter),
+that owns the restart count changes: `job.state_generation` / `dfn_hop_state_generation()` (`DfnHop`, the model stream's `dfn2_stream_state_generation()`),
 and for Align-ULCNet `io.state_generation` / `ulcnet_stream_state_generation()` (the model stream), or the generation of the pre/post class a
 caller drives directly (`ulcnet_prepost_state_generation()`). The counter advances on a reset, on a refused
 commit (a non-finite head or one beyond `DFN2_PREPOST_HEAD_LIMIT`, and for Align-ULCNet also a finite head whose enhanced spectrum is not finite) of a real frame, and on a run
@@ -247,7 +245,7 @@ was started, `STREAM_RUN_FAILED` for one from the start on, 0 only when every he
 accelerator's state before a run when the generation it is handed differs; it records the value only when the zeroing succeeded, and reports
 `STREAM_RUN_NOT_STARTED` otherwise. No separate "recovery pending" flag exists. A block whose `StreamWork.action` is `STREAM_WORK_BYPASS` is not run. It starts at 1 for the DFN2 objects and at 0 for the Align-ULCNet ones:
 compare it, never assume the value. A float host that drives a pre/post class registers its own state buffers in that class's config
-instead, and the library zeroes and checks them; the DFN2 stage and bridge register none.
+instead, and the library zeroes and checks them; the DFN2 model stream and bridge register none.
 
 A frame that is never fetched, or left open at `end`, takes the
 identity, so latency does not depend on the model. Every library's pool is

@@ -34,10 +34,6 @@ def _aec_include():
 # 巨集名 -> 定義它的檔案（相對 repo 根）。#define 只有一處，所以不必去重。
 # AEC 函式庫的巨集不在本 repo 內，另列於 _AEC_SOURCES。
 _SOURCES = {
-    'DFN_RES_STAGE_LAYOUT_VERSION':
-        'pipelines/dfn/dfn_res_stage.h',
-    'DFN_RATE_BRIDGE_LAYOUT_VERSION':
-        'pipelines/dfn/dfn_rate_bridge.h',
     'ULCNET_MODEL_IO_LAYOUT_VERSION':
         'lib/aiaec/ulcnet/ulcnet_model_io.h',
     'DEEPVQE_PREPOST_LAYOUT_VERSION':
@@ -51,7 +47,7 @@ _AEC_SOURCES = {
 }
 
 # 已退役的巨集：文件不能再把它寫成目前值。
-_RETIRED_MACROS = ('MCAB_LAYOUT_VERSION',)
+_RETIRED_MACROS = ('MCAB_LAYOUT_VERSION', 'DFN_RES_STAGE_LAYOUT_VERSION', 'DFN_RATE_BRIDGE_LAYOUT_VERSION')
 
 _DOC_ROOT = _REPO / 'docs'
 _DOC_SUFFIXES = ('.html', '.md')

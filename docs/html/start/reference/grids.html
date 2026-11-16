@@ -131,7 +131,7 @@ ULCNet 與 DeepVQE-S 的合成同樣用 <code>AC_OLA_ACCUMULATE</code>：每 hop
 另累加 w×w、除以包絡、第一幀不吐；ULCNet、DeepVQE-S、DFN2 的出貨路徑都用 ACCUMULATE）。頻譜縮放由 DFN2／DFN3／RNNoise-ERB 用：<code>spec_scale</code> = <code>grid.stft_scale</code>（1/√n_fft）；DFN2／DFN3 的 <code>ispec_scale</code> = <code>grid.stft_unscale</code>（√n_fft），
 RNNoise-ERB 的 <code>ispec_scale</code> 保持 1.0（√n_fft 已折進 <code>rnnoise_apply_gains()</code>）。出貨 grid（48 k／1024）的值是 1/32 與 32，皆 2 的冪、乘法不進位；
 n_fft 為 4 的次方（256、1024、4096）時精確，512 為四捨五入的 float。縮放恰為 1.0f 時略過乘法。
-<code>DfnHop</code>（以及舊的 <code>DfnResStage</code>／<code>DfnRateBridge</code>）吃 audio-scale 頻譜、自己乘 <code>dfn2_stft_scale()</code>／<code>dfn2_stft_unscale()</code>，呼叫端的 <code>AcStft</code>／<code>AcIstft</code> 保持 1.0。</p>
+<code>DfnHop</code> 吃 audio-scale 頻譜、自己乘 <code>dfn2_stft_scale()</code>／<code>dfn2_stft_unscale()</code>，呼叫端的 <code>AcStft</code>／<code>AcIstft</code> 保持 1.0。</p>
 <div class="tbl">
 <table>
 <tr><th>家族</th><th>呼叫點</th><th>分析</th><th>合成</th><th>FFT／窗</th></tr>
@@ -212,10 +212,10 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <tr><td><code>AEC_LAYOUT_VERSION</code> = 4</td>
 <td>AEC 函式庫 <code>aec.h</code>（sibling 檢出）</td>
 <td><code>Aec</code> pool 的版號，單支與 4ch array（<code>AecConfig.n_mics = 4</code>：共享 delay + 4 lanes + 融合與增益級，全在同一塊 pool）共用 <code>AecMemReq</code>；SRP-PHAT/BF 在 sample helper <code>array_sample_beam.h</code>，沒有 descriptor</td></tr>
-<tr><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6</td>
-<td><code>pipelines/dfn/dfn_res_stage.h</code></td><td>DFN2 post-RES stage（舊物件；兩支 pipeline 範例改走模型串流，其版號為 <code>DFN2_STREAM_LAYOUT_VERSION</code> = 5，<code>stream/ainr/dfn2/dfn2_stream.h</code>）</td></tr>
-<tr><td><code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 7</td>
-<td><code>pipelines/dfn/dfn_rate_bridge.h</code></td><td>原生格點 ↔ 48 kHz stage 的 rate bridge 轉接層（舊物件；範例直接用 <code>AinrBridge</code>，<code>AINR_BRIDGE_LAYOUT_VERSION</code> = 1，<code>stream/ainr/bridge/ainr_bridge.h</code>）</td></tr>
+<tr><td><code>DFN2_STREAM_LAYOUT_VERSION</code> = 5</td>
+<td><code>stream/ainr/dfn2/dfn2_stream.h</code></td><td>DFN2 模型串流（兩支 pipeline 範例走它）</td></tr>
+<tr><td><code>AINR_BRIDGE_LAYOUT_VERSION</code> = 1</td>
+<td><code>stream/ainr/bridge/ainr_bridge.h</code></td><td>原生格點 ↔ 48 kHz 的取樣率橋接器（範例直接用 <code>AinrBridge</code>）</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18</td>
 <td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code></td><td>Align-ULCNet 模型 I/O 與 state 排列</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> = 4</td>
@@ -315,7 +315,7 @@ post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變�
 (L+1)×512×sr/48000 是整數除法；L+1 不是 3 的倍數時模型延遲含小數個原生樣本，<code>ainr_bridge_added_delay_samples()</code> 向下取整（pair 0/1：501／458／244；pair 2/4：1354／1311／671），
 <code>ainr_bridge_added_delay_exact()</code> 回精確值（分子／6：pair 0/1 為 501 1/3、458 1/3、244 2/3；pair 2/4 為 1354 2/3、1311 2/3、671 1/3）。延遲由脈衝釘住（重心對精確值，容差 0.01 樣本），但訊號經兩顆 FIR resampler 往返，<b>不是</b>逐位元等值
 （<code>stream/ainr/bridge/ainr_bridge.c</code>、
-<code>stream/ainr/bridge/tests/test_ainr_bridge.c</code>、<code>pipelines/dfn/tests/test_dfn_rate_bridge.c</code>）</td></tr>
+<code>stream/ainr/bridge/tests/test_ainr_bridge.c</code>）</td></tr>
 </table>
 </div>
 <p class="note">DFN2 的分析本來就是 center=False 串流（見 <a href="grids.html">訊號 grid、視窗與記憶體版號</a> 的 framing 一節），所以 48 k host 的格點與窗

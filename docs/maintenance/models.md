@@ -117,7 +117,7 @@ make -C AINR/RNNoise-ERB test   # ERB table, feature contract, features, framing
 - [ ] DeepFilterNet2 frames per call (`export_onnx.py --frames-per-call N`, N in 1..64; the C side takes it as
       `DFN2GridSpec.frames_per_call`): N = 1 is the one-frame graph byte for byte; for N > 1 the chunked stream equals
       the one-frame stream (`tests/test_dfn2_frames_per_call.py`, and `tests/test_dfn2_frames_per_call_c.py` for the C host,
-      both in `make -C AINR test-pairs`); `make test` and the pipelines stay at N = 1 (the pipeline stage and rate bridge
+      both in `make -C AINR test-pairs`); `make test` and the pipelines stay at N = 1 (the pipeline hop and rate bridge
       refuse any other value). The accelerator toolchain's support for a GRU with a sequence longer than one and the
       quantized accuracy of an N-frame graph are not measured.
 - [ ] No model library (AINR, AIAEC) holds framing, FFT or window code and no Makefile passes a dead `-D` flag:

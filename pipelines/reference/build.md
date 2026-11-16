@@ -47,7 +47,7 @@ make -C 4ch 4ch_static
 # (also runs as part of `make test` above):
 make example-adapter
 
-# Build the DFN2 archive (model stream, rate bridge, pre/post, the older stage) with no stdio linked in
+# Build the DFN2 archive (model stream, rate bridge, pre/post) with no stdio linked in
 # at all (board images that forbid the stdio symbol set; dfn2_stream.o is built with -DDFN2_STREAM_NO_STDIO,
 # so its ERB file loader is out too), and audit that it holds:
 make NO_STDIO=1 libaudio_pipeline_dfn.a
@@ -62,7 +62,7 @@ make -C 4ch AEC_NO_ARRAY=1 test      # "SKIPPED", exit 0
 # A DeepFilterNet2 lookahead pair other than the default 1/1 selects what the test programs run (the
 # pipeline units hold no pair, see "DFN lookahead pair" below). The DFN C tests rebuilt and run per
 # pair, and at the 16 and 32 kHz test grids:
-make DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4 test_dfn_res_stage
+make DFN2_MASK_LOOKAHEAD=2 DFN2_DF_LOOKAHEAD=4 test_dfn_hop
 make test-pairs DFN_TEST_PAIRS="0/0 2/4"
 make test-dfn-grids
 
@@ -89,9 +89,9 @@ so do not read the twins as identical for every setting (`docs/c_python_function
 `D` in 0..4 (15 legal pairs, no ordering rule between them; `AINR/README.md`, "Lookahead pairs"). The exported graph does
 not depend on the pair, but a checkpoint is tied to the pair it was trained for, and only the shipped 1/1 has one: the
 audio quality of every other pair is unmeasured. The pair is two run-time fields of the model grid
-(`mask_lookahead`, `df_lookahead` of `DFN2GridSpec`), so the units (`dfn2_stream.c`, `ainr_bridge.c`, the older `dfn_res_stage.c` and `dfn_rate_bridge.c`, the
+(`mask_lookahead`, `df_lookahead` of `DFN2GridSpec`), so the units (`dfn2_stream.c`, `ainr_bridge.c`, the
 example mains) hold no grid and no pair: the application builds a `DFN2Grid` with `dfn2_grid_make()` and puts it in
-`DFN2StreamConfig.grid` (the examples: `DfnHopPoolPlan.stream_cfg.grid`; the stage: `DfnResStageConfig.grid`), and the example mains read it from `--ai-sample-rate` / `--ai-fft-size`. `Makefile` takes
+`DFN2StreamConfig.grid` (the examples: `DfnHopPoolPlan.stream_cfg.grid`), and the example mains read it from `--ai-sample-rate` / `--ai-fft-size`. `Makefile` takes
 `DFN2_MASK_LOOKAHEAD` and `DFN2_DF_LOOKAHEAD` (default 1/1, each a single decimal in range) and `DFN2_TEST_GRID_KHZ` (16, 32 or 48,
 default 48); they select only what the **test programs** run:
 `-DDFN2_GRID_KHZ=<n>` (when `DFN2_TEST_GRID_KHZ` is not 48) and `-DDFN2_MASK_LOOKAHEAD=<M> -DDFN2_DF_LOOKAHEAD=<D>` (when the pair is
@@ -105,10 +105,10 @@ rebuilds and runs the DFN C tests for each pair of `DFN_TEST_PAIRS` (default `0/
 test prints the pair it was built with and (the stage test, the mono composition) the stage latency it measured;
 `dfn/tests/check_pair_report.sh` compares them with the pair asked for and with `(M + D + 1) * hop`, so a pair flag that never
 reached a test build is red. The other pairs are not exercised by it. `make test-dfn-grids` builds the stage, bridge and hop tests for the 16 and 32 kHz
-test grids (with the test header's pair 1/1, not the 0/0 of those rows in the example table: it runs the same stage code at another
+test grids (with the test header's pair 1/1, not the 0/0 of those rows in the example table: it runs the same code at another
 grid, it does not test a table row).
 
-`make` builds the mono executables and the DFN2 archive (`libaudio_pipeline_dfn.a`: `dfn2_stream.o`, `ainr_bridge.o`, the DFN2 pre/post objects, `dfn_res_stage.o`, `dfn_rate_bridge.o`). A unit that includes `dfn/dfn_hop.h` or `dfn/dfn_hop_pool.h` compiles with `-I ../stream/ainr/dfn2 -I ../stream/ainr/bridge -I ../stream/common` (`DFN_HOP_INC`). There is no mono
+`make` builds the mono executables and the DFN2 archive (`libaudio_pipeline_dfn.a`: `dfn2_stream.o`, `ainr_bridge.o`, the DFN2 pre/post objects). A unit that includes `dfn/dfn_hop.h` or `dfn/dfn_hop_pool.h` compiles with `-I ../stream/ainr/dfn2 -I ../stream/ainr/bridge -I ../stream/common` (`DFN_HOP_INC`). There is no mono
 library archive: the mono examples link the producer libraries (`libaec.a`, `libanr.a`,
 `libaudio_common.a`) directly and carry their grid derivation and per-hop chain in their own
 sources. The 4-channel array is not a pipeline archive: it is an instance of the AEC library (`libaec.a`,
@@ -219,7 +219,7 @@ allocation ever, end to end, not just on the per-hop audio path.
 增益／頻譜緩衝，把各塊切在自己的 pool 裡，再逐個 `init`
 （`mono/aec_nr_res/main.c` 的 `derive_lane()` / `post_plan()` / `pool_bytes()` / `rig_build()` 就是這段
 的最小寫法；每 hop 的串接寫在該檔的 `mono_form()`，可整段複製改寫）。帶 descriptor 的物件是 `Aec`（單支與 4ch array 同一個型別：`aec_get_mem_requirements()` → `aec_init_ex()`；4ch array 的 descriptor 涵蓋整個 pool，
-四條 lane、共用 `DelayAec` 與增益級都在內）以及 DFN2 的模型串流與取樣率橋接器（`DFN2Stream`、`AinrBridge`；舊的 `DfnResStage`／`DfnRateBridge` 也是），其餘函式庫
+四條 lane、共用 `DelayAec` 與增益級都在內）以及 DFN2 的模型串流與取樣率橋接器（`DFN2Stream`、`AinrBridge`），其餘函式庫
 （`AnrDenoiser`、`AcIstft`）各有自己的 `*_mem_size` 與 `init`，整合者自己加總（DFN2 範例的尾段由 `dfn_hop_pool_plan()`／`dfn_hop_pool_bytes()`／`dfn_hop_pool_build()` 一次算完切好）。神經網路的遞迴 state 不在任何一個
 pool 裡：float 主機登錄自己的 buffer，板端由加速器持有並依 state generation 重載量化零（`mono_aec_dfn_res`、`mono_alignulcnet` 的 `run_accelerator()` 註解寫明）；
 DFN2 的 ERB 矩陣由應用讀入並持有（範例 `--erb-fwd` / `--erb-inv` 各讀一個 raw float32 檔），函式庫只借兩個指標，矩陣也不在任何 pool 裡。
