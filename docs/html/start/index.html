@@ -10,7 +10,7 @@
 <nav aria-label="導覽"><a href="../index.html">Audio_ALG</a></nav>
 <main>
 <h1>建置與第一次執行</h1>
-<p>在 <code>Audio_ALG/</code> 根目錄執行。預設從同層的 <code>AEC/</code>、<code>NR/</code> 和 <code>audiolib/</code> 讀取 C 原始碼，版本由 <code>lib/*.pin</code> 指定。</p>
+<p>在 <code>Audio_ALG/</code> 根目錄執行。預設從同層的 <code>AEC/</code>、<code>NR/</code> 和 <code>audiolib/</code> 讀取 C 原始碼，版本由 <code>lib/*.pin</code> 指定。工作區路徑與 <code>CFLAGS</code>、include 路徑不可含空白或引號。</p>
 
 <h2>建置 mono 範例</h2><pre><code>make -f lib/deps.mk bootstrap-deps
 make -C pipelines check-pins

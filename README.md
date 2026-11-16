@@ -16,4 +16,4 @@ bin="$(make -s -C pipelines print-bin-dir)"
 "$bin/aec_nr_pipeline" mic.wav far.wav out.wav 1 --nr-level 2
 ```
 
-C 建置預設從同層的 AEC、NR、audiolib 讀取依賴，版本在 `lib/*.pin`。執行 Python pipeline 或 C／Python parity 前，另執行 `git submodule update --init --recursive`，以取得 Python 套件及錄音。
+C 建置預設從同層的 AEC、NR、audiolib 讀取依賴，版本在 `lib/*.pin`。工作區路徑與 `CFLAGS`、include 路徑不可含空白或引號。執行 Python pipeline 或 C／Python parity 前，另執行 `git submodule update --init --recursive`，以取得 Python 套件及錄音。
