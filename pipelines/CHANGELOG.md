@@ -32,6 +32,13 @@
 - `docs/c_python_function_map.md`: PL-DFN-01, -02, -03, -05, -06 and -11 are removed (`Dfn2Stage.push` and `Dfn2Stage.reset` are now covered only by the partial rows AINR-DFN2-15, -16 and -17; `dfn2_stream.c` is not a covered file), PL-DFN-07, -09, -10 and -13 name `ainr_bridge.c` only; 879 -> 827 C functions.
 - No layout version, descriptor or pool size of a retained module changes.
 
+## [Unreleased] — 2026-11-16 — Align-ULCNet stream: the int16 pre_process entry is removed (`ULCNET_STREAM_LAYOUT_VERSION` 6)
+
+- **Public API removed** `ulcnet_stream_pre_process()` (the `int16_t` entry; no product code called it). A caller feeds `ulcnet_stream_pre_process_f32()` (full-scale float, `/ 32768.0f` of the old int16 samples gives the same input bit for bit), the packet entry or the `_freq` entries. `ulcnet_stream_post_process()` still writes int16 PCM.
+- **Pool change** The per-hop `err_f` / `far_f` conversion scratch is gone: a full (non-`freq_only`) stream is smaller by 2 x hop floats plus 16 bytes of struct (host 16 kHz / 512: 103312 -> 101248 bytes; 16 kHz / 256: 53648 -> 52608; 48 kHz / 1024: 202640 -> 198528), a `freq_only` stream by 16 bytes. `ULCNET_STREAM_LAYOUT_VERSION` 5 -> 6, so a pool sized by an older build is refused by `ulcnet_stream_init_ex()`.
+- **Tests** `smoke_ulcnet_stream`, `verify_vs_sample` (its int16 rows convert through a test helper into the f32 entry), `test_ulcnet_pcm_events` (the int16 == quantised-f32 comparison goes with the entry) and `freq_only` (pinned pool bytes) drive the f32 entry. `link-only-aiaec` no longer expects the symbol.
+- **Docs** `docs/html/start/reference/integration.html` (layout-version table), `docs/html/models/align-ulcnet/reference/core.html`, `CLAUDE.md`.
+
 ## [Unreleased] — 2026-11-16 — AIAEC: the production catalog registers the 16 kHz / 256 and 16 kHz / 512 graphs of both models
 
 - **Production catalog** (`stream/aiaec/aiaec.c`). DeepVQE-S 16k/256 N=1 and 16k/512 N=1 resolve to `/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin`; Align-ULCNet 16k/256 N=1 and 16k/512 N=1 resolve to `/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin`. Each path is written once (one macro per model). The card holds one graph per model, which runs only at its own `--fft-size`: the sample's `graph_io_check_ports()` refuses the other grid at init, before any inference. Every N=8 row, N=2 and a `hop_in` that is not a model-hop multiple are refused (`AIAEC_ERR_FRAMES_PER_CALL`, `AIAEC_ERR_IN_HOP`). The test catalog is unchanged.

@@ -23,13 +23,13 @@ typedef struct Row { int sr, fft, depth, n; size_t slim_bytes; } Row;
 
 /* The pinned bytes are host (LP64) numbers. */
 static const Row ROWS[] = {
-    { 16000, 256, 63, 1, 7824 },
-    { 16000, 256, 63, 8, 58320 },
-    { 16000, 512, 32, 1, 14992 },
-    { 16000, 512, 32, 8, 115664 },
-    { 48000, 1024, 47, 1, 29328 },
-    { 48000, 1024, 47, 8, 230352 },
-    { 16000, 512, 32, 64, 922064 },
+    { 16000, 256, 63, 1, 7808 },
+    { 16000, 256, 63, 8, 58304 },
+    { 16000, 512, 32, 1, 14976 },
+    { 16000, 512, 32, 8, 115648 },
+    { 48000, 1024, 47, 1, 29312 },
+    { 48000, 1024, 47, 8, 230336 },
+    { 16000, 512, 32, 64, 922048 },
 };
 
 #define GUARD 4096u
@@ -221,9 +221,6 @@ static void check_pcm_refused(UlcnetStream *slim, const unsigned char *pool, siz
         CHECK(ulcnet_stream_pre_process_f32(slim, pcm_f, pcm_f, d[0], &io) == -1, "%s: f32 pre_process accepted", label);
         CHECK(memcmp(snap, pool, bytes) == 0 && memcmp(&io, &before, sizeof io) == 0 &&
               ulcnet_stream_state_generation(slim) == gen, "%s: a refused f32 pre_process changed the stream", label);
-        CHECK(ulcnet_stream_pre_process(slim, pcm, pcm, d[0], &io) == -1, "%s: int16 pre_process accepted", label);
-        CHECK(memcmp(snap, pool, bytes) == 0 && memcmp(&io, &before, sizeof io) == 0 &&
-              ulcnet_stream_state_generation(slim) == gen, "%s: a refused int16 pre_process changed the stream", label);
     } else {
         CHECK(ulcnet_stream_pre_process_packet_f32(slim, pcm_f, pcm_f, d, &io) == -1,
               "%s: f32 packet pre_process accepted", label);
@@ -254,7 +251,7 @@ static size_t framing_bytes(const UlcnetGrid *g, int n) {
     ac_stft_config_default(&scfg, g->n_fft);
     scfg.ola = AC_OLA_ACCUMULATE;
     return ck_align16_size(fft_get_mem_size(g->n_fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&scfg)) +
-           ck_align16_size(ac_istft_get_mem_size(&scfg)) + ck_align16_size((3u * hop + 6u * plane) * sizeof(float));
+           ck_align16_size(ac_istft_get_mem_size(&scfg)) + ck_align16_size((hop + 6u * plane) * sizeof(float));
 }
 
 static void run_row(const Row *r) {

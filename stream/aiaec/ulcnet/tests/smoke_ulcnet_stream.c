@@ -35,7 +35,7 @@ static int fake_accelerator(UlcnetModelIoOutputs *out) {
 
 /* Independent confirmation against the bare UlcnetPrepost class: pre_process_freq() then
  * frame_bypass() with no frame_open() in between -- exactly the sequence a reprime hop uses
- * inside ulcnet_stream_pre_process(). Prints and returns frame_bypass()'s actual return value. */
+ * inside ulcnet_stream_pre_process_f32(). Prints and returns frame_bypass()'s actual return value. */
 static int confirm_bare_frame_bypass_after_pre_process_freq(const UlcnetGrid *grid) {
     UlcnetPrepostConfig pcfg;
     UlcnetPrepostMemReq preq;
@@ -87,7 +87,8 @@ int main(void) {
     UlcnetStreamMemReq req;
     UlcnetStream *s;
     void *pool;
-    int16_t *err_in, *far_in, *pcm_out;
+    float *err_in, *far_in;
+    int16_t *pcm_out;
     int hop, hops, i, k;
     int bare_bypass_rc;
     const int reprime_hop = 5;
@@ -116,7 +117,7 @@ int main(void) {
     bare_bypass_rc = confirm_bare_frame_bypass_after_pre_process_freq(&grid);
     if (bare_bypass_rc != 0) {
         fprintf(stderr, "bare frame_bypass() check did not return 0 (got %d) -- the reprime path "
-                        "inside ulcnet_stream_pre_process() relies on this returning 0\n",
+                        "inside ulcnet_stream_pre_process_f32() relies on this returning 0\n",
                 bare_bypass_rc);
         return 1;
     }
@@ -164,8 +165,8 @@ int main(void) {
         fprintf(stderr, "ulcnet_stream_hop_size returned %d\n", hop);
         return 1;
     }
-    err_in = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
-    far_in = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
+    err_in = (float *)calloc((size_t)hop, sizeof(float));
+    far_in = (float *)calloc((size_t)hop, sizeof(float));
     pcm_out = (int16_t *)calloc((size_t)hop, sizeof(int16_t));
     if (!err_in || !far_in || !pcm_out) {
         fprintf(stderr, "pcm buffer allocation failed\n");
@@ -179,14 +180,14 @@ int main(void) {
         int pre_rc, post_rc, ai_rc = 0;
 
         for (k = 0; k < hop; ++k) {
-            err_in[k] = (int16_t)((k * 7 + i * 3) % 101 - 50);
-            far_in[k] = (int16_t)((k * 11 + i * 5) % 97 - 48);
+            err_in[k] = (float)((k * 7 + i * 3) % 101 - 50) / 32768.0f;
+            far_in[k] = (float)((k * 11 + i * 5) % 97 - 48) / 32768.0f;
         }
 
         delay.changed = (i == reprime_hop) ? 1 : 0;
         delay.solid = 1;
 
-        pre_rc = ulcnet_stream_pre_process(s, err_in, far_in, delay, &io);
+        pre_rc = ulcnet_stream_pre_process_f32(s, err_in, far_in, delay, &io);
         if (pre_rc < 0) {
             fprintf(stderr, "pre_process rc=%d at hop %d (expected 0 or 1)\n", pre_rc, i);
             return 1;

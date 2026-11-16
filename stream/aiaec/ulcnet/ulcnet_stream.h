@@ -2,7 +2,7 @@
  * UlcnetPrepost lifecycle and alignment reset / reprime; one hop of PCM per call, no HPF. A post-filter BEHIND a linear
  * AEC: the inputs are its linear-error hop and the raw far, never raw mic.
  *
- *     per hop: pre_rc = ulcnet_stream_pre_process(ctx, err_in, far_in, delay, &io);   // -1: contract error
+ *     per hop: pre_rc = ulcnet_stream_pre_process_f32(ctx, err_in, far_in, delay, &io);   // -1: contract error
  *              if (pre_rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs); }
  *              ulcnet_stream_post_process(ctx, ai_rc, pcm_out);
  *
@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #define ULCNET_STREAM_DESCRIPTOR_VERSION 1u
-#define ULCNET_STREAM_LAYOUT_VERSION     5u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define ULCNET_STREAM_LAYOUT_VERSION     6u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define ULCNET_STREAM_ALIGNMENT          16u
 /* Identity hops after an alignment boundary: each frame spans two hops, so only the boundary hop's frame straddles it. */
 #define ULCNET_STREAM_REPRIME_FRAMES     1u
@@ -102,13 +102,9 @@ typedef struct UlcnetHopIO {
 
 /* One hop in as full-scale float err_in and far_in (hop_size samples each): alignment-edge check (may restart the model), analysis,
  * pre_process_freq, then frame_bypass (reprime hop: io zeroed, returns 0) or frame_open (returns 1). -1: contract error
- * (a freq_only stream included). The int16 entry below round-trips float lanes through int16 (up to 4 LSB of PCM). */
+ * (a freq_only stream included). */
 int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                   UlcnetStreamDelay delay, UlcnetHopIO *io);
-
-/* int16 wrapper: converts (/32768.0f), then the f32 path; same returns. */
-int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
-                              UlcnetStreamDelay delay, UlcnetHopIO *io);
 
 /* Once per pre_process. ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail
  * OPEN). pcm_out is a full hop (return 1), a reprime or alignment-event hop included (its frame is the error spectrum).

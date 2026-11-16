@@ -32,9 +32,7 @@ struct UlcnetStream {
     AcIstft   *istft;
     UlcnetPrepost *prepost;
 
-    /* Per-job scratch, one slab: err_f / far_f / hop_out [hop], err_re / err_im / far_re / far_im / enh_re / enh_im [frames * n_bins]. */
-    float *err_f;
-    float *far_f;
+    /* Per-job scratch, one slab: hop_out [hop], err_re / err_im / far_re / far_im / enh_re / enh_im [frames * n_bins]. */
     float *hop_out;
     float *err_re;
     float *err_im;
@@ -125,12 +123,11 @@ static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *ba
     out->prepost_bytes = (size_t)pp_req.bytes;
     out->prepost_build_hash = pp_req.build_flags_hash;
 
-    /* err_f, far_f, hop_out [hop] + err_re, err_im, far_re, far_im, enh_re, enh_im [frames * n_bins], one
-     * slab (the other stream modules' "one aligned slab" pattern); only the slab base is part of
-     * the pool ABI. */
+    /* hop_out [hop] + err_re, err_im, far_re, far_im, enh_re, enh_im [frames * n_bins], one slab; only the slab base is
+     * part of the pool ABI. */
     if (!cfg->freq_only) {
         scratch_bytes = ck_add_size(
-            ck_mul_size(3u, ck_mul_size(hop, sizeof(float))),
+            ck_mul_size(hop, sizeof(float)),
             ck_mul_size(6u, ck_mul_size(plane_bins, sizeof(float))));
         if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
             return -1;
@@ -235,9 +232,7 @@ static UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, un
         hop = (size_t)cfg->grid.hop;
         n_bins = (size_t)cfg->grid.n_bins;
         plane_bins = (size_t)s->frames * n_bins;
-        s->err_f = (float *)layout->scratch_mem;
-        s->far_f = s->err_f + hop;
-        s->hop_out = s->far_f + hop;
+        s->hop_out = (float *)layout->scratch_mem;
         s->err_re = s->hop_out + hop;
         s->err_im = s->err_re + plane_bins;
         s->far_re = s->err_im + plane_bins;
@@ -339,8 +334,7 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 
     apply_alignment_edge(s, delay);
 
-    /* err_in/far_in are read once each, here, and never stored -- the scratch slab exists only
-     * for ulcnet_stream_pre_process()'s int16 conversion below. */
+    /* err_in and far_in are read once here and not stored. */
     ac_stft_push_planar(s->stft_err, err_in, s->err_re, s->err_im);
     ac_stft_push_planar(s->stft_far, far_in, s->far_re, s->far_im);
 
@@ -403,23 +397,6 @@ int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, 
         return -1;
     packet_events(s, delay, events);
     return open_packet(s, err_re, err_im, far_re, far_im, events, io);
-}
-
-int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
-                              UlcnetStreamDelay delay, UlcnetHopIO *io) {
-    int hop, i;
-
-    /* Thin int16 wrapper: converts into the per-hop float scratch, then runs
-     * ulcnet_stream_pre_process_f32()'s path (see ulcnet_stream.h). The contract check is
-     * repeated here, not deferred to the f32 call, so a refused call never touches
-     * s->err_f/far_f -- the "no state touched before any write" shape used elsewhere in this file. */
-    if (!s || !err_in || !far_in || !io || !s->stft_err || s->hop_state != ULCNET_STREAM_IDLE || s->frames != 1) return -1;
-    hop = s->grid.hop;
-    for (i = 0; i < hop; ++i) {
-        s->err_f[i] = (float)err_in[i] / 32768.0f;
-        s->far_f[i] = (float)far_in[i] / 32768.0f;
-    }
-    return ulcnet_stream_pre_process_f32(s, s->err_f, s->far_f, delay, io);
 }
 
 int ulcnet_stream_post_process_freq(UlcnetStream *s, int ai_rc, float *re, float *im) {

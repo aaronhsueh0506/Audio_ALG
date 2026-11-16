@@ -1,7 +1,7 @@
 /* The PCM entries of ulcnet_stream through alignment events. An event restarts only the model (state, generation, one
  * identity hop): the stream's analysis and synthesis keep running, so the PCM of every hop, the event hops included,
  * equals the spectrum entries driven by an AcStft / AcIstft pair of the caller's. Checked here sample for sample on two
- * grids, for the one-hop f32 and int16 entries and for the packet entry (N = 8, against the one-hop stream), through
+ * grids, for the one-hop f32 entry and for the packet entry (N = 8, against the one-hop stream), through
  * changed events, a solid false -> true edge, an event on hop #0 and two events in a row. The stand-in accelerator's mask
  * depends on the hops since the last model restart, so a model that was not restarted (or restarted twice) shows. */
 #include <math.h>
@@ -119,19 +119,17 @@ static long long energy(const int16_t *x, int n) {
 static void run_grid(int sample_rate, int n_fft) {
     const UlcnetGridSpec spec = { sample_rate, n_fft, 8 };
     UlcnetGrid g;
-    UlcnetStream *s_f32, *s_i16, *s_ref, *s_pkt;
+    UlcnetStream *s_f32, *s_ref, *s_pkt;
     Framing fr;
-    Fake f_f32 = {0, 0, 0}, f_i16 = {0, 0, 0}, f_ref = {0, 0, 0}, f_pkt = {0, 0, 0};
-    static int16_t pcm_f32[HOPS * HOP_MAX], pcm_i16[HOPS * HOP_MAX], pcm_ref[HOPS * HOP_MAX], pcm_pkt[HOPS * HOP_MAX];
+    Fake f_f32 = {0, 0, 0}, f_ref = {0, 0, 0}, f_pkt = {0, 0, 0};
+    static int16_t pcm_f32[HOPS * HOP_MAX], pcm_ref[HOPS * HOP_MAX], pcm_pkt[HOPS * HOP_MAX];
     static float err[NF * HOP_MAX], far[NF * HOP_MAX], er[BINS_MAX], ei[BINS_MAX], fr_[BINS_MAX], fi[BINS_MAX];
     static float out_re[BINS_MAX], out_im[BINS_MAX], hop_out[HOP_MAX];
-    static int16_t err_q[HOP_MAX], far_q[HOP_MAX];
     long long edge_energy = 0;
     int h, i, edges = 0, edge_hops_nonzero = 0;
 
     if (ulcnet_grid_make(&g, &spec) != ULCNET_GRID_OK) abort();
     s_f32 = stream_make(&g, 1, 0);
-    s_i16 = stream_make(&g, 1, 0);
     s_ref = stream_make(&g, 1, 1);
     s_pkt = stream_make(&g, NF, 0);
     framing_make(&fr, g.n_fft);
@@ -149,16 +147,6 @@ static void run_grid(int sample_rate, int n_fft) {
         CHECK(ulcnet_stream_post_process(s_f32, pre == 1 ? STREAM_RUN_OK : STREAM_RUN_NOT_STARTED, pcm_f32 + (size_t)h * g.hop) == 1,
               "%d: f32 post", h);
 
-        /* the int16 entry: the same signal quantised the way the entry quantises */
-        for (i = 0; i < g.hop; ++i) {
-            err_q[i] = stream_saturate_s16(err[i] * 32768.0f);
-            far_q[i] = stream_saturate_s16(far[i] * 32768.0f);
-        }
-        pre = ulcnet_stream_pre_process(s_i16, err_q, far_q, d, &io);
-        if (pre == 1) fake_run(&f_i16, &io, 1);
-        CHECK(ulcnet_stream_post_process(s_i16, pre == 1 ? STREAM_RUN_OK : STREAM_RUN_NOT_STARTED, pcm_i16 + (size_t)h * g.hop) == 1,
-              "%d: i16 post", h);
-
         /* the reference: the caller's analysis and synthesis around the spectrum entries, never restarted */
         (void)ac_stft_push_planar(fr.err, err, er, ei);
         (void)ac_stft_push_planar(fr.far, far, fr_, fi);
@@ -173,29 +161,6 @@ static void run_grid(int sample_rate, int n_fft) {
           "%d Hz: the f32 entry differs from the spectrum entries around the caller's framing", sample_rate);
     CHECK(f_f32.jobs == f_ref.jobs && f_f32.jobs == HOPS - edges, "%d Hz: jobs f32 %ld ref %ld, want %d", sample_rate, f_f32.jobs,
           f_ref.jobs, HOPS - edges);
-
-    /* the int16 entry equals the f32 entry fed the same quantised signal: its own check against the reference above is
-     * not exact (quantisation), so the second reference is a stream driven through the f32 entry with err_q / 32768 */
-    {
-        UlcnetStream *s_q = stream_make(&g, 1, 0);
-        Fake f_q = {0, 0, 0};
-        static int16_t pcm_q[HOPS * HOP_MAX];
-        for (h = 0; h < HOPS; ++h) {
-            UlcnetHopIO io;
-            int pre;
-            signal_hop(h, g.hop, err, far);
-            for (i = 0; i < g.hop; ++i) {
-                err[i] = (float)stream_saturate_s16(err[i] * 32768.0f) / 32768.0f;
-                far[i] = (float)stream_saturate_s16(far[i] * 32768.0f) / 32768.0f;
-            }
-            pre = ulcnet_stream_pre_process_f32(s_q, err, far, event_of(h), &io);
-            if (pre == 1) fake_run(&f_q, &io, 1);
-            CHECK(ulcnet_stream_post_process(s_q, pre == 1 ? STREAM_RUN_OK : STREAM_RUN_NOT_STARTED, pcm_q + (size_t)h * g.hop) == 1,
-                  "%d: q post", h);
-        }
-        CHECK(memcmp(pcm_i16, pcm_q, sizeof(int16_t) * (size_t)HOPS * g.hop) == 0,
-              "%d Hz: the int16 entry differs from the f32 entry on the same quantised signal", sample_rate);
-    }
 
     /* the packet entry: N = 8 hops per job equal the one-hop stream */
     for (h = 0; h < HOPS; h += NF) {
@@ -229,7 +194,7 @@ static void run_grid(int sample_rate, int n_fft) {
     CHECK(ulcnet_stream_state_generation(s_f32) == (uint32_t)edges && ulcnet_stream_state_generation(s_pkt) == 0u,
           "%d Hz: generation f32 %u (want %d, one per event), packet %u (want 0: the graph restarts the model)", sample_rate,
           ulcnet_stream_state_generation(s_f32), edges, ulcnet_stream_state_generation(s_pkt));
-    printf("  %d Hz / fft %d: %d hops, %d events (every one after hop #0 carries signal, energy %lld), f32 == spectrum entries + framing, int16 == f32 on the quantised signal, N = 8 == N = 1\n",
+    printf("  %d Hz / fft %d: %d hops, %d events (every one after hop #0 carries signal, energy %lld), f32 == spectrum entries + framing, N = 8 == N = 1\n",
            sample_rate, n_fft, HOPS, edges, edge_energy);
 }
 

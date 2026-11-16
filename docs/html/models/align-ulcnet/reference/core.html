@@ -342,7 +342,7 @@ PCM in (float AEC error, float raw far)
 對齊邊界檢查 (delay.changed || !prev_solid &amp;&amp; delay.solid)
   |-- 是 --> 只重啟模型 (UlcnetPrepost reset, generation +1) + 武裝 1 個 reprime hop；STFT x2 與 ISTFT 照跑
   v
-float 直接送入分析（int16 wrapper 先除以 32768）
+float 直接送入分析
   |
   v
 ac_stft_push_planar x2 (stft_err, stft_far) -----> err_re/im, far_re/im
@@ -401,7 +401,7 @@ k     pre_process -> open --------------------------------------->  替身回 ST
 <h2 id="section-11">I/O 表</h2>
 <div class="tbl"><table>
 <tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
-<tr><td>輸入</td><td><code>err_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>（<code>ulcnet_stream_pre_process</code>）或 <code>const float*</code> 滿幅 ~=1.0（<code>ulcnet_stream_pre_process_f32</code>，可直接接板端 AEC 的浮點輸出）；各長度 <code>ulcnet_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
+<tr><td>輸入</td><td><code>err_in</code>、<code>far_in</code></td><td><code>const float*</code> 滿幅 ~=1.0（<code>ulcnet_stream_pre_process_f32</code>，可直接接板端 AEC 的浮點輸出）；各長度 <code>ulcnet_stream_hop_size(s)</code></td><td>每 hop 1 次</td><td>1 hop（16 kHz／512 時為 256 samples）</td></tr>
 <tr><td>輸入</td><td><code>delay</code>（<code>UlcnetStreamDelay</code>）</td><td><code>{int changed, int solid}</code>，by value</td><td>每 hop 1 次</td><td>—</td></tr>
 <tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>UlcnetModelIoInputs</code>）</td><td><code>error_mag</code>／<code>far_mag</code>／<code>error_cos</code>／<code>error_sin</code> 各 <code>[BINS]</code>，<code>key_history</code>／<code>value_history</code>／<code>logit_history</code>／<code>h_gru</code> 視圖</td><td>僅 <code>pre_process</code> 回 1 時有效；回 0（reprime）時 <code>*io</code> 全零且不可用</td><td>—</td></tr>
 <tr><td>輸出</td><td><code>io.outputs</code>（<code>UlcnetModelIoOutputs</code>）</td><td><code>output</code>（mask）＋四組 <code>*_history_out</code>／<code>h_gru_out</code>（NaN 預填）</td><td>加速器寫一次</td><td>—</td></tr>
