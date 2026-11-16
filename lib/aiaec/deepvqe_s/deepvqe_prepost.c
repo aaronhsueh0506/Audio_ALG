@@ -513,7 +513,7 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p) {
     int ok;
     int id, i;
     int n_bins;
-    size_t taps_per_frame;
+    size_t taps_per_frame, enh_elements;
 
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
 
@@ -539,6 +539,13 @@ int deepvqe_prepost_frame_finish(DeepVqePrepost *p) {
         deepvqe_ccm_process(&p->ccm, p->mic_re + at, p->mic_im + at,
                             p->taps + (size_t)i * taps_per_frame,
                             p->enh_re + at, p->enh_im + at);
+    }
+    /* Finite taps can still overflow the convolution, and a huge finite mic bin passes through it. */
+    enh_elements = (size_t)p->frames_per_call * (size_t)n_bins;
+    if (!all_finite(p->enh_re, enh_elements) || !all_finite(p->enh_im, enh_elements)) {
+        zero_state(p);
+        p->prepared = 0;
+        return -1;
     }
     p->deliver_slot = 0;
     p->frame_open = 0;

@@ -1526,6 +1526,52 @@ static int case_whole(void) {
     return 0;
 }
 
+/* ---- enhanced: a finite batch whose enhanced spectrum overflows ------- */
+
+/* A mic spectrum at the top of the float range and finite taps: every bin with a full set of taps overflows the
+ * convolution. The commit is refused like a non-finite tap (generation +1, state zero, the batch stays open for the
+ * bypass, which writes silence), and the next frame is a cold start. */
+static int case_enhanced(void) {
+    Inst inst, fresh;
+    DeepVqePrepostInputs inputs;
+    DeepVqePrepostOutputs outputs;
+    static float big_re[BINS_MAX], big_im[BINS_MAX], g_re[BINS_MAX], g_im[BINS_MAX];
+    static float a_re[BINS_MAX], a_im[BINS_MAX], b_re[BINS_MAX], b_im[BINS_MAX];
+    uint32_t before;
+    size_t i;
+
+    CHECK(inst_make(&inst) == 0);
+    CHECK(inst_make(&fresh) == 0);
+    for (i = 0; i < BINS; ++i) { big_re[i] = 3.0e38f; big_im[i] = 0.0f; }
+    make_frame(g_re, g_im, 0.25f);
+    before = deepvqe_prepost_state_generation(inst.p);
+
+    CHECK(deepvqe_prepost_pre_process_freq(inst.p, big_re, big_im, g_re, g_im) == 1);
+    CHECK(deepvqe_prepost_frame_open(inst.p, &inputs, &outputs) == 0);
+    for (i = 0; i < outputs.taps_elements; ++i) outputs.taps[i] = 0.5f;
+    CHECK(deepvqe_prepost_frame_finish(inst.p) == -1);
+    CHECK(deepvqe_prepost_state_generation(inst.p) == before + 1u);
+    CHECK(inst_state_zero(&inst));
+    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == -1);   /* the batch is still open */
+    CHECK(deepvqe_prepost_frame_bypass(inst.p) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == 0);
+    CHECK(all_zero(a_re, BINS) && all_zero(a_im, BINS));
+
+    /* the ring was emptied with the state: the next frame equals a fresh instance's first frame */
+    CHECK(open_and_run(inst.p, &inputs, &outputs, 0.125f) == 0);
+    CHECK(deepvqe_prepost_frame_finish(inst.p) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(inst.p, a_re, a_im) == 0);
+    CHECK(open_and_run(fresh.p, &inputs, &outputs, 0.125f) == 0);
+    CHECK(deepvqe_prepost_frame_finish(fresh.p) == 0);
+    CHECK(deepvqe_prepost_post_process_freq(fresh.p, b_re, b_im) == 0);
+    CHECK(memcmp(a_re, b_re, BINS * sizeof(float)) == 0 && memcmp(a_im, b_im, BINS * sizeof(float)) == 0);
+    CHECK(!all_zero(a_re, BINS));
+
+    inst_free(&inst);
+    inst_free(&fresh);
+    return 0;
+}
+
 /* ---- generation: the restart counter ---------------------------------- */
 
 static int case_generation(void) {
@@ -2155,6 +2201,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
     else if (strcmp(argv[1], "inplace") == 0)   status = case_inplace();
     else if (strcmp(argv[1], "whole") == 0)     status = case_whole();
+    else if (strcmp(argv[1], "enhanced") == 0)  status = case_enhanced();
     else if (strcmp(argv[1], "generation") == 0) status = case_generation();
     else if (strcmp(argv[1], "fail") == 0)      status = case_fail();
     else if (strcmp(argv[1], "failboard") == 0) status = case_fail_board();
@@ -2332,6 +2379,13 @@ def test_commit_reads_the_whole_of_every_registered_buffer(driver):
     frame and the frame a window drops are all refused, zero every tensor and
     advance the generation; h_gru is checked whole."""
     _run(driver, 'whole')
+
+
+def test_a_finite_batch_with_an_overflowing_enhanced_spectrum_is_refused(driver):
+    """Finite taps on a mic spectrum near FLT_MAX overflow the CCM sum: frame_finish
+    refuses the batch like a non-finite tap (-1, generation +1, state zero, the batch
+    stays open for frame_bypass, which writes silence) and the next frame is a cold start."""
+    _run(driver, 'enhanced')
 
 
 def test_state_generation_counts_restarts(driver):

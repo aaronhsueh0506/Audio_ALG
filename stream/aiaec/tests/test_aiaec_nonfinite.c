@@ -12,6 +12,9 @@
  *            AIAEC_ERR_NONFINITE_INPUT before any state change. No block is open (postprocess is a sequence error),
  *            the generation is unchanged, and a run that was offered the bad block in between equals, bit for bit,
  *            a twin that never saw it: the tensors handed out, the state generation and every output.
+ *   overflow DeepVQE-S _freq: a mic spectrum near FLT_MAX is accepted and finite taps overflow the CCM sum; the block
+ *            closes with zero spectra (never an Inf), the generation moves by one, and the next block equals a fresh
+ *            instance's first block.
  *   order    a wrong kind, a wrong size or a NULL plane is reported as such even when the planes also hold NaN.
  *   mixed    a bad input offered while a block is open is a sequence error and leaves that block intact. */
 
@@ -245,6 +248,52 @@ static int section_limit(void) {
     return bad;
 }
 
+#if PRODUCT_DV
+/* ---------------------------------------------------------------------------------------------
+ * overflow
+ * ------------------------------------------------------------------------------------------- */
+static int section_overflow(void) {
+    static Out out, fresh_out;
+    int g, bad = 0;
+    for (g = 0; g < N_GRIDS; ++g) {
+        Inst x, y;
+        StreamWork w;
+        size_t i, len;
+        unsigned int before;
+        int rc, zero = 1;
+        if (inst_open(&x, GRIDS[g].fft, GRIDS[g].n, 1) != 0 || inst_open(&y, GRIDS[g].fft, GRIDS[g].n, 1) != 0) return 1;
+        len = plane_len(&x);
+        fill_clean(&x, 0);
+        for (i = 0; i < len; ++i) { x.plane[0][i] = 3.0e38f; x.plane[1][i] = 0.0f; }
+        before = inst_gen(&x);
+        rc = inst_pre(&x, &w);
+        CHECK(rc == AIAEC_OK, "overflow fft=%d N=%d: a finite mic spectrum near FLT_MAX refused rc=%d", GRIDS[g].fft, GRIDS[g].n, rc);
+        for (i = 0; rc == AIAEC_OK && i < w.outputs[0].elements; ++i) w.outputs[0].data[i] = 0.5f;
+        rc = inst_post(&x, STREAM_RUN_OK, &out);
+        for (i = 0; i < len; ++i) zero = zero && out.re[i] == 0.0f && out.im[i] == 0.0f;
+        CHECK(rc == AIAEC_OK && out_finite(&x, &out) && zero, "overflow fft=%d N=%d: postprocess rc=%d, spectra finite %d, zero %d",
+              GRIDS[g].fft, GRIDS[g].n, rc, out_finite(&x, &out), zero);
+        CHECK(inst_gen(&x) == before + 1u, "overflow fft=%d N=%d: generation %u -> %u, want +1", GRIDS[g].fft, GRIDS[g].n, before, inst_gen(&x));
+
+        fill_clean(&x, 1);
+        fill_clean(&y, 1);
+        CHECK(inst_pre(&x, &w) == AIAEC_OK, "overflow: next block refused");
+        run_accel(&w, x.n);
+        CHECK(inst_post(&x, STREAM_RUN_OK, &out) == AIAEC_OK, "overflow: next block postprocess");
+        CHECK(inst_pre(&y, &w) == AIAEC_OK, "overflow: fresh block refused");
+        run_accel(&w, y.n);
+        CHECK(inst_post(&y, STREAM_RUN_OK, &fresh_out) == AIAEC_OK, "overflow: fresh block postprocess");
+        CHECK(memcmp(out.re, fresh_out.re, len * sizeof(float)) == 0 && memcmp(out.im, fresh_out.im, len * sizeof(float)) == 0,
+              "overflow fft=%d N=%d: the block after the refusal differs from a fresh instance's first block", GRIDS[g].fft, GRIDS[g].n);
+        bad |= g_fail;
+        inst_close(&x);
+        inst_close(&y);
+    }
+    printf("section_overflow: a finite mic spectrum near FLT_MAX with finite taps closes with zero spectra, one generation step, cold restart\n");
+    return bad;
+}
+#endif
+
 /* ---------------------------------------------------------------------------------------------
  * refusal
  * ------------------------------------------------------------------------------------------- */
@@ -437,6 +486,9 @@ static int section_order(void) {
 
 int main(void) {
     g_fail |= section_limit();
+#if PRODUCT_DV
+    g_fail |= section_overflow();
+#endif
     g_fail |= section_refusal();
     g_fail |= section_order();
     printf("test_aiaec_nonfinite[%s]: %s\n", PRODUCT_DV ? "deepvqe_s" : "align_ulcnet", g_fail ? "FAIL" : "PASS");

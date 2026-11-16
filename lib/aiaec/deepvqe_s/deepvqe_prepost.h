@@ -264,9 +264,9 @@ int deepvqe_prepost_frame_open(DeepVqePrepost *p,
  * window included) must be finite. Then the N taps are applied to the CCM ring in order (the last
  * TIME_ORDER raw microphone spectra, advanced once per frame, oldest batch frame first) and the N
  * enhanced spectra are staged for post_process_freq, one drained per call over the N calls that
- * follow. On a non-finite value the registered buffers are zeroed (nothing registered: only the
- * taps are checked), the CCM ring is emptied, the state generation advances, the batch stays open
- * and -1 is returned: call frame_bypass() or re-run. */
+ * follow; they must be finite too. On a non-finite value (tap, state element or enhanced bin) the
+ * registered buffers are zeroed (nothing registered: no state is checked), the CCM ring is emptied,
+ * the state generation advances, the batch stays open and -1 is returned: call frame_bypass() or re-run. */
 int deepvqe_prepost_frame_finish(DeepVqePrepost *p);
 
 /* Fail closed: the primary input is the raw microphone with no canceller in front, so emit
