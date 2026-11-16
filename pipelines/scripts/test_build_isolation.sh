@@ -42,8 +42,9 @@
 #   SP-S9:   command-line override rejection, all three Makefiles (pipelines/lib-aec/lib-nr, submodule paths)
 #   SP-S9b:  FP-policy allow-list: bypass shapes a character deny-list misses (bare glob, tilde, shell
 #            redirection, process substitution), the exact-token $(filter) check's own path, override rejection
-#            of the check's own internal variables, and the positive control (an override-free build succeeds
-#            with the internal -DAUDIO_PIPELINE_BACKEND_STR define reaching the compile line)
+#            of the check's own internal variables, and the positive controls (an override-free build succeeds;
+#            an allowed -D token given in EXTRA_CFLAGS reaches the archive's compile lines, and an override-free
+#            build's lines do not carry it)
 #   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character safety: the `EXTRA_LDFLAGS=';id'` injection repro, the
 #            SP-S9b glob/tilde/redirect matrix for EXTRA_LDFLAGS, a positive control (a real `-Wl,-rpath,... -L...`
 #            flag still builds and runs test_array_sample_post to ALL PASS), and override rejection of
@@ -1055,13 +1056,10 @@ sp9b_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     '-O2;rm' dashe
 sp9b_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' dashe
 sp9b_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' dashe
 
-# Positive control: a plain, override-free build must still succeed, AND
-# the internal -DAUDIO_PIPELINE_BACKEND_STR=\"ne10\" define (this repo's own
-# wrinkle -- a legitimate Makefile-generated token containing a backslash
-# and a double quote, neither of which is in the allow-list's character
-# set) must still reach the actual compile line, protected by the
-# `-DAUDIO_PIPELINE_BACKEND_STR=%` filter-out exclusion. Uses scratch
-# OBJ_ROOT/BIN_ROOT (this one actually builds, unlike every case above).
+# Positive controls. A plain, override-free build must still succeed. A -D token that passes the allow-list,
+# given in EXTRA_CFLAGS, must reach the compile line of every archive object, and the override-free build's
+# compile lines must not carry it (so the grep can tell the two apart). Both build with scratch
+# OBJ_ROOT/BIN_ROOT (these actually build, unlike every case above).
 mkscratch sp9b_pos
 SP9B_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9b_pos/obj"
 SP9B_POS_BIN_ROOT="$SCRATCH_ROOT/sp9b_pos/bin"
@@ -1072,11 +1070,29 @@ else
   fail "SP-S9b: plain override-free 'make libaudio_pipeline_dfn.a' unexpectedly FAILED under the new allow-list"
   cat "$SP9B_POS_LOG" >&2
 fi
-if grep -qF -- '-DAUDIO_PIPELINE_BACKEND_STR=\"ne10\"' "$SP9B_POS_LOG"; then
-  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"ne10\\\" still reaches the archive's compile lines"
+SP9B_TOKEN='-DSP9B_CARRY_PROBE=1'
+mkscratch sp9b_tok
+SP9B_TOK_LOG="$SCRATCH_ROOT/tmp/sp9b_token_build.log"
+if make BACKEND=ne10 EXTRA_CFLAGS="$SP9B_TOKEN" OBJ_ROOT="$SCRATCH_ROOT/sp9b_tok/obj" BIN_ROOT="$SCRATCH_ROOT/sp9b_tok/bin" \
+     libaudio_pipeline_dfn.a >"$SP9B_TOK_LOG" 2>&1; then
+  pass "SP-S9b: 'make EXTRA_CFLAGS=$SP9B_TOKEN libaudio_pipeline_dfn.a' SUCCEEDS (the token is in the allowed set)"
 else
-  fail "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR define did NOT appear on the compile line"
-  cat "$SP9B_POS_LOG" >&2
+  fail "SP-S9b: 'make EXTRA_CFLAGS=$SP9B_TOKEN libaudio_pipeline_dfn.a' unexpectedly FAILED"
+  cat "$SP9B_TOK_LOG" >&2
+fi
+sp9b_archive_lines=$(grep -E ' -c -o .*(dfn2_stream|ainr_bridge|dfn2_prepost|dfn2_model_io|dfn2_process)\.o ' "$SP9B_TOK_LOG" || true)
+sp9b_objs_compiled=$(printf '%s\n' "$sp9b_archive_lines" | grep -c . || true)
+sp9b_objs_tokened=$(printf '%s\n' "$sp9b_archive_lines" | grep -cF -- "$SP9B_TOKEN" || true)
+if [ "$sp9b_objs_compiled" -ge 5 ] && [ "$sp9b_objs_tokened" = "$sp9b_objs_compiled" ]; then
+  pass "SP-S9b: $SP9B_TOKEN reaches all $sp9b_objs_compiled archive compile lines"
+else
+  fail "SP-S9b: $SP9B_TOKEN reached $sp9b_objs_tokened of $sp9b_objs_compiled archive compile lines (want all, at least 5)"
+  cat "$SP9B_TOK_LOG" >&2
+fi
+if grep -qF -- "$SP9B_TOKEN" "$SP9B_POS_LOG"; then
+  fail "SP-S9b: the override-free build's compile lines carry $SP9B_TOKEN (the carry-through check cannot tell the two builds apart)"
+else
+  pass "SP-S9b: the override-free build's compile lines do not carry $SP9B_TOKEN"
 fi
 
 echo "############################################################"

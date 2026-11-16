@@ -15,8 +15,6 @@
 
 #include "aec.h"
 #include "dfn/tests/dfn_test_grid.h"
-#include "dfn/dfn_res_stage.h"
-#include "dfn/dfn_rate_bridge.h"
 #include "dfn2_stream.h"
 #include "ainr_bridge.h"
 #include "dfn2_prepost.h"
@@ -126,8 +124,6 @@ int main(int argc, char **argv) {
     DFN3Grid dfn3_grid;
     UlcnetGrid ulc_grid;
     DeepVqeGrid deep_grid;
-    DfnResStageConfig stage = dfn_res_stage_default_config(dfn_test_grid());
-    DfnRateBridgeConfig bridge = dfn_rate_bridge_default_config(16000, dfn_test_grid());
     DFN2StreamConfig stream;
     UlcnetStreamConfig ulc_stream, ulc_stream_freq;
     AinrBridgeConfig ainr_bridge_cfg = ainr_bridge_default_config(16000, DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD);
@@ -172,8 +168,6 @@ int main(int argc, char **argv) {
     assert(deepvqe_prepost_config_defaults(&deep, &deep_grid) == 0);
     dfn2.erb_fwd = dfn3.erb_fwd = erb_fwd;
     dfn2.erb_inv = dfn3.erb_inv = erb_inv;
-    stage.erb_fwd = bridge.stage.erb_fwd = erb_fwd;
-    stage.erb_inv = bridge.stage.erb_inv = erb_inv;
     memset(&stream, 0, sizeof stream);
     stream.grid = *dfn_test_grid();
     stream.erb_fwd = erb_fwd;
@@ -190,13 +184,11 @@ int main(int argc, char **argv) {
     /* Two carves of the one instance: with the fusion and the gain stage (FULL), and lanes only (STATE). */
     EXERCISE(aec, AecMemReq, flow);
     EXERCISE(aec, AecMemReq, lanes_only);
-    EXERCISE(dfn_res_stage, DfnResStageMemReq, stage);
-    EXERCISE(dfn_rate_bridge, DfnRateBridgeMemReq, bridge);
     EXERCISE(dfn2_stream_abi, DFN2StreamMemReq, stream);
     EXERCISE(ainr_bridge, AinrBridgeMemReq, ainr_bridge_cfg);
     EXERCISE(ulcnet_stream_abi, UlcnetStreamMemReq, ulc_stream);
     EXERCISE(ulcnet_stream_abi, UlcnetStreamMemReq, ulc_stream_freq);
-    assert(cases == 12u);
+    assert(cases == 10u);
     if (write_file) assert(fclose(write_file) == 0);
     if (foreign_file) {
         assert(fgetc(foreign_file) == EOF);

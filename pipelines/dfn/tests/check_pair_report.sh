@@ -6,7 +6,7 @@
 #
 # The line says which lookahead pair the program was BUILT with, so a pair flag that never reached
 # the test build is caught here: it prints 1/1 and make asked for another pair. When the program also
-# measured the latency (need_measured = 1; the stage test from the hops until its first emitted
+# measured the latency (need_measured = 1; the hop test from the hops until its first emitted
 # spectrum, the mono composition from the shift against the hand-written chain) the stage latency L
 # must equal mask + df and the algorithmic latency (L + 1) * hop must equal (mask + df + 1) * hop.
 # Exit 0 and the accepted line on success; exit 1 and the reason otherwise.

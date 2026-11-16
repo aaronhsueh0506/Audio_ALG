@@ -1,6 +1,6 @@
 /* The DeepFilterNet2 grid a pipeline test program runs.
  *
- * The library and the pipeline objects (dfn_res_stage, dfn_rate_bridge, dfn_hop) hold no grid:
+ * The library and the pipeline objects (dfn_hop and the model streams below it) hold no grid:
  * they take a DFN2Grid built by the application with dfn2_grid_make(). A test program decides one
  * when it is built, so that one test source covers every grid and lookahead pair and its buffers
  * can be plain arrays:

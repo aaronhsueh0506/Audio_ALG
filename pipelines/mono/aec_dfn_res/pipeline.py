@@ -18,7 +18,7 @@ resamplers and the FIFOs keep running), as in the C pipeline.
 The host runs on the product's own grid (16 kHz by default).  At 48 kHz the
 stage takes E and P directly; at 16 kHz the rate bridge
 (:class:`pipelines.dfn.dfn2_rate_adapter.Dfn2RateBridge`, the twin of
-``pipelines/dfn/dfn_rate_bridge.c``) runs the same stage on its 48 kHz grid: only
+``stream/ainr/bridge/ainr_bridge.c``) runs the same stage on its 48 kHz grid: only
 DFN2 leaves the product rate, the AEC, RES and comfort noise never do.
 
 This is the Python twin of the ``mono_aec_dfn_res`` C pipeline.  The

@@ -1330,7 +1330,7 @@ def test_the_pipelines_product_code_holds_no_build_time_grid():
     if not dfn.is_dir():
         pytest.skip('the pipelines tree is not next to AINR')
     names = [p.name for p in paths]
-    for expected in ('dfn_res_stage.c', 'dfn_rate_bridge.c', 'dfn_hop.h', 'dfn_example_args.h'):
+    for expected in ('dfn_hop.h', 'dfn_hop_pool.h', 'dfn_example_args.h'):
         assert expected in names, expected
     assert names.count('main.c') == 2
     assert _product_grid_uses(paths) == []

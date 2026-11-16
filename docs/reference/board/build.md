@@ -256,7 +256,7 @@ with both flags. The second flag guarantees that guarded AArch64 `sqrtf`
 lowers to `FSQRT` without a cold errno fallback; production code does not
 read math `errno`.
 They are appended LAST in the `CFLAGS` assembly (after
-`-DAUDIO_PIPELINE_BACKEND_STR`, `EXTRA_CFLAGS`, `WERROR`) so nothing can
+`EXTRA_CFLAGS`, `WERROR`) so nothing can
 override it. `EXTRA_CFLAGS` (or a
 `CFLAGS=` override) containing `-Ofast`/`-ffast-math`/`-ffp-contract=<any>`
 is rejected at parse time:

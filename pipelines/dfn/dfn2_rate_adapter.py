@@ -294,7 +294,7 @@ def round_trip(signal: np.ndarray, native_rate: int, via_rate: int = 48000
 
 
 class Dfn2RateBridge:
-    """Twin of ``pipelines/dfn/dfn_rate_bridge.c``: run a 48 kHz :class:`Dfn2Stage`
+    """Twin of ``stream/ainr/bridge/ainr_bridge.c``: run a 48 kHz :class:`Dfn2Stage`
     inside an 8 or 16 kHz pipeline.
 
     Per native hop: the two native spectra (E, P) are synthesised with the
@@ -384,7 +384,7 @@ class Dfn2RateBridge:
         self.host_hops = None
 
     def reset_synthesis(self) -> None:
-        """Twin of ``dfn_rate_bridge_reset_synthesis()``: the host's post chain was hard-reset in the
+        """Twin of ``ainr_bridge_reset_synthesis()``: the host's post chain was hard-reset in the
         hop about to be pushed.  Clears the overlap-add tails of the two native-grid synthesis objects
         (estimate and apply lane) and nothing else -- the stage, the resamplers, the 48 kHz FIFOs and
         synthesis, the output FIFO and the counters keep running.  Call it before :meth:`push` of the

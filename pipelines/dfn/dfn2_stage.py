@@ -59,7 +59,7 @@ _DFN2_DIR = os.path.join(_AINR_DIR, 'DeepFilterNet2')
 
 # Grid and geometry pinned by the model contract (config.ini). The C library takes the same grid
 # at run time (dfn2_grid_make(), lib/ainr/dfn2/dfn2_grid.h); the pipelines take it in their
-# configs (DfnResStageConfig.grid).
+# configs (DFN2StreamConfig.grid).
 SAMPLE_RATE = 48000
 N_FFT = 1024
 HOP = 512
