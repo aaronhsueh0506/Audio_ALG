@@ -44,8 +44,7 @@ struct UlcnetStream {
     float *enh_im;
 
     int hop_state;              /* ULCNET_STREAM_IDLE / _FRAME_OPEN / _FRAME_CLOSED */
-    int had_hop;                 /* 0 until the first pre_process call completes */
-    int prev_solid;               /* delay.solid as of the previous hop */
+    int prev_solid;               /* delay.solid of the previous hop; 1 after init and reset */
     unsigned reprime_remaining;  /* identity hops still owed after an alignment-edge restart */
 };
 
@@ -200,8 +199,7 @@ static UlcnetStream *ulcnet_stream_finish_init(const UlcnetStreamConfig *cfg, un
     s->grid = cfg->grid;
     s->frames = cfg_frames(cfg);
     s->hop_state = ULCNET_STREAM_IDLE;
-    s->had_hop = 0;
-    s->prev_solid = 0;
+    s->prev_solid = 1;
     s->reprime_remaining = 0;
 
     s->fft = NULL;
@@ -284,12 +282,7 @@ void ulcnet_stream_reset(UlcnetStream *s) {
     ulcnet_prepost_reset(s->prepost);
     s->hop_state = ULCNET_STREAM_IDLE;
     s->reprime_remaining = 0;
-    /* Also clears the alignment-edge tracker: had_hop == 0 suppresses the next edge check
-     * regardless of the recorded delay.solid, so the hop after ANY reset (explicit or
-     * pre_process-detected) is exactly like the first hop after init, never re-triggering off a
-     * stale prev_solid. */
-    s->had_hop = 0;
-    s->prev_solid = 0;
+    s->prev_solid = 1;   /* the next hop reads like the first hop after init: no rising edge */
 }
 
 uint32_t ulcnet_stream_state_generation(const UlcnetStream *s) {
@@ -307,13 +300,10 @@ static void restart_model(UlcnetStream *s) {
     s->reprime_remaining = ULCNET_STREAM_REPRIME_FRAMES;
 }
 
-/* Alignment-edge detection, before the hop's own analysis: a new alignment generation, or the
- * first hop where `solid` turns true after a prior hop where it was false. Only the solid-transition
- * term is gated by s->had_hop (no prior value on the very first hop); delay.changed is NOT gated --
- * a fresh generation on hop 0 restarts there too. */
+/* Alignment-edge detection, before the hop's own analysis: a new alignment generation, or `solid` turning true
+ * after a hop where it was false. prev_solid is 1 after init and reset, so a first hop only restarts on `changed`. */
 static void apply_alignment_edge(UlcnetStream *s, UlcnetStreamDelay delay) {
-    if (delay.changed || (s->had_hop && !s->prev_solid && delay.solid)) restart_model(s);
-    s->had_hop = 1;
+    if (delay.changed || (!s->prev_solid && delay.solid)) restart_model(s);
     s->prev_solid = delay.solid;
 }
 
@@ -372,8 +362,7 @@ int ulcnet_stream_pre_process_freq(UlcnetStream *s, const float *err_re, const f
 static void packet_events(UlcnetStream *s, const UlcnetStreamDelay *delay, int *events) {
     int k;
     for (k = 0; k < s->frames; ++k) {
-        events[k] = delay[k].changed || (s->had_hop && !s->prev_solid && delay[k].solid);
-        s->had_hop = 1;
+        events[k] = delay[k].changed || (!s->prev_solid && delay[k].solid);
         s->prev_solid = delay[k].solid;
     }
 }
