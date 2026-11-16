@@ -247,6 +247,8 @@ Include roots: the directory of each header used, `stream/common`, audiolib `com
 `common/include` (`fft_wrapper.h`). An application on a frequency-domain core also includes the
 `lib/ainr/**` / `lib/aiaec/**` headers its model page names; a `-DDFN2_STREAM_NO_STDIO` build calls
 `stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
+`lib/ainr/dfn2/dfn2_prepost.c` includes `stream_run.h` (for `STREAM_RUN_NOT_STARTED` in `dfn2_model_run_frame`): a build that compiles it
+directly, not through the Makefiles of this repo, adds `stream/common` to that object's include roots.
 
 - [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`
       and as C++11, given only the include roots above, and keeps C linkage:
