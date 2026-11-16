@@ -1,6 +1,6 @@
 /* Run-status table of dfn2_stream_post_process(): each status x the first job after a start and a steady job at
- * N == 1 (the first mask_lookahead hops have no job), and the per-hop path of N > 1. A stand-in accelerator keeps its own state and follows the documented protocol (zero it when
- * io.state_generation changed); the test compares that state with the one the status rules predict:
+ * N == 1 (the first mask_lookahead hops have no job), and the per-hop path of N > 1. A stand-in accelerator follows the
+ * documented protocol (zero its state when io.state_generation changed); the test compares it with what the rules predict:
  *   STREAM_RUN_OK            the run advanced the state;
  *   STREAM_RUN_NOT_STARTED   nothing ran: the state and the generation stay;
  *   any other value          the run may have corrupted the state: it is zeroed before the next run, generation + 1.

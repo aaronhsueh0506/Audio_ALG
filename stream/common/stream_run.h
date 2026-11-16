@@ -45,7 +45,10 @@ typedef struct StreamWork {
 } StreamWork;
 
 /* Status of a SUBMIT block, passed to postprocess (ignored on BYPASS): OK = every head written by a completed
- * run; NOT_STARTED = no run started, the accelerator state untouched; any other value = the state may be dirty. */
+ * run; NOT_STARTED = no run started, the accelerator state untouched; any other value = the state may be dirty.
+ * The library advances the state generation whenever the device state may no longer be the one to continue from
+ * (reset, refused commit, a dirty status, a model restart); before a run, zero the accelerator's state when the
+ * generation differs from the value at the last zeroing. */
 enum {
     STREAM_RUN_OK          = 0,
     STREAM_RUN_NOT_STARTED = 0x4E53,

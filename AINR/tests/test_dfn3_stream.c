@@ -625,8 +625,8 @@ static int nan_head_callback(void *user, const DFN3PrepostInputs *i, DFN3Prepost
 }
 
 /* Nothing registered: the views hold NULL and 0, the generation starts at 1 and moves by one per reset and per
- * refused finish only, and no buffer the library was not
- * given is touched, not even one registered by an earlier instance on the same pool. */
+ * refused finish only, and no buffer the library was not given is touched, not even one registered by an earlier
+ * instance on the same pool. */
 static int board_form_follows_the_documented_generation(void) {
     static struct {
         unsigned char head[32];

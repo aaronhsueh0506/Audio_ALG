@@ -6,10 +6,7 @@
  *              if (pre_rc == 1) { device_state_sync(io.state_generation); ai_rc = run_accelerator(&io.inputs, &io.outputs); }
  *              ulcnet_stream_post_process(ctx, ai_rc, pcm_out);
  *
- * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any other
- * value = it may be dirty. The library advances the state generation whenever the device state may no longer be the one to
- * continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the accelerator's state when
- * the generation differs from the value at the last zeroing.
+ * Run status and state generation: STREAM_RUN_* in stream_run.h.
  * Alignment: delay.changed, or delay.solid going false -> true after an earlier hop, restarts the model (state, generation)
  * and arms ULCNET_STREAM_REPRIME_FRAMES identity hops (the hop is bypassed, pre_process returns 0). The analysis and
  * synthesis keep running: the PCM entries give the samples of the spectrum entries around an AcStft / AcIstft.

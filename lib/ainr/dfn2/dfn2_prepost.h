@@ -178,10 +178,9 @@ int dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd,
  * applies to the whole next committed call, frames pushed earlier included. */
 int dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 
-/* One analysed frame (n_bins bins), no transform. Returns the accelerator invocations needed: 1 at the
- * zero-indexed hop L + N - 1, then every N hops after (N == 1: every hop from hop L), 0 otherwise; on a 0 the
- * clocks have advanced and no frame is open. -1 on NULL args or with a frame open. Bins are not checked: each must be
- * finite with |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
+/* One analysed frame (n_bins bins), no transform: 1 at hop L + N - 1, then every N hops (N == 1: every hop from hop L), else 0
+ * with the clocks advanced and no frame open; -1 on NULL or a frame open. Bins are not checked: each must be finite with
+ * |bin| <= 2^63 at model scale, else the normaliser is corrupt until reset (the stream/ainr entries check). */
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p, const float *spec_re,
                                   const float *spec_im);
 

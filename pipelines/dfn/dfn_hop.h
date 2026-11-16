@@ -20,10 +20,7 @@
  * a start have none: nn_begin returns 0 and the model does not run), the bridge path 0, 1 or 2 by its
  * schedule. A frame the model refuses or leaves unwritten, a frame left open and a frame never fetched all
  * take the identity through the cascade.
- * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
- * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
- * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing. A frame left open reports
+ * Run status and state generation: STREAM_RUN_* in stream_run.h. A frame left open reports
  * STREAM_RUN_FAILED, a frame never fetched, a hop with no model frame and the identity model STREAM_RUN_NOT_STARTED.
  *
  * dfn_hop_process() does the same with the model callback of the pool plan. The pointers are not
@@ -165,10 +162,9 @@ static inline void dfn_hop_reset(DfnHop* h) {
     memset(h->out_spec, 0, (size_t)h->n_bins * sizeof(Complex));
 }
 
-/* Takes the audio-scale spectra e and p (n_bins bins each), scaled to the model's normalised spectra, estimated
- * on e and applied on p. job->job_ready says whether a model frame is open (0 for the first mask_lookahead hops
- * after a start). A bin that is non-finite or beyond 2^63 at model scale refuses the block whole and leaves the
- * stream untouched. 0, or -1. */
+/* Takes the audio-scale spectra e (estimated on) and p (applied on), n_bins bins each, scaled to the model's spectra;
+ * job->job_ready is 0 for the first mask_lookahead hops. A bin non-finite or beyond 2^63 at model scale refuses the
+ * block whole and leaves the stream untouched. 0, or -1. */
 static inline int dfn_hop_open_frame(DfnHop* h, const Complex* e, const Complex* p, DfnHopJob* job) {
     float* w = h->planar;
     const int n = h->n_bins;

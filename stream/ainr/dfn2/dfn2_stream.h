@@ -17,12 +17,9 @@
  *
  * device_state_sync is the caller's code on accelerator memory this stream never touches; skipping it leaves
  * stale or garbage state live. io.state_generation is sampled every hop.
- * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
- * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
- * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing.
+ * Run status and state generation: STREAM_RUN_* in stream_run.h.
  * A hop without a job (io.job_ready 0) emits silence and the status passed to post_process is ignored.
- * The output trails the input by mask_lookahead + df_lookahead + N hops; nothing is flushed.
+ * The output trails the input by mask_lookahead + df_lookahead + N hops.
  *
  * A caller with its own analysis and synthesis uses dfn2_stream_pre_process_freq_dual() /
  * dfn2_stream_post_process_freq() instead; cfg.freq_only then keeps the HPF, STFT/ISTFT and PCM buffers out of the pool. */

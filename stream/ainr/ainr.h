@@ -12,13 +12,10 @@
  *         ...SUBMIT: run the accelerator on work (state sync and readback recovery are the sample's);
  *            BYPASS: no accelerator call...
  *         ainr_postprocess(ctx, run_status, pcm_out);   // hop_in valid samples, BYPASS block included
- *     the output trails the input by info.queue_frames + 1 model hops; nothing is trimmed or flushed
+ *     the output trails the input by info.queue_frames + 1 model hops
  *
- * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
- * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
- * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing; the accelerator's state is
- * zero when the generation is seeded after init. The status of a BYPASS block is not read.
+ * Run status and state generation: STREAM_RUN_* in stream_run.h. The accelerator's state is zero when the generation
+ * is seeded after init. The status of a BYPASS block is not read.
  *
  * A block whose run did not succeed still calls ainr_postprocess() with its run status. An unregistered
  * config is refused before any SDK call. Every successful preprocess pairs with one postprocess, a SUBMIT block
@@ -100,10 +97,9 @@ int ainr_set_atten_lim(AinrCtx *ctx, float atten_lim_db);
  * All-zero bytes are quantized zero: the port check refuses a fixed-point state port with zero_point != 0. */
 unsigned int ainr_state_generation(const AinrCtx *ctx);
 
-/* One block in: exactly cfg->hop_in samples. AINR_OK: work (action SUBMIT) holds the block's one job (inputs: ERB
- * window, spec window; outputs: erb_mask, then coefs and alpha in the full archive); run it, then ainr_postprocess().
- * Work with action BYPASS holds no job: skip the accelerator and call ainr_postprocess() all the same.
- * AINR_ERR_SEQUENCE (no postprocess since the last call) or AINR_ERR_NULL: no block is open. */
+/* One block in: exactly cfg->hop_in samples. AINR_OK: work SUBMIT holds the block's one job (run it, then ainr_postprocess()),
+ * work BYPASS holds none (skip the accelerator, call ainr_postprocess() all the same). AINR_ERR_SEQUENCE (no postprocess
+ * since the last call) or AINR_ERR_NULL: no block is open. */
 int ainr_preprocess(AinrCtx *ctx, const int16_t *pcm_in, StreamWork *work);
 
 /* Closes the block with its run status: 0 commits (full: df_alpha clamped to [0, 1]), anything else bypasses with a

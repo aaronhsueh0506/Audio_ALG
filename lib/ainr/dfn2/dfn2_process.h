@@ -116,24 +116,18 @@ void dfn2_apply_atten_lim(int n_bins,
                           float *enh_re, float *enh_im,
                           float atten_lim_db);
 
-/* Network outputs -> enhanced spectrum, model.py compose() (mask-only: compose_mask_only(), noisy *
- * mask, no delay or warm-up; `coefs`, `alpha` ignored). erb_mask [n_erb] in [0,1]; coefs [df_bins *
- * df_order * 2] as model.py's (df_bins, df_order, 2); alpha 0 = masked residual, 1 = deep filter, clamped to
- * [0, 1] before use;
- * out_*: delayed by df_lookahead frames. Returns 1 when out is valid, 0 during warm-up (not for the
- * ISTFT) or on a NULL pointer or non-finite alpha. */
+/* Network outputs -> enhanced spectrum, model.py compose() (mask-only: noisy * mask, `coefs` and `alpha` ignored): erb_mask
+ * [n_erb] in [0,1], coefs [df_bins * df_order * 2], alpha clamped to [0, 1]; out_* delayed by df_lookahead frames. 1 when
+ * out is valid, 0 during warm-up (not for the ISTFT) or on a NULL pointer or non-finite alpha. */
 int dfn2_enhance_spectrum(DFN2State *st,
                  const float *spec_re, const float *spec_im,
                  const float *erb_mask, const float *coefs, float alpha,
                  float *out_re, float *out_im);
 
-/* Streaming form: one CURRENT spectrum per call plus the heads as they arrive. heads_valid = 1: the
- * heads are those of frame current - mask_lookahead; 0 only for the first mask_lookahead frames
- * (head pointers may then be NULL). A valid out is frame current - mask_lookahead - df_lookahead,
- * reported by output_frame_index (may be NULL). Mask-only: the masked noisy head frame. Nothing is flushed.
- * alpha is clamped to [0, 1] before use. atten_lim_db 0 = off, else a |atten_lim_db| dB limit (sign ignored)
- * mixed against the delayed noisy target. Returns 1 = valid out, 0 = warm-up, -1 = pointer,
- * timing or non-finite alpha / atten_lim_db error. */
+/* Streaming form, one CURRENT spectrum per call: heads_valid 1 = the heads of frame current - mask_lookahead (0 only for the
+ * first mask_lookahead frames, head pointers may then be NULL); a valid out is frame current - mask_lookahead - df_lookahead
+ * (output_frame_index may be NULL). alpha clamped to [0, 1]; atten_lim_db 0 = off, else |atten_lim_db| dB (sign ignored).
+ * 1 = valid out, 0 = warm-up, -1 = pointer, timing or non-finite alpha / atten_lim_db. */
 int dfn2_enhance_spectrum_stream(DFN2State *st,
                         const float *current_spec_re,
                         const float *current_spec_im,

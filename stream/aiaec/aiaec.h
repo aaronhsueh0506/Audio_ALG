@@ -9,12 +9,9 @@
  *         aiaec_preprocess(ctx, &in, &work);        // work.action: SUBMIT or BYPASS
  *         ...SUBMIT: the sample's accelerator run on work; BYPASS: no accelerator call...
  *         aiaec_postprocess(ctx, run_status, pcm_out);   // once per successful preprocess, failed run or BYPASS included
- *     the output trails the input by one model hop (fft / 2 samples), both models, every N; nothing is trimmed or flushed.
+ *     the output trails the input by one model hop (fft / 2 samples), both models, every N.
  *
- * Run status (stream_run.h): 0 = every head written; STREAM_RUN_NOT_STARTED = the device state was not touched; any
- * other value = it may be dirty. The library advances the state generation whenever the device state may no longer be
- * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing. The status of a BYPASS block is
+ * Run status and state generation: STREAM_RUN_* in stream_run.h. The status of a BYPASS block is
  * not read. STREAM_RUN_NOT_STARTED leaves the generation alone, except for an Align-ULCNet packet with an event frame:
  * the restart the graph never applied advances it once.
  *

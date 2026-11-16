@@ -174,14 +174,10 @@ int dfn3_enhance_spectrum(DFN3State *st,
                           const float *erb_mask, const float *coefs,
                           float *out_re, float *out_im);
 
-/* Streaming handoff: each call pushes one CURRENT spectrum. With heads_valid = 1, erb_mask/coefs are the heads for
- * current_frame - mask_lookahead; the first mask_lookahead calls pass heads_valid = 0 (heads may be NULL). The
- * latency is grid.output_delay frames: call t returns the enhanced frame t - output_delay. With df_lookahead >
- * mask_lookahead the calls after the warm-up keep their heads and return 0 until the first output frame is complete.
- * output_frame_index may be NULL; atten_lim_db = 0 disables the mix. Every spectrum and active head must be finite:
- * invalid input is refused before any ring, clock or output changes, so the frame can be retried. Do not mix
- * with dfn3_enhance_spectrum() without dfn3_state_reset(). Returns 1 = valid out, 0 = warm-up, -1 = invalid input or
- * clock contract. */
+/* Streaming handoff, one CURRENT spectrum per call: heads_valid 1 = the heads of current_frame - mask_lookahead (0 for the first
+ * mask_lookahead calls, heads may be NULL); call t returns frame t - output_delay. Every spectrum and active head must be finite
+ * (refused before any state changes, so the frame can be retried); atten_lim_db 0 disables the mix. 1 = valid out, 0 = warm-up (or
+ * the first output frame still incomplete, df_lookahead > mask_lookahead), -1 = invalid input or clock contract; not to be mixed with dfn3_enhance_spectrum() without dfn3_state_reset(). */
 int dfn3_enhance_spectrum_stream(DFN3State *st,
                                  const float *current_spec_re,
                                  const float *current_spec_im,

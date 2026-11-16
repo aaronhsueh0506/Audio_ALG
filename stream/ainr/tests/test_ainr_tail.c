@@ -2,7 +2,7 @@
  * (run_status != 0: unit mask, alpha 0 -- the near-identity pass-through). A single 16000-count
  * sample is placed at input index PULSE_AT; the output carries it back at index PULSE_AT + latency, where
  * latency = (queue_frames + 1) * model_hop is the literal of the catalog row (ainr.h). The stream is
- * fed real blocks only: nothing is trimmed, padded or flushed.
+ * fed real blocks only.
  *
  *   PCM family   ainr_preprocess/ainr_postprocess, internal ISTFT.
  *   _freq        an upstream AcStft feeds E == P; an external AcIstft (ACCUMULATE, scale 1) synthesises.
