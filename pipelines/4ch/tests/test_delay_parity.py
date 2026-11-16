@@ -294,6 +294,24 @@ def _assert_served_far_is_the_delayed_far(rows, far, hop):
 # Tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("argument, value", [
+    ("--hops", "33554433"),           # hops * hop wraps a 32-bit int
+    ("--hops", "100001"),
+    ("--delay", "2147483647"),        # pad + hops * hop wraps
+    ("--delay", "2000000"),           # more than 120 s of samples
+    ("--hops", "12x"),
+    ("--hops", ""),
+    ("--sample-rate", " 16000"),
+    ("--proxy-noise", "nan"),
+    ("--quarantine-s", "1.5s"),
+])
+def test_dumper_refuses_out_of_range_and_malformed_numbers(dumper, argument, value):
+    """A bad number is a usage error (exit 2) with a message, never a wrapped size or an out-of-bounds read."""
+    result = subprocess.run([dumper, "--hops", "10", argument, value], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, (result.returncode, result.stderr[-200:])
+    assert result.stderr.strip()
+
+
 def test_fixed_ring_fill_is_whole_hop_and_matches_c(dumper):
     scene = _FIXED_SCENE
     c_hop, c_rows = _c_rows(dumper, **scene)

@@ -31,6 +31,24 @@
 
 #include "aec.h"
 #include "array_test_rig.h"
+#include "example_cli.h"
+
+#define MAX_HOPS 100000                    /* --hops */
+#define MAX_DELAY_S 120                    /* --delay and --shift-delay, seconds of the sample rate */
+#define MAX_SCENE_SAMPLES 200000000LL      /* pad + hops * hop */
+
+/* An option value that is a whole decimal int / finite float, else a message and -1. */
+static int int_option(const char* option, const char* text, int* value) {
+    if (example_cli_parse_int(text, value) == 0) return 0;
+    fprintf(stderr, "dump_delay_parity: %s '%s' is not an integer\n", option, text);
+    return -1;
+}
+
+static int float_option(const char* option, const char* text, float* value) {
+    if (example_cli_parse_float(text, value) == 0) return 0;
+    fprintf(stderr, "dump_delay_parity: %s '%s' is not a finite number\n", option, text);
+    return -1;
+}
 
 /* xorshift32 -> [-0.125, 0.125). Every operation is exactly representable in
  * float32 (the 24-bit mantissa feed is exact, the two scale factors are
@@ -90,23 +108,31 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             mode = argv[++i];
         } else if (strcmp(argv[i], "--delay") == 0 && i + 1 < argc) {
-            delay = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &delay) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--shift-at") == 0 && i + 1 < argc) {
-            shift_at = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &shift_at) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--shift-delay") == 0 && i + 1 < argc) {
-            shift_delay = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &shift_delay) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--hops") == 0 && i + 1 < argc) {
-            hops = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &hops) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) {
-            sample_rate = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &sample_rate) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--fft-size") == 0 && i + 1 < argc) {
-            fft_size = atoi(argv[++i]);
+            if (int_option(argv[i], argv[i + 1], &fft_size) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--backward-quarantine") == 0) {
             quarantine = 1;
         } else if (strcmp(argv[i], "--quarantine-s") == 0 && i + 1 < argc) {
-            quarantine_s = (float)atof(argv[++i]);
+            if (float_option(argv[i], argv[i + 1], &quarantine_s) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--proxy-noise") == 0 && i + 1 < argc) {
-            proxy_noise = (float)atof(argv[++i]);
+            if (float_option(argv[i], argv[i + 1], &proxy_noise) != 0) return 2;
+            ++i;
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             g_rng = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else {
@@ -114,8 +140,11 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (delay < 0 || hops <= 0 || g_rng == 0) {
-        fprintf(stderr, "invalid --delay/--hops/--seed\n");
+    if (delay < 0 || hops <= 0 || hops > MAX_HOPS || g_rng == 0 || sample_rate <= 0 ||
+        (long long)delay > (long long)MAX_DELAY_S * sample_rate ||
+        (long long)shift_delay > (long long)MAX_DELAY_S * sample_rate) {
+        fprintf(stderr, "invalid --delay/--shift-delay/--hops/--sample-rate/--seed (hops <= %d, delays <= %d s)\n",
+                MAX_HOPS, MAX_DELAY_S);
         return 2;
     }
     if ((shift_at >= 0) != (shift_delay >= 0)) {
@@ -150,6 +179,11 @@ int main(int argc, char** argv) {
     /* `pad` samples of pre-history so the echo is valid from the first
      * streamed sample, at either bulk delay. */
     pad = delay > shift_delay ? delay : shift_delay;
+    if ((long long)pad + (long long)hops * hop > MAX_SCENE_SAMPLES) {
+        fprintf(stderr, "the scene is longer than %lld samples\n", MAX_SCENE_SAMPLES);
+        status = 2;
+        goto cleanup;
+    }
     total = pad + hops * hop;
     far_hist = (float*)malloc((size_t)total * sizeof(float));
     mic = (float*)malloc((size_t)hop * AEC_ARRAY_MICS *
