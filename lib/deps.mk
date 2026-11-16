@@ -72,7 +72,52 @@ COMMON_DIR  ?= $(abspath $(AUDIO_ALG_ROOT)/../audiolib/common)
 # audited; defaulting once here closes the gap for any future includer too.
 AR      ?= ar
 RANLIB  ?= ranlib
-TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
+define DEPS_NEWLINE
+
+
+endef
+
+# TOOLCHAIN_FWD is pasted into shell text, each value between single quotes (WERROR bare): a value with a single quote or a
+# line break would end the quoting and run what follows as a command, and a WERROR that is not 0 or 1 would be bare shell
+# text. Expanding it with such a value is a parse-time error (DEPS_TOOLCHAIN_CHECK expands to nothing otherwise).
+DEPS_TOOLCHAIN_CHECK = $(strip $(foreach v,CC CXX AR RANLIB EXTRA_CFLAGS,$(if $(or $(findstring ',$($(v))),$(findstring $(DEPS_NEWLINE),$($(v)))),\
+  $(error $(v) contains a single quote or a line break: it is pasted into shell command text (TOOLCHAIN_FWD)))))$(if $(filter-out 0 1,$(WERROR)),\
+  $(error WERROR must be exactly 0 or 1 (TOOLCHAIN_FWD pastes it into shell command text)))
+TOOLCHAIN_FWD = $(DEPS_TOOLCHAIN_CHECK)CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
+
+# The compiler-target probe of every includer's CC_TARGET_SIG. COMMON_DIR is pasted as one single-quoted word (a single quote in
+# it is closed, escaped and reopened), so a directory with a space or a single quote reaches `sh` intact; the flags that
+# follow stay separate words, as the callers' CFLAGS are.
+TARGET_ABI_SIGNATURE = $(shell sh '$(subst ','\'',$(COMMON_DIR))/scripts/target_abi_signature.sh' $(CC) $(CPPFLAGS) $(CFLAGS))
+
+# Shared by every includer that keys its OBJ_DIR on CFG_SIG_PAYLOAD: $(eval $(call CHECK_01,VAR)) refuses a VAR that is
+# not exactly one word, 0 or 1.
+define CHECK_01
+ifneq ($$(words $$($(1))),1)
+$$(error $(1) must be exactly 0 or 1)
+endif
+ifneq ($$(filter-out 0 1,$$($(1))),)
+$$(error $(1) must be exactly 0 or 1)
+endif
+endef
+
+# The recipe of an includer's `_cfg_guard` target (`_cfg_guard:` and, on the next line, a tab and $(CFG_GUARD_RECIPE)): the
+# compiler target must be known, and $(OBJ_DIR)/config.manifest must be absent or equal CFG_SIG_PAYLOAD, else two
+# configurations have landed in one directory.
+define CFG_GUARD_RECIPE
+@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
+  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
+  exit 1; }
+@mkdir -p "$(OBJ_DIR)"
+@m="$(OBJ_DIR)/config.manifest"; \
+if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
+  echo "FATAL: configuration signature collision in $$m" >&2; \
+  echo "  stored : $$(cat "$$m")" >&2; \
+  echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
+  exit 1; \
+fi; \
+printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
+endef
 
 # Shared by every includer that needs the audiolib common archive's path: resolves COMMON_LIB via
 # a sub-make (forwarding BACKEND/SIMD/TOOLCHAIN_FWD, which the caller must already have set) and
@@ -93,7 +138,7 @@ TOOLCHAIN_FWD = CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLA
 # skipped, since <other-goal> may still need COMMON_LIB.
 define RESOLVE_COMMON_LIB
 ifneq ($$(MAKECMDGOALS),clean)
-COMMON_LIB := $$(shell $$(MAKE) -s -C $$(COMMON_DIR) BACKEND=$$(BACKEND) SIMD=$$(SIMD) $$(TOOLCHAIN_FWD) \
+COMMON_LIB := $$(shell $$(MAKE) -s -C '$$(subst ','\'',$$(COMMON_DIR))' BACKEND=$$(BACKEND) SIMD=$$(SIMD) $$(TOOLCHAIN_FWD) \
 	lib print-lib-path | tail -1)
 ifeq ($$(strip $$(COMMON_LIB)),)
 $$(error COMMON_LIB resolution failed: the audiolib sub-make (-C $$(COMMON_DIR)) produced no path -- check CC='$$(CC)' CXX='$$(CXX)' can build there)
@@ -150,10 +195,12 @@ print-deps-sh:
 # released it" (confirmed: widening this exact window turned most concurrent runs into false
 # failures), so only sustained failure to acquire the lock -- not a single missing instant -- is
 # reported as stuck/misconfigured.
-BOOTSTRAP_LOCK_WAIT = @if [ -d '$(2)' ]; then \
-	  echo "bootstrap-deps: $(1) checkout $(2) already exists, left alone"; \
+# $(call BOOTSTRAP_LOCK_WAIT,label,DIR_VAR,URL_VAR,COMMIT_VAR): DIR_VAR, URL_VAR and COMMIT_VAR name environment variables
+# (exported on bootstrap-deps below); the shell reads them as "$DIR_VAR", so a directory, URL or commit never becomes shell text.
+BOOTSTRAP_LOCK_WAIT = @if [ -d "$$$(2)" ]; then \
+	  echo "bootstrap-deps: $(1) checkout $$$(2) already exists, left alone"; \
 	else \
-	  lock='$(2).bootstrap-lock'; tries=0; \
+	  lock="$$$(2).bootstrap-lock"; tries=0; \
 	  while ! mkdir "$$lock" 2>/dev/null; do \
 	    tries=$$((tries + 1)); \
 	    if [ "$$tries" -ge 1800 ]; then \
@@ -163,23 +210,33 @@ BOOTSTRAP_LOCK_WAIT = @if [ -d '$(2)' ]; then \
 	    sleep 1; \
 	  done; \
 	  trap 'rmdir "$$lock" 2>/dev/null' EXIT; \
-	  if [ -d '$(2)' ]; then \
-	    echo "bootstrap-deps: $(1) checkout $(2) already exists, left alone"; \
+	  if [ -d "$$$(2)" ]; then \
+	    echo "bootstrap-deps: $(1) checkout $$$(2) already exists, left alone"; \
 	  else \
-	    echo "bootstrap-deps: cloning $(1) $(4) from $(3) -> $(2)"; \
-	    stage='$(2).bootstrap-staging.'"$$$$"; rm -rf "$$stage"; \
-	    if git clone --quiet '$(3)' "$$stage" && git -C "$$stage" checkout --quiet '$(4)'; then \
-	      mv "$$stage" '$(2)'; \
+	    echo "bootstrap-deps: cloning $(1) $$$(4) from $$$(3) -> $$$(2)"; \
+	    stage="$$$(2).bootstrap-staging.$$$$"; rm -rf "$$stage"; \
+	    if git clone --quiet "$$$(3)" "$$stage" && git -C "$$stage" checkout --quiet "$$$(4)"; then \
+	      mv "$$stage" "$$$(2)"; \
 	    else \
-	      echo "bootstrap-deps: FAIL could not clone+checkout $(1) $(4) from $(3)" >&2; rm -rf "$$stage"; exit 1; \
+	      echo "bootstrap-deps: FAIL could not clone+checkout $(1) $$$(4) from $$$(3)" >&2; rm -rf "$$stage"; exit 1; \
 	    fi; \
 	  fi; \
 	fi
 
+bootstrap-deps: export P_BS_AEC_DIR = $(AEC_REPO_DIR)
+bootstrap-deps: export P_BS_AEC_URL = $(AEC_URL)
+bootstrap-deps: export P_BS_AEC_COMMIT = $(AEC_COMMIT)
+bootstrap-deps: export P_BS_NR_DIR = $(NR_REPO_DIR)
+bootstrap-deps: export P_BS_NR_URL = $(NR_URL)
+bootstrap-deps: export P_BS_NR_COMMIT = $(NR_COMMIT)
+bootstrap-deps: export P_BS_AUDIOLIB_DIR = $(AUDIOLIB_DIR)
+bootstrap-deps: export P_BS_AUDIOLIB_URL = $(AUDIOLIB_URL)
+bootstrap-deps: export P_BS_AUDIOLIB_COMMIT = $(AUDIOLIB_COMMIT)
+
 bootstrap-deps:
-	$(call BOOTSTRAP_LOCK_WAIT,AEC,$(AEC_REPO_DIR),$(AEC_URL),$(AEC_COMMIT))
-	$(call BOOTSTRAP_LOCK_WAIT,NR,$(NR_REPO_DIR),$(NR_URL),$(NR_COMMIT))
-	$(call BOOTSTRAP_LOCK_WAIT,audiolib,$(AUDIOLIB_DIR),$(AUDIOLIB_URL),$(AUDIOLIB_COMMIT))
+	$(call BOOTSTRAP_LOCK_WAIT,AEC,P_BS_AEC_DIR,P_BS_AEC_URL,P_BS_AEC_COMMIT)
+	$(call BOOTSTRAP_LOCK_WAIT,NR,P_BS_NR_DIR,P_BS_NR_URL,P_BS_NR_COMMIT)
+	$(call BOOTSTRAP_LOCK_WAIT,audiolib,P_BS_AUDIOLIB_DIR,P_BS_AUDIOLIB_URL,P_BS_AUDIOLIB_COMMIT)
 
 # Report each pinned dependency against the directory a build actually resolves to -- AEC_DIR/
 # NR_DIR/COMMON_DIR, honoring any override of those directly (not AEC_REPO_DIR/NR_REPO_DIR/

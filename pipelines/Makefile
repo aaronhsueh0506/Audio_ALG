@@ -495,7 +495,7 @@ TARGET_ABI_INCLUDES := $(DFN_HOP_INC) $(ULCNET_STREAM_INC) -I$(DFN2_DIR) -I../li
 
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
-override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) DFN2_LOOKAHEAD=$(DFN2_MASK_LOOKAHEAD)/$(DFN2_DF_LOOKAHEAD) DFN2_TEST_GRID_KHZ=$(DFN2_TEST_GRID_KHZ) DFN_TEST_CFLAGS=$(DFN_TEST_CFLAGS) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) AEC_NO_ARRAY=$(AEC_NO_ARRAY) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) COMMON_PRODUCER_SIG=$(COMMON_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono/aec_nr_res/main.c mono/aec_nr_res/tests/test_mono_chain.c mono/aec_nr_res/tests/test_no_stdio_stack.c mono/aec_nr_res/example_board_adapter.c $(STREAM_ULCNET_DIR)/ulcnet_stream.c mono/alignulcnet/tests/test_mono_ulcnet.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_model_io.c mono/alignulcnet/main.c $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_DFN2_DIR)/dfn2_stream.c 4ch/tests/test_array_sample_post.c tests/test_readme_flow.c mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_dfn_res/main.c dfn/tests/test_dfn_hop.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c $(TARGET_ABI_SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 

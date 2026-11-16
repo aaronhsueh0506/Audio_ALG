@@ -8,12 +8,9 @@ override CFLAGS += -ffp-contract=off -fno-math-errno
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
 
-ifneq ($(words $(SIMD)),1)
-$(error SIMD must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(SIMD)),)
-$(error SIMD must be exactly 0 or 1)
-endif
+include ../lib/deps.mk
+
+$(eval $(call CHECK_01,SIMD))
 
 # -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it on
 # with `make WERROR=1`), same control name and shape as pipelines/Makefile's.
@@ -31,7 +28,6 @@ endif
 
 # COMMON_DIR comes from the one shared lib/deps.mk (see lib/audiolib.pin): the sibling audiolib
 # dev checkout by default, still a caller-overridable `?=`.
-include ../lib/deps.mk
 CPPFLAGS := -I. -I../lib/aiaec/ulcnet -I../lib/aiaec/deepvqe_s -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 ifeq ($(SIMD),0)
 CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
@@ -49,7 +45,7 @@ endif
 BUILD_DIR := build
 # The same CC command can select a different SDK through PATH.
 # Include effective pointer/FP/ISA predefines to avoid cross-ABI cache reuse.
-override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) CPPFLAGS=$(CPPFLAGS) SIMD=$(SIMD) WERROR=$(WERROR)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
@@ -79,18 +75,7 @@ $(LIB): $(OBJECTS)
 	rm -f "$@" && $(AR) rcs "$@" $(OBJECTS)
 
 _cfg_guard:
-	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
-	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
-	  exit 1; }
-	@mkdir -p "$(OBJ_DIR)"
-	@m="$(OBJ_DIR)/config.manifest"; \
-	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
-	  echo "FATAL: configuration signature collision in $$m" >&2; \
-	  echo "  stored : $$(cat "$$m")" >&2; \
-	  echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
-	  exit 1; \
-	fi; \
-	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
+	$(CFG_GUARD_RECIPE)
 
 # One recipe for every object: the sources live in several directories, so
 # VPATH resolves the %.c, and -MMD -MP records each object's real header

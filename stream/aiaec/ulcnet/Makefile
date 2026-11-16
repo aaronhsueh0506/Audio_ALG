@@ -20,25 +20,21 @@ ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
 
+include ../../../lib/deps.mk
+
 # Align-ULCNet has no file-loader TU (no matrices to load, unlike DFN2's ERB) -- nothing here
 # needs stdio at all. NO_STDIO is kept as a build-matrix knob for consistency with the other
 # stream Makefiles (and audit-no-stdio below checks it holds), but it changes nothing in this
 # directory's sources.
 NO_STDIO ?= 0
 override NO_STDIO := $(strip $(NO_STDIO))
-ifneq ($(words $(NO_STDIO)),1)
-$(error NO_STDIO must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(NO_STDIO)),)
-$(error NO_STDIO must be exactly 0 or 1)
-endif
+$(eval $(call CHECK_01,NO_STDIO))
 
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
 
-include ../../../lib/deps.mk
 # RESOLVE_COMMON_LIB (from lib/deps.mk) resolves COMMON_LIB via a sub-make forwarding
 # BACKEND/SIMD/TOOLCHAIN_FWD and validates it -- a cross-compile (different CC/CXX, or
 # EXTRA_CFLAGS carrying e.g. -arch arm64e) must build a COMMON_LIB for the SAME target, not
@@ -48,12 +44,7 @@ include ../../../lib/deps.mk
 $(eval $(call RESOLVE_COMMON_LIB))
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
-ifneq ($(words $(SIMD)),1)
-$(error SIMD must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(SIMD)),)
-$(error SIMD must be exactly 0 or 1)
-endif
+$(eval $(call CHECK_01,SIMD))
 
 SIMD_CPPFLAGS :=
 ifeq ($(SIMD),0)
@@ -61,7 +52,7 @@ SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
 
 BUILD_DIR := build
-override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
@@ -120,18 +111,7 @@ $(LIB): $(LIB_OBJECTS)
 	rm -f "$@" && $(AR) rcs "$@" $(LIB_OBJECTS)
 
 _cfg_guard:
-	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
-	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
-	  exit 1; }
-	@mkdir -p "$(OBJ_DIR)"
-	@m="$(OBJ_DIR)/config.manifest"; \
-	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
-	  echo "FATAL: configuration signature collision in $$m" >&2; \
-	  echo "  stored : $$(cat "$$m")" >&2; \
-	  echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
-	  exit 1; \
-	fi; \
-	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
+	$(CFG_GUARD_RECIPE)
 
 $(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -MMD -MP -c -o "$@" "$<"

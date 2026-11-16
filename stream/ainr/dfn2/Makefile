@@ -20,17 +20,14 @@ ifneq ($(BACKEND),ne10)
 $(error BACKEND must be ne10 (got '$(BACKEND)'): ne10 is the only FFT backend)
 endif
 
+include ../../../lib/deps.mk
+
 # MASK_ONLY selects the DFN2 variant this archive and its stream objects are built against; the two
 # variants must never share an OBJ_DIR (DFN2_VARIANT_SYMBOL makes mixing them a link error, not a
 # silent bug -- see dfn2_process.h), so MASK_ONLY is folded into CFG_SIG like SIMD is.
 MASK_ONLY ?= 0
 override MASK_ONLY := $(strip $(MASK_ONLY))
-ifneq ($(words $(MASK_ONLY)),1)
-$(error MASK_ONLY must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(MASK_ONLY)),)
-$(error MASK_ONLY must be exactly 0 or 1)
-endif
+$(eval $(call CHECK_01,MASK_ONLY))
 MASK_CPPFLAGS :=
 ifeq ($(MASK_ONLY),1)
 MASK_CPPFLAGS += -DDFN2_MASK_ONLY
@@ -40,12 +37,7 @@ endif
 # via -DDFN2_STREAM_NO_STDIO; see audit-no-stdio.
 NO_STDIO ?= 0
 override NO_STDIO := $(strip $(NO_STDIO))
-ifneq ($(words $(NO_STDIO)),1)
-$(error NO_STDIO must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(NO_STDIO)),)
-$(error NO_STDIO must be exactly 0 or 1)
-endif
+$(eval $(call CHECK_01,NO_STDIO))
 NO_STDIO_CPPFLAGS :=
 ifeq ($(NO_STDIO),1)
 NO_STDIO_CPPFLAGS += -DDFN2_STREAM_NO_STDIO
@@ -56,7 +48,6 @@ ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
 
-include ../../../lib/deps.mk
 # RESOLVE_COMMON_LIB (from lib/deps.mk) resolves COMMON_LIB via a sub-make forwarding
 # BACKEND/SIMD/TOOLCHAIN_FWD and validates it -- a cross-compile (different CC/CXX, or
 # EXTRA_CFLAGS carrying e.g. -arch arm64e) must build a COMMON_LIB for the SAME target, not
@@ -67,12 +58,7 @@ include ../../../lib/deps.mk
 $(eval $(call RESOLVE_COMMON_LIB))
 override CFLAGS += -I$(COMMON_DIR)/include -I$(COMMON_DIR)
 
-ifneq ($(words $(SIMD)),1)
-$(error SIMD must be exactly 0 or 1)
-endif
-ifneq ($(filter-out 0 1,$(SIMD)),)
-$(error SIMD must be exactly 0 or 1)
-endif
+$(eval $(call CHECK_01,SIMD))
 
 SIMD_CPPFLAGS :=
 ifeq ($(SIMD),0)
@@ -80,7 +66,7 @@ SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
 
 BUILD_DIR := build
-override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
+override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
 CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) MASK_ONLY=$(MASK_ONLY) MASK_CPPFLAGS=$(MASK_CPPFLAGS) NO_STDIO=$(NO_STDIO) NO_STDIO_CPPFLAGS=$(NO_STDIO_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-mask$(MASK_ONLY)-$(CFG_SIG)
@@ -158,18 +144,7 @@ $(LIB): $(LIB_OBJECTS)
 	rm -f "$@" && $(AR) rcs "$@" $(LIB_OBJECTS)
 
 _cfg_guard:
-	@test -n "$(CC_TARGET_SIG)" && test "$(CC_TARGET_SIG)" != unavailable || { \
-	  echo "FATAL: cannot determine compiler target; CC preprocessing with the configured flags must succeed." >&2; \
-	  exit 1; }
-	@mkdir -p "$(OBJ_DIR)"
-	@m="$(OBJ_DIR)/config.manifest"; \
-	if [ -f "$$m" ] && [ "$$(cat "$$m")" != "$(CFG_SIG_PAYLOAD)" ]; then \
-	  echo "FATAL: configuration signature collision in $$m" >&2; \
-	  echo "  stored : $$(cat "$$m")" >&2; \
-	  echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
-	  exit 1; \
-	fi; \
-	printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$m"
+	$(CFG_GUARD_RECIPE)
 
 $(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
