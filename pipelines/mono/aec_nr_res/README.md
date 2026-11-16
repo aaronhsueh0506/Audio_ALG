@@ -72,8 +72,8 @@ differs, the synthesis drops its overlap-add tail before its `ac_istft_push()`; 
 its comfort-noise generator to `AEC_CNG_SEED` before the hop's first draw. The program never resets the AEC in response. The denoiser is
 not touched by the event (the library does not touch NR state and neither does this program: NR keeps running through
 the reset; following the event in the denoiser would be an application policy and this one is "no"). Warm-transfer and
-soft (double-talk-aware) realignments, the bad-relock soft revert, `aec_apply_external_realign()` and a change of `AecLinearView.generation`
-alone do not move the serial.
+soft (double-talk-aware) realignments, the bad-relock soft revert, `aec_apply_external_realign()` and a change of the alignment generation
+(`AecLinearView.delay_state == CHANGED`) alone do not move the serial.
 
 Strength: `aec_set_level(aec, level)` for the AEC's RES gain,
 `anr_set_level(anr, level)` for the denoiser.

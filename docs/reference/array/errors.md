@@ -91,7 +91,7 @@ destroy 之後，caller-owned pool 的 instance 的每個入口都拒絕該 hand
 |---|---|---|
 | `AEC/c_impl/src/aec_array.c`（及 `aec.c` 的分派） | `libaec.a` | **本手冊的主體**：array instance，含 lane、共用 estimator、對齊環、融合與增益級；不含 SRP／BF、NR |
 | `AEC/c_impl/include/aec.h` | — | 本手冊的公開 API（「Array instance」一節） |
-| `AEC/c_impl/include/internal/aec_array_internal.h` | — | 內部 header，**不是**公開 API，不要 include |
+| `AEC/c_impl/include/internal/aec_array_internal.h`、`aec_view_internal.h` | — | 內部 header，**不是**公開 API，不要 include（`AecLinearView`／`AecResidualView` 只放函式庫外的呼叫端讀的欄位，其餘欄位在 `aec_view_internal.h`） |
 
 `pipelines/4ch/` 本身沒有函式庫 archive。sample 層檔案（範例碼，**不在**任何 archive 內，沒有 ABI、沒有 layout version，可整份複製改寫）：
 `array_sample_beam.{h,c}`（SRP-PHAT ＋ BF ＋ 備援 VAD 的 helper，另一份手冊；`array_sample_default_config()` 也在這裡）、
@@ -131,7 +131,7 @@ destroy 之後，caller-owned pool 的 instance 的每個入口都拒絕該 hand
 - [ ] link 順序照 [integration.md §1.5](integration.md#15-archive-link-order)；沒有多連 `libdoa.a` / `libbf.a` / `libspatial_common.a`
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用 `print-lib-path` 查的
-- [ ] 沒有 include `aec_array_internal.h`
+- [ ] 沒有 include `aec_array_internal.h`、`aec_view_internal.h`
 
 初始化：
 

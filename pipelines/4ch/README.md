@@ -198,7 +198,7 @@ Sample-layer headers (in no archive):
 `array_sample_beam.h` (with `array_sample_default_config()`), `array_sample_driver.h`, and the header-only `array_sample_post.h`
 and `array_sample_unit.h` (the array + helper unit and the stages behind the fuse, shared by `4ch_raw` and `4ch_static`)
 (`array_sample_anr_gain()` runs the denoiser on a fused view, `array_sample_post_reset_due()` and `ARRAY_SAMPLE_PSD_SCALE_INV`; it needs `anr.h`).
-Internal, do not include: `aec_array_internal.h`, `bf.h`, `srp.h`.
+Internal, do not include: `aec_array_internal.h`, `aec_view_internal.h`, `bf.h`, `srp.h`.
 
 ## Python reference seam
 

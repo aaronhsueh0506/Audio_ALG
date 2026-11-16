@@ -325,7 +325,7 @@ delta_ratio &lt; 0.3
 <ul>
   <li>收斂穩定旗標要求 <code>!epc.active</code>，不會被判為已穩定</li>
   <li>double-talk 指標被抑制（<code>raw_dt</code> 歸零、<code>is_stationary_dt</code> 清除、<code>shadow_dt</code> ×0.08）</li>
-  <li><code>epc_active</code> 由 <code>AecLinearView.epc_active</code>（<code>aec_get_linear()</code>）交給後級</li>
+  <li><code>epc_active</code> 是函式庫內部狀態，公開的 <code>AecLinearView</code> 不帶它：外部後級不需要知道，這段只影響 AEC 自己的 double-talk 判定</li>
 </ul>
 
 <h3>3.4 Stationary far-end DT 保護</h3>
