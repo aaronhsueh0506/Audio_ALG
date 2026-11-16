@@ -225,9 +225,9 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             UlcnetModelIoOutputs *outputs);
 
 /* Packet boundary (descriptor frames > 1; the one-frame calls above refuse such a state and these refuse a one-frame
- * state): as prepare(), for N frames. The spectra are frame-major, N * spectrum_bins floats per plane, oldest frame
- * first; events[k] != 0 marks frame k as an alignment boundary (frame_reset 1.0), N entries. Every frame's features are
- * computed, event frames included (the graph needs finite inputs); `output` is NaN-prefilled after all of them. */
+ * state): as prepare() for N frames, spectra frame-major (N * spectrum_bins floats per plane, oldest first); events[k] != 0
+ * marks frame k as an alignment boundary (frame_reset 1.0; N entries). Every frame's features are computed, event frames too
+ * (the graph needs finite inputs); `output` is NaN-prefilled after all of them. */
 int ulcnet_model_io_prepare_packet(UlcnetModelIoState *state,
                                    const float *error_re, const float *error_im,
                                    const float *far_re, const float *far_im,
