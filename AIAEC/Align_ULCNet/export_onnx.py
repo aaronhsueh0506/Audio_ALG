@@ -43,8 +43,9 @@ raw far against that error. The calibration and ONNX commands must use the same
 ``--max-delay-frames``. NPZ output writes a sibling JSON contract; binary
 output writes ``manifest.json`` inside its output directory.
 
-STFT/WOLA and PBFDKF stay outside the graph (``ulcnet_process.c`` and the AEC
-library). The graph boundary follows the checkpoint and supports 16 kHz / FFT
+STFT/WOLA (audiolib), the feature front end and mask back end
+(``ulcnet_model_io.c``) and PBFDKF (the AEC library) stay outside the graph.
+The graph boundary follows the checkpoint and supports 16 kHz / FFT
 window 256 / hop 128, 16 kHz / 512 / 256 or 48 kHz / 1024 / 512; the C pre/post must be compiled
 for the same grid (one binary serves one grid).
 
@@ -781,7 +782,7 @@ def _write_metadata(
         'logit_history_order': 'oldest_first',
         'score_window_frames': SCORE_WINDOW_FRAMES,
         'production_streaming_equivalent': True,
-        'c_frontend_postprocess': 'lib/aiaec/ulcnet/ulcnet_process.c',
+        'c_frontend_postprocess': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
         'c_model_io_state': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
     }
     if packet:

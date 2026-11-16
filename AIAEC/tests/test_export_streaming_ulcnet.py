@@ -402,6 +402,12 @@ def test_exported_metadata_carries_the_checkpoint_frontend(tmp_path):
         linear_aec.LINEAR_AEC_CONTRACT_VERSION)
     for key, value in expected.items():
         assert metadata[key] == value
+    # The C files the metadata names must exist: the front end and the mask
+    # back end are both in the model-I/O translation unit.
+    repo = Path(__file__).resolve().parents[2]
+    for key in ('c_frontend_postprocess', 'c_model_io_state'):
+        assert metadata[key] == 'lib/aiaec/ulcnet/ulcnet_model_io.c'
+        assert (repo / metadata[key]).is_file()
     written = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
     props = {p.key: p.value for p in onnx.load(str(path)).metadata_props}
     for key, value in expected.items():
