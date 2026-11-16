@@ -9,27 +9,10 @@
  *     -> dfn_res_stage_process(E48, P48) -> 48 kHz iFFT + WOLA -> resample down
  *   -> native FIFO -> emit exactly one native hop.
  *
- * Clocks: the stage runs a fixed per-hop schedule (16 kHz/hop 128: 0,1,1,1;
- * 16 kHz/hop 256 and 8 kHz/hop 128: 1,2), so a hop carries at most two inferences.
- * The native output FIFO is prefilled with `prefill` zeros (init derives it from the
- * resamplers' tick counts).
- * Delay added to the hosting pipeline's own output: prefill + up group delay +
- * (L + 1)*512*sr/48000 + down group delay native samples, L = dfn_res_stage_lookahead_frames() of the stage's grid;
- * for the shipped 1/1 pair 16 kHz/hop 128 -> 672 (42.0 ms), 16 kHz/hop 256 -> 629 (39.3 ms),
- * 8 kHz/hop 128 -> 330 (41.3 ms), as returned by dfn_rate_bridge_added_delay_samples(), which
- * floors the sum. The stage term is a whole number of native samples only when L + 1 is a
- * multiple of 3; every other term is whole, so the exact delay is the floored one plus 0, 1/3
- * or 2/3 of a sample, from dfn_rate_bridge_added_delay_exact() (e.g. pair 0/1 at 16 kHz/hop
- * 128: 501 1/3). The resamplers are not an identity (pass-band
- * response applied twice).
+ * Clocks, the added delay (L = dfn_res_stage_lookahead_frames() of the stage's grid; 672 / 629 / 330 native
+ * samples for the shipped 1/1 pair) and the post-chain reset timing are those of stream/ainr/bridge/ainr_bridge.h;
+ * dfn_rate_bridge_added_delay_samples() floors the sum and dfn_rate_bridge_added_delay_exact() gives the remainder.
  * Fail-open: with no model the stage emits P48 delayed L frames.
- * Post-chain reset of the host (lib/aec aec_post_reset_serial() moved): the two native-grid
- * synthesis objects (estimate and apply lane) are the host's overlap-add and run at the top of
- * dfn_rate_bridge_begin(), with no FIFO or lookahead between the spectra and them, so
- * dfn_rate_bridge_reset_synthesis() on that hop, before its begin() or process(), lands on the
- * hop the serial protocol demands (no delay line; the 48 kHz stage path synthesises its output
- * L hops after the spectra went in and delays the clear by L). Everything downstream of those
- * two objects is a continuous time-domain stream and is left alone.
  * Memory: static pool with the 32-byte descriptor; the AinrBridge and stage pools are carved
  * inside it. No heap after init, no stdio. */
 
@@ -94,16 +77,9 @@ DfnRateBridge *dfn_rate_bridge_create(const DfnRateBridgeConfig *cfg);
 void dfn_rate_bridge_destroy(DfnRateBridge *b);   /* frees only create()'s heap */
 /* Resets the resamplers, FIFOs, OLAs, the stage and the prefill. */
 void dfn_rate_bridge_reset(DfnRateBridge *b);
-/* Synthesis-only reset: the host's post chain was hard-reset in the hop about to begin (the AEC's
- * aec_post_reset_serial() moved). Clears the overlap-add tail and frame counter of the two
- * native-grid synthesis objects (estimate lane, apply lane) and nothing else: the stage (model
- * state, DF history, lookahead delay lines, frame counters), both resamplers, both 48 kHz FIFOs and
- * analysis histories, the 48 kHz synthesis, the output FIFO with its prefill and the diagnostics
- * counters all keep running, so the added delay and the DFN2 state are unchanged. Call it between
- * hops, before dfn_rate_bridge_begin() / process() of the hop on which the serial moved, and
- * reseed the comfort noise (AEC_CNG_SEED) next to it; the AEC is not reset in response.
- * Returns 0, or -1 on NULL or while a hop is in progress (begin() already ran: the clear would
- * land after that hop's synthesis, so nothing is cleared). */
+/* Synthesis-only reset (ainr_bridge_reset_synthesis): the stage, resamplers, FIFOs and counters keep running. Call it
+ * between hops, before begin() / process() of the hop on which aec_post_reset_serial() moved, and reseed the
+ * comfort noise (AEC_CNG_SEED) next to it; the AEC is not reset. 0, or -1 on NULL or while a hop is in progress. */
 int dfn_rate_bridge_reset_synthesis(DfnRateBridge *b);
 
 /* One native hop: the two native spectra in (n_freqs each), one native hop out.
@@ -136,12 +112,8 @@ int dfn_rate_bridge_hop_size(const DfnRateBridge *b);      /* -1 on NULL */
 int dfn_rate_bridge_n_freqs(const DfnRateBridge *b);       /* -1 on NULL */
 /* Native samples the bridge adds to the hosting pipeline's own latency. */
 int dfn_rate_bridge_added_delay_samples(const DfnRateBridge *b);   /* floor of the exact value */
-/* The same delay without the floor: *numerator / *denominator native samples, the denominator
- * always DFN_RATE_BRIDGE_DELAY_DENOMINATOR (not reduced). With the grid's rate `sr` (8000 or
- * 16000):
- *     numerator = (prefill + up latency) * 6
- *               + ((L + 1) * 512 + down latency in 48 kHz frames) * sr / 8000
- * whose division is exact. Returns 0, or -1 on a NULL argument. */
+/* The delay without the floor, *numerator / *denominator native samples (ainr_bridge_added_delay_exact()'s
+ * formula; denominator always DFN_RATE_BRIDGE_DELAY_DENOMINATOR). 0, or -1 on NULL. */
 int dfn_rate_bridge_added_delay_exact(const DfnRateBridge *b, int *numerator,
                                       int *denominator);
 DfnResStage *dfn_rate_bridge_stage(const DfnRateBridge *b);

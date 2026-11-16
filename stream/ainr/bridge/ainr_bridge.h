@@ -27,8 +27,14 @@
  * Scales: the 48 kHz AcStft / AcIstft run at audiolib's default scales (1); a model that expects
  * normalised spectra applies its own scale to the views and the inverse to what it puts back.
  * Model grid: 48000 / 1024 / 512 / 513 bins are constants here (AINR_BRIDGE_MODEL_*); the FIFO
- * capacities, the schedule and the prefill calibration are written for them. Taking the model grid from
- * the caller is a later step.
+ * capacities, the schedule and the prefill calibration are written for them.
+ * One host hop, phased (the caller runs the model for every frame the hop carries, 0, 1 or 2):
+ *     ainr_bridge_begin(b, E, P);                          // WOLA + resample up
+ *     while (ainr_bridge_model_begin(b, &f) > 0) {         // a 48 kHz frame opens
+ *         run_model(f.estimate_spec, f.apply_spec, f.out_spec);
+ *         ainr_bridge_model_end(b);                        // f.out_spec goes back
+ *     }
+ *     ainr_bridge_finish(b, out_hop);                      // one host hop out
  * Layer: stream/ (it frames with audiolib's AcStft / AcIstft, which lib/ model cores never do). It
  * embeds no model, so the library DFN2 core, dfn2_stream_*_freq or a DFN3 stream plugs in alike.
  * Memory: static pool with the 32-byte descriptor; no heap after init, no stdio. */
@@ -100,42 +106,30 @@ AinrBridge *ainr_bridge_create(const AinrBridgeConfig *cfg);
 void ainr_bridge_destroy(AinrBridge *b);   /* frees only create()'s heap */
 /* Resets the resamplers, FIFOs, overlap-adds and the prefill. The model is the caller's to reset. */
 void ainr_bridge_reset(AinrBridge *b);
-/* Synthesis-only reset: clears the overlap-add tail and frame counter of the two host-grid synthesis
- * objects and nothing else (resamplers, FIFOs, analysis histories, 48 kHz synthesis, output FIFO with
- * its prefill and the counters keep running, so the added delay is unchanged). Call it between hops,
- * before ainr_bridge_begin() of the hop on which the serial moved. Returns 0, or -1 on NULL or while
- * a hop is in progress (nothing is cleared). */
+/* Clears only the overlap-add tail and frame counter of the two host-grid synthesis objects (the added delay is
+ * unchanged). Between hops, before ainr_bridge_begin() of the hop on which the serial moved. 0, or -1 on NULL or
+ * while a hop is in progress (nothing is cleared). */
 int ainr_bridge_reset_synthesis(AinrBridge *b);
 
-/* One host hop, phased: the caller runs the model for every frame the hop carries (0, 1 or 2):
- *     ainr_bridge_begin(b, E, P);                          // WOLA + resample up
- *     while (ainr_bridge_model_begin(b, &f) > 0) {         // a 48 kHz frame opens
- *         run_model(f.estimate_spec, f.apply_spec, f.out_spec);
- *         ainr_bridge_model_end(b);                        // f.out_spec goes back
- *     }
- *     ainr_bridge_finish(b, out_hop);                      // one host hop out
- * begin takes the host spectra (n_freqs bins each) and returns 0, or -1 on NULL arguments or a hop
- * already begun. model_begin returns 1 with the open frame in *frame, 0 when the hop has no further
- * frame, -1 on a contract error (no hop begun, or a frame still open). model_end returns 0, or -1 when
- * no frame is open. A frame must be answered with a full out_spec before the next model_begin: the
- * bridge does not skip or repeat frames (the model's own failure handling decides what it writes;
- * out_spec is zero until written). finish returns 0 and writes hop_size floats, or -1 on NULL, no hop
- * begun, a frame still open or a due frame not yet fetched; nothing changes then. After a -1 whose
- * cause was the caller's inability to answer an open frame, ainr_bridge_reset() is the way out. */
+/* Takes the host spectra (n_freqs bins each). 0, or -1 on NULL arguments or a hop already begun. */
 int ainr_bridge_begin(AinrBridge *b, const Complex *estimate_spec, const Complex *apply_spec);
+/* 1 with the open frame in *frame, 0 when the hop has no further frame, -1 when no hop is begun or a frame is
+ * still open. */
 int ainr_bridge_model_begin(AinrBridge *b, AinrBridgeFrame *frame);
+/* 0, or -1 when no frame is open. A frame must be answered with a full out_spec (zero until written): the bridge
+ * does not skip or repeat frames. */
 int ainr_bridge_model_end(AinrBridge *b);
+/* Writes hop_size floats; 0, or -1 (nothing changes) on NULL, no hop begun, a frame still open or a due frame not
+ * fetched. After a -1 from a frame the caller cannot answer, ainr_bridge_reset() is the way out. */
 int ainr_bridge_finish(AinrBridge *b, float *out_hop);
 
 int ainr_bridge_hop_size(const AinrBridge *b);      /* -1 on NULL */
 int ainr_bridge_n_freqs(const AinrBridge *b);       /* -1 on NULL */
 /* Host samples the bridge adds to the host's own latency. */
 int ainr_bridge_added_delay_samples(const AinrBridge *b);   /* floor of the exact value */
-/* The same delay without the floor: *numerator / *denominator host samples, the denominator always
- * AINR_BRIDGE_DELAY_DENOMINATOR (not reduced). With the host rate `sr` (8000 or 16000):
- *     numerator = (prefill + up latency) * 6
- *               + ((L + 1) * 512 + down latency in 48 kHz frames) * sr / 8000
- * whose division is exact. Returns 0, or -1 on a NULL argument. */
+/* The delay without the floor, *numerator / *denominator host samples (denominator always
+ * AINR_BRIDGE_DELAY_DENOMINATOR). Host rate sr: numerator = (prefill + up latency) * 6 +
+ * ((L + 1) * 512 + down latency in 48 kHz frames) * sr / 8000, an exact division. 0, or -1 on NULL. */
 int ainr_bridge_added_delay_exact(const AinrBridge *b, int *numerator, int *denominator);
 /* Diagnostics: 48 kHz frames run in total and in the last hop. */
 void ainr_bridge_get_counters(const AinrBridge *b, long long *frames_48k, int *last_hop_frames);
