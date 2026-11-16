@@ -41,7 +41,8 @@
 #
 # usage: pyc_parity_pipelines.sh [options]
 #   --work DIR       scratch directory for build trees, dumps and logs (default $PYC_WORK, else
-#                    ${TMPDIR:-/tmp}/pyc_parity_pipelines.<uid>); never inside the source tree
+#                    ${TMPDIR:-/tmp}/pyc_parity_pipelines.<uid>, created 0700 and refused when it belongs to someone
+#                    else or is writable by others); never inside the source tree
 #   --json FILE      machine-readable results (default <work>/results.json)
 #   --layers L       1, 2 or 1,2 (default 1,2)
 #   --only P[,P...]  run only scenarios whose id starts with one of the prefixes (see --list)
@@ -69,7 +70,9 @@ JOBS="${PYC_JOBS:-4}"
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
 
-WORK="${PYC_WORK:-${TMPDIR:-/tmp}/pyc_parity_pipelines.$(id -u)}"
+WORK="${PYC_WORK:-}"
+WORK_IS_DEFAULT=0
+if [ -z "$WORK" ]; then WORK="${TMPDIR:-/tmp}/pyc_parity_pipelines.$(id -u)"; WORK_IS_DEFAULT=1; fi
 JSON=""
 LAYERS="1,2"
 ONLY=""
@@ -78,7 +81,7 @@ REUSE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --work) WORK="$2"; shift 2 ;;
+    --work) WORK="$2"; WORK_IS_DEFAULT=0; shift 2 ;;
     --json) JSON="$2"; shift 2 ;;
     --layers) LAYERS="$2"; shift 2 ;;
     --only) ONLY="$2"; shift 2 ;;
@@ -131,6 +134,14 @@ case "$(cd "$(dirname "$WORK")" 2>/dev/null && pwd)/$(basename "$WORK")" in
 esac
 [ -n "$JSON" ] || JSON="$WORK/results.json"
 
+# The default directory has a predictable name: it is created private (0700) and used only when it is a plain directory
+# of this user that no one else can write to, since the drivers built in it are run afterwards.
+if [ "$WORK_IS_DEFAULT" = 1 ]; then
+  [ -e "$WORK" ] || mkdir -m 700 "$WORK" 2>/dev/null || true
+  if [ -L "$WORK" ] || [ ! -d "$WORK" ] || [ ! -O "$WORK" ] || [ -n "$(find "$WORK" -maxdepth 0 \( -perm -020 -o -perm -002 \))" ]; then
+    die "default work directory $WORK is not a directory of this user that is closed to group and others; remove it or pass --work DIR"
+  fi
+fi
 mkdir -p "$WORK" || die "cannot create $WORK"
 mkdir -p "$WORK/logs" "$WORK/inputs" "$WORK/run"
 
