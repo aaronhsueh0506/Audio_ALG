@@ -574,7 +574,7 @@ $(OBJ_DIR)/mono_alignulcnet_main.o: mono/alignulcnet/main.c $(STREAM_ULCNET_DIR)
 
 # ulcnet_stream.o: the Align-ULCNet model stream (stream/aiaec/ulcnet), linked by the example and
 # the tests that run it. Not a member of any archive.
-$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_range.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) $(ULCNET_STREAM_INC) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 # test_mono_ulcnet: the mono linear AEC feeding the model stream (identity end to end, alignment

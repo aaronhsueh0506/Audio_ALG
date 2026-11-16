@@ -34,9 +34,6 @@
 /* The one model this product ships (aiaec_product.h). Never a caller input. */
 #define AIAEC_BOUND_MODEL_ID ((int)(AIAEC_PRODUCT_MODEL_ID))
 
-/* IEEE bits of FLT_MAX: a spectrum bin only has to be finite (the features stay finite up to FLT_MAX). */
-#define AIAEC_FINITE_LIMIT_BITS 0x7F7FFFFFu
-
 static int aiaec_bound_model_in_build(void)
 {
     return 0
@@ -576,20 +573,8 @@ unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx) { return ctx ?
  * Block entries
  * ------------------------------------------------------------------------------------------- */
 
-/* 1 when every |x[k]| is at most the float whose IEEE bits are limit_bits (a NaN or Inf is above any finite limit). */
-static int aiaec_plane_within(const float *x, size_t n, uint32_t limit_bits)
-{
-    size_t k;
-    for (k = 0; k < n; ++k) {
-        uint32_t bits;
-        memcpy(&bits, &x[k], sizeof bits);
-        if ((bits & 0x7FFFFFFFu) > limit_bits) return 0;
-    }
-    return 1;
-}
-
 /* Shared by both families. `pin` (PCM in) or `fin` (spectra in) is non-NULL, the other NULL;
- * kind, size, NULL and finiteness gates run in that order before the first call that advances any state. */
+ * the kind, size and NULL gates run here; the stream refuses a non-finite or over-limit input (-2) before it moves. */
 static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const AiaecFreqInput *fin,
                                  StreamWork *work)
 {
@@ -610,14 +595,6 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 : (!fin->u.deepvqe_s.mic_re || !fin->u.deepvqe_s.mic_im ||
                    !fin->u.deepvqe_s.far_re || !fin->u.deepvqe_s.far_im))
             return AIAEC_ERR_NULL;
-        if (fin) {
-            const size_t plane = (size_t)c->frames_per_call * (size_t)c->n_bins;
-            if (!aiaec_plane_within(fin->u.deepvqe_s.mic_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.deepvqe_s.mic_im, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.deepvqe_s.far_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.deepvqe_s.far_im, plane, AIAEC_FINITE_LIMIT_BITS))
-                return AIAEC_ERR_NONFINITE_INPUT;
-        }
 
         if (pin)
             rc = deepvqe_stream_pre_process_packet(c->u.deepvqe.inner, pin->u.deepvqe_s.mic_in,
@@ -626,6 +603,7 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
             rc = deepvqe_stream_pre_process_packet_freq(c->u.deepvqe.inner, fin->u.deepvqe_s.mic_re,
                                                         fin->u.deepvqe_s.mic_im, fin->u.deepvqe_s.far_re,
                                                         fin->u.deepvqe_s.far_im, &hio);
+        if (rc == DEEPVQE_STREAM_ERR_RANGE) return AIAEC_ERR_NONFINITE_INPUT;
         if (rc != 1) return AIAEC_ERR_SEQUENCE;
 
         aiaec_block_fill_deepvqe(&c->u.deepvqe.grid, &hio.inputs, &hio.outputs, hio.state_generation, work);
@@ -652,20 +630,6 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 : (!fin->u.align_ulcnet.err_re || !fin->u.align_ulcnet.err_im ||
                    !fin->u.align_ulcnet.far_re || !fin->u.align_ulcnet.far_im))
             return AIAEC_ERR_NULL;
-        if (pin) {
-            const size_t samples = (size_t)c->cfg.hop_in;
-            if (!aiaec_plane_within(pin->u.align_ulcnet.residual_in, samples, AIAEC_PCM_LIMIT_BITS) ||
-                !aiaec_plane_within(pin->u.align_ulcnet.far_in, samples, AIAEC_PCM_LIMIT_BITS))
-                return AIAEC_ERR_NONFINITE_INPUT;
-        } else {
-            const size_t plane = (size_t)c->frames_per_call * (size_t)c->n_bins;
-            if (!aiaec_plane_within(fin->u.align_ulcnet.err_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.align_ulcnet.err_im, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.align_ulcnet.far_re, plane, AIAEC_FINITE_LIMIT_BITS) ||
-                !aiaec_plane_within(fin->u.align_ulcnet.far_im, plane, AIAEC_FINITE_LIMIT_BITS))
-                return AIAEC_ERR_NONFINITE_INPUT;
-        }
-
         if (c->frames_per_call > 1) {
             /* A packet: one event per model hop, one job for all of them. The graph resets and bypasses an
              * event hop itself (no generation change; a failed job advances it instead). */
@@ -683,6 +647,7 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
                 rc = ulcnet_stream_pre_process_packet_freq(c->u.align.inner, fin->u.align_ulcnet.err_re,
                                                            fin->u.align_ulcnet.err_im, fin->u.align_ulcnet.far_re,
                                                            fin->u.align_ulcnet.far_im, delays, &hio);
+            if (rc == ULCNET_STREAM_ERR_RANGE) return AIAEC_ERR_NONFINITE_INPUT;
             if (rc != 1) return AIAEC_ERR_SEQUENCE;
             aiaec_block_fill_align(&c->u.align.grid, c->frames_per_call, &hio.inputs, &hio.outputs,
                                    hio.state_generation, work);
@@ -701,6 +666,7 @@ static int aiaec_core_preprocess(AiaecCore *c, const AiaecInput *pin, const Aiae
             rc = ulcnet_stream_pre_process_freq(c->u.align.inner, fin->u.align_ulcnet.err_re,
                                                 fin->u.align_ulcnet.err_im, fin->u.align_ulcnet.far_re,
                                                 fin->u.align_ulcnet.far_im, delay, &hio);
+        if (rc == ULCNET_STREAM_ERR_RANGE) return AIAEC_ERR_NONFINITE_INPUT;
         if (rc < 0) return AIAEC_ERR_SEQUENCE;
 
         if (rc == 0) {

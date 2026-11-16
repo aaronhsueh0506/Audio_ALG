@@ -361,7 +361,7 @@ $(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
 # Align-ULCNet model stream.
-$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
+$(OBJ_DIR)/ulcnet_stream.o: $(STREAM_ULCNET_DIR)/ulcnet_stream.c $(STREAM_ULCNET_DIR)/ulcnet_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_range.h $(STREAM_COMMON_DIR)/stream_run.h $(ULCNET_DIR)/ulcnet_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) $(ULCNET_STREAM_INC) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard

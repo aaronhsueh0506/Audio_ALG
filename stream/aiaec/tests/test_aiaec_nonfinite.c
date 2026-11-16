@@ -32,6 +32,10 @@
 #define PRODUCT_DV (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S)
 #define PRODUCT_AL (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_ALIGN_ULCNET)
 
+#if !PRODUCT_DV
+#include "ulcnet_stream.h"
+#endif
+
 static int g_fail = 0;
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } while (0)
 #define CHECK(cond, ...) do { if (!(cond)) FAIL(__VA_ARGS__); } while (0)
@@ -485,6 +489,13 @@ static int section_order(void) {
 }
 
 int main(void) {
+#if !PRODUCT_DV
+    if (AIAEC_PCM_LIMIT_BITS != ULCNET_STREAM_PCM_LIMIT_BITS) {
+        printf("FAIL: AIAEC_PCM_LIMIT_BITS %08x != ULCNET_STREAM_PCM_LIMIT_BITS %08x\n",
+               (unsigned)AIAEC_PCM_LIMIT_BITS, (unsigned)ULCNET_STREAM_PCM_LIMIT_BITS);
+        g_fail = 1;
+    }
+#endif
     g_fail |= section_limit();
 #if PRODUCT_DV
     g_fail |= section_overflow();

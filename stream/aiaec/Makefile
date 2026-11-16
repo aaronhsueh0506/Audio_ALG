@@ -74,7 +74,7 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 STREAM_SOURCES := aiaec.c
 STREAM_HEADERS := aiaec.h aiaec_internal.h aiaec_product.h deepvqe_s/deepvqe_stream.h ../../lib/aiaec/deepvqe_s/deepvqe_prepost.h \
 	ulcnet/ulcnet_stream.h ../../lib/aiaec/ulcnet/ulcnet_prepost.h \
-	../../lib/aiaec/ulcnet/ulcnet_model_io.h ../common/stream_mem.h ../common/stream_run.h
+	../../lib/aiaec/ulcnet/ulcnet_model_io.h ../common/stream_mem.h ../common/stream_range.h ../common/stream_run.h
 
 LIB := $(OBJ_DIR)/libaiaec.a
 LIB_OBJECTS := $(OBJ_DIR)/aiaec.o

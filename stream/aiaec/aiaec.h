@@ -22,8 +22,8 @@
  * model: the analysis and synthesis keep running and its pcm_out is the hop's error spectrum through them.
  *
  * Refusals of a preprocess, in this order, before any state change and with no block opened: NULL / SEQUENCE,
- * INPUT_KIND, INPUT_SIZE, NULL input, NONFINITE_INPUT (a NaN or Inf in any plane of a _freq input, either model; for the
- * Align-ULCNet float PCM input a sample beyond AIAEC_PCM_LIMIT_BITS too; DeepVQE-S int16 PCM needs no scan).
+ * INPUT_KIND, INPUT_SIZE, NULL input, NONFINITE_INPUT (the stream refuses a NaN or Inf in any plane of a _freq input,
+ * either model; for the Align-ULCNet float PCM input a sample beyond AIAEC_PCM_LIMIT_BITS too; DeepVQE-S int16 PCM has no check).
  *
  * Align-ULCNet takes the linear AEC's float residual, the raw far of the same hop and one AiaecAlignEvent per model
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
@@ -184,7 +184,7 @@ int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, Aiaec
 void aiaec_reset_freq(AiaecFreqCtx *ctx);
 unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx);
 
-/* As aiaec_preprocess() with frames for samples; the NONFINITE scan covers the four planes (N * n_bins floats each). An
+/* As aiaec_preprocess() with frames for samples; the NONFINITE refusal covers the four planes (N * n_bins floats each). An
  * Align-ULCNet event restarts only the model: the caller's analysers and ISTFT keep running (do not reset the ISTFT), and
  * the output equals the PCM family's through the same AcStft / AcIstft. */
 int aiaec_preprocess_freq(AiaecFreqCtx *ctx, const AiaecFreqInput *input, StreamWork *work);
