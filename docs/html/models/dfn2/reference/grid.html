@@ -134,7 +134,7 @@ DFN2Grid grid
 <tr><td>32 kHz、0／0</td><td>256 = 8 ms</td><td>16 ms</td><td>0</td><td>1 hop = 256 samples = 8 ms</td><td>0／0</td></tr>
 <tr><td>16 kHz、0／0</td><td>128 = 8 ms</td><td>16 ms</td><td>0</td><td>1 hop = 128 samples = 8 ms</td><td>0／0</td></tr>
 </table></div>
-<p class="note">延遲 = (1 + M + D) × hop（<code>dfn2_prepost_latency_frames(grid)</code> + 1，N = 1）；其他 pair 照公式換算，音質待量測。第一個真幀需要 <code>dfn2_model_io_ready_frames()</code> = mask_lookahead + <code>frames_per_call</code> 個 feature frame；N = 1 時其前的 M 個 hop 沒有 job（不呼叫加速器）。</p>
+<p class="note">延遲 = (1 + M + D) × hop（<code>dfn2_prepost_latency_frames(grid)</code> + 1，N = 1）；其他 pair 照公式換算，音質待量測。第一個真幀需要 <code>dfn2_model_io_ready_frames()</code> 個 feature frame（N &gt; 1 時是 <code>frames_per_call</code>，N = 1 時是 mask_lookahead + 1）；N = 1 時其前的 M 個 hop 沒有 job（不呼叫加速器），N &gt; 1 時第一包的前 M 個 head 屬於串流開始之前的 frame，輸出靜音。</p>
 
 <h2 id="section-9">板端 sample 與測試／pipeline 的 grid</h2>
 <p>pipeline 的兩支範例 main 各持有一張 (sample rate, FFT size) → n_erb、df_bins、mask／df lookahead 的表（每一列是一個 <code>DFN2GridSpec</code>，帶 <code>df_order</code>、<code>frames_per_call</code> 與七個正規化器值；兩支範例 main 沒有 32000／512 那一列，AEC 沒有 32 kHz 格點），沒有 n_erb 或 df_bins 旗標，預設 48000 與 1024，表外的組合列出可用的列後被拒。板端的五支 sample（<code>audio_sample/</code>，不在本 repo：<code>alg_ai3_dfn.c</code>、<code>alg_ai3_dfn_lite.c</code>、<code>alg_ai3_aec_dfn.c</code>、<code>uvc_ai_nr_stream.c</code>、<code>uvc_audio_live2a.c</code>）不持有 grid 表：它們只給 <code>{sr, fft, hop_in}</code>，grid 由 <code>stream/ainr/ainr.h</code> 的登錄表決定，可用組態見 <a href="../index.html">DFN2 產品首頁</a>；下表是範例 main 的表（板端只登錄了 16000／256 與 48000／1024）：</p>

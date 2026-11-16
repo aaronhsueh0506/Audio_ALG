@@ -219,7 +219,7 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與兩個顯式
 <tr><td><code>h_gru</code></td><td>(1,5,1,256)</td><td>5,120</td><td>應用端:浮點 host 登錄 pointer + 元素數,板端由加速器持有</td><td>顯式 graph I/O,<code>h_gru_out</code> 與輸入同位址;列 0 encoder、列 1–2 ERB decoder、列 3–4 DF decoder</td></tr>
 <tr><td><code>df_convp_history</code></td><td>(1,64,5,96)</td><td>122,880</td><td>同上</td><td>顯式 graph I/O,完整 5 幀 window,<code>df_convp_history_out</code> 與輸入同位址;erb_conv0/df_conv0 的 3 幀輸入 window 由 host 位移,不在此</td></tr>
 </table></div>
-<p class="note">陣列按 grid 精確配置,較小的 grid 配置較少(state 區塊:16 kHz 256 點 32,448、32 kHz 512 點 44,320 bytes);表為出貨 grid(ring = <code>grid.ring</code> = max(df_order, M+D+1) = 5)。pool 79,984 = state 區塊 67,904 + io 區塊 2,688 + 標頭與逐框暫存 17,744。各 grid 的 pool 見 <a href="grid.html">DFN2 grid 與 ERB</a>(本機量測)。</p>
+<p class="note">陣列按 grid 精確配置,較小的 grid 配置較少(state 區塊:16 kHz 256 點 32,448、32 kHz 512 點 44,320 bytes);表為出貨 grid(ring = <code>grid.ring</code> = max(df_order, M+D+1) = 5)。pool 79,984 = state 區塊 67,904 + io 區塊 2,688 + 標頭與逐框暫存 9,392。各 grid 的 pool 見 <a href="grid.html">DFN2 grid 與 ERB</a>(本機量測)。</p>
 
 <h2 id="section-7">延遲與 warm-up</h2>
 <ul>
@@ -473,7 +473,7 @@ layout 版本、另一組幾何或另一個 lookahead pair 匯出的圖</b>—�
 <table>
 <tr><th>項目</th><th>DFN2(cascade)</th><th>DFN3(平行)</th></tr>
 <tr><td>匯出的 ONNX graph</td><td colspan="2">與 pair 無關;匯出 metadata 帶 <code>mask_lookahead</code>、<code>df_lookahead</code> 與視窗對齊(<code>input_window_alignment</code>)</td></tr>
-<tr><td>host 視窗與就緒</td><td>heads[t] 的視窗是 <code>[t-(2-M)..t+M]</code>(串流起點之前補零);第一組 heads 要 <code>dfn2_model_io_ready_frames()</code> = M + N 幀(N = 1:M+1)</td><td>同一視窗;已推入 M+1 幀(<code>dfn3_model_io_ready_frames()</code>)才有第一組 heads</td></tr>
+<tr><td>host 視窗與就緒</td><td>heads[t] 的視窗是 <code>[t-(2-M)..t+M]</code>(串流起點之前補零);第一組 heads 要 <code>dfn2_model_io_ready_frames()</code> 幀(N &gt; 1:N;N = 1:M+1)</td><td>同一視窗;已推入 M+1 幀(<code>dfn3_model_io_ready_frames()</code>)才有第一組 heads</td></tr>
 <tr><td>DF 視窗(<code>df_order</code> 5)</td><td colspan="2"><code>[t-(4-D)..t+D]</code></td></tr>
 <tr><td>輸出延遲(framing 之外)</td><td>M+D hops(相加)</td><td><code>max(M, D)</code> hops(<code>grid.output_delay</code>)</td></tr>
 <tr><td>ring 深度</td><td><code>grid.ring</code> = <code>max(df_order, M+D+1)</code>;出貨 5,2/4 為 7;mask-only 為 M+1</td><td><code>grid.ring</code> = <code>df_order + max(M,D) − D</code></td></tr>

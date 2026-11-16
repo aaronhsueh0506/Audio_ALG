@@ -71,7 +71,7 @@ cc app.c -Istream/ainr -Istream/common -I$AUDIOLIB/common \
 <tr><th>full 16 kHz／256／N=1</th><td>[1,1,3,24]</td><td>[1,2,3,96]</td><td>[1,1,1,24]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
 <tr><th>full 16 kHz／256／N=8</th><td>[1,1,10,24]</td><td>[1,2,10,96]</td><td>[1,1,8,24]</td><td>[1,8,96,10]</td><td>[1,1,8,1]</td></tr>
 <tr><th>full 48 kHz／1024／N=1（mask_lookahead 1 與 0 的 graph 同一列）</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
-<tr><th>full 48 kHz／1024／N=2（mask_lookahead 0）</th><td>[1,1,4,32]</td><td>[1,2,4,96]</td><td>[1,1,2,32]</td><td>[1,2,96,10]</td><td>[1,1,2,1]</td></tr>
+<tr><th>full 48 kHz／1024／N=2（mask_lookahead 0 或 1）</th><td>[1,1,4,32]</td><td>[1,2,4,96]</td><td>[1,1,2,32]</td><td>[1,2,96,10]</td><td>[1,1,2,1]</td></tr>
 <tr><th>full 32 kHz／512／N=1（mask_lookahead 0）</th><td>[1,1,3,28]</td><td>[1,2,3,96]</td><td>[1,1,1,28]</td><td>[1,1,96,10]</td><td>[1,1,1,1]</td></tr>
 <tr><th>full 32 kHz／512／N=4（mask_lookahead 0）</th><td>[1,1,6,28]</td><td>[1,2,6,96]</td><td>[1,1,4,28]</td><td>[1,4,96,10]</td><td>[1,1,4,1]</td></tr>
 <tr><th>lite 48 kHz／1024／N=1</th><td>[1,1,3,32]</td><td>[1,2,3,96]</td><td>[1,1,1,32]</td><td colspan="2">無</td></tr>
@@ -129,11 +129,12 @@ while (read_block(pcm_in, hop_in)) {
 <tr><td>full 16 kHz／256／N=1</td><td>128</td><td>0</td><td>128</td></tr>
 <tr><td>full 16 kHz／256／N=8</td><td>128</td><td>0</td><td>128</td></tr>
 <tr><td>full 48 kHz／1024／N=1</td><td>512</td><td>2</td><td>1536</td></tr>
+<tr><td>full 48 kHz／1024／N=2</td><td>512</td><td>2</td><td>1536</td></tr>
 <tr><td>lite 48 kHz／1024／N=1</td><td>512</td><td>1</td><td>1024</td></tr>
 <tr><td>mask_lookahead 0 的模型，32 kHz／512／N=1、4</td><td>256</td><td>0</td><td>256</td></tr>
 <tr><td>mask_lookahead 0 的模型，48 kHz／1024／N=1、2</td><td>512</td><td>0</td><td>512</td></tr>
 </tbody></table>
-<p>每包 <code>hop_in</code> 個樣本進、<code>hop_in</code> 個樣本出，沒有排空、補零或裁頭的步驟：輸出就是這條串流。輸出與輸入逐樣本對照時，把輸出往前移上表的延遲。N&gt;1 時，每包的 N 個 hop 在同一次加速器執行中算完（視窗是這 N 個 frame 加前兩個共 N + 2 個，N 個 head 與這 N 個 frame 對齊），輸出與 N=1 逐 hop 相同、不位移。</p>
+<p>每包 <code>hop_in</code> 個樣本進、<code>hop_in</code> 個樣本出，沒有排空、補零或裁頭的步驟：輸出就是這條串流。輸出與輸入逐樣本對照時，把輸出往前移上表的延遲。N&gt;1 時，每包的 N 個 hop 在同一次加速器執行中算完（視窗是這 N 個 frame 加前兩個共 N + 2 個，N 個 head 是 frame T−N+1−M 到 T−M，M = 0 時才與這一包的 N 個 frame 相同；第一包的前 M 個 head 屬於串流開始之前的 frame，輸出靜音），輸出與 N=1 逐 hop 相同、不位移。</p>
 
 <h2>衰減上限（<code>--atten-lim</code>）</h2>
 <p><code>ainr_set_atten_lim(ctx, dB)</code>（<code>_freq</code> 家族有同名函式）設定抑制量上限，預設 0 dB（關閉）；取絕對值，正負號不影響（-6 與 6 同為 6 dB，與 Python 的 <code>inference.py</code> 相同）。只能在兩包之間呼叫：pre 之後、post 之前回 <code>AINR_ERR_SEQUENCE</code>，NaN 或 Inf 回 <code>AINR_ERR_NONFINITE_INPUT</code>，NULL 回 <code>AINR_ERR_NULL</code>。它不改 pool 大小、不改 layout、不動 state；<code>ainr_reset()</code> 保留設定值。N &gt; 1 時新值從下一個完整區塊起生效。</p>

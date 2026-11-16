@@ -164,7 +164,7 @@ done:
 The spectra are `torch.stft(normalized=True)` scaled: the `AcStft` / `AcIstft` of step 3 carry `dfn2_stft_scale(grid.n_fft)` and
 `dfn2_stft_unscale(grid.n_fft)`, so the application passes audio-scale samples. Build every unit that includes the DFN2 headers with the same
 `-DDFN2_MASK_ONLY` setting as the library; `DFN2_REQUIRE_VARIANT_LINK()` turns a mismatch into a link error. With the shipped 1/1
-pair `valid` is 0 for the first two hops (the output is zeros) and the end-to-end delay is three hops. The example assumes
+pair `post_frame` returns 0 for the first two hops (the output is zeros) and the end-to-end delay is three hops. The example assumes
 `frames_per_call` 1 (the table row above); the other pairs are in
 [Lookahead pairs](../README.md#lookahead-pairs).
 

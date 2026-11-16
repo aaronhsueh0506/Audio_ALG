@@ -394,7 +394,8 @@ normalises by the window envelope like `torch.istft`; with periodic sqrt-Hann at
 hop 0 starts and by about one ulp. The center-0 frame is bit-identical to the last frame per hop of
 the centered schedule, which `tests/test_ulcnet_prepost_c.py` pins. The
 lifecycle and per-hop sequence of the model streams are described once, in
-`../README.md` ("C pre/post-processing"). Specific to this one: the identity
+`docs/html/models/reference/onnx.html` (section 4) and the contract block at the head of
+`stream/aiaec/ulcnet/ulcnet_stream.h`. Specific to this one: the identity
 frame is the error spectrum because stream 0 is a residual, and it leaves every
 state tensor as the accelerator wrote it (a runtime that reported failure is
 taken not to have written; with in-place state the board zeroes the state

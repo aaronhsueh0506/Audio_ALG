@@ -141,8 +141,8 @@ tensor，無隱藏 state；四個 state 都歸應用端——浮點 host 登錄�
 <tr><td>h_gru（subband_gru0 兩層，接 subband_gru1 兩層）</td><td>(1, 4, 1, 128)</td><td>2.00 KB</td><td>2.00 KB</td><td>2.00 KB</td><td>2.00 KB</td></tr>
 <tr><td><b>boundary 小計</b></td><td></td><td><b>59.00 KB</b></td><td><b>111.00 KB</b></td><td><b>458.00 KB</b></td><td><b>874.00 KB</b></td></tr>
 </table>
-<p>上表是<b>過邊界的 state tensor</b>，由應用端持有，不在 pool 內。<code>get_mem_size</code> 的 pool 只含 instance header、四個特徵輸入、壓縮域 error 頻譜、
-<code>output</code> 與兩路頻譜的 staging，只隨 grid 走、不隨 D 走（本機量測：D = 4、8、16、32、64 位元組相同；D 只進 <code>build_flags_hash</code>）：</p>
+<p>上表是<b>過邊界的 state tensor</b>，由應用端持有，不在 pool 內。頻譜的 staging 屬於 stream。<code>get_mem_size</code> 的 pool 只含 instance header、四個特徵輸入、壓縮域 error 頻譜、
+<code>output</code>（packet 另有 <code>frame_reset</code>），只隨 grid 走、不隨 D 走（本機量測：D = 4、8、16、32、64 位元組相同；D 只進 <code>build_flags_hash</code>）：</p>
 <table>
 <tr><th>函式</th><th>16 kHz／512（TA=26）</th><th>48 kHz／1024（TA=52）</th></tr>
 <tr><td><code>ulcnet_prepost_get_mem_size</code>（class）</td><td>8,512 B</td><td>16,704 B</td></tr>
