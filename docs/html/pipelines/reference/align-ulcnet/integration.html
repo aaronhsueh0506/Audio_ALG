@@ -235,7 +235,7 @@ int four_ulcnet_run(void) {
 <tr><td><code>*_get_mem_requirements()</code>、<code>*_get_mem_size()</code></td><td>0／大小</td><td>-1 或 0 大小(延遲組合被拒;<code>ulcnet_stream_get_mem_size()</code> 對無效 grid 或範圍外的 <code>frames_per_call</code> 回 -1,<code>req</code> 未動)</td><td>不要 init</td></tr>
 <tr><td><code>ulcnet_model_io_descriptor_validate()</code></td><td>0</td><td>-1:非 raw-far、layout 不符、D 超出 [2, 64]、格點不符</td><td>換成這個 grid 的 graph;不要 init</td></tr>
 <tr><td><code>aec_init()</code>、<code>aec_init_ex()</code>、<code>array_sample_beam_init()</code>、<code>ulcnet_stream_init_ex()</code></td><td>物件指標</td><td>NULL:pool 未對齊(串流依 <code>req.alignment</code>,16-byte)、太小、config 無效、<code>_ex</code> 的 descriptor 不符;被拒的 init 不動 pool</td><td>重新查大小並配置</td></tr>
-<tr><td><code>ulcnet_stream_pre_process_freq()</code></td><td>1(幀已開,<code>io</code> 有效)、0(本 hop 無模型幀:alignment 邊界後的 identity hop,<code>io</code> 全零)</td><td>-1:NULL 引數、上一 hop 還沒 <code>post_process_freq</code>、封包串流;串流未動</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
+<tr><td><code>ulcnet_stream_pre_process_freq()</code></td><td>1(幀已開,<code>io</code> 有效)、0(本 hop 無模型幀:alignment 邊界後的 identity hop,<code>io</code> 全零)</td><td>-1:NULL 引數、上一 hop 還沒 <code>post_process_freq</code>、封包串流;串流未動。<code>ULCNET_STREAM_ERR_RANGE</code>(-2):輸入有 NaN／Inf(PCM 入口:或超過 2^112);串流未動,下一次呼叫與沒收過這次輸入的串流一樣</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
 <tr><td>加速器(<code>run_accelerator()</code>)</td><td>0(mask 寫滿)</td><td>非 0 不是錯誤:把它交給 <code>post_process_freq</code>,該幀 identity,generation 不動</td><td>定點加速器重填量化 0(state 可能寫了一半)</td></tr>
 <tr><td><code>ulcnet_stream_post_process_freq(ai_rc)</code></td><td>1;每次輸出整個頻譜(hop #0 也是)</td><td><code>ai_rc == STREAM_RUN_OK</code> 但 mask 沒寫滿、mask 或增強頻譜有非有限值不是錯誤:該幀 identity、state generation +1;<code>ai_rc</code> 為 STREAM_RUN_NOT_STARTED 以外的非 0 值也是 identity、generation +1。-1 只在 NULL 引數或沒有對應的 <code>pre_process_freq</code>(此時不寫輸出)</td><td>-1 時 reset 前端 + 串流 + 應用端的 STFT／ISTFT;generation 變了就重載量化 0</td></tr>
 <tr><td><code>ac_istft_push_planar()</code></td><td><code>grid.hop</code></td><td>回的不是整個 hop 時由應用端判定為失敗</td><td>reset 前端 + 串流 + 應用端的 STFT／ISTFT</td></tr>
@@ -274,8 +274,8 @@ int four_ulcnet_run(void) {
   | ulcnet_stream_pre_process_freq(stream, err_re, err_im, far_re, far_im, delay, &amp;io)                    |
   |----------------------------------------------------&gt;|                                                 |
   |                          |                          | delay.changed 或 首次 solid:ulcnet_prepost_reset(state generation +1)並武裝 reprime = 1
-  |                          |                          | ulcnet_prepost_pre_process_freq:前端特徵(error_mag、far_mag、error_cos、error_sin)
-  |                          |                          | reprime &gt; 0 ? 遞減,frame_bypass,io 清零,回 0  :  frame_open(mask 預填 NaN),回 1
+  |                          |                          | 輸入範圍檢查(在邊界檢查之前;超出回 ULCNET_STREAM_ERR_RANGE,什麼都不動);暫存誤差頻譜
+  |                          |                          | reprime &gt; 0 ? 遞減,identity,io 清零,回 0  :  ulcnet_prepost_pre_frame(error_mag、far_mag、error_cos、error_sin)＋ulcnet_prepost_views(mask 預填 NaN),回 1
   |&lt;- 1(io.inputs、io.outputs、io.state_generation)| 0(reprime 幀)| -1 ---|                              |
 -- 回 1 時:呼叫端跑加速器 ----------------------------------------------------------------------------------------------
   | io.state_generation 與上次不同 -&gt; 重載量化 0                                                          |
@@ -283,8 +283,8 @@ int four_ulcnet_run(void) {
 -- 收尾 ----------------------------------------------------------------------------------------------------------------
   | ulcnet_stream_post_process_freq(stream, ai_rc, out_re, out_im)                                        |
   |----------------------------------------------------&gt;|                                                 |
-  |                          |                          | ai_rc == STREAM_RUN_OK:frame_finish 驗證 mask 與增強頻譜有限(失敗:generation +1、frame_bypass)
-  |                          |                          | ai_rc != OK:frame_fail(ai_rc != NOT_STARTED);reprime 幀已在 pre 內 bypass
+  |                          |                          | ai_rc == STREAM_RUN_OK:validate_run 驗證 mask 與 state、post_frame 驗證增強頻譜有限(失敗:generation +1 一次、誤差頻譜)
+  |                          |                          | ai_rc != OK:ai_rc != NOT_STARTED 時 zero_state(generation +1)、誤差頻譜;reprime 幀本來就是 identity
   |                          |                          | 採用的增強頻譜（否則 err）寫入 out_re／out_im，不合成
   | 1 | -1(NULL、沒有對應的 pre)                                                                          |
   | ac_istft_push_planar(istft, out_re, out_im, out)   應用端合成:每 hop 回整個 hop(含 hop #0,AC_OLA_ACCUMULATE) |</pre>

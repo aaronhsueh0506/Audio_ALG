@@ -29,7 +29,7 @@
 <tr><td><code>--delay-mode</code> <code>--delay-num-filters</code> <code>--fixed-delay</code> <code>-h</code></td><td><code>pipelines/mono/alignulcnet/main.c</code>(<code>parse_options()</code>)、<code>pipelines/4ch/alignulcnet/main.c</code>(<code>ulc_parse()</code>)</td><td>matched(預設)|fixed|external;n 1..5(僅 matched);fixed 樣本 ≥ 0(僅 fixed)</td><td>兩個範例的 CLI,都經 <code>pipelines/example_cli.h</code> 的 <code>example_cli_delay_set_option()</code> 與 <code>example_cli_delay_validate()</code>;數字由 <code>example_cli_parse_int()</code> 嚴格解析(<code>3x</code>、<code>12x</code>、空字串、前導空白、超出 int 範圍被拒,純十進位與前導 <code>+</code> 通過),被拒回 2。n 不是 runtime 旋鈕,改了要重查 pool。可靠搜尋範圍 n=1…5 約 125／221／317／413／509 ms</td></tr>
 <tr><td><code>AecConfig</code> 的 <code>delay_*</code> 與 <code>aec_config_from_level()</code> 的 level(mono)</td><td><code>pipelines/mono/alignulcnet/main.c</code>(<code>derive_lane()</code>)</td><td>level 範例用 BALANCED(須為 enum 內的值)</td><td>此鏈不使用 <code>Aec</code> 的抑制增益(post 區塊停在 AecState 更新後);level 只是必填且須合法</td></tr>
 <tr><td><code>AecConfig.delay_*</code>、<code>capture_proxy_channel</code>(4ch array,<code>aec.h</code>);<code>ArraySampleBeamParams.geometry</code>、<code>uca_radius_m</code>／<code>ula_spacing_m</code>／<code>microphone_x_m[]</code>／<code>y_m[]</code>、<code>num_angles</code>、<code>speed_of_sound_m_s</code>(4ch)</td><td><code>pipelines/4ch/array_sample_beam.h</code></td><td>與 DFN2 的 4ch 範例相同</td><td>範圍、預設與驗證規則見 <a href="../dfn2/configuration.html">DFN2 pipeline 參數與狀態</a></td></tr>
-<tr><td><code>UlcnetStreamConfig{grid, frames_per_call, freq_only}</code> → <code>ulcnet_stream_init_ex(&amp;cfg, mem, bytes, &amp;req)</code></td><td><code>stream/aiaec/ulcnet/ulcnet_stream.h</code></td><td>範例的 <code>frames_per_call</code> 為 0(一 hop 一次推論)、<code>freq_only</code> 為 1(只用頻譜進出口,PCM 進出口回 −1,pool 不含 FFT、STFT／ISTFT 與 PCM scratch)。頻譜進出口不做 STFT／ISTFT：時域 error 由應用端的 <code>AcStft</code> 分析(mono)，或把 BF 頻譜拆成平面(4ch)</td><td>init 時。pool 大小隨 grid 與 <code>freq_only</code>(<code>freq_only = 1</code>:16 kHz／512 為 14,976 B、48 kHz／1024 為 29,312 B；0:101,248 B、198,528 B)，<code>ulcnet_stream_get_mem_size()</code> 現查；兩種的 descriptor 互不接受</td></tr>
+<tr><td><code>UlcnetStreamConfig{grid, frames_per_call, freq_only}</code> → <code>ulcnet_stream_init_ex(&amp;cfg, mem, bytes, &amp;req)</code></td><td><code>stream/aiaec/ulcnet/ulcnet_stream.h</code></td><td>範例的 <code>frames_per_call</code> 為 0(一 hop 一次推論)、<code>freq_only</code> 為 1(只用頻譜進出口,PCM 進出口回 −1,pool 不含 FFT、STFT／ISTFT 與 PCM scratch)。頻譜進出口不做 STFT／ISTFT：時域 error 由應用端的 <code>AcStft</code> 分析(mono)，或把 BF 頻譜拆成平面(4ch)</td><td>init 時。pool 大小隨 grid 與 <code>freq_only</code>(<code>freq_only = 1</code>:16 kHz／512 為 10,720 B、48 kHz／1024 為 20,960 B；0:94,928 B、186,064 B)，<code>ulcnet_stream_get_mem_size()</code> 現查；兩種的 descriptor 互不接受</td></tr>
 <tr><td><code>run_accelerator(user, inputs, outputs)</code></td><td><code>pipelines/mono/alignulcnet/main.c</code>、<code>pipelines/4ch/alignulcnet/main.c</code></td><td>回 0 = <code>outputs-&gt;output</code>(mask)每個值寫滿;其他值 = 該幀走 identity</td><td>板端換成 NPU 呼叫。範例預設回 −1(無模型,每幀 identity)</td></tr>
 <tr><td><code>UlcnetModelIoDescriptor</code>(12 欄)</td><td><code>lib/aiaec/ulcnet/ulcnet_model_io.h</code></td><td>只接受 <code>far_input_mode = ULCNET_FAR_RAW</code>、layout 18、與 grid 相同的取樣率／fft／hop／bins、D 在 [2, 64];5 個模型內部欄位不比對</td><td><code>ulcnet_model_io_descriptor_default(&amp;grid, &amp;desc)</code> 填該 grid 的契約(內部欄位為 0);板端改從 ONNX metadata 填</td></tr>
 <tr><td><code>UlcnetHopIO.state_generation</code>／<code>ulcnet_stream_state_generation()</code></td><td><code>stream/aiaec/ulcnet/ulcnet_stream.h</code></td><td>單調遞增計數(init 後 0)</td><td>定點加速器的 state 緩衝在 C 清零時不會跟著變：每次跑加速器前比較，變了就填量化後的 0</td></tr>
@@ -67,24 +67,26 @@
 <tr><td></td><td><code>ulcnet_stream_get_mem_size / _init_ex / _pre_process_freq / _post_process_freq / _reset / _state_generation / _hop_size</code></td><td>模型串流的頻譜進出口(沒有 destroy)</td></tr>
 <tr><td></td><td><code>ulcnet_grid_make / ulcnet_model_io_descriptor_default / ulcnet_model_io_descriptor_validate / ulcnet_model_io_descriptor_frames</code></td><td>grid 與 descriptor</td></tr>
 <tr><td>診斷(不必呼叫)</td><td><code>aec_array_get_timing</code></td><td>檢查與診斷</td></tr>
-<tr><td>internal(.c 內 <code>static</code>)</td><td><code>ulcnet_stream.c: apply_alignment_edge / open_hop</code></td><td>alignment 邊界記帳、reprime 武裝、開幀；<code>stream/aiaec/ulcnet/ulcnet_stream.c</code></td></tr>
+<tr><td>internal(.c 內 <code>static</code>)</td><td><code>ulcnet_stream.c: apply_alignment_edge / open_hop / close_block</code></td><td>alignment 邊界記帳、reprime 武裝、開幀；<code>stream/aiaec/ulcnet/ulcnet_stream.c</code></td></tr>
 </table>
 
 <h2 id="details">Pool 與邊界條件</h2><h2 id="section-5">加速器邊界(應用端擁有 state,加速器本身無狀態)</h2>
 <p>範例 <code>main.c</code> 的 <code>run_accelerator(user, inputs, outputs)</code> 是「graph 內」那格的位置,把 <a href="../../mono/align-ulcnet/index.html">Mono · Align-ULCNet</a> 邊界表裡的「runtime 保存」變成具體的 C 邊界:accelerator 的單次呼叫是<b>無狀態</b>的(一次一幀),K/V window、attention-logit window、GRU hidden 全部由<b>應用端</b>在呼叫之間保存(範例的串流不登錄 state:板端放在加速器的緩衝,<code>UlcnetHopIO</code> 的 state 視圖為 NULL；float host 要登錄 <code>UlcnetModelIoStateBuffers</code> 時改用 <code>ulcnet_prepost</code> 類別),每個 <code>*_out</code> 就地綁定到同名輸入的位址——這是刻意選的邊界(export_onnx.py 稱其 boundary 為 <code>stateless_one_frame_full_state</code>,metadata <code>state_binding = in_place_same_address</code>):ONNX graph 本身只吃「當前幀 + 顯式 state 輸入(完整 window)」、只吐「當前幀的 mask(<code>output</code>)+ 每個 state 的完整下一個 window」(位移在 graph 內:輸入端 Slice 加 Concat),runtime 在一次呼叫內先讀完所有 state 輸入、再把輸出寫到綁定的位址;沒有複製路徑,CPU 不搬 ring。不在 graph 內部遞迴。加速器不需處理 state 的清零:C 端要求清零(reset、alignment 邊界或拒絕一幀)時 <code>ulcnet_stream_state_generation()</code>(init 後 0)加一,fixed-point 的 accelerator 另有 state 緩衝時,板端每次跑前比對 <code>io.state_generation</code>,不同就重填量化後的 0。</p>
-<p><b>串流的頻譜進出口是 ULCNet 前後處理 class 的一層薄殼。</b>每幀的 prepare → run → commit-or-discard 交易只寫在一個地方(<code>ulcnet_prepost.c</code>),串流負責驅動它並加上 alignment 邊界政策:class 只收頻譜(頻譜進、頻譜出,framing 時鐘屬於呼叫端)。<code>ulcnet_model_io.{h,c}</code> 的特徵、mask 暫存與固定前後端由 class 持有,遞迴 state 不在其中。</p>
+<p><b>串流的頻譜進出口負責呼叫生命週期,class 只有逐幀函式。</b><code>ulcnet_prepost.c</code> 提供 <code>pre_frame</code>／<code>views</code>／<code>validate_run</code>／<code>post_frame</code>／<code>zero_state</code>,串流(<code>ulcnet_stream.c</code>)決定它們的呼叫順序、暫存要活到 post 的誤差頻譜與事件、identity 幀、失敗時的重啟與輸入範圍檢查,並加上 alignment 邊界政策:class 只收頻譜(頻譜進、頻譜出,framing 時鐘屬於呼叫端)。<code>ulcnet_model_io.{h,c}</code> 的特徵、mask 暫存與固定前後端由 class 持有,遞迴 state 不在其中。</p>
 <table>
 <tr><th>state 張量</th><th>shape(ONNX 慣例,省略 batch/time)</th><th>排列</th></tr>
 <tr><td>key/value window</td><td>[1,32,D,ta_bins]；ta_bins=26(16 kHz)或52(48 kHz),見 <code>export_onnx.py</code> 的 <code>state_shapes()</code>／<code>ta_bins_for()</code></td><td><b>newest-first</b>(index 0 = 最近一幀;新幀接在前面、Slice 保留 index 0..D−2)</td></tr>
 <tr><td>logit window</td><td>[1,32,5,D]</td><td><b>oldest-first</b>(index 4 = 最近一幀,與 K/V 相反;Slice 保留 index 1..4、新列接在後面)</td></tr>
 <tr><td>GRU hidden(兩顆 subband GRU 各 2 層)</td><td>[1,4,1,128]</td><td>—(無 ring;前兩列 subband 0、後兩列 subband 1)</td></tr>
 </table>
-<p><code>ulcnet_model_io_prepare()</code> 在每次 infer 前把目前的 err/far RI 與上述三組 state 包成 <code>UlcnetModelIoInputs</code>(唯讀視圖)並把 <code>UlcnetModelIoOutputs</code>(accelerator 要寫的 <code>output</code> 與四個 <code>*_out</code>)綁好:只有 <code>output</code> 預填 NaN;每個 <code>*_out</code> 指向對應輸入的位址,不預填。<code>ulcnet_model_io_enhance_spectrum()</code> 不更新任何 state,先驗證:<code>output</code>(mask)皆有限,且已登錄 state 時,每個登錄緩衝整塊(含較舊的格子)皆有限,才成功(NaN 未被覆蓋或任何非有限值 = 判定失敗;state 已被覆寫無法回滾,已登錄的 state 全部歸零、state generation 加一、交易丟棄,板端未登錄時只加 generation——與 pipeline 自己的 fail-open 全有限值檢查是兩層獨立保護),再乘上壓縮域 error、逆冪並解包 <code>enhanced_re/im</code>;解包出的 <code>enhanced_re/im</code> 有任何非有限值同樣判定失敗,處置相同(state 歸零或只加 generation、交易丟棄)。descriptor 發布固定 raw-far deployment ABI(<code>ULCNET_FAR_RAW</code>)。</p>
+<p><code>ulcnet_model_io_pre_frame()</code>（每個 slot 一次）與 <code>ulcnet_model_io_views()</code> 在每次 infer 前把目前的 err/far RI 與上述三組 state 包成 <code>UlcnetModelIoInputs</code>(唯讀視圖)並把 <code>UlcnetModelIoOutputs</code>(accelerator 要寫的 <code>output</code> 與四個 <code>*_out</code>)綁好:只有 <code>output</code> 預填 NaN;每個 <code>*_out</code> 指向對應輸入的位址,不預填。<code>ulcnet_model_io_validate_run()</code> 不更新 state 內容,先驗證:<code>output</code>(mask)皆有限,且已登錄 state 時,每個登錄緩衝整塊(含較舊的格子)皆有限,才成功(NaN 未被覆蓋或任何非有限值 = 判定失敗;state 已被覆寫無法回滾,已登錄的 state 全部歸零、state generation 加一、這個 run 丟棄,板端未登錄時只加 generation——與 pipeline 自己的 fail-open 全有限值檢查是兩層獨立保護)。<code>ulcnet_model_io_post_frame()</code> 再對每個 slot 乘上壓縮域 error、逆冪並解包到輸出;解包出的頻譜有任何非有限值回 -2,由串流 <code>zero_state</code> 一次並把整包換成誤差頻譜(state 歸零或只加 generation)。descriptor 發布固定 raw-far deployment ABI(<code>ULCNET_FAR_RAW</code>)。</p>
 <pre>ulcnet_stream_pre_process_freq(stream, err, far, delay, &amp;io) … post_process_freq(stream, ai_rc, out)   ← 每個發射幀一次
- │  (串流內部,對 pipeline 不可見;串流只是驅動 class;reprime hop 在 pre 內直接 frame_bypass,不開幀)
- ├─ ulcnet_prepost_pre_process_freq(prepost, err_re, err_im, far_re, far_im)
- │      一個頻譜 = 一次 accelerator 呼叫,回傳恆 1(否則即失敗)
- ├─ ulcnet_prepost_frame_open(prepost, &amp;inputs, &amp;outputs)          → pre_process_freq 回 1,交出 io
+ │  (串流內部,對 pipeline 不可見;呼叫順序與暫存在串流;reprime hop 在 pre 內直接 identity,不呼叫 pre_frame／views)
+ ├─ 輸入範圍檢查(頻譜 bin 為 NaN／Inf、PCM 樣本為 NaN／Inf 或超過 2^112 → ULCNET_STREAM_ERR_RANGE(-2),什麼都不動)
+ ├─ 暫存誤差頻譜(identity 與事件幀的來源)
+ ├─ ulcnet_prepost_pre_frame(prepost, slot, err_re, err_im, far_re, far_im, event)
+ │      一個 slot 一次;N 個 slot 都寫完才 views
+ ├─ ulcnet_prepost_views(prepost, &amp;inputs, &amp;outputs)               → pre_process_freq 回 1,交出 io
  │      inputs.key_history/value_history  ← 登錄的 K/V 緩衝(newest-first;板端:NULL)
  │      inputs.logit_history              ← 登錄的 logit 緩衝(oldest-first;板端:NULL)
  │      inputs.h_gru                      ← 登錄的 GRU hidden(合併的單一 tensor;板端:NULL)
@@ -92,13 +94,16 @@
  │      outputs.*_history_out / h_gru_out = 對應 inputs 的位址(不預填)
  ├─ ai_rc = run_accelerator(user, &amp;io.inputs, &amp;io.outputs)   ← 呼叫端(板端)一次無狀態 tensor invocation
  │      runtime 先讀完所有 state 輸入、再寫輸出(輸出位址 = 輸入位址)
- │      回非 STREAM_RUN_OK → post_process_freq 以 ulcnet_prepost_frame_fail(prepost, ai_rc != STREAM_RUN_NOT_STARTED) 收掉交易(STREAM_RUN_NOT_STARTED:state 不動;其他:state 歸零、generation +1)
- ├─ ulcnet_prepost_frame_finish(prepost)
- │      output 有限,已登錄的 state 整塊有限,解包出的 enhanced_re/im 也有限?
- │        是 → 交出 enhanced_re/im(state 已由 runtime 就地寫好,finish 不位移、不複製)
- │        否 → 已登錄的 state 歸零(state generation +1),frame_bypass 收尾(fail-open:交出誤差頻譜)
- └─ ulcnet_prepost_post_process_freq(prepost, out_re, out_im)</pre>
-<p class="note">D(<code>delay_depth</code>)決定 K/V 與 logit window 的深度(依 export descriptor),但不進 pool 大小:串流 pool 只隨 grid,範例的 <code>freq_only</code> 串流在 D=8 時為 14,976 B(16 kHz／512)與 29,312 B(48 kHz／1024),D=32 同大小、build_flags_hash 不同。遞迴 state 另由應用端持有,大小見 <a href="../../mono/align-ulcnet/index.html">Mono · Align-ULCNet</a> 的 State 表。串流 pool <b>不在</b>helper／<code>Aec</code> 的 pool 內，由 caller 另外切塊。實際產品一律以 <code>ulcnet_stream_get_mem_size()</code> 現查，不可跨 grid 沿用常數。</p>
+ │      回非 STREAM_RUN_OK → post_process_freq 的處置:STREAM_RUN_NOT_STARTED:state 不動;其他:ulcnet_prepost_zero_state(state 歸零、generation +1);輸出誤差頻譜
+ ├─ ulcnet_prepost_validate_run(prepost)
+ │      output 有限,已登錄的 state 整塊有限?
+ │        否 → 已登錄的 state 歸零(state generation +1 一次),輸出誤差頻譜(fail-open)
+ ├─ ulcnet_prepost_post_frame(prepost, slot, out_re, out_im)   (事件幀:輸出誤差頻譜,不呼叫)
+ │      解包出的頻譜有限?
+ │        是 → 交出增強頻譜(state 已由 runtime 就地寫好,不位移、不複製)
+ │        否(-2)→ ulcnet_prepost_zero_state 一次,整包輸出誤差頻譜(fail-open)
+ └─ 整包寫完才做合成(PCM 入口)</pre>
+<p class="note">D(<code>delay_depth</code>)決定 K/V 與 logit window 的深度(依 export descriptor),但不進 pool 大小:串流 pool 只隨 grid,範例的 <code>freq_only</code> 串流在 D=8 時為 10,720 B(16 kHz／512)與 20,960 B(48 kHz／1024),D=32 同大小、build_flags_hash 不同。遞迴 state 另由應用端持有,大小見 <a href="../../mono/align-ulcnet/index.html">Mono · Align-ULCNet</a> 的 State 表。串流 pool <b>不在</b>helper／<code>Aec</code> 的 pool 內，由 caller 另外切塊。實際產品一律以 <code>ulcnet_stream_get_mem_size()</code> 現查，不可跨 grid 沿用常數。</p>
 
 <h2 id="section-6">Identity reprime(alignment 邊界,option A)</h2>
 <h3>mono(<code>Aec</code> + <code>ulcnet_stream</code> 的頻譜進出口)</h3>

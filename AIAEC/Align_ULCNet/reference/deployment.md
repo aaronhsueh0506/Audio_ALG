@@ -22,12 +22,12 @@ flowchart LR
         ERR["linear_error"]
         RFAR["raw_far"]
         STFT["application: two AcStft (audiolib)<br/>sqrt-Hann, center 0, 50% hop"]
-        FEAT["prepare(): fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
+        FEAT["pre_frame(): fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
         ERRF["error_mag / error_cos / error_sin<br/>each [1,1,BINS]<br/>compressed error RI kept in model_io state"]
         FARF["far_mag<br/>[1,1,BINS]"]
         STATE["state tensors, the application's<br/>K/V window + logit window<br/>one h_gru tensor"]
-        CHECK["enhance_spectrum(): validate"]
-        INV["complex multiply by the mask<br/>+ inverse signed power, fp32<br/>(enhance_spectrum)"]
+        CHECK["validate_run(): validate"]
+        INV["complex multiply by the mask<br/>+ inverse signed power, fp32<br/>(post_frame)"]
         WOLA["application: AcIstft (audiolib)<br/>overlap-add, AC_OLA_ACCUMULATE"]
         OUT["enhanced PCM hop"]
         MIC --> AEC
@@ -75,7 +75,7 @@ compressed-domain phase as cos/sin in fp32, and the graph binds the four
 feature tensors as separate inputs so each keeps its own quantization scale.
 The graph ends at the `complex_mask` 1x1 Conv and returns the learned mask
 itself; the fixed back end (complex multiply of the compressed error spectrum,
-which `prepare()` keeps in the model-I/O state, by that mask, then the inverse
+which `pre_frame()` keeps in the model-I/O state, by that mask, then the inverse
 signed power) runs on the host.
 The far branch is the original raw reference. PBFDKF's aligned copy is private
 to formation of the linear-error branch; the model's TA block owns alignment.
@@ -105,7 +105,7 @@ Outputs per invocation:
 
 | tensor | float32 shape | CPU action |
 |---|---:|---|
-| `output` | `[1,2,1,BINS]` | the learned complex mask, planar (plane 0 real, plane 1 imaginary); multiply the compressed error spectrum by it, apply the inverse signed power (`sign(x) * |x|^(1/0.3)`). `ulcnet_model_io_enhance_spectrum()` does both; the application's `AcIstft` does the IFFT and overlap-add |
+| `output` | `[1,2,1,BINS]` | the learned complex mask, planar (plane 0 real, plane 1 imaginary); multiply the compressed error spectrum by it, apply the inverse signed power (`sign(x) * |x|^(1/0.3)`). `ulcnet_model_io_post_frame()` does both; the application's `AcIstft` does the IFFT and overlap-add |
 | `key_history_out` | `[1,32,D,TA_BINS]` | bound to the address of `key_history` |
 | `value_history_out` | `[1,32,D,TA_BINS]` | bound to the address of `value_history` |
 | `logit_history_out` | `[1,32,5,D]` | bound to the address of `logit_history` |
@@ -113,10 +113,10 @@ Outputs per invocation:
 
 Every state tensor comes back whole with exactly its input's shape, and the
 runtime binds each `*_out` to the address of the input of the same name:
-`prepare()` returns `out.<state>_out == in.<state>`, fixed for the life of the
+`views()` returns `out.<state>_out == in.<state>`, fixed for the life of the
 state. The runtime must finish reading every state input before it writes any
 state output. There is no copy path and no ping-pong. A refused
-`enhance_spectrum()` cannot roll back: the registered state tensors are zeroed
+`validate_run()` cannot roll back: the registered state tensors are zeroed
 (a board registers none), the state generation advances, and a run that
 reported failure is taken not to have written. With in-place state a failed run
 may still have overwritten the state tensors, so a board zeroes them before the
@@ -139,7 +139,7 @@ debug-only and is not part of the production ABI.
 
 `ulcnet_model_io_state_generation()` (also exposed as
 `ulcnet_prepost_state_generation()`) counts the times the C side
-restarted the state: `reset`, each refused frame and each run reported as
+restarted the state: `reset`, `zero_state`, each refused run and each run reported as
 started and failed (`stream_run.h`: any status except `STREAM_RUN_OK` and
 `STREAM_RUN_NOT_STARTED`) add one, whether or not state is registered; it is 0
 after init. A board whose accelerator keeps fixed-point state loads the
@@ -147,8 +147,8 @@ quantized representation of zero into its state inputs at start and whenever
 the value differs from the one it last saw; it does not track failures itself.
 
 A board that calls the model I/O layer directly uses it in this order (error
-paths fail open and must not call `enhance_spectrum` with incomplete
-accelerator outputs):
+paths fail open and must not call `post_frame` with incomplete accelerator
+outputs):
 
 ```c
 UlcnetGridSpec spec = { .sample_rate = 16000, .n_fft = 512, .delay_depth = 8 };
@@ -174,19 +174,23 @@ if (ulcnet_model_io_state_generation(state) != generation_seen) {
     /* ... reload the quantized zero into the accelerator's state buffers ... */
     generation_seen = ulcnet_model_io_state_generation(state);
 }
-ulcnet_model_io_prepare(state, err_re, err_im, far_re, far_im, &in, &out);
+ulcnet_model_io_pre_frame(state, 0, err_re, err_im, far_re, far_im, 0);
+ulcnet_model_io_views(state, &in, &out);
 /* Bind in.* to the accelerator inputs and every out.*_out to the address of
  * the matching in.* state (a float host registers its buffers with
- * UlcnetModelIoStateBuffers instead of NULL; prepare() returns them). The
+ * UlcnetModelIoStateBuffers instead of NULL; views() returns them). The
  * runtime reads all state inputs before it writes any state output. */
 if (run_accelerator(&in, &out) == 0 &&
-    ulcnet_model_io_enhance_spectrum(state, enhanced_re, enhanced_im) == 0) {
+    ulcnet_model_io_validate_run(state) == 0 &&
+    ulcnet_model_io_post_frame(state, 0, enhanced_re, enhanced_im) == 0) {
     /* enhanced_re/im may now be sent to the synthesis (ac_istft_push_planar). */
 } else {
-    /* Output the linear-error hop. A refused enhance_spectrum() advanced the
-     * state generation (the next hop's check reloads the board's state; a float
-     * host's registered buffers are already zeroed); a run that was never
-     * finished leaves the state as the accelerator wrote it. */
+    /* Output the linear-error hop. A refused validate_run() already advanced
+     * the state generation; a non-finite enhanced bin (post_frame() returns -2)
+     * needs one ulcnet_model_io_reset(state) from the caller. Either way the
+     * next hop's check reloads the board's state (a float host's registered
+     * buffers are zeroed); a run that was never finished leaves the state as
+     * the accelerator wrote it. */
 }
 ```
 
@@ -299,8 +303,8 @@ model-local `export_onnx.py` is a supported user entry point.
 ## Graph boundary
 
 There is one boundary and no layout switch: the fixed front and back ends run on
-the host (`stream_features`, `host_back_end`; C: `ulcnet_model_io_prepare` and
-`ulcnet_model_io_enhance_spectrum`), the graph binds the four feature tensors and four
+the host (`stream_features`, `host_back_end`; C: `ulcnet_model_io_pre_frame`,
+`ulcnet_model_io_views` and `ulcnet_model_io_post_frame`), the graph binds the four feature tensors and four
 rank-4 state tensors, and the two subband GRU hiddens travel as one `h_gru`.
 `export_onnx.py` and `inference.py calib` take no layout flag, and
 `inference.py calib` exports the graph from the same model instance in the same
@@ -353,21 +357,21 @@ Conv has no activation, so its range comes from calibration.
 `ulcnet_model_io.c/.h` carve the feature tensors, the mask staging and the
 compressed error spectrum from one caller-owned pool; its size follows the
 grid, not D, and it holds no recurrent state. The state is the application's
-(see "Stateless accelerator deployment"). `prepare()` NaN-fills only `output`
-(the state tensors are the inputs and are not prefilled), binds each `*_out`
-to its input address, computes the four feature tensors internally from the
-raw spectra and keeps the compressed error spectrum in the pool.
-`enhance_spectrum()` updates no state: it checks that `output` (the mask) is
+(see "Stateless accelerator deployment"). `views()` NaN-fills only `output`
+(the state tensors are the inputs and are not prefilled) and binds each `*_out`
+to its input address; `pre_frame()` computes the four feature tensors of a
+slot internally from the raw spectra and keeps the compressed error spectrum
+in the pool. `validate_run()` updates no state: it checks that `output` (the mask) is
 finite and, when state is registered, that every element of every registered
 buffer is (a non-finite value left in an older window slot would reach `output`
-on a later frame), then multiplies the compressed error spectrum by the mask
-and applies the inverse signed power into `enhanced_re/im`, and checks that the
-enhanced spectrum is finite: a finite mask can overflow the inverse power
-(a mask bin of 3.0e30 does), and a non-finite error bin passes through it. On
-any non-finite value the registered buffers are zeroed (cold start), the state
-generation advances, the transaction is discarded and -1 is returned; the
-caller's outputs are untouched after a refused mask or state and hold no valid
-frame after a refused spectrum. A partial write to state is detectable only as
+on a later frame); on a non-finite value the registered buffers are zeroed
+(cold start), the state generation advances once and -1 is returned.
+`post_frame()` then multiplies the compressed error spectrum of a slot by the
+mask and applies the inverse signed power into the caller's arrays, and checks
+that the enhanced spectrum is finite: a finite mask can overflow the inverse
+power (a mask bin of 3.0e30 does), and a non-finite error bin passes through it.
+It returns -2 and touches neither state nor generation; the caller restarts once
+per run and the arrays hold no valid frame. A partial write to state is detectable only as
 a non-finite value. The enhanced-spectrum check is C only: the Python
 reference `host_back_end` returns the non-finite frame. `ulcnet_prepost.h` states the
 framing contract below; the library holds no transform code. Board NPU drivers and mono/4ch pipeline wiring are outside
@@ -376,7 +380,10 @@ this model-side deliverable.
 `ulcnet_prepost.c/.h` is the pre/post *class* over the model I/O layer: one
 opaque `UlcnetPrepost` that takes the error and far spectra and owns the
 feature front end and the per-frame accelerator transaction, so an integrator
-never composes `ulcnet_model_io` by hand. It is frequency domain only. The
+never composes `ulcnet_model_io` by hand. It is frequency domain only and holds
+per-frame functions only (`pre_frame`, `views`, `validate_run`, `post_frame`,
+`zero_state`); the call lifecycle (what is kept until post, identity frames, the
+restart after a failed run, the input range check) is `stream/aiaec/ulcnet`'s. The
 application frames with audiolib as `ulcnet_prepost.h` states: the analysis
 `AcStft` per stream from `ac_stft_config_default(&sc, grid.n_fft)` (sqrt-Hann,
 `spec_scale` 1, center 0, one frame per hop from hop 0) and one `AcIstft` with
@@ -386,12 +393,12 @@ normalises by the window envelope like `torch.istft`; with periodic sqrt-Hann at
 50 % overlap that envelope is 1 up to rounding, so the two differ only in how
 hop 0 starts and by about one ulp. The center-0 frame is bit-identical to the last frame per hop of
 the centered schedule, which `tests/test_ulcnet_prepost_c.py` pins. The
-lifecycle and per-hop sequence shared by every class are described once, in
-`../README.md` ("C pre/post-processing"). Specific to this one:
-`frame_bypass` is the pass-through identity because stream 0 is a residual, and
-it leaves every state tensor as the accelerator wrote it (a runtime that
-reported failure is taken not to have written; with in-place state the board
-zeroes the state before the next run); the pool's `build_flags_hash`
+lifecycle and per-hop sequence of the model streams are described once, in
+`../README.md` ("C pre/post-processing"). Specific to this one: the identity
+frame is the error spectrum because stream 0 is a residual, and it leaves every
+state tensor as the accelerator wrote it (a runtime that reported failure is
+taken not to have written; with in-place state the board zeroes the state
+before the next run); the pool's `build_flags_hash`
 still folds D, so `_init_ex` refuses a pool recorded for another D although the
 bytes are equal. The class gate is `tests/test_ulcnet_prepost_c.py`.
 
