@@ -6,7 +6,7 @@
 
 | 項目 | 位置 |
 |---|---|
-| 產品、grid、`N = hop_in / (fft / 2)`、graph 與 ERB 的選擇，延遲（AIAEC 另含尾端長度） | `stream/ainr/ainr.c`、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` 只回 `graph_path`、`queue_frames`；`AiaecInfo` 只回 `graph_path`、`trim_samples`、`queue_frames`、`tail_zero_blocks` |
+| 產品、grid、`N = hop_in / (fft / 2)`、graph 與 ERB 的選擇，延遲（DFN2） | `stream/ainr/ainr.c`、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` 只回 `graph_path`、`queue_frames`；`AiaecInfo` 只回 `graph_path` |
 | 這一包的訊號與 head（資料指標、元素數、`[b,c,h,w]`、generation、action、`frame_reset` 控制值） | `StreamWork`（`stream/common/stream_run.h`），由真實的 pre 呼叫填 |
 | 每個登錄的組態（含尚未交付 graph 的）的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_deepvqes.h`、`stream/aiaec/graph_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列，註明所對應的匯出器 |
 | 共用接線程式：列的展開、state 配對、`stream_check_ports()` 呼叫、buffer 大小、pre 到 AI3 的邊界核對 | `stream/common/graph_io.h`（SDK 無關、只有標頭；`make -C stream/common test-graph-io`）。sample 加 `-I stream/common -I stream/ainr`（或 `stream/aiaec`）並編譯 `stream/common/stream_bind.c` |
