@@ -1,5 +1,6 @@
 #include "array_sample_driver.h"
 #include "example_cli.h"
+#include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
 #include <stdio.h>
 #include <math.h>
@@ -130,13 +131,9 @@ int array_sample_main(int argc, char **argv, const ArraySampleOps *ops, void *us
         if (rc < 0) goto cleanup;
         if (rc == 0) break;
         if (ops->process(user, frames) != 0) goto cleanup;
-        if (hop.check_finite) {
-            for (int i = 0; i < hop.hop; ++i) {
-                if (!isfinite(hop.output[i])) {
-                    if (ops->nonfinite) ops->nonfinite(user);
-                    goto cleanup;
-                }
-            }
+        if (hop.check_finite && !skn_all_finite_f32(hop.output, (size_t)hop.hop)) {
+            if (ops->nonfinite) ops->nonfinite(user);
+            goto cleanup;
         }
         if (ops->consume && ops->consume(user, frames) != 0) goto cleanup;
         ++frames;

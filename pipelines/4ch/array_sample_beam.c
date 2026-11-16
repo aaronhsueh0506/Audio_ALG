@@ -11,6 +11,7 @@
 #include "anr_types.h"            /* anr_retime_alpha, anr_retime_frames */
 #include "spatial_simd.h"
 #include "utility/mem_align.h"
+#include "utility/simd_kernel_nn.h"   /* skn_all_finite_f32 */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -379,15 +380,6 @@ int array_sample_beam_process_with_activity(ArraySampleBeam* b, const float* mic
     return array_sample_beam_process_beam(b, &front, vad_raw, vad_out, frequency_mask, beam, info);
 }
 
-static int floats_finite(const float* values, size_t count) {
-    size_t i;
-    if (!values) return 0;
-    for (i = 0; i < count; ++i) {
-        if (!isfinite(values[i])) return 0;
-    }
-    return 1;
-}
-
 static int auto_vad(ArraySampleBeam* b, const float* microphones_interleaved) {
     float sum = 0.0f;
     float power;
@@ -428,7 +420,7 @@ int array_sample_beam_process(ArraySampleBeam* b, const float* microphones_inter
     if (!b || b->destroyed || !microphones_interleaved || !far_reference || !beam)
         return AEC_ERR_ARG;
     /* auto_vad() reads only the microphones: refuse a non-finite far before it moves. */
-    if (!floats_finite(far_reference, (size_t)b->hop_size)) return AEC_ERR_ARG;
+    if (!skn_all_finite_f32(far_reference, (size_t)b->hop_size)) return AEC_ERR_ARG;
     speech = auto_vad(b, microphones_interleaved);
     return array_sample_beam_process_with_activity(b, microphones_interleaved, far_reference,
                                                   speech, speech, NULL, beam, info);
