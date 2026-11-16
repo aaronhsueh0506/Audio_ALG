@@ -22,6 +22,7 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
 
 /* An ERB file of the grid's size: zero forward table, inverse with band 0 owning every bin (init checks the
  * header, the length and that the inverse is a partition of unity). */
@@ -62,7 +63,7 @@ int main(int argc, char **argv) {
         hop = cfg.fft / 2;
         bins = hop + 1;
         n_erb = cfg.sr == 16000 ? 24 : 32;
-        snprintf(erb, sizeof(erb), "/tmp/ainr_dump_work_%d.bin", (int)getpid());
+        erb_fixture_scratch_path(erb, sizeof(erb), "ainr_dump_work");
         if (write_erb(erb, bins, n_erb) != 0) return 2;
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;
         rc = family == 0 ? ainr_init_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &pcm, &info)

@@ -178,7 +178,7 @@ static void run_row(const Row *r) {
         DFN2StreamConfig fcfg = make_cfg(&grid, NULL, NULL);
         DFN2StreamMemReq freq;
         void *fpool = NULL;
-        snprintf(path, sizeof(path), "/tmp/dfn2_erb_partition_%d_%d.bin", r->fft, (int)getpid());
+        erb_fixture_scratch_path(path, sizeof(path), "dfn2_erb_partition");
         CHECK(dfn2_stream_get_mem_size(&fcfg, &freq) == 0, "%d/%d: file sizing", r->sr, r->fft);
         if (posix_memalign(&fpool, 16, (size_t)freq.bytes) != 0) exit(2);
         write_file(path, &grid, good_split);

@@ -155,7 +155,7 @@ CORE_HEADERS := ../../lib/ainr/dfn2/dfn2_grid.h \
 	../../lib/ainr/dfn2/dfn2_model_io_priv.h \
 	../../lib/ainr/dfn2/dfn2_prepost.h
 
-TEST_FIXTURE := tests/ainr_test_fixture.h
+TEST_FIXTURE := tests/ainr_test_fixture.h dfn2/tests/erb_fixture.h
 
 AINR_TEST_BIN := $(OBJ_DIR)/test_ainr_dfn2
 AINR_TEST_SOURCES := tests/test_ainr_dfn2.c $(CORE_SOURCES) dfn2/dfn2_stream.c ainr.c

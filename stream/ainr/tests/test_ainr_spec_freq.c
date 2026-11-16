@@ -126,7 +126,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
     if (ainr_get_mem_size_freq(&cfg, &req_freq) != AINR_OK) { fprintf(stderr, "%s: get_mem_size_freq fail\n", label); return 1; }
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_spec_freq_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_erb");
     write_synthetic_erb(erb_path, n_bins, n_erb);
 
     pool_pcm = alloc_aligned((size_t)req_pcm.bytes, req_pcm.alignment);
@@ -225,7 +225,7 @@ static int test_core_ordering_and_bypass(void) {
     float *im2 = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int rc, k, f, same;
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_spec_freq_n8_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_n8_erb");
     write_synthetic_erb(erb_path, n_bins, T2_ERB);
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "test_core_ordering: get_mem_size fail\n"); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
@@ -298,7 +298,7 @@ static int test_freq_core_matches_pcm_core(void) {
     float *out_im_freq = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int block, rc;
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_spec_freq_n8f_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_n8f_erb");
     write_synthetic_erb(erb_path, n_bins, T2_ERB);
     if (ainr_get_mem_size(&cfg, &req_p) != AINR_OK || ainr_get_mem_size_freq(&cfg, &req_f) != AINR_OK) {
         fprintf(stderr, "test_freq_core_matches_pcm_core: get_mem_size fail\n"); return 1;
@@ -366,8 +366,7 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
     cfg.fft = fft;
     cfg.hop_in = n * hop;
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_spec_freq_delay_erb_%d_%d_%d.bin",
-             sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_spec_freq_delay_erb");
     write_synthetic_erb(erb_path, n_bins, n_erb);
 
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }

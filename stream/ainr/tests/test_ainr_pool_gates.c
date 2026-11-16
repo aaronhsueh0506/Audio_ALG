@@ -232,7 +232,7 @@ static int run_case(int sr, int fft, int n_erb, int n, uint64_t pcm_bytes, uint6
     char erb[160];
     int f, rc = 0;
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * (fft / 2);
-    snprintf(erb, sizeof(erb), "/tmp/ainr_poolgates_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_poolgates_erb");
     write_synthetic_erb(erb, fft / 2 + 1, n_erb);
     for (f = FAM_PCM; f <= FAM_FREQ; ++f)
         rc |= run_family((Fam)f, &cfg, erb, n_erb, f == FAM_PCM ? pcm_bytes : freq_bytes, label);

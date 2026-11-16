@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
+
 /* ERB_PATTERN: fwd[i] = (i % 17) * 0.01 and an inverse that splits bin k 0.75 / 0.25 over bands k % n_erb and
  * (k + 1) % n_erb (bin-major both; ainr_init refuses an inverse that is not a partition of unity). ERB_IDENTITY: every bin in
  * one contiguous band, forward = band mean, inverse = 1, so a unit mask is a unit gain.

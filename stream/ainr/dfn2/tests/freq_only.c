@@ -268,7 +268,7 @@ static void run_row(const Row *r) {
 
         if (!inv_bin) exit(2);
         erb_fixture_split_inv_bin_major(inv_bin, g.n_bins, g.n_erb);
-        snprintf(path, sizeof(path), "/tmp/dfn2_stream_freq_only_erb_%d.bin", (int)getpid());
+        erb_fixture_scratch_path(path, sizeof(path), "dfn2_stream_freq_only_erb");
         memset(&cfile, 0, sizeof(cfile));
         cfile.grid = g;
         CHECK(dfn2_stream_get_mem_size(&cfile, &rfile_full) == 0, "%s: file sizing", label);

@@ -264,7 +264,7 @@ static int run_status_table(int sr, int fft, int n_erb, int n, int warm, const c
     int fi, si, rc = 0;
     char erb[160];
     int n_bins = fft / 2 + 1;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_runstatus_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_runstatus_erb");
     write_synthetic_erb(erb, n_bins, n_erb);
     for (fi = 0; fi < 2; ++fi)
         for (si = 0; si < (int)(sizeof(statuses) / sizeof(statuses[0])); ++si) {
@@ -294,7 +294,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int warm, const char *lab
     int fi, rc = 0;
     char erb[160];
     int n_bins = fft / 2 + 1;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_stategen_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_stategen_erb");
     write_synthetic_erb(erb, n_bins, n_erb);
     for (fi = 0; fi < 2; ++fi) {
         Fam f;

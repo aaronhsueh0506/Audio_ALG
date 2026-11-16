@@ -4,7 +4,26 @@
 #ifndef DFN2_STREAM_TEST_ERB_FIXTURE_H
 #define DFN2_STREAM_TEST_ERB_FIXTURE_H
 
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+/* A scratch file name under /tmp: the file is created here with O_EXCL (mode 0600), so a symlink or
+ * file planted under a guessed name is refused, never followed; the caller rewrites it and unlinks it. Exits on failure. */
+static inline void erb_fixture_scratch_path(char *out, size_t cap, const char *tag)
+{
+    int attempt;
+    for (attempt = 0; attempt < 64; ++attempt) {
+        int fd;
+        if (snprintf(out, cap, "/tmp/%s_%d_%d.bin", tag, (int)getpid(), attempt) >= (int)cap) break;
+        fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { close(fd); return; }
+    }
+    fprintf(stderr, "cannot create a scratch file for %s\n", tag);
+    exit(2);
+}
 
 /* Band 0 owns every bin. band_major [n_erb][n_bins]. */
 static inline void erb_fixture_unit_inv(float *inv_band_major, int n_bins, int n_erb)

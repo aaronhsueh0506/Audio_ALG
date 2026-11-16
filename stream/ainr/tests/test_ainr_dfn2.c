@@ -636,7 +636,7 @@ int main(void) {
 
     n_bins = grid16.n_bins;
     n_erb = grid16.n_erb;
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_dfn2_scratch_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_dfn2_scratch_erb");
     write_synthetic_erb(erb_path, n_bins, n_erb);
 
     if (test_n1_matches_reference(erb_path) != 0) return 1;

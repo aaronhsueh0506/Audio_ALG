@@ -74,7 +74,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     double v;
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = hop_in;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_tail_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_tail_erb");
     write_identity_erb(erb, n_bins, n_erb);
 
     /* PCM family: init reports the queue; the internal ISTFT synthesises. */

@@ -16,6 +16,7 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
 #include "ainr_product.h"
 #include "dfn2_model_io.h"
 #include "graph_io.h"
@@ -131,7 +132,7 @@ static void run_family(const AinrConfig *cfg, int family, int n, const GraphIoCo
     rc = family == 0 ? ainr_get_mem_size(cfg, &req) : ainr_get_mem_size_freq(cfg, &req);
     CHECK(rc == AINR_OK, "%s mem size %d", tag, rc);
     if (rc != AINR_OK) return;
-    snprintf(erb, sizeof erb, "/tmp/ainr_graph_io_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_graph_io_erb");
     if (write_erb(erb, bins, (int)mc->wiring.outputs[0].w) != 0) exit(2);
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
     rc = family == 0 ? ainr_init_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
@@ -212,7 +213,7 @@ int main(void)
 
     if (ID_HAS_ROWS) {
         char erb[96];
-        snprintf(erb, sizeof erb, "/tmp/ainr_graph_io_refusal_%d.bin", (int)getpid());
+        erb_fixture_scratch_path(erb, sizeof(erb), "ainr_graph_io_refusal");
         if (write_erb(erb, 513, 32) != 0) exit(2);
         check_refusals(erb);
         unlink(erb);

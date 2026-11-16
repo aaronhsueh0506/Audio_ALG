@@ -202,7 +202,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     size_t cap = (size_t)BLOCKS * (size_t)n * (size_t)n_bins * 8u;
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * hop;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_nonfinite_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_erb");
     write_synthetic_erb(erb, n_bins, n_erb);
     clean.buf = (float *)malloc(cap * sizeof(float)); clean.cap = cap;
     omit.buf = (float *)malloc(cap * sizeof(float));  omit.cap = cap;
@@ -254,7 +254,7 @@ static int run_boundary(int sr, int fft, int n_erb, const char *label) {
 
     if (edge * scale != ldexpf(1.0f, 63)) { fprintf(stderr, "%s: scale is not a power of two\n", label); return 1; }
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = fft / 2;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_nonfinite_edge_%d_%d.bin", fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_edge");
     write_synthetic_erb(erb, n_bins, n_erb);
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "%s: mem size fail\n", label); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
@@ -320,7 +320,7 @@ static int run_stream_guard(const char *label) {
     spec.frames_per_call = 1;
     if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) { fprintf(stderr, "%s: grid fail\n", label); return 1; }
     nb = (size_t)grid.n_bins;
-    snprintf(erb, sizeof(erb), "/tmp/ainr_nonfinite_stream_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_stream_erb");
     write_synthetic_erb(erb, grid.n_bins, grid.n_erb);
     memset(&scfg, 0, sizeof(scfg));
     scfg.grid = grid;

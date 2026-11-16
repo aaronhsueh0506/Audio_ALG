@@ -18,6 +18,7 @@
 #include "ainr.h"
 #include "ainr_product.h"
 #include "ainr_test.h"
+#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
 
 static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); ++g_fail; } } while (0)
@@ -87,7 +88,7 @@ int main(void) {
     n1.sr = 16000; n1.fft = 256; n1.hop_in = 128;
 #endif
     rc = ainr_get_mem_size(&n1, &req);
-    snprintf(erb, sizeof(erb), "/tmp/ainr_product_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_product_erb");
 #ifdef DFN2_MASK_ONLY
     write_synthetic_erb(erb, 513, 32);
 #else

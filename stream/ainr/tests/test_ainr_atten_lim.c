@@ -59,7 +59,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     float *z;
     const int blocks = 24;
 
-    snprintf(erb, sizeof(erb), "/tmp/ainr_attenlim_erb_%d_%d_%d.bin", sr, fft, (int)getpid());
+    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_attenlim_erb");
     write_synthetic_erb(erb, n_bins, n_erb);
     memset(&cfg, 0, sizeof(cfg));
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * (fft / 2);

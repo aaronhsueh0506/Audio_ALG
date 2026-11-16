@@ -154,9 +154,9 @@ int main(void) {
     FILE *fp;
     int32_t hdr[2];
 
-    snprintf(path, sizeof(path), "/tmp/dfn2_stream_scratch_erb_%d.bin", (int)getpid());
-    snprintf(bad_path, sizeof(bad_path), "/tmp/dfn2_stream_scratch_erb_bad_%d.bin", (int)getpid());
-    snprintf(short_path, sizeof(short_path), "/tmp/dfn2_stream_scratch_erb_short_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(path, sizeof(path), "dfn2_stream_scratch_erb");
+    erb_fixture_scratch_path(bad_path, sizeof(bad_path), "dfn2_stream_scratch_erb_bad");
+    erb_fixture_scratch_path(short_path, sizeof(short_path), "dfn2_stream_scratch_erb_short");
 
     for (i = 0; i < elems; ++i) { fwd[i] = (float)(i % 17) * 0.01f; }
     erb_fixture_split_inv_bin_major(inv_bin_major, (int)n_bins, (int)n_erb);

@@ -3,6 +3,7 @@
  * exports ainr_*, runs a real round trip per family on its own catalog row, and StreamWork's counts and
  * shapes reflect the variant it was built as. Pass -DAINR_TEST_EXPECT_LITE for the mask-only archive. */
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,20 @@
 
 #include "ainr.h"
 #include "ainr_test.h"
+
+/* A scratch file created with O_EXCL (mode 0600), so a symlink planted under a guessed name is refused, not followed. */
+static void erb_fixture_scratch_path(char *out, size_t cap, const char *tag)
+{
+    int attempt;
+    for (attempt = 0; attempt < 64; ++attempt) {
+        int fd;
+        if (snprintf(out, cap, "/tmp/%s_%d_%d.bin", tag, (int)getpid(), attempt) >= (int)cap) break;
+        fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { close(fd); return; }
+    }
+    fprintf(stderr, "cannot create a scratch file for %s\n", tag);
+    exit(2);
+}
 
 #ifdef STREAM_COMMON_BIND_H
 #error "ainr.h must not pull in the sample-side graph/device wiring header"
@@ -111,7 +126,7 @@ static int run_round_trip(void) {
     StreamWork io;
     int rc, i, b;
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_link_only_erb");
     write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
 
     cfg.sr = EXPECT_SR;
@@ -173,7 +188,7 @@ static int run_round_trip_freq(void) {
     StreamWork io;
     int rc, i, b;
 
-    snprintf(erb_path, sizeof(erb_path), "/tmp/ainr_link_only_freq_erb_%d.bin", (int)getpid());
+    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_link_only_freq_erb");
     write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
 
     cfg.sr = EXPECT_SR;
