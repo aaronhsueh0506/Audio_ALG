@@ -318,7 +318,7 @@ int four_dfn_run(void) {
   |-- dfn_hop_nn_end(&amp;hop, rc) ------------------------&gt;|                          |                          |
   |                          |                          | dfn2_stream_post_process_freq(stream, rc, re, im, &amp;valid);valid ? 乘 dfn2_stft_unscale : 全零 |
   |                          |                          |-------------------------&gt;|                          |
-  |                          |                          |                          | rc != 0 -&gt; dfn2_prepost_frame_bypass()(identity,時鐘照走);輸出未寫或非有限 -&gt; frame_finish 被拒(state generation +1)-&gt; frame_bypass()
+  |                          |                          |                          | rc != 0 -&gt; post_frame_identity()(時鐘照走);輸出未寫或非有限 -&gt; validate_run 被拒(state generation +1)-&gt; post_frame_identity()
 -- 收尾(兩條路徑相同) ----------------------------------------------------------------------------------------------------
   |-- dfn_hop_end(&amp;hop, out) --------------------------&gt;|                          |                          |
   |                          |                          | 沒被取走或沒關的 job 走 identity;ac_istft_push(istft, out_spec, out) -&gt; 剛好一個 hop

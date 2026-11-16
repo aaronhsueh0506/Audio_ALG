@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### `DFN2Prepost` is the per-frame level; `dfn2_stream` sequences the call
+
+- The lib keeps `dfn2_prepost_pre_frame`, `_views`, `_validate_run`, `_post_frame`, `_post_frame_identity` and `_zero_state` and the model state they advance. It no
+  longer includes `stream_run.h`, holds no per-call latch (`frame_open`, `prepared`, `valid_frames`) and no application or enhanced staging; the
+  pre/post entry points of the previous interface (`pre_process_freq{,_dual}`, `pre_process_block_dual`, `block_input/output`, `frame_open`, `frame_finish`,
+  `frame_bypass`, `frame_fail`, `post_process_freq`, `post_process_block`) and `dfn2_model_run_frame` are gone. The Python twin (`pipelines/dfn/dfn2_stage.py`) and
+  the export scripts are unchanged: their comments still name the old C functions, which map to `post_frame_identity` (bypass), `validate_run` (finish) and `zero_state` (fail).
+- `dfn2_stream` runs N `pre_frame` calls, one job, `validate_run` once, then N `post_frame` (or `post_frame_identity`) calls, holds the application-spectrum
+  staging of the call, and returns `DFN2_STREAM_ERR_RANGE` (-2) from the `_freq` entries for a bin that is non-finite or beyond `DFN2_STREAM_BIN_LIMIT_BITS`
+  (through `stream/common/stream_range.h`); `dfn2_stream_bins_in_range` and `ainr`'s own scan are gone. Outputs are bit-identical for every existing entry, grid and N.
+- Pools shrink: 16 kHz / 256 N = 1 PCM 65,328 -> 63,152 B, freq_only 46,704 -> 45,552; 48 kHz / 1024 1/1 PCM 160,112 -> 151,792, freq_only 88,496 -> 84,272 (the
+  `DFN2Prepost` 88,336 -> 79,984); lite 48 kHz PCM 99,728 -> 91,408. `DFN2_PREPOST_CARVE_VERSION` 13 and `DFN2_STREAM_LAYOUT_VERSION` 6 are unchanged.
+- `tests/dfn2_lifecycle_driver.h` runs the old call shapes over the per-frame functions for the lib-only tests; `stream/ainr/dfn2/tests/lifecycle.c` holds the call gates,
+  refused runs per tensor, the generation table and the warm-up hops.
+
+### Blocks of N > 1 frames at `mask_lookahead` > 0
+
+- A call is the newest N + 2 input frames and its heads are the frames T - N + 1 - M .. T - M (latency M + D as at N = 1). Every block is a job; the first block's first M heads
+  are before the stream start, `post_frame` discards them while the clock is below M, and they come out as silence (only the accelerator's recurrent state has seen M more
+  frames than at N = 1). `dfn2_model_io_ready_frames()` is N for N > 1 and M + 1 for N = 1; `dfn2_prepost_get_mem_size` and `ainr` no longer refuse the combination
+  (`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED` stays in the enum, never returned).
+- The catalog gives `AINR_MODEL_ID_DFN2_FULL` and `_ALT2` a 48 kHz / 1024 N = 2 graph (`.../dfn2/nvt_model_48k_n2.bin`); `AINR_MODEL_ID_DFN2_FULL_L0` keeps NULL paths and its own file.
+- `stream/ainr/dfn2/tests/lookahead_blocks.c` compares the N > 1 stream with a one-frame reference of the same stateful stand-in, for M = 1, 2, D = 0, 1, N = 2, 3, 8, PCM and spectrum.
+
 ### `DFN2Prepost` stages the application spectrum once; `DFN2HopIO.action` replaces the integer job flag
 
 - `spec_re` / `spec_im` hold the frames of a call (one slot per frame) and are what the enhance stage reads on every entry: the single entry, the dual entry and the block entry. The separate `apply_re` / `apply_im` arrays are gone. `dfn2_prepost_block_input()` returns the `spec_*` slots. Pool (host, bytes): 48 kHz / 1024 N=1 92,480 -> 88,336 (mask-only 32,096 -> 27,952); 16 kHz / 256 N=1 47,616 -> 46,544; 32 kHz / 512 62,656 -> 60,560; 16 kHz / 256 N=8 and 48 kHz N=4 shrink by one frame as well (131,680 -> 127,536 at 48 kHz N=4, pair 0/0). Output is bit-identical (the pool, grid, stream and `ainr` golden hashes did not change). `DFN2_PREPOST_CARVE_VERSION` stays 13 and `DFN2_STREAM_LAYOUT_VERSION` 6: this release already moves both.

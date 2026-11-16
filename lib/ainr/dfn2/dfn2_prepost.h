@@ -1,9 +1,6 @@
-/* DeepFilterNet2 per-frame functions and model state: features, windows, enhance rings, output and state validation, zero state.
- * Spectra are normalized=True (scale by dfn2_stft_scale(n_fft) in, dfn2_stft_unscale(n_fft) out); L, D, N = mask_lookahead,
- * df_lookahead, frames_per_call. The pool is the caller's and holds no recurrent state. The per-call sequence is dfn2_stream.h's.
- *
- *     pre_frame x N -> views -> accelerator -> validate_run -> post_frame / post_frame_identity x N
- */
+/* DeepFilterNet2 per-frame functions and the model state they advance; spectra are normalized=True (dfn2_stft_scale in, dfn2_stft_unscale
+ * out); L, D, N = mask_lookahead, df_lookahead, frames_per_call. The per-call sequence is dfn2_stream.h's: pre_frame x N, views,
+ * accelerator, validate_run, post_frame / post_frame_identity x N. The pool is the caller's and holds no recurrent state. */
 
 #ifndef DFN2_PREPOST_H
 #define DFN2_PREPOST_H
@@ -183,10 +180,9 @@ int dfn2_prepost_views(DFN2Prepost *p, DFN2PrepostInputs *inputs, DFN2PrepostOut
  * -1 on NULL, nothing touched. */
 int dfn2_prepost_validate_run(DFN2Prepost *p);
 
-/* Post, one frame, with head `slot` (of N) of the lib-owned heads and app = this frame's application spectrum (n_bins bins, MODEL
- * scale); out (n_bins, never aliasing app) is the enhanced frame at the input's scale. 1: emitted. 0: no spectrum yet (the first
- * L + D frames), out zero-filled; while the clock is below L the head is discarded. -1: NULL, slot outside [0, N) or a non-finite
- * alpha or attenuation limit, nothing advanced. Advances the rings, the clock and output_frame_index. */
+/* Post, one frame, with head `slot` of the lib-owned heads; app is this frame's application spectrum, out the enhanced frame (n_bins
+ * bins each, never aliasing). 1 emitted; 0 no spectrum yet (the first L + D frames, out zero-filled; below L the head is discarded);
+ * -1 NULL, slot outside [0, N) or non-finite alpha / attenuation limit, nothing advanced. Advances the rings and the clock. */
 int dfn2_prepost_post_frame(DFN2Prepost *p, int slot, const float *app_re, const float *app_im,
                             float *out_re, float *out_im);
 

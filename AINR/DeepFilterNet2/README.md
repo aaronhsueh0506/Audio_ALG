@@ -70,17 +70,17 @@ detectable inside the library. Against the training graph's `center=True` paddin
 accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run `make -C .. test-simd` to compare the default NEON path against the
 scalar reference; `make -C .. SIMD=0 test` forces the latter.
 
-`dfn2_prepost.h/.c` is the integrator's entry point: one opaque object that wraps `dfn2_process.c` and `dfn2_model_io.c` behind
-the same lifecycle and per-hop shape as the AIAEC classes, described once in `../../AIAEC/README.md` ("C pre/post-processing").
-Specific to this one:
+`dfn2_prepost.h/.c` is the per-frame level: one opaque object that wraps `dfn2_process.c` and `dfn2_model_io.c` behind one-frame
+functions (`pre_frame`, `views`, `validate_run`, `post_frame`, `post_frame_identity`, `zero_state`) and the model state they advance. The
+per-call lifecycle (what runs when, N frames per call, the application-spectrum staging, the run status and the range check of the
+spectrum entries) is `stream/ainr/dfn2/dfn2_stream.h`'s. Specific to this one:
 
 - the `DFN2Grid` in its config decides everything that depends on the signal grid or the lookahead pair;
-- with `frames_per_call` 1, `pre_process_freq` returns 1 on every hop from hop `mask_lookahead` (M) on. The first M hops (the graph's
-  right-hand neighbours are not there yet) return 0: no frame is opened (`frame_open()`, `frame_finish()`, `frame_bypass()` and
-  `frame_fail()` are refused), the framing and compose clocks advance with no heads, nothing is emitted, and the registered state and
-  the state generation stay as they were, so the first frame with a job starts from the state the stream began with and the accelerator
-  is not called for the first M hops. `dfn2_model_run_frame()` refuses them like any call without an open frame. For N > 1 frames per
-  call (M = 0 only) the block entry takes the N frames at once and every block has a job, see [Multi-frame export](reference/multiframe.md);
+- with `frames_per_call` 1, `pre_frame` returns 1 on every hop from hop `mask_lookahead` (M) on. The first M hops (the graph's
+  right-hand neighbours are not there yet) return 0: no job, the framing and compose clocks advance with no heads (`post_frame_identity`
+  queues the frame), nothing is emitted, and the registered state and the state generation stay as they were, so the first frame with a
+  job starts from the state the stream began with and the accelerator is not called for the first M hops. For N > 1 frames per call
+  the stream calls `pre_frame` N times and every block has a job, at any M, see [Multi-frame export](reference/multiframe.md);
 - the spectra are `torch.stft(normalized=True)` on the instance's grid (`dfn2_stft_scale(grid.n_fft)` = 1/sqrt(n_fft); 1024 points on
   the shipped 48 kHz grid), so chaining an AIAEC spectrum in is a sqrt(n_fft) scale error (`dfn2_stft_unscale(grid.n_fft)`, 32x on
   the shipped grid; see `dfn2_prepost.h`);
@@ -92,13 +92,12 @@ Specific to this one:
   `df_convp_window_next`) to the same address as its input and the output of one invocation is the input of the next with no copy;
   it must read all state inputs before it writes any state output. A board registers nothing (NULL and 0 in the views): its
   accelerator holds the state;
-- a commit that finds a non-finite head or state value, or an `erb_mask` / `coefs` element beyond `DFN2_PREPOST_HEAD_LIMIT` (1e6; a sigmoid mask is at most 1), zeroes the registered tensors, advances the state generation and returns -1
-  with the frame still open; `dfn2_prepost_frame_bypass()` then passes the noisy spectrum through;
-- a run that did not succeed closes the frame with `dfn2_prepost_frame_fail(p, run_started)`: the same noisy-spectrum output as
-  `frame_bypass()`; `run_started != 0` (the accelerator may have rewritten its state) zeroes the registered tensors and advances the
-  state generation, `0` (nothing ran) leaves both. `dfn2_model_run_frame()` with a failing `infer()` is `frame_fail(p, 1)`, with `infer()` returning `STREAM_RUN_NOT_STARTED` (it ran nothing) `frame_fail(p, 0)`;
+- `dfn2_prepost_validate_run()` finds a non-finite head or state value, or an `erb_mask` / `coefs` element beyond `DFN2_PREPOST_HEAD_LIMIT` (1e6; a sigmoid mask is at most 1): it zeroes the registered tensors, advances the state generation once and returns -1;
+  the caller then posts the noisy spectrum with `dfn2_prepost_post_frame_identity()` for every frame of the call;
+- a run that did not succeed takes the same identity output; the caller calls `dfn2_prepost_zero_state()` when the accelerator may have rewritten its state (it zeroes the
+  registered tensors and advances the state generation) and leaves it alone when nothing ran (the stream's `STREAM_RUN_NOT_STARTED`);
 - `dfn2_prepost_state_generation()` is 1 after init and advances on every `dfn2_prepost_reset()`, every refused
-  commit and every `frame_fail(p, 1)` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
+  run and every `zero_state()` (modulo 2^32), whether or not state is registered: the accelerator's fixed-point copy of the state is not reached by either event, so a
   runtime that sees a different value than at the previous frame refills its state tensors with quantized zeros.
 
 Its gate is `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in `libainr_prepost.a` (`make -C .. print-lib-path` prints
@@ -143,7 +142,7 @@ Specific to DFN2:
   (the accelerator does not run for them); the first M + D hops emit nothing (`valid` 0).
 - The rings hold `grid.ring = max(df_order, M + D + 1)` frames: five up to
   `M + D = 4`, six for `M + D = 5` (1/4, 2/3), seven for `M + D = 6` (2/4). The state is carved to that ring at init, so a
-  deeper pair only makes the pool larger (88,336 bytes at 1/1, 100,368 at 2/3, 112,400 at 2/4 on the 48 kHz grid; 64-bit host).
+  deeper pair only makes the pool larger (79,984 bytes at 1/1, 92,016 at 2/3, 104,048 at 2/4 on the 48 kHz grid; 64-bit host).
   Mask-only keeps only the noisy ring, `M + 1` frames.
 
 ## Integration reference

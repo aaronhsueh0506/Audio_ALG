@@ -33,19 +33,19 @@ its invocations (`--frames` counts invocations, the report records
 The C host takes N as `DFN2GridSpec.frames_per_call` (1..64, a run-time field; `DFN2_GRID_ERR_FRAMES_PER_CALL` otherwise),
 with the lookahead pair:
 
-- the window holds `N + 2` frames: the call's N frames and the two before them. With N > 1
-  (and `M` = 0, a grid with `M` > 0 is refused by `get_mem_size` and init) `pre_process_freq` and
-  `post_process_freq` return -1 and a call goes through the block entry:
-  `pre_process_block_dual` takes the N frames at once (N * `n_bins` per plane) and returns 1, so every block has a job;
-  `dfn2_model_io_frame_slot()` still names the slot of the last pushed frame;
-- `frame_open()` publishes N heads per tensor, `frame_finish()` builds the N enhanced frames
-  in one burst, and `post_process_block` hands all N out, so the output is the N == 1 stream with no shift:
+- the window holds `N + 2` frames: the call's N frames and the two before them, and its heads are the frames `T - N + 1 - M .. T - M`
+  (T the newest frame of the call). With N > 1 the stream's packet entries take the N frames at once (N * `n_bins` per plane) and call
+  `pre_frame` N times; the Nth returns 1, so every block has a job, at any M. `dfn2_model_io_frame_slot()` names the slot of the last pushed
+  frame (N > 1: its position in the call). The first block's first M heads belong to frames before the stream start: `post_frame` discards
+  them while the clock is below M, their output is silence, and only the accelerator's state has seen M more frames than at N == 1;
+- `views()` publishes N heads per tensor, `validate_run()` checks them all once, and the stream calls `post_frame` for each of the N frames in order,
+  so the output is the N == 1 stream with no shift:
   latency `1 + M + D` hops (`dfn2_prepost_latency_frames(grid)` + 1; 2 hops at 16 kHz / 256, 128 samples, also at N = 8).
-  The first `D` frames of a stream carry no spectrum (`valid_frames` counts the rest, the last ones of the block). A refused commit
-  zeroes the registered state and advances the generation, and `frame_bypass()` passes all N frames as the noisy spectrum;
+  The first `M + D` frames of a stream carry no spectrum (the packet entry returns how many of the N have one). A refused run
+  zeroes the registered state and advances the generation once, and the stream posts all N frames with `post_frame_identity()` (the noisy spectrum);
 - `DFN2ModelIoDescriptor` keeps its 18 fields and 72 bytes: N is
   `input_frames - 2` (`input_frames` = N + 2, metadata `input_feature_frames`),
-  so `dfn2_model_io_descriptor_validate()` and `dfn2_model_run_frame()` refuse
+  so `dfn2_model_io_descriptor_validate()` refuses
   another N, and a descriptor made for the one-frame graph (`input_frames` = 3)
   is refused by a grid of N > 1;
 - N is folded into the pool hash (a pool of another N is refused) and into the pool

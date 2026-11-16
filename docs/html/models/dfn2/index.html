@@ -21,13 +21,14 @@
 <tr><th>full</th><td>16000 / 256</td><td>128（N=1）</td><td><code>AINR_OK</code></td><td>128</td></tr>
 <tr><th>full</th><td>16000 / 256</td><td>1024（N=8）</td><td><code>AINR_OK</code></td><td>128</td></tr>
 <tr><th>full</th><td>48000 / 1024</td><td>512（N=1）</td><td><code>AINR_OK</code></td><td>1536</td></tr>
+<tr><th>full</th><td>48000 / 1024</td><td>1024（N=2）</td><td><code>AINR_OK</code></td><td>1536</td></tr>
 <tr><th>lite</th><td>48000 / 1024</td><td>512（N=1）</td><td><code>AINR_OK</code></td><td>1024</td></tr>
 <tr><th>full，mask_lookahead 0 的模型（<code>AINR_MODEL_ID_DFN2_FULL_L0</code>）</th><td>16000 / 256</td><td>128（N=1）、1024（N=8）</td><td><code>AINR_OK</code></td><td>128</td></tr>
 <tr><th>同上</th><td>32000 / 512</td><td>256（N=1）、1024（N=4）</td><td>正式登錄：<code>AINR_ERR_FRAMES_PER_CALL</code>（graph 尚未交付）</td><td>256</td></tr>
 <tr><th>同上</th><td>48000 / 1024</td><td>512（N=1）、1024（N=2）</td><td>正式登錄：<code>AINR_ERR_FRAMES_PER_CALL</code>（graph 尚未交付）</td><td>512</td></tr>
 </tbody></table>
 <p>lite 只有 48 kHz／1024／N=1，沒有 16 kHz，也沒有 N&gt;1。full 與 lite 的 archive 分開建置，不可混連。「可啟動」只表示登錄表有這一列；graph 的實際交付狀態見「驗證狀態」。</p>
-<p>N&gt;1 要求 <code>mask_lookahead</code> = 0，所以板端以 1024 樣本一塊錄音時（N = 1024 / 模型 hop：16 kHz 為 8、32 kHz 為 4、48 kHz 為 2）要用 mask_lookahead 0 訓練的 graph。這組 graph 是自己的模型 id <code>AINR_MODEL_ID_DFN2_FULL_L0</code>（3，<code>ainr_product.h</code>）：48 kHz／1024／N=1 在 mask_lookahead 1 的模型與 mask_lookahead 0 的模型是兩張 shape 相同的不同 graph，客戶組態沒有 lookahead 欄位，兩者不能共用同一個 (sr, fft, N)，所以由產品綁定其中一個（<code>-DAINR_PRODUCT_MODEL_ID=3</code>）。其 16 kHz 兩列指向出貨模型的同兩個檔（那兩列本來就是 mask_lookahead 0）；32 kHz 與 48 kHz 的 mask_lookahead 0 graph 還沒有交付，板端路徑為 NULL，登錄表的這幾列在正式建置被拒（與未登錄的 N 同一個回傳碼 -6），設定路徑之後才啟動。測試建置（<code>AINR_TEST_CATALOG</code>）給這幾列 <code>test://</code> 佔位路徑，讓受閘的 API 能端到端執行。32 kHz 的 ERB 檔是 <code>fb_32000_28.bin</code>（28 個 band），48 kHz 沿用 <code>fb_48000_32.bin</code>。這些列的 df_lookahead 暫與 16 kHz 的列一樣取 0（交付 graph 的 lookahead 對才是準），沒有量化替代版本。</p>
+<p>N&gt;1 在任何 <code>mask_lookahead</code> 都可用：full 的 48 kHz／1024 有 N=2 一列（同一個 checkpoint、mask_lookahead 1，graph 檔 <code>nvt_model_48k_n2.bin</code>；第一包的前 M 個 head 屬於串流開始之前的 frame，輸出靜音，加速器的遞迴 state 比 N=1 多看過 M 個 frame）。lite 沒有 N&gt;1 的 graph。mask_lookahead 0 的 graph 另有自己的模型 id <code>AINR_MODEL_ID_DFN2_FULL_L0</code>（3，<code>ainr_product.h</code>）：48 kHz／1024／N=1 在 mask_lookahead 1 的模型與 mask_lookahead 0 的模型是兩張 shape 相同的不同 graph，客戶組態沒有 lookahead 欄位，兩者不能共用同一個 (sr, fft, N)，所以由產品綁定其中一個（<code>-DAINR_PRODUCT_MODEL_ID=3</code>）。其 16 kHz 兩列指向出貨模型的同兩個檔（那兩列本來就是 mask_lookahead 0）；32 kHz 與 48 kHz 的 mask_lookahead 0 graph 還沒有交付，板端路徑為 NULL，登錄表的這幾列在正式建置被拒（與未登錄的 N 同一個回傳碼 -6），設定路徑之後才啟動。測試建置（<code>AINR_TEST_CATALOG</code>）給這幾列 <code>test://</code> 佔位路徑，讓受閘的 API 能端到端執行。32 kHz 的 ERB 檔是 <code>fb_32000_28.bin</code>（28 個 band），48 kHz 沿用 <code>fb_48000_32.bin</code>。這些列的 df_lookahead 暫與 16 kHz 的列一樣取 0（交付 graph 的 lookahead 對才是準），沒有量化替代版本。</p>
 
 <h3>被拒絕的組態</h3>
 <p><code>ainr_get_mem_size()</code> 與 <code>ainr_init()</code> 依序檢查 sr／fft、<code>hop_in</code>、N 的限制、graph 是否登錄，第一個不成立的就是回傳碼。被拒時尚未呼叫任何 SDK。兩者都回 0（<code>AINR_OK</code>）或負的 <code>AINR_ERR_*</code>。下列回傳碼為本庫 host 建置對 full 與 lite archive 各探測的結果。</p>
@@ -36,7 +37,7 @@
 <tbody>
 <tr><td>sr／fft 不在上表（例：16000/512、32000/512、8000/256）</td><td><code>AINR_ERR_GRID</code>（-3）</td><td><code>AINR_ERR_GRID</code>（-3）；16 kHz 一律在此被拒</td></tr>
 <tr><td><code>hop_in</code> 為 0、負數，或不是 <code>fft / 2</code> 的正整數倍（例：16000/256 的 100；48000/1024 的 256）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td><td><code>AINR_ERR_IN_HOP</code>（-4）</td></tr>
-<tr><td>48000/1024，<code>hop_in</code> 為 1024、2048 等（N&gt;1；N&gt;1 要求 <code>mask_lookahead</code> = 0）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td><td><code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5）</td></tr>
+<tr><td>48000/1024，<code>hop_in</code> 為 2048、4096 等（N 不是 1 或 2；lite 的 1024 也在此）</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td></tr>
 <tr><td>16000/256，<code>hop_in</code> 是 128 的倍數但 N 不是 1 或 8（例：256、2048）</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td><td>不適用（先被 -3 擋下）</td></tr>
 <tr><td>mask_lookahead 0 的模型：32000/512 的 N=1、4 與 48000/1024 的 N=1、2（graph 尚未交付，路徑 NULL），及這些 grid 上其他 N</td><td><code>AINR_ERR_FRAMES_PER_CALL</code>（-6）</td><td>不適用（lite 不含這個模型）</td></tr>
 </tbody></table>
@@ -177,7 +178,7 @@ while (read_block(pcm_in, hop_in)) {
 <ul>
 <li>測試用隨機權重的小 checkpoint（48 kHz／1024／hop 512，與 full 的 48 kHz 產品同 grid）。一般 WAV 的 <code>inference.py --frames-per-call</code> 路徑在 PyTorch 上逐包串流，N=1 與 N=8 的輸出彼此一致、也與整檔一次跑一致，長度與輸入相同；mask-only（lite 的圖）同樣比對。這條路徑不經 ONNX Runtime。</li>
 <li>ONNX Runtime 在這個檔案裡只執行校正流程（<code>calib --frames-per-call 8</code>）匯出的 N=8 full 與 mask-only 圖，逐包串流後與 PyTorch 比對。</li>
-<li>這個 N=8 圖的 grid 是 48 kHz／1024，而 stream 對 48 kHz／1024 的 N&gt;1 回 <code>AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED</code>（-5），所以它不對應上表任何一列，不能當作 full 16 kHz／256／N=8 的證據。</li>
+<li>這個 N=8 圖的 grid 是 48 kHz／1024，而登錄表的 48 kHz／1024 只有 N=1 與 N=2（<code>AINR_ERR_FRAMES_PER_CALL</code>，-6，對 N=8），所以它不對應上表任何一列，不能當作 full 16 kHz／256／N=8 的證據。</li>
 <li><code>AINR/tests</code> 內另有兩個測試檔也有 ONNX Runtime 的串流比對，用的是 16 kHz／512 的隨機小模型，上表不引用它們。</li>
 </ul>
 <p>上表的「未驗」代表本庫沒有對應的測試或實跑紀錄，不代表已知失敗。</p>

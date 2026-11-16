@@ -181,7 +181,7 @@ Pool printed by the skeleton (`4ch_aec_bf_dfn_res`, matched delay, five-filter b
 array (four lanes, shared estimator, ring, fusion buffers and gain stage in one pool), the SRP/BF helper,
 the P buffer, and the DFN tail of `dfn_hop_pool_bytes()`, each part 16-byte
 aligned; shipped pair): 1,536,352 bytes at the 16 kHz default (array plus helper 1,316,640 bytes, the P buffer, and a DFN tail of
-218,672 bytes: the model stream 88,496, the six conversion buffers 12,312 and the bridge 117,856) and
+214,448 bytes: the model stream 84,272, the six conversion buffers 12,312 and the bridge 117,856) and
 5,053,600 bytes at 48 kHz (array plus helper 4,901,728 bytes; DFN tail 147,760: the stream and the buffers, the synthesis 42,832
 and the output spectrum 4,104). The stream is a `freq_only` one (`DFN2StreamConfig.freq_only`, set by `dfn_hop_pool_plan()`):
 its pool holds the `DFN2Prepost` and no analysis, synthesis or PCM buffer. The array's own pool is 524,448 bytes at

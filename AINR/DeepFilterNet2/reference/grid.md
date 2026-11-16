@@ -58,12 +58,12 @@ they merged into the single `DFN2_GRID_ERR_NORM_ALPHA` = -12). Every library ent
 
 | grid (board table pair) | full | mask-only |
 |---|---|---|
-| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 46,544 | 9,712 |
-| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 60,560 | 14,512 |
-| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 88,336 | 27,952 |
+| 16 kHz, n_fft 256, n_erb 24, pair 0/0 | 44,336 | 7,504 |
+| 32 kHz, n_fft 512, n_erb 28, pair 0/0 | 56,304 | 10,256 |
+| 48 kHz, n_fft 1024, n_erb 32, pair 1/1 (mask-only 1/0) | 79,984 | 19,600 |
 
-On the 48 kHz grid a deeper ring grows the full pool: 100,368 bytes at 2/3 (ring 6) and 112,400 at 2/4 (ring 7); `frames_per_call` 4 (pair 0/0, the block staging
-holds the four frames) gives 127,536. The recurrent state the shipped graph needs is 1,280 + 30,720 floats (`h_gru` and `df_convp_history`), the application's.
+On the 48 kHz grid a deeper ring grows the full pool: 92,016 bytes at 2/3 (ring 6) and 104,048 at 2/4 (ring 7); `frames_per_call` 4 (pair 0/0, the lib holds
+the four frames of heads) gives 94,576. The recurrent state the shipped graph needs is 1,280 + 30,720 floats (`h_gru` and `df_convp_history`), the application's.
 
 **What stays compile time**: `-DDFN2_MASK_ONLY` (every translation unit; the variant of the state and of the accelerator boundary
 structs) and `DFN2_FEATURE_VERSION`. The graph geometry (GRU rows and width, encoder channels, pathway window) is not in the

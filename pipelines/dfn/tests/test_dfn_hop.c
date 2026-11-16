@@ -526,7 +526,7 @@ static void test_path(int bridge_mode) {
     }
 }
 
-/* Writes a finite mask far beyond DFN2_PREPOST_HEAD_LIMIT: frame_finish refuses it, so the hop takes the identity. */
+/* Writes a finite mask far beyond DFN2_PREPOST_HEAD_LIMIT: validate_run refuses it, so the hop takes the identity. */
 static int huge_mask_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
     size_t i;
     (void)user;

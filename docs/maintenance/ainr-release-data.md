@@ -26,13 +26,13 @@
 | 產品 | sr／fft | n_erb | df_bins | df_order | mask lookahead | df lookahead | 每包 N 的登錄 |
 |---|---|---:|---:|---:|---:|---:|---|
 | full | 16000／256 | 24 | 96 | 5 | 0 | 0 | 1、8 |
-| full | 48000／1024 | 32 | 96 | 5 | 1 | 1 | 1 |
+| full | 48000／1024 | 32 | 96 | 5 | 1 | 1 | 1、2 |
 | lite | 48000／1024 | 32 | 96 | 0 | 1 | 0 | 1 |
 | full，mask_lookahead 0 的模型（`AINR_MODEL_ID_DFN2_FULL_L0`） | 16000／256 | 24 | 96 | 5 | 0 | 0 | 1、8 |
 | 同上 | 32000／512 | 28 | 96 | 5 | 0 | 0 | 1、4（graph 未交付，路徑 NULL） |
 | 同上 | 48000／1024 | 32 | 96 | 5 | 0 | 0 | 1、2（graph 未交付，路徑 NULL） |
 
-`mask lookahead` 大於 0 時 N 只能是 1（`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED`），所以 48 kHz 的 full 與 lite 沒有 N>1 的列。N>1 是 mask_lookahead 0 的模型：板端以 1024 樣本一塊錄音時 N = 1024／模型 hop（16 kHz 為 8、32 kHz 為 4、48 kHz 為 2），一包是一次 job、沒有額外延遲。這個模型是自己的 id，因為它的 48 kHz／1024／N=1 與 mask_lookahead 1 的模型的同一把鍵是兩張 shape 相同的不同 graph，而客戶組態沒有 lookahead 欄位；其 df lookahead 暫取 0（交付的 graph 才是準），沒有 ALT1／ALT2 量化替代。32 kHz／512 的 ERB 檔是 `fb_32000_28.bin`。登錄表中 `atten_lim_db` 與 HPF 欄位在所有列都是 0／關閉。
+N>1 在任何 mask lookahead 都可用（`AINR_ERR_LOOKAHEAD_BLOCK_UNSUPPORTED` 不再回傳）：full 的 48 kHz／1024 登錄 N = 1、2（同一個 checkpoint，N = 2 的檔是 `nvt_model_48k_n2.bin`；`ALT2` 為 `16x8/dfn2/nvt_model_48k_n2.bin`；第一包的前 M 個 head 屬於串流開始之前的 frame，輸出靜音，加速器的遞迴 state 比 N=1 多看過 M 個 frame），lite 沒有 N>1 的列。mask_lookahead 0 的模型另有一列組：板端以 1024 樣本一塊錄音時 N = 1024／模型 hop（16 kHz 為 8、32 kHz 為 4、48 kHz 為 2），一包是一次 job、沒有額外延遲。這個模型是自己的 id，因為它的 48 kHz／1024／N=1 與 mask_lookahead 1 的模型的同一把鍵是兩張 shape 相同的不同 graph，而客戶組態沒有 lookahead 欄位；其 df lookahead 暫取 0（交付的 graph 才是準），沒有 ALT1／ALT2 量化替代；它的 48 kHz／1024／N=2 檔不得沿用 mask_lookahead 1 的 `nvt_model_48k_n2.bin` 檔名。32 kHz／512 的 ERB 檔是 `fb_32000_28.bin`。登錄表中 `atten_lim_db` 與 HPF 欄位在所有列都是 0／關閉。
 
 ## Graph 與 ERB 檔
 
