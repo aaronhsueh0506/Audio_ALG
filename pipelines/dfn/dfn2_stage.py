@@ -23,9 +23,9 @@ heads for frame ``t`` are ready once frame ``t + M`` has been pushed, and the
 output emitted on frame ``t`` belongs to source frame ``t - (M + D)`` (a
 cascade, not a maximum), so the first ``M + D`` frames emit nothing; after the
 last real frame the caller pushes ``M + D`` all-zero frames (``flush``) to drain
-the last source frames, with the heads still being evaluated on them.  The ring and the deep-filter
-history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)`` slots and
-``DF_ORDER - D - 1`` past taps.
+the last source frames, with the heads still being evaluated on them.  The ring
+and the deep-filter history follow ``dfn2_grid.h``: ``max(DF_ORDER, M + D + 1)``
+slots and ``DF_ORDER - D - 1`` past taps.
 
 Fail-open: a heads callable that raises, or returns a non-finite value in any
 head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_bypass``:
