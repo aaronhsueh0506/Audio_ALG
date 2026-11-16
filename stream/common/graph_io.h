@@ -181,9 +181,9 @@ static inline size_t graph_io_output_bytes(const GraphIoConfig *cfg, int i, size
 /* stream_check_ports() of the opened graph against the config: STREAM_PORT_OK or a STREAM_PORT_ERR_*, counts
  * first; msg (may be NULL) gets a one-line reason. Run once after the graph is opened, before the first run. */
 static inline int graph_io_check_ports(const GraphIoConfig *cfg,
-                                           const StreamDeviceDesc in[], int n_in,
-                                           const StreamDeviceDesc out[], int n_out,
-                                           char *msg, size_t msg_len)
+                                       const StreamDeviceDesc in[], int n_in,
+                                       const StreamDeviceDesc out[], int n_out,
+                                       char *msg, size_t msg_len)
 {
     if (!cfg) return STREAM_PORT_ERR_NULL;
     return stream_check_ports(&cfg->wiring, in, n_in, out, n_out, msg, msg_len);
@@ -200,7 +200,7 @@ static inline int graph_io_check_counts(const GraphIoConfig *cfg, int input_coun
 
 /* One work tensor against a port shape: data present, then element count and [b, c, h, w] equal. */
 static inline int graph_io_check_tensor(const StreamPortShape *want, const void *data, size_t elements,
-                                            unsigned int b, unsigned int c, unsigned int h, unsigned int w)
+                                        unsigned int b, unsigned int c, unsigned int h, unsigned int w)
 {
     if (!data) return GRAPH_IO_ERR_NULL;
     if (elements != want->elements || b != want->b || c != want->c || h != want->h || w != want->w)
@@ -211,7 +211,7 @@ static inline int graph_io_check_tensor(const StreamPortShape *want, const void 
 /* Signal i of the work against the graph's input i: data present, element count and [b, c, h, w] equal;
  * ERR_INDEX outside the signals (a state port is never a work tensor). */
 static inline int graph_io_check_input(const GraphIoConfig *cfg, int i, const void *data, size_t elements,
-                                           unsigned int b, unsigned int c, unsigned int h, unsigned int w)
+                                       unsigned int b, unsigned int c, unsigned int h, unsigned int w)
 {
     if (!cfg) return GRAPH_IO_ERR_NULL;
     if (i < 0 || i >= cfg->wiring.signal_in_count) return GRAPH_IO_ERR_INDEX;
@@ -220,7 +220,7 @@ static inline int graph_io_check_input(const GraphIoConfig *cfg, int i, const vo
 
 /* As check_input, for head j against output j. */
 static inline int graph_io_check_output(const GraphIoConfig *cfg, int j, const void *data, size_t elements,
-                                            unsigned int b, unsigned int c, unsigned int h, unsigned int w)
+                                        unsigned int b, unsigned int c, unsigned int h, unsigned int w)
 {
     if (!cfg) return GRAPH_IO_ERR_NULL;
     if (j < 0 || j >= cfg->wiring.head_out_count) return GRAPH_IO_ERR_INDEX;
@@ -230,29 +230,29 @@ static inline int graph_io_check_output(const GraphIoConfig *cfg, int j, const v
 /* rc = GRAPH_IO_OK or the first mismatch of a pointer to a work with input_count / inputs[] / output_count /
  * outputs[] (the stream libraries' work types). Run on every block the stream asks to submit, before any SDK
  * call; a mismatch means no accelerator run and a failed block for the post-processing. */
-#define GRAPH_IO_CHECK_WORK(rc, cfg, work)                                                              \
-    do {                                                                                                    \
-        int graph_io_i_;                                                                                \
-        (rc) = graph_io_check_counts((cfg), (work)->input_count, (work)->output_count);                 \
-        for (graph_io_i_ = 0; (rc) == GRAPH_IO_OK && graph_io_i_ < (work)->input_count;         \
-             ++graph_io_i_)                                                                             \
-            (rc) = graph_io_check_input((cfg), graph_io_i_, (work)->inputs[graph_io_i_].data,   \
-                       (work)->inputs[graph_io_i_].elements, (work)->inputs[graph_io_i_].b,         \
-                       (work)->inputs[graph_io_i_].c, (work)->inputs[graph_io_i_].h,                \
-                       (work)->inputs[graph_io_i_].w);                                                  \
-        for (graph_io_i_ = 0; (rc) == GRAPH_IO_OK && graph_io_i_ < (work)->output_count;        \
-             ++graph_io_i_)                                                                             \
-            (rc) = graph_io_check_output((cfg), graph_io_i_, (work)->outputs[graph_io_i_].data, \
-                       (work)->outputs[graph_io_i_].elements, (work)->outputs[graph_io_i_].b,       \
-                       (work)->outputs[graph_io_i_].c, (work)->outputs[graph_io_i_].h,              \
-                       (work)->outputs[graph_io_i_].w);                                                 \
+#define GRAPH_IO_CHECK_WORK(rc, cfg, work)                                                                      \
+    do {                                                                                                        \
+        int graph_io_i_;                                                                                        \
+        (rc) = graph_io_check_counts((cfg), (work)->input_count, (work)->output_count);                         \
+        for (graph_io_i_ = 0; (rc) == GRAPH_IO_OK && graph_io_i_ < (work)->input_count;                         \
+             ++graph_io_i_)                                                                                     \
+            (rc) = graph_io_check_input((cfg), graph_io_i_, (work)->inputs[graph_io_i_].data,                   \
+                                        (work)->inputs[graph_io_i_].elements, (work)->inputs[graph_io_i_].b,    \
+                                        (work)->inputs[graph_io_i_].c, (work)->inputs[graph_io_i_].h,           \
+                                        (work)->inputs[graph_io_i_].w);                                         \
+        for (graph_io_i_ = 0; (rc) == GRAPH_IO_OK && graph_io_i_ < (work)->output_count;                        \
+             ++graph_io_i_)                                                                                     \
+            (rc) = graph_io_check_output((cfg), graph_io_i_, (work)->outputs[graph_io_i_].data,                 \
+                                         (work)->outputs[graph_io_i_].elements, (work)->outputs[graph_io_i_].b, \
+                                         (work)->outputs[graph_io_i_].c, (work)->outputs[graph_io_i_].h,        \
+                                         (work)->outputs[graph_io_i_].w);                                       \
     } while (0)
 
 /* Row lookup shared by the model headers: the row of (model, sample_rate, fft, n) in rows[row_count], expanded
  * into cfg. OK, or ERR_NO_ROW (a configuration without a row is refused, never derived) / ERR_NULL / ERR_ROW;
  * cfg is zeroed on failure. */
 static inline int graph_io_find_row(const GraphIoRow *rows, int row_count, int model, int sample_rate,
-                                        int fft, int n, GraphIoConfig *cfg)
+                                    int fft, int n, GraphIoConfig *cfg)
 {
     int i;
 

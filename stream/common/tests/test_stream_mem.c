@@ -25,7 +25,7 @@ int main(void) {
     cur = 24;
     CHECK(stream_carve(NULL, &cur, (size_t)-1, &p) == -1 && cur == 24, "overflow leaves cursor");
 
-    CHECK(stream_fnv1a_u32(2166136261u, 0u) == 0x4b95f515u, "fnv1a of 0 (got %08x)", stream_fnv1a_u32(2166136261u, 0u));
+    CHECK(stream_fnv1a_u32(AC_FNV1A_SEED, 0u) == 0x4b95f515u, "fnv1a of 0 (got %08x)", stream_fnv1a_u32(AC_FNV1A_SEED, 0u));
     CHECK(stream_saturate_s16(0.5f) == 16384 && stream_saturate_s16(2.0f) == 32767 &&
           stream_saturate_s16(-2.0f) == -32768 && stream_saturate_s16(NAN) == 0 &&
           stream_saturate_s16(INFINITY) == 32767 && stream_saturate_s16(-INFINITY) == -32768, "saturate");

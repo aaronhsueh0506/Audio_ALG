@@ -24,22 +24,14 @@ typedef struct StreamMemReq {
 /* Reserves `bytes` at *cursor, 16-byte aligned; base NULL only sizes (out stays NULL). -1 on size
  * overflow, with *cursor and *out untouched. */
 static inline int stream_carve(unsigned char *base, size_t *cursor, size_t bytes, void **out) {
-    size_t aligned = ck_align16_size(*cursor);
-    size_t next = ck_add_size(aligned, bytes);
-    if (MEM_SIZE_INVALID(next)) return -1;
-    if (out) *out = base ? (void *)(base + aligned) : NULL;
-    *cursor = next;
+    if (ck_carve(base, cursor, bytes, 1u, out) != 0) return -1;
+    if (out && !base) *out = NULL;
     return 0;
 }
 
-/* One FNV-1a-32 fold of `v`'s four bytes into `h`: once per field, seeded with 2166136261u. */
+/* One FNV-1a-32 fold of `v`'s four bytes into `h`: once per field, seeded with AC_FNV1A_SEED. */
 static inline uint32_t stream_fnv1a_u32(uint32_t h, uint32_t v) {
-    int i;
-    for (i = 0; i < 4; ++i) {
-        h ^= (v >> (i * 8)) & 0xffu;
-        h *= 16777619u;
-    }
-    return h;
+    return ac_fnv1a_u32(h, v);
 }
 
 /* float PCM (full scale 1.0f) -> int16: scale by 32768, clip to the asymmetric int16 range, add +-0.5f and truncate (audiolib

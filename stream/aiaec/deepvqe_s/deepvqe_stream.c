@@ -146,7 +146,7 @@ static int deepvqe_stream_layout(const DeepVqeStreamConfig *cfg, unsigned char *
 }
 
 static uint32_t build_hash(const DeepVqeStreamConfig *cfg, uint32_t prepost_hash) {
-    uint32_t h = 2166136261u;
+    uint32_t h = AC_FNV1A_SEED;
     const DeepVqeGrid *g = &cfg->grid;
     h = stream_fnv1a_u32(h, (uint32_t)g->sample_rate);
     h = stream_fnv1a_u32(h, (uint32_t)g->n_fft);

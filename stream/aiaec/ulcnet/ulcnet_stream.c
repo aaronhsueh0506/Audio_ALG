@@ -142,7 +142,7 @@ static int ulcnet_stream_layout(const UlcnetStreamConfig *cfg, unsigned char *ba
 }
 
 static uint32_t build_hash(const UlcnetStreamConfig *cfg, uint32_t prepost_hash) {
-    uint32_t h = 2166136261u;
+    uint32_t h = AC_FNV1A_SEED;
     const UlcnetGrid *g = &cfg->grid;
     h = stream_fnv1a_u32(h, (uint32_t)g->sample_rate);
     h = stream_fnv1a_u32(h, (uint32_t)g->n_fft);

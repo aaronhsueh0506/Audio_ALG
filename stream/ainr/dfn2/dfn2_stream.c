@@ -198,7 +198,7 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
 }
 
 static uint32_t build_hash(const DFN2StreamConfig *cfg, uint32_t prepost_hash) {
-    uint32_t h = 2166136261u;
+    uint32_t h = AC_FNV1A_SEED;
     const DFN2Grid *g = &cfg->grid;
     h = stream_fnv1a_u32(h, (uint32_t)g->sample_rate);
     h = stream_fnv1a_u32(h, (uint32_t)g->n_fft);

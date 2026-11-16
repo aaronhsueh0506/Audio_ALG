@@ -165,7 +165,7 @@ static int resolve(const AinrBridgeConfig *cfg, Resolved *r) {
 
 static void fill_descriptor(const AinrBridgeConfig *cfg, const Resolved *r,
                             AinrBridgeMemReq *out) {
-    uint32_t h = 2166136261u;
+    uint32_t h = AC_FNV1A_SEED;
     h = stream_fnv1a_u32(h, AINR_BRIDGE_LAYOUT_VERSION);
     h = stream_fnv1a_u32(h, (uint32_t)cfg->sample_rate);
     h = stream_fnv1a_u32(h, (uint32_t)r->fft_n);

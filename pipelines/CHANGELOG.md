@@ -3,6 +3,12 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — `stream/ainr` tests named for what they check; `stream_mem.h` forwards to audiolib
+
+- **Renamed.** `tests/test_ainr_spec_freq.c` is `tests/test_ainr_freq.c` (`make test-ainr-freq`, `AINR_FREQ_TEST_BIN`) and `tests/test_ainr_tail.c` is `tests/test_ainr_latency.c` (`make test-ainr-latency`); the `_spec` family they were named after is gone and the second one checks latency, not a tail. The dumper family numbers of `dump_work` are unchanged.
+- **`stream_fnv1a_u32()`** returns `ac_fnv1a_u32()` and **`stream_carve()`** is a wrapper over `ck_carve()` (audiolib `mem_align.h`); the stream modules seed their `build_flags_hash` with `AC_FNV1A_SEED`. Same hashes, offsets, cursors and return codes: 25 million random and edge calls (cursors and sizes around `SIZE_MAX`, with and without a base, with and without `out`) compared against the previous header, no difference.
+- **`stream/common/graph_io.h`**: continuation lines and the backslashes of `GRAPH_IO_CHECK_WORK` re-aligned. Whitespace only (equal after whitespace normalisation, macros included, and through the preprocessor).
+
 ## [Unreleased] — 2026-11-16 — Build: one configuration guard and one 0/1 check in `lib/deps.mk`, no directory or toolchain value as shell text; `ainr_bridge.c` uses `stream_mem.h`
 
 - **`stream/ainr/bridge/ainr_bridge.c`** takes its FNV-1a fold from `stream_fnv1a_u32()` and its 16-byte rounding from `ck_align16_size()` (`align_up()` still returns 0 for an overflow); it includes `stream_mem.h`, so every compile line of it needs `-I stream/common` (`stream/ainr/bridge`, `pipelines` and `pipelines/4ch` Makefiles have it; a board source list that compiles `ainr_bridge.c` adds it). Descriptor bytes, hash and alignment of every accepted bridge configuration are unchanged (475 configurations dumped before and after, identical).
