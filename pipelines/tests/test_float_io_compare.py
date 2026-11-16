@@ -74,3 +74,12 @@ def test_heads_nonfinite_values_must_agree_in_kind_and_position(tmp_path, a_valu
     b = _f32(tmp_path / 'b.f32', b_values)
     r = _run('--heads-a', a, '--heads-b', b, '--head-elems', '2', '--fail-max-abs', '0')
     assert r.returncode == rc, r.stdout
+
+
+def test_log_with_a_very_long_line_is_parsed_in_linear_time(tmp_path):
+    long_line = 'a b ' * 25000 + '\n'    # 100,000 characters, no ':' or '='
+    for name in ('a.log', 'b.log'):
+        (tmp_path / name).write_text('io_in_us: 10\n' + long_line + 'wall_excl_npu=5\n')
+    r = subprocess.run([sys.executable, '-I', str(_TOOL), '--log-a', str(tmp_path / 'a.log'), '--log-b', str(tmp_path / 'b.log')],
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0 and 'io_in_us' in r.stdout and 'wall_excl_npu' in r.stdout, r.stdout

@@ -27,7 +27,9 @@ import sys
 import wave
 
 TIMING = re.compile(r"(_us|_ms|us|ms)$|^(io_|ai3_|conv|wall|cpu_|npu_)", re.I)
-PAIR = re.compile(r"([A-Za-z_][\w.\-/ ]*?)\s*[:=]\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+# A name is at most eight words of 64 characters: an unbounded name made a long line without ':' or '=' quadratic.
+PAIR = re.compile(r"([A-Za-z_][\w.\-/]{0,63}(?: [\w.\-/]{1,63}){0,7})\s*[:=]\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+MAX_LINE = 16384   # longer lines (binary noise, a capture without newlines) are scanned only up to here
 PORT = re.compile(r"scale_ratio|zero_point", re.I)
 MODE = re.compile(r"\[AI3\]\s*float_in=(\d+)\s+float_out=(\d+)(.*)")
 
@@ -138,7 +140,7 @@ def parse_log(path):
                 mode = (int(m.group(1)), int(m.group(2)), m.group(3).strip())
             if PORT.search(line):
                 ports.append(line.strip())
-            for k, v in PAIR.findall(line):
+            for k, v in PAIR.findall(line[:MAX_LINE]):
                 pairs[k.strip()] = float(v)
     return pairs, ports, mode
 
