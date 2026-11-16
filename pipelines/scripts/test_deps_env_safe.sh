@@ -53,7 +53,7 @@ else
 fi
 
 # 5. The toolchain values pasted into shell text (TOOLCHAIN_FWD): a single quote or a line break in CC, CXX, AR, RANLIB or
-# EXTRA_CFLAGS, or a WERROR that is not 0 or 1, is a parse-time error; ordinary values expand.
+# EXTRA_CFLAGS, or a WERROR that is not exactly one word, 0 or 1, is a parse-time error; ordinary values expand.
 cat > "$T/probe.mk" <<EOF
 include $ROOT/lib/deps.mk
 ifdef SHOW_FWD
@@ -71,6 +71,11 @@ n=0
 for bad in "CC=cc'; touch $T/MARK5; echo '" "EXTRA_CFLAGS=-O2' ; touch $T/MARK5; echo '" "WERROR=1; touch $T/MARK5" "WERROR=2"; do
     n=$((n + 1))
     if make -s -f "$T/probe.mk" show SHOW_FWD=1 "$bad" >/dev/null 2>&1; then ck no "toolchain value $n was accepted: $bad"; else ck ok "toolchain value $n was refused"; fi
+done
+for bad in "WERROR=1 1" "WERROR=0 1" "WERROR="; do
+    out="$(make -s -f "$T/probe.mk" show SHOW_FWD=1 "$bad" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "WERROR must be exactly 0 or 1"; then ck ok "'$bad' was refused with the WERROR text"
+    else ck no "'$bad' gave rc=$rc: $out"; fi
 done
 if [ ! -e "$T/MARK5" ]; then ck ok "nothing ran while the toolchain values were refused"; else ck no "a toolchain value was executed"; fi
 

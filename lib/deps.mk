@@ -78,10 +78,10 @@ define DEPS_NEWLINE
 endef
 
 # TOOLCHAIN_FWD is pasted into shell text, each value between single quotes (WERROR bare): a value with a single quote or a
-# line break would end the quoting and run what follows as a command, and a WERROR that is not 0 or 1 would be bare shell
+# line break would end the quoting and run what follows as a command, and a WERROR that is not exactly one word, 0 or 1, would be bare shell
 # text. Expanding it with such a value is a parse-time error (DEPS_TOOLCHAIN_CHECK expands to nothing otherwise).
 DEPS_TOOLCHAIN_CHECK = $(strip $(foreach v,CC CXX AR RANLIB EXTRA_CFLAGS,$(if $(or $(findstring ',$($(v))),$(findstring $(DEPS_NEWLINE),$($(v)))),\
-  $(error $(v) contains a single quote or a line break: it is pasted into shell command text (TOOLCHAIN_FWD)))))$(if $(filter-out 0 1,$(WERROR)),\
+  $(error $(v) contains a single quote or a line break: it is pasted into shell command text (TOOLCHAIN_FWD)))))$(if $(or $(filter-out 0 1,$(WERROR)),$(filter-out 1,$(words $(WERROR)))),\
   $(error WERROR must be exactly 0 or 1 (TOOLCHAIN_FWD pastes it into shell command text)))
 TOOLCHAIN_FWD = $(DEPS_TOOLCHAIN_CHECK)CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' WERROR=$(WERROR)
 
