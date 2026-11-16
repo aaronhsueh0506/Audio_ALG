@@ -155,7 +155,7 @@ static int run_pair(DFN2Stream *slim, DFN2Stream *full, const DFN2Grid *g, const
             src = pre_freq(slim, g, er, ei, pr, pi_, &sio);
             frc = pre_freq(full, g, er, ei, pr, pi_, &fio);
             er[5] = (float)NAN;
-            if (src != -1 || frc != -1 || pre_freq(slim, g, er, ei, pr, pi_, &sio) != -1) ++bad;
+            if (src != DFN2_STREAM_ERR_RANGE || frc != DFN2_STREAM_ERR_RANGE || pre_freq(slim, g, er, ei, pr, pi_, &sio) != DFN2_STREAM_ERR_RANGE) ++bad;
             er[5] = keep;
         }
         memset(&sio, 0, sizeof(sio));

@@ -260,6 +260,7 @@ _POOL_MAIN = r"""
 #include <stdlib.h>
 #include <string.h>
 #include "dfn2_prepost.h"
+#include "tests/dfn2_lifecycle_driver.h"
 
 #define MAX_BINS 513
 #define MAX_ERB 40
@@ -320,7 +321,7 @@ static int config_for(const DFN2Grid *g, DFN2PrepostConfig *cfg) {
 
 static int accepted(void *pool, size_t bytes, const DFN2PrepostConfig *cfg,
                     const DFN2PrepostMemReq *expected) {
-    return dfn2_prepost_init_ex(pool, bytes, cfg, expected) != NULL;
+    return dfn2_life_init_ex(pool, bytes, cfg, expected) != NULL;
 }
 
 static int infer_ok(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
@@ -389,10 +390,10 @@ static int infer_nan(void *user, const DFN2PrepostInputs *in, DFN2PrepostOutputs
 }
 
 /* One analysed frame of zeros; every hop is closed with post_process, as the call order says. */
-static int hop_in(DFN2Prepost *p) { return dfn2_prepost_pre_process_freq(p, zeros, zeros); }
+static int hop_in(DFN2Prepost *p) { return dfn2_life_pre_process_freq(p, zeros, zeros); }
 static int hop_out(DFN2Prepost *p) {
     float re[MAX_BINS], im[MAX_BINS];
-    return dfn2_prepost_post_process_freq(p, re, im, NULL);
+    return dfn2_life_post_process_freq(p, re, im, NULL);
 }
 /* Hops of a cold or reset instance until the heads of a real frame are due: the first mask_lookahead hops carry
  * no job (pre 0, no frame opens, the hop closes); the last hop's pre_process result (1) is returned, else -1. */
@@ -401,7 +402,7 @@ static int to_ready(DFN2Prepost *p) {
     for (i = 0; i < dfn2_prepost_grid(p)->mask_lookahead; ++i) {
         DFN2PrepostInputs in;
         DFN2PrepostOutputs out;
-        if (hop_in(p) != 0 || dfn2_prepost_frame_open(p, &in, &out) == 0 || hop_out(p) != 0) return -1;
+        if (hop_in(p) != 0 || dfn2_life_frame_open(p, &in, &out) == 0 || hop_out(p) != 0) return -1;
     }
     return hop_in(p);
 }
@@ -410,7 +411,7 @@ static int to_ready(DFN2Prepost *p) {
 static int frame_commits(DFN2Prepost *p, const float *gru, const float *convp) {
     DFN2PrepostInputs in;
     DFN2PrepostOutputs out;
-    if (to_ready(p) != 1 || dfn2_prepost_frame_open(p, &in, &out) != 0) return 0;
+    if (to_ready(p) != 1 || dfn2_life_frame_open(p, &in, &out) != 0) return 0;
     if (in.gru_hidden != gru || out.gru_hidden_next != gru) return 0;
 #ifndef DFN2_MASK_ONLY
     if (in.df_convp_window != convp || out.df_convp_window_next != convp) return 0;
@@ -418,7 +419,7 @@ static int frame_commits(DFN2Prepost *p, const float *gru, const float *convp) {
     (void)convp;
 #endif
     infer_ok(NULL, &in, &out);
-    return dfn2_prepost_frame_finish(p) == 0 && hop_out(p) == 0;
+    return dfn2_life_frame_finish(p) == 0 && hop_out(p) == 0;
 }
 
 int main(void) {
@@ -483,7 +484,7 @@ int main(void) {
                 printf("%s badgrid2\n", verb);
                 continue;
             }
-            p = dfn2_prepost_create(&cb);
+            p = dfn2_life_create(&cb);
             ready = to_ready(p);   /* past the hops without a job: a real frame is open */
             if (dfn2_model_io_descriptor_default(&a, &desc) != 0) {
                 printf("%s nodesc\n", verb);
@@ -494,9 +495,9 @@ int main(void) {
             model.reset = NULL;
             model.io_descriptor = strcmp(verb, "runnull") ? &desc : NULL;
             infer_calls = 0;
-            rc = dfn2_model_run_frame(&model, p);
+            rc = dfn2_life_model_run_frame(&model, p);
             printf("%s %d %d %d\n", verb, ready, rc, infer_calls);
-            dfn2_prepost_destroy(p);
+            dfn2_life_destroy(p);
         } else if (!strcmp(verb, "desc")) {
             /* desc <grid A> <grid B>: the default descriptor of A against A and against B */
             DFN2ModelIoDescriptor d;
@@ -579,7 +580,7 @@ int main(void) {
             memset(pool, 0xa5, bytes);
             memcpy(copy, pool, bytes);
             status = dfn2_prepost_get_mem_size(&cfg, &req);
-            p = dfn2_prepost_init(pool, bytes, &cfg);
+            p = dfn2_life_init(pool, bytes, &cfg);
             if (p) {
                 const int gru_in = (bits & 3u) == 3u, convp_in = (bits >> 2) == 3u;
                 clean = status == 0 && req.bytes == base.bytes && req.build_flags_hash == base.build_flags_hash;
@@ -590,9 +591,9 @@ int main(void) {
                 clean = status == -1 && memcmp(&req, &untouched, sizeof req) == 0 &&
                         memcmp(pool, copy, bytes) == 0 && state_all(7.0f);
             }
-            made = dfn2_prepost_create(&cfg);
+            made = dfn2_life_create(&cfg);
             printf("reg %u %d %d %d %d %d\n", bits, status, p != NULL, made != NULL, clean, works);
-            dfn2_prepost_destroy(made);
+            dfn2_life_destroy(made);
             free(pool);
             free(copy);
         } else if (!strcmp(verb, "board")) {
@@ -632,16 +633,16 @@ int main(void) {
                 printf("board nosize\n");
                 continue;
             }
-            dfn2_prepost_init(pool, (size_t)req.bytes, &reg);
+            dfn2_life_init(pool, (size_t)req.bytes, &reg);
             state_fill(5.0f);
             memset(&foreign, 0x5a, sizeof foreign);
             memset(foreign.head, 0xa5, sizeof foreign.head);
             memset(foreign.tail, 0xa5, sizeof foreign.tail);
             memcpy(&foreign_ref, &foreign, sizeof foreign);
-            p = dfn2_prepost_init(pool, (size_t)req.bytes, &board);
+            p = dfn2_life_init(pool, (size_t)req.bytes, &board);
             g[0] = dfn2_prepost_state_generation(p);
             to_ready(p);
-            dfn2_prepost_frame_open(p, &in, &out);
+            dfn2_life_frame_open(p, &in, &out);
             views = in.gru_hidden == NULL && in.gru_hidden_elements == 0u && out.gru_hidden_next == NULL &&
                     out.gru_hidden_elements == 0u;
 #ifndef DFN2_MASK_ONLY
@@ -649,41 +650,41 @@ int main(void) {
                     out.df_convp_window_next == NULL && out.df_convp_window_elements == 0u;
 #endif
             infer_ok(NULL, &in, &out);
-            commit_rc = dfn2_prepost_frame_finish(p);
+            commit_rc = dfn2_life_frame_finish(p);
             hop_out(p);
             g[1] = dfn2_prepost_state_generation(p);
             hop_in(p);
-            dfn2_prepost_frame_open(p, &in, &out);
-            bypass_rc = dfn2_prepost_frame_bypass(p);
+            dfn2_life_frame_open(p, &in, &out);
+            bypass_rc = dfn2_life_frame_bypass(p);
             hop_out(p);
             g[2] = dfn2_prepost_state_generation(p);
             hop_in(p);
-            dfn2_prepost_frame_open(p, &in, &out);                   /* the heads stay NaN: refused */
-            refuse_rc = dfn2_prepost_frame_finish(p);
+            dfn2_life_frame_open(p, &in, &out);                   /* the heads stay NaN: refused */
+            refuse_rc = dfn2_life_frame_finish(p);
             g[3] = dfn2_prepost_state_generation(p);
-            again_rc = dfn2_prepost_frame_finish(p);
+            again_rc = dfn2_life_frame_finish(p);
             g[4] = dfn2_prepost_state_generation(p);
-            bypass2_rc = dfn2_prepost_frame_bypass(p);
+            bypass2_rc = dfn2_life_frame_bypass(p);
             hop_out(p);
             g[5] = dfn2_prepost_state_generation(p);
-            dfn2_prepost_reset(p);
+            dfn2_life_reset(p);
             g[6] = dfn2_prepost_state_generation(p);
             model.user = NULL;
             model.reset = NULL;
             model.io_descriptor = &desc;
             model.infer = infer_fail;
             to_ready(p);
-            fail_rc = dfn2_model_run_frame(&model, p);
+            fail_rc = dfn2_life_model_run_frame(&model, p);
             hop_out(p);
             g[7] = dfn2_prepost_state_generation(p);
             model.infer = infer_nan;
             hop_in(p);
-            nan_rc = dfn2_model_run_frame(&model, p);
+            nan_rc = dfn2_life_model_run_frame(&model, p);
             hop_out(p);
             g[8] = dfn2_prepost_state_generation(p);
             model.infer = infer_ok;
             hop_in(p);
-            good_rc = dfn2_model_run_frame(&model, p);
+            good_rc = dfn2_life_model_run_frame(&model, p);
             hop_out(p);
             g[9] = dfn2_prepost_state_generation(p);
             statuses = commit_rc == 0 && bypass_rc == 0 && refuse_rc == -1 && again_rc == -1 && bypass2_rc == 0 &&
@@ -718,7 +719,7 @@ int main(void) {
             copy = malloc(most);
             memset(pool, 0xa5, most);
             fill_tables(&b);   /* ca and cb share the table arrays: each instance is built over its own grid's tables */
-            live = dfn2_prepost_init_ex(pool, most, &cb, &rb);
+            live = dfn2_life_init_ex(pool, most, &cb, &rb);
             state_fill(7.0f);
             memcpy(copy, pool, most);
             refused += !accepted(pool, most, &ca, &rb);
@@ -742,7 +743,7 @@ int main(void) {
             untouched = memcmp(pool, copy, most) == 0 && state_all(7.0f);
             alive = live != NULL;
             fill_tables(&a);
-            live = dfn2_prepost_init_ex(pool, most, &ca, &ra);
+            live = dfn2_life_init_ex(pool, most, &ca, &ra);
             control = live != NULL && registered_zero() && frame_commits(live, s_gru, s_convp);
             printf("stale %d %d %d %d\n", refused, untouched, alive, control);
             free(pool);
@@ -896,14 +897,14 @@ class _PoolMirror:
         return self._struct_size(fields)[0]
 
     def _prepost_header(self, mask):
-        fields = ['ptr', 'ptr', self._grid(), 'float', 'ptr', 'ptr'] + ['ptr'] * 2 + ['ptr'] * 2
-        fields += ['ptr'] * 4 + ['ptr']
+        fields = ['ptr', 'ptr', self._grid(), 'float', 'ptr', 'ptr'] + ['ptr'] * 2   # feat_erb, feat_spec
+        fields += ['ptr']                                                       # head_erb_mask
         if not mask:
-            fields += ['ptr', 'ptr']
-        fields += ['ptr']
+            fields += ['ptr', 'ptr']                                            # head_coefs, head_alpha
+        fields += ['ptr']                                                       # skip_mask
         if not mask:
-            fields += ['ptr']
-        fields += ['ll', 'int', 'int', 'int', 'ptr']
+            fields += ['ptr']                                                   # skip_coefs
+        fields += ['ll', 'ptr']
         return self._struct_size(fields)[0]
 
     def _carve(self, sizes):
@@ -936,13 +937,12 @@ class _PoolMirror:
         io = [4 * g['input_frames'] * ne, 4 * 2 * g['input_frames'] * db]
         sizes = [self._prepost_header(mask), self._state_header(mask), self._carve(state),
                  self._io_header(mask), self._carve(io),
-                 4 * n * nb, 4 * n * nb, 4 * ne, 4 * 2 * db, 4 * n * nb, 4 * n * nb, 4 * n * ne]
+                 4 * ne, 4 * 2 * db, 4 * n * ne]
         if not mask:
             sizes += [4 * n * db * order * 2, 4 * n]
         sizes += [4 * ne]
         if not mask:
             sizes += [4 * db * order * 2]
-        sizes += [P * n, P * n]
         return self._carve(sizes)
 
     @staticmethod

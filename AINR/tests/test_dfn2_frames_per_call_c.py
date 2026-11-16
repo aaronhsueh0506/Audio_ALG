@@ -71,6 +71,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "dfn2_test_grid.h"
+#include "dfn2_lifecycle_driver.h"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -245,7 +246,7 @@ static DFN2Prepost *make(void) {
     cfg.gru_hidden_elements = DFN2_TEST_GRU_ELEMENTS;
     cfg.df_convp_history = host_convp;
     cfg.df_convp_history_elements = DFN2_TEST_CONVP_ELEMENTS;
-    return dfn2_prepost_create(&cfg);
+    return dfn2_life_create(&cfg);
 }
 
 static DFN2PrepostInputs views_in;
@@ -287,7 +288,7 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
             int i, rc, valid = 0;
             long long last = -1;
             if (h == reset_hop) {
-                dfn2_prepost_reset(p);
+                dfn2_life_reset(p);
                 stub.next_head = 0;
                 rec('R', h, 0, 0, NULL, 0);
             }
@@ -309,10 +310,10 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
                     }
                 }
             }
-            rc = dfn2_prepost_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_app_re, blk_app_im);
+            rc = dfn2_life_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_app_re, blk_app_im);
             CHECK(rc == 1);
-            CHECK(dfn2_model_run_frame(&model, p) >= 0);
-            CHECK(dfn2_prepost_post_process_block(p, blk_out_re, blk_out_im, &valid) == 0);
+            CHECK(dfn2_life_model_run_frame(&model, p) >= 0);
+            CHECK(dfn2_life_post_process_block(p, blk_out_re, blk_out_im, &valid) == 0);
             CHECK(valid >= 0 && valid <= NF);
             if (valid) CHECK(dfn2_prepost_output_frame_index(p, &last) == 0);
             for (i = 0; i < NF; ++i) {
@@ -327,13 +328,13 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
         /* the final state, as for N == 1: the views of the next open block */
         memset(blk_est_re, 0, sizeof blk_est_re);
         memset(blk_est_im, 0, sizeof blk_est_im);
-        CHECK(dfn2_prepost_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_est_re, blk_est_im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &views_in, &views_out) == 0);
+        CHECK(dfn2_life_pre_process_block_dual(p, blk_est_re, blk_est_im, blk_est_re, blk_est_im) == 1);
+        CHECK(dfn2_life_frame_open(p, &views_in, &views_out) == 0);
         rec('S', 0, 0, 0, views_in.gru_hidden, (int)views_in.gru_hidden_elements);
         rec('W', 0, 0, 0, views_in.df_convp_window, (int)views_in.df_convp_window_elements);
         rec('G', (int)dfn2_prepost_state_generation(p), 0, 0, NULL, 0);
         printf("calls=%d generation=%u\n", stub.calls, dfn2_prepost_state_generation(p));
-        dfn2_prepost_destroy(p);
+        dfn2_life_destroy(p);
         return 0;
     }
 
@@ -342,7 +343,7 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
         int rc, written = 0;
         long long frame = -1;
         if (h == reset_hop) {
-            dfn2_prepost_reset(p);
+            dfn2_life_reset(p);
             stub.next_head = 0;
             rec('R', h, 0, 0, NULL, 0);
         }
@@ -353,11 +354,11 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
             app_im[k] = 0.5f * est_im[k];
         }
         rc = h % 3 == 0
-            ? dfn2_prepost_pre_process_freq_dual(p, est_re, est_im, app_re, app_im)
-            : dfn2_prepost_pre_process_freq(p, est_re, est_im);
+            ? dfn2_life_pre_process_freq_dual(p, est_re, est_im, app_re, app_im)
+            : dfn2_life_pre_process_freq(p, est_re, est_im);
         CHECK(rc == 0 || rc == 1);
-        if (rc == 1) CHECK(dfn2_model_run_frame(&model, p) >= 0);
-        CHECK(dfn2_prepost_post_process_freq(
+        if (rc == 1) CHECK(dfn2_life_model_run_frame(&model, p) >= 0);
+        CHECK(dfn2_life_post_process_freq(
                   p, out_spec, out_spec + DFN2_N_BINS, &written) == 0);
         (void)dfn2_prepost_output_frame_index(p, &frame);
         rec('O', h, (written ? 1 : 0) | (rc << 1), frame, out_spec, 2 * DFN2_N_BINS);
@@ -371,13 +372,13 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
         for (;;) {
             memset(est_re, 0, sizeof est_re);
             memset(est_im, 0, sizeof est_im);
-            rc = dfn2_prepost_pre_process_freq(p, est_re, est_im);
+            rc = dfn2_life_pre_process_freq(p, est_re, est_im);
             CHECK(rc == 0 || rc == 1);
             if (rc == 1) break;
-            CHECK(dfn2_prepost_post_process_freq(
+            CHECK(dfn2_life_post_process_freq(
                       p, out_spec, out_spec + DFN2_N_BINS, NULL) == 0);
         }
-        CHECK(dfn2_prepost_frame_open(p, &views_in, &views_out) == 0);
+        CHECK(dfn2_life_frame_open(p, &views_in, &views_out) == 0);
         rec('S', 0, 0, 0, views_in.gru_hidden, (int)views_in.gru_hidden_elements);
         rec('W', 0, 0, 0, views_in.df_convp_window,
             (int)views_in.df_convp_window_elements);
@@ -385,7 +386,7 @@ static int run_stream(int real, int hops, int reset_hop, long long plo, long lon
     rec('G', (int)dfn2_prepost_state_generation(p), 0, 0, NULL, 0);
     printf("calls=%d generation=%u\n", stub.calls,
            dfn2_prepost_state_generation(p));
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
     return 0;
 }
 
@@ -481,9 +482,9 @@ static int case_contract(void) {
     bad = d;
     bad.input_frames = DFN2_MODEL_INPUT_FRAMES + (NF == 1);
     if (NF > 1) {   /* the per-hop entries refuse a block stream, the block entry refuses N == 1 */
-        CHECK(dfn2_prepost_pre_process_freq(p, est_re, est_im) == -1);
-        CHECK(dfn2_prepost_pre_process_freq_dual(p, est_re, est_im, est_re, est_im) == -1);
-        CHECK(dfn2_prepost_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS, NULL) == -1);
+        CHECK(dfn2_life_pre_process_freq(p, est_re, est_im) == -1);
+        CHECK(dfn2_life_pre_process_freq_dual(p, est_re, est_im, est_re, est_im) == -1);
+        CHECK(dfn2_life_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS, NULL) == -1);
     }
     for (h = 0; h < LA + DA + 6 * NF + 4; h += (NF > 1 ? NF : 1)) {
         int rc, want;
@@ -494,14 +495,14 @@ static int case_contract(void) {
                 re_blk[b] = noise(h, 2 * b);
                 im_blk[b] = noise(h, 2 * b + 1);
             }
-            rc = dfn2_prepost_pre_process_block_dual(p, re_blk, im_blk, re_blk, im_blk);
+            rc = dfn2_life_pre_process_block_dual(p, re_blk, im_blk, re_blk, im_blk);
             CHECK(rc == 1);
         } else {
             for (b = 0; b < DFN2_N_BINS; ++b) {
                 est_re[b] = noise(h, 2 * b);
                 est_im[b] = noise(h, 2 * b + 1);
             }
-            rc = dfn2_prepost_pre_process_freq(p, est_re, est_im);
+            rc = dfn2_life_pre_process_freq(p, est_re, est_im);
             want = h >= LA;   /* N == 1: every hop from hop L */
             CHECK(rc == want);
         }
@@ -509,13 +510,13 @@ static int case_contract(void) {
             int calls = stub.calls;
             /* Another N's descriptor is refused before infer() runs. */
             model.io_descriptor = &bad;
-            CHECK(dfn2_model_run_frame(&model, p) == -1);
+            CHECK(dfn2_life_model_run_frame(&model, p) == -1);
             CHECK(stub.calls == calls);
             /* ... and so is one made for another grid. */
             model.io_descriptor = &other_d;
-            CHECK(dfn2_model_run_frame(&model, p) == -1);
+            CHECK(dfn2_life_model_run_frame(&model, p) == -1);
             CHECK(stub.calls == calls);
-            CHECK(dfn2_prepost_frame_open(p, &views_in, &views_out) == 0);
+            CHECK(dfn2_life_frame_open(p, &views_in, &views_out) == 0);
             CHECK(views_in.erb_window_elements ==
                   dfn2_prepost_erb_window_elements(grid));
             CHECK(dfn2_prepost_erb_window_elements(grid) == (size_t)WF * E);
@@ -526,17 +527,17 @@ static int case_contract(void) {
             CHECK(views_out.alpha_elements == (size_t)NF);
             CHECK(isnan(views_out.alpha[NF - 1]));
             model.io_descriptor = &d;
-            CHECK(dfn2_model_run_frame(&model, p) == 1);
+            CHECK(dfn2_life_model_run_frame(&model, p) == 1);
             CHECK(stub.calls == calls + 1);
         }
         if (NF > 1) {
             static float out_blk_re[MAX_BLOCK * DFN2_N_BINS], out_blk_im[MAX_BLOCK * DFN2_N_BINS];
             int valid = -1;
-            CHECK(dfn2_prepost_post_process_block(p, out_blk_re, out_blk_im, &valid) == 0);
+            CHECK(dfn2_life_post_process_block(p, out_blk_re, out_blk_im, &valid) == 0);
             CHECK(valid == NF - (LA + DA > h ? (LA + DA - h < NF ? LA + DA - h : NF) : 0));
             if (valid && first_written < 0) first_written = h + (NF - valid);
         } else {
-            CHECK(dfn2_prepost_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS,
+            CHECK(dfn2_life_post_process_freq(p, out_spec, out_spec + DFN2_N_BINS,
                                                  &written) == 0);
             if (written && first_written < 0) first_written = h;
         }
@@ -544,7 +545,7 @@ static int case_contract(void) {
     CHECK(first_written == LA + DA);
     /* the frames before the first call open nothing and move nothing */
     CHECK(dfn2_prepost_state_generation(p) == 1u);
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
 
     CHECK(dfn2_prepost_config_defaults(&cfg, grid) == 0);
     cfg.erb_fwd = &erb_fwd[0][0];
@@ -573,8 +574,8 @@ static int case_req_check(unsigned long long bytes, unsigned hash) {
     room = (room + 15u) / 16u * 16u;
     pool = aligned_alloc(16u, room);
     CHECK(pool != NULL);
-    CHECK(dfn2_prepost_init_ex(pool, room, &cfg, &req) != NULL);
-    CHECK(dfn2_prepost_init_ex(pool, room, &cfg, &other) == NULL);
+    CHECK(dfn2_life_init_ex(pool, room, &cfg, &req) != NULL);
+    CHECK(dfn2_life_init_ex(pool, room, &cfg, &other) == NULL);
     free(pool);
     printf("req_check refused\n");
     return 0;

@@ -34,6 +34,7 @@
 #include "../lib/ainr/dfn2/dfn2_prepost.h"
 #include "../lib/ainr/gtcrn/gtcrn_process.h"
 #include "dfn2_test_grid.h"
+#include "dfn2_lifecycle_driver.h"
 #include "gtcrn_test_grid.h"
 
 #define HOPS 640
@@ -122,7 +123,7 @@ static uint64_t run_dfn2(void)
     cfg.gru_hidden_elements = DFN2_TEST_GRU_ELEMENTS;
     cfg.df_convp_history = dfn_convp;
     cfg.df_convp_history_elements = DFN2_TEST_CONVP_ELEMENTS;
-    p = dfn2_prepost_create(&cfg);
+    p = dfn2_life_create(&cfg);
     if (!p) exit(2);
     for (int h = 0; h < HOPS; ++h) {
         int v, valid = 0, kind = hop_kind(h);
@@ -136,16 +137,16 @@ static uint64_t run_dfn2(void)
         make_spectrum(h, DFN2_N_BINS, re, im);
         if (h % 4 == 3) {
             make_spectrum(h + 1, DFN2_N_BINS, app_re, app_im);
-            v = dfn2_prepost_pre_process_freq_dual(p, re, im, app_re, app_im);
+            v = dfn2_life_pre_process_freq_dual(p, re, im, app_re, app_im);
         } else {
-            v = dfn2_prepost_pre_process_freq(p, re, im);
+            v = dfn2_life_pre_process_freq(p, re, im);
         }
         if (no_frame != (v == 0) || (v != 0 && v != 1)) exit(2);
         hash_u32(&d.status, (uint32_t)v);
         if (no_frame) {
             DFN2PrepostInputs in;
             DFN2PrepostOutputs out;
-            if (dfn2_prepost_frame_open(p, &in, &out) == 0 || dfn2_prepost_state_generation(p) != 1u) exit(2);
+            if (dfn2_life_frame_open(p, &in, &out) == 0 || dfn2_prepost_state_generation(p) != 1u) exit(2);
             for (size_t i = 0; i < DFN2_TEST_GRU_ELEMENTS; ++i)
                 if (dfn_gru[i] != 0.0f) exit(2);
             for (size_t i = 0; i < DFN2_TEST_CONVP_ELEMENTS; ++i)
@@ -156,7 +157,7 @@ static uint64_t run_dfn2(void)
             float* gru;
             float* convp;
             int rc, skipped = 0;
-            if (dfn2_prepost_frame_open(p, &in, &out) != 0) exit(2);
+            if (dfn2_life_frame_open(p, &in, &out) != 0) exit(2);
             if (in.erb_window_elements != dfn2_prepost_erb_window_elements(grid) ||
                 in.spec_window_elements != dfn2_prepost_spec_window_elements(grid) ||
                 in.gru_hidden != dfn_gru ||
@@ -187,21 +188,21 @@ static uint64_t run_dfn2(void)
                                 poison_where(kind), h);
                 }
             }
-            rc = kind == K_SKIP ? dfn2_prepost_frame_bypass(p)
-                                : dfn2_prepost_frame_finish(p);
-            if (rc != 0 && kind != K_SKIP) skipped = dfn2_prepost_frame_bypass(p);
+            rc = kind == K_SKIP ? dfn2_life_frame_bypass(p)
+                                : dfn2_life_frame_finish(p);
+            if (rc != 0 && kind != K_SKIP) skipped = dfn2_life_frame_bypass(p);
             hash_u32(&d.status, (uint32_t)rc);
             hash_u32(&d.status, (uint32_t)skipped);
             hash_u32(&d.status, dfn2_prepost_state_generation(p));
             hash_f32(&d.state, gru, in.gru_hidden_elements);
             hash_f32(&d.state, convp, in.df_convp_window_elements);
         }
-        if (dfn2_prepost_post_process_freq(p, out_re, out_im, &valid) != 0) exit(2);
+        if (dfn2_life_post_process_freq(p, out_re, out_im, &valid) != 0) exit(2);
         hash_u32(&d.status, (uint32_t)valid);
         hash_f32(&d.post, out_re, DFN2_N_BINS);
         hash_f32(&d.post, out_im, DFN2_N_BINS);
     }
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
     printf("  dfn2   in=%016llx state=%016llx post=%016llx status=%016llx\n",
            (unsigned long long)d.in, (unsigned long long)d.state,
            (unsigned long long)d.post, (unsigned long long)d.status);

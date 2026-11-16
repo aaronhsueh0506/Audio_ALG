@@ -11,7 +11,7 @@
  *
  * Every window handed out and every delivered spectrum must also be finite. N = 1 and N = 8 (full
  * 16 kHz/256), 48 kHz/1024 N = 1 (full or lite by the archive variant). A second part drives the
- * DFN2Stream freq entry directly: its own guard returns -1 with the stream untouched. A third part
+ * DFN2Stream freq entry directly: its own guard returns DFN2_STREAM_ERR_RANGE with the stream untouched. A third part
  * pins the limit: a bin at exactly 2^63 (model scale) is accepted, the next float up refused. Not built
  * under NO_STDIO. */
 
@@ -347,7 +347,7 @@ static int run_stream_guard(const char *label) {
                 for (v = 0; v < 8; ++v) {   /* 0..3: NaN/Inf, 4..7: finite, above the limit */
                     size_t at = nb - 1 - (size_t)(v & 3);
                     y[v & 3][at] = v >= 4 ? ((v & 1) ? -1e25f : 1e25f) : ((v & 1) ? INFINITY : NAN);
-                    if (dfn2_stream_pre_process_freq_dual(s[0], y[0], y[1], y[2], y[3], &io) != -1) {
+                    if (dfn2_stream_pre_process_freq_dual(s[0], y[0], y[1], y[2], y[3], &io) != DFN2_STREAM_ERR_RANGE) {
                         fprintf(stderr, "%s: array %d with a %s bin was accepted\n", label, v & 3,
                                 v >= 4 ? "too large" : "non-finite");
                         bad = 1;
@@ -397,7 +397,7 @@ static int run_stream_guard(const char *label) {
         z[2] = lim;
         if (!f) { fprintf(stderr, "%s: init fail\n", label); return 1; }
         z[3] = over;
-        if (dfn2_stream_pre_process_freq_dual(f, z, z, z, z, &io) != -1) {
+        if (dfn2_stream_pre_process_freq_dual(f, z, z, z, z, &io) != DFN2_STREAM_ERR_RANGE) {
             fprintf(stderr, "%s: a bin one float above 2^63 was accepted\n", label); bad = 1;
         }
         z[3] = -lim;

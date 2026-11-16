@@ -1,5 +1,6 @@
-/* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and DFN2Prepost around int16
- * PCM, grid.frames_per_call N in [1, 64]. N == 1: one hop per call, a job on every hop from hop L (io.action ==
+/* DeepFilterNet2 PCM stream: optional HPF, AcStft/AcIstft (AC_OLA_ACCUMULATE) and the dfn2_prepost per-frame functions
+ * around int16 PCM, grid.frames_per_call N in [1, 64]. The stream sequences a call (N pre_frame, one job, validate_run,
+ * N post_frame or post_frame_identity) and holds the application-spectrum staging of the call. N == 1: one hop per call, a job on every hop from hop L (io.action ==
  * STREAM_WORK_SUBMIT; the first mask_lookahead hops after init or reset are STREAM_WORK_BYPASS). N > 1 (L == 0 only): one packet of N hops per call and one job
  * (dfn2_stream_{pre,post}_process_packet, below); the per-hop entries refuse it.
  *
@@ -46,18 +47,8 @@ extern "C" {
  * <= 2^127 < FLT_MAX. A larger or non-finite bin would put Inf/NaN into the feature normaliser until reset. */
 #define DFN2_STREAM_BIN_LIMIT_BITS 0x5F000000u
 
-/* 1 when every x[k] * scale (float product, scale 1.0f for MODEL scale) is finite and within the limit above. */
-static inline int dfn2_stream_bins_in_range(const float *x, size_t n, float scale)
-{
-    size_t k;
-    for (k = 0; k < n; ++k) {
-        float m = x[k] * scale;
-        uint32_t bits;
-        memcpy(&bits, &m, sizeof bits);
-        if ((bits & 0x7FFFFFFFu) > DFN2_STREAM_BIN_LIMIT_BITS) return 0;
-    }
-    return 1;
-}
+/* Returned by the _freq pre entries for a bin that is non-finite or beyond the limit above; nothing moved. Other contract errors are -1. */
+#define DFN2_STREAM_ERR_RANGE (-2)
 
 typedef struct DFN2StreamConfig {
     DFN2Grid grid;             /* dfn2_grid_make(); frames_per_call in [1, 64] */
@@ -115,7 +106,7 @@ typedef struct DFN2Stream DFN2Stream;
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
 /* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost
- * (freq_only: DFN2Prepost alone), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or tables that fail
+ * (freq_only: DFN2Prepost and the spectrum staging), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or tables that fail
  * dfn2_erb_tables_valid() (finite erb_fwd >= 0; erb_inv in [0, 1] summing to exactly 1.0f in every bin, band-ascending in float32). */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
@@ -158,20 +149,20 @@ typedef struct DFN2HopIO {
     unsigned int       state_generation;
 } DFN2HopIO;
 
-/* One PCM hop in (dfn2_stream_hop_size(s) samples), frames_per_call == 1: int16 -> float, HPF, STFT, pre_process_freq,
- * frame_open on a SUBMIT hop. 1 with *io filled (inputs/outputs only on SUBMIT), or -1 on NULL args, no preceding
+/* One PCM hop in (dfn2_stream_hop_size(s) samples), frames_per_call == 1: int16 -> float, HPF, STFT, pre_frame, views
+ * on a SUBMIT hop. 1 with *io filled (inputs/outputs only on SUBMIT), or -1 on NULL args, no preceding
  * post_process, a freq_only context or frames_per_call > 1. */
 int dfn2_stream_pre_process(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 
 /* Closes the hop, once per pre_process: on a SUBMIT hop ai_rc 0 commits, STREAM_RUN_NOT_STARTED bypasses, any other
  * value bypasses and advances the generation (otherwise ai_rc is ignored); one hop is then drained to pcm_out through
- * the ISTFT. Returns the spectral-validity flag (1/0) of dfn2_prepost_post_process_freq(), -1 on error (a freq_only
+ * the ISTFT. Returns the spectral-validity flag (1/0) of the hop's post_frame, -1 on error (a freq_only
  * context included); it is not an alignment: count L + D hops. */
 int dfn2_stream_post_process(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
 
 /* As dfn2_stream_pre_process() on spectra, for either kind of context: est and app are n_bins floats each, MODEL scale; est drives features and
- * heads, app is what mask, deep filter and attenuation limit act on (est == app: one spectrum). -1, state untouched, on
- * NULL args, no preceding post_process, or a bin that is non-finite or beyond DFN2_STREAM_BIN_LIMIT_BITS. */
+ * heads, app is what mask, deep filter and attenuation limit act on (est == app: one spectrum). State untouched on a refusal, which
+ * is DFN2_STREAM_ERR_RANGE for a bin that is non-finite or beyond DFN2_STREAM_BIN_LIMIT_BITS, else -1 (NULL args, no preceding post_process). */
 int dfn2_stream_pre_process_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,
                                       const float *app_re, const float *app_im, DFN2HopIO *io);
 
@@ -185,8 +176,8 @@ int dfn2_stream_post_process_freq(DFN2Stream *s, int ai_rc, float *re, float *im
 int dfn2_stream_pre_process_packet(DFN2Stream *s, const int16_t *pcm_in, DFN2HopIO *io);
 int dfn2_stream_post_process_packet(DFN2Stream *s, int ai_rc, int16_t *pcm_out);
 
-/* The packet entries on spectra (N * n_bins floats per plane, frame-major, MODEL scale): -1, state untouched, on NULL args,
- * a pending packet, N == 1 or a bad bin in any frame. post returns 0 with *valid_frames (may be NULL) set, -1 on error. */
+/* The packet entries on spectra (N * n_bins floats per plane, frame-major, MODEL scale): state untouched on a refusal, which is
+ * DFN2_STREAM_ERR_RANGE for a bad bin in any frame, else -1 (NULL args, a pending packet, N == 1). post returns 0 with *valid_frames (may be NULL) set, -1 on error. */
 int dfn2_stream_pre_process_packet_freq_dual(DFN2Stream *s, const float *est_re, const float *est_im,
                                              const float *app_re, const float *app_im, DFN2HopIO *io);
 int dfn2_stream_post_process_packet_freq(DFN2Stream *s, int ai_rc, float *re, float *im, int *valid_frames);

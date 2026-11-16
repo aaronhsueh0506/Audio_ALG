@@ -1,5 +1,5 @@
-/* Verifies dfn2_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): features ->
- * dfn2_prepost_frame_open -> accelerator -> dfn2_prepost_frame_finish/frame_fail -> post_process_freq ->
+/* Verifies dfn2_stream_pre_process/post_process against a hand-written per-hop loop (the oracle): dfn2_prepost_pre_frame ->
+ * dfn2_prepost_views -> accelerator -> dfn2_prepost_validate_run / zero_state -> dfn2_prepost_post_frame[_identity] ->
  * ac_istft_push_planar -> int16 saturate. The oracle is built directly against lib/ainr/dfn2/dfn2_prepost.h and
  * audiolib, never against dfn2_stream.c. The two drivers run the SAME deterministic fake accelerator (a pure
  * function of a global hop counter, ignoring its own input argument so its output cannot depend on which driver
@@ -105,33 +105,31 @@ static int board_init(BoardDriver *d, const DFN2Grid *grid, const float *erb_fwd
     return 0;
 }
 
-/* 1: the hop has a job (frame open, views in *in / *out); 0: no job this hop (nothing open); -1: error. */
+/* 1: the hop has a job (views in *in / *out); 0: no job this hop; -1: error. */
 static int board_pre(BoardDriver *d, const int16_t *pcm_in, DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
     int hop = d->grid.hop, k, need;
     for (k = 0; k < hop; ++k) d->hop_in[k] = (float)pcm_in[k] / 32768.0f;
     if (d->hpf) hpf_process(d->hpf, d->hop_in, hop);
     ac_stft_push_planar(d->stft, d->hop_in, d->spec_re, d->spec_im);
-    need = dfn2_prepost_pre_process_freq(d->prepost, d->spec_re, d->spec_im);
+    need = dfn2_prepost_pre_frame(d->prepost, d->spec_re, d->spec_im);
     if (need != 1) return need;
-    if (dfn2_prepost_frame_open(d->prepost, in, out) != 0) return -1;
+    if (dfn2_prepost_views(d->prepost, in, out) != 0) return -1;
     return 1;
 }
 
 static int board_post(BoardDriver *d, int job, int ai_rc, int16_t *pcm_out, int *valid_out) {
-    int prc, valid = 0, hop = d->grid.hop, k;
+    int prc, commit = 0, valid = 0, hop = d->grid.hop, k;
     if (job) {
-        if (ai_rc == STREAM_RUN_OK) {
-            if (dfn2_prepost_frame_finish(d->prepost) != 0) dfn2_prepost_frame_bypass(d->prepost);
-        } else {
-            dfn2_prepost_frame_fail(d->prepost, ai_rc != STREAM_RUN_NOT_STARTED);
-        }
+        if (ai_rc == STREAM_RUN_OK) commit = dfn2_prepost_validate_run(d->prepost) == 0;
+        else if (ai_rc != STREAM_RUN_NOT_STARTED) dfn2_prepost_zero_state(d->prepost);
     }
-    prc = dfn2_prepost_post_process_freq(d->prepost, d->enh_re, d->enh_im, &valid);
-    if (prc == 0) {
+    prc = commit ? dfn2_prepost_post_frame(d->prepost, 0, d->spec_re, d->spec_im, d->enh_re, d->enh_im)
+                 : dfn2_prepost_post_frame_identity(d->prepost, d->spec_re, d->spec_im, d->enh_re, d->enh_im);
+    if (prc >= 0) {
+        valid = prc;
         ac_istft_push_planar(d->istft, d->enh_re, d->enh_im, d->hop_out);
     } else {
         memset(d->hop_out, 0, (size_t)hop * sizeof(float));
-        valid = 0;
     }
     for (k = 0; k < hop; ++k) {
         float v = d->hop_out[k] * 32768.0f;

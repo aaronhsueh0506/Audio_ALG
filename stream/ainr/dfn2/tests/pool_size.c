@@ -38,13 +38,13 @@ typedef struct Row {
 
 #ifdef DFN2_MASK_ONLY
 static const Row ROWS[] = {
-    { 48000, 1024, 32, 1, 0, 1, 99728, 231056, 152432, 283760, 28112, 159440, 0xa46d74b9f5cac26eull, 0 },
+    { 48000, 1024, 32, 1, 0, 1, 91408, 222736, 144112, 275440, 23888, 155216, 0xa46d74b9f5cac26eull, 0 },
 };
 #else
 static const Row ROWS[] = {
-    { 16000, 256, 24, 0, 0, 1, 65328, 90096, 79632, 104400, 46704, 71472, 0x2f7313027241b827ull, 0 },
-    { 16000, 256, 24, 0, 0, 8, 113440, 138208, 127744, 152512, 94816, 119584, 0x2e1edf1fefe3f177ull, 0 },
-    { 48000, 1024, 32, 1, 1, 1, 160112, 291440, 212816, 344144, 88496, 219824, 0xe0a89c487b7e4ad5ull, 0 },
+    { 16000, 256, 24, 0, 0, 1, 63152, 87920, 77456, 102224, 45552, 70320, 0x2f7313027241b827ull, 0 },
+    { 16000, 256, 24, 0, 0, 8, 103968, 128736, 118272, 143040, 86368, 111136, 0x2e1edf1fefe3f177ull, 0 },
+    { 48000, 1024, 32, 1, 1, 1, 151792, 283120, 204496, 335824, 84272, 215600, 0xe0a89c487b7e4ad5ull, 0 },
 };
 #endif
 
@@ -134,7 +134,7 @@ static void run_row(const Row *r, int idx) {
         size_t one_fft = two_ffts / 2u, pcm_half, erb;
         ac_stft_config_default(&scfg, r->fft);
         pcm_half = one_fft + (ac_stft_get_mem_size(&scfg) - one_fft) + (ac_istft_get_mem_size(&scfg) - one_fft) +
-                   ck_align16_size((size_t)(2 * (r->fft / 2) + 4 * n_bins) * sizeof(float));
+                   ck_align16_size((size_t)(2 * (r->fft / 2) + 2 * n_bins) * sizeof(float));
         erb = ck_align16_size((size_t)n_bins * (size_t)r->n_erb * sizeof(float));
         fm.freq_only = 1;
         ff.freq_only = 1;

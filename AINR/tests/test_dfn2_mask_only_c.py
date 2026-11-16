@@ -51,6 +51,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "dfn2_test_grid.h"
+#include "dfn2_lifecycle_driver.h"
 
 #ifndef DFN2_MASK_ONLY
 #error "this driver is the mask-only build"
@@ -129,7 +130,7 @@ int main(int argc, char **argv) {
     cfg.gru_hidden = gru_hidden;
     cfg.gru_hidden_elements = DFN2_TEST_GRU_ELEMENTS;
     cfg.atten_lim_db = (float)atof(argv[7]);
-    p = dfn2_prepost_create(&cfg);
+    p = dfn2_life_create(&cfg);
     CHECK(p != NULL);
     CHECK(dfn2_prepost_grid(p) != NULL &&
           dfn2_prepost_grid(p)->n_erb == DFN2_N_ERB);
@@ -142,12 +143,12 @@ int main(int argc, char **argv) {
         const unsigned int generation = dfn2_prepost_state_generation(p);
         const int no_job = t < DFN2_MASK_LOOKAHEAD;
         /* the first DFN2_MASK_LOOKAHEAD hops carry no job: no frame opens and nothing moves */
-        CHECK(dfn2_prepost_pre_process_freq(p, frame_re, frame_im) == (no_job ? 0 : 1));
+        CHECK(dfn2_life_pre_process_freq(p, frame_re, frame_im) == (no_job ? 0 : 1));
         if (no_job) {
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == -1);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == -1);
             CHECK(dfn2_prepost_state_generation(p) == generation);
         } else {
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
             CHECK(inputs.gru_hidden == gru_hidden &&
                   inputs.gru_hidden_elements == DFN2_TEST_GRU_ELEMENTS);
             CHECK(outputs.gru_hidden_next == gru_hidden);
@@ -155,11 +156,11 @@ int main(int argc, char **argv) {
             memcpy(outputs.erb_mask,
                    mask + (size_t)(t - DFN2_MASK_LOOKAHEAD) * DFN2_N_ERB,
                    DFN2_N_ERB * sizeof(float));
-            CHECK(dfn2_prepost_frame_finish(p) == 0);
+            CHECK(dfn2_life_frame_finish(p) == 0);
             CHECK(dfn2_prepost_state_generation(p) == generation);
         }
         valid = -1;
-        CHECK(dfn2_prepost_post_process_freq(p, re, im, &valid) == 0);
+        CHECK(dfn2_life_post_process_freq(p, re, im, &valid) == 0);
         CHECK(valid == (t >= dfn2_prepost_latency_frames(grid) ? 1 : 0));
         if (valid) {
             int32_t index;
@@ -171,7 +172,7 @@ int main(int argc, char **argv) {
         }
     }
     fclose(out);
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
     free(erb_fwd);
     free(erb_inv);
     free(spec);

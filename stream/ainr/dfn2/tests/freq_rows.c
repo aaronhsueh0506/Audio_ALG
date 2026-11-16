@@ -309,7 +309,7 @@ static void row_refusal(void) {
                     arr[0] = sp.est_re; arr[1] = sp.est_im; arr[2] = sp.app_re; arr[3] = sp.app_im;
                     save = arr[which][nb / 2];
                     arr[which][nb / 2] = BAD[v];
-                    if (dfn2_stream_pre_process_freq_dual(a.s, sp.est_re, sp.est_im, sp.app_re, sp.app_im, &junk) != -1) ++bad;
+                    if (dfn2_stream_pre_process_freq_dual(a.s, sp.est_re, sp.est_im, sp.app_re, sp.app_im, &junk) != DFN2_STREAM_ERR_RANGE) ++bad;
                     arr[which][nb / 2] = save;
                     if (dfn2_stream_state_generation(a.s) != gen) ++bad;
                 }

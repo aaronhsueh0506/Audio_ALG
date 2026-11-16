@@ -26,7 +26,6 @@ are compiled once for the module):
   reset     _reset really clears state (a re-run reproduces the first run)
   skip      _frame_bypass is the exact identity, never steps the state itself and
             leaves it as the accelerator wrote it
-  guard     the four frame-state-machine gates the contract block promises
   txn       a refused commit zeroes the two recurrent tensors (written in place,
             so there is nothing to roll back to), keeps the frame open and leaves
             windows and clocks alone, proved for each of the five accelerator
@@ -82,6 +81,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "tests/dfn2_test_grid.h"   /* the grid this program runs, and the library header */
+#include "tests/dfn2_lifecycle_driver.h"
 #include "stream_run.h"
 #include "utility/mem_align.h"
 #include "tests/ainr_test_hop.h"
@@ -292,8 +292,8 @@ static int state_all_zero(const DFN2PrepostInputs *in) {
 static int check_no_frame(DFN2Prepost *p) {
     DFN2PrepostInputs in;
     DFN2PrepostOutputs out;
-    return dfn2_prepost_frame_open(p, &in, &out) == -1 && dfn2_prepost_frame_finish(p) == -1 &&
-           dfn2_prepost_frame_bypass(p) == -1 && dfn2_prepost_frame_fail(p, 1) == -1 ? 0 : -1;
+    return dfn2_life_frame_open(p, &in, &out) == -1 && dfn2_life_frame_finish(p) == -1 &&
+           dfn2_life_frame_bypass(p) == -1 && dfn2_life_frame_fail(p, 1) == -1 ? 0 : -1;
 }
 
 /* One of the five accelerator output tensors, by index, for the txn sweep. */
@@ -405,7 +405,7 @@ static DFN2Prepost *start_ex(void *pool, size_t bytes, const DFN2PrepostConfig *
     DFN2PrepostConfig c = *cfg;
     DFN2Prepost *p;
     register_state(&c, next_bufs());
-    p = dfn2_prepost_init_ex(pool, bytes, &c, expected);
+    p = dfn2_life_init_ex(pool, bytes, &c, expected);
     if (p) hop_forget(p);
     return p;
 }
@@ -418,20 +418,20 @@ static DFN2Prepost *make_class(const DFN2PrepostConfig *cfg) {
     DFN2PrepostConfig c = *cfg;
     DFN2Prepost *p;
     register_state(&c, next_bufs());
-    p = dfn2_prepost_create(&c);
+    p = dfn2_life_create(&c);
     if (p) hop_forget(p);
     return p;
 }
 
 static void stop(DFN2Prepost *p) {
     hop_forget(p);
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
 }
 
 /* reset of the instance and of the framing the host owns around it. */
 static void treset(DFN2Prepost *p) {
     int i;
-    dfn2_prepost_reset(p);
+    dfn2_life_reset(p);
     for (i = 0; i < 16; ++i)
         if (p && hop_slots[i].p == p) {
             ac_stft_reset(hop_slots[i].hop.stft);
@@ -444,7 +444,7 @@ static int tpre(DFN2Prepost *p, const float *pcm) {
     static float re[DFN2_N_BINS], im[DFN2_N_BINS];
     AinrTestHop *h = hop_of(p);
     ainr_test_hop_analysis(h, pcm, re, im);
-    return dfn2_prepost_pre_process_freq(p, re, im);
+    return dfn2_life_pre_process_freq(p, re, im);
 }
 
 /* hop out: the next enhanced frame through the synthesis, a silent hop while warming up;
@@ -453,7 +453,7 @@ static int tpost(DFN2Prepost *p, float *out, int *written) {
     static float re[DFN2_N_BINS], im[DFN2_N_BINS];
     AinrTestHop *h = hop_of(p);
     int valid = 0;
-    if (dfn2_prepost_post_process_freq(p, re, im, &valid) != 0) return -1;
+    if (dfn2_life_post_process_freq(p, re, im, &valid) != 0) return -1;
     if (valid) ainr_test_hop_synthesis(h, re, im, out);
     else memset(out, 0, (size_t)DFN2_HOP_LEN * sizeof(float));
     if (written) *written = valid ? DFN2_HOP_LEN : 0;
@@ -490,10 +490,10 @@ static int drive_time_ex(DFN2Prepost *p, const float *in, float *out,
         n = tpre(p, in + (size_t)hop * DFN2_HOP_LEN);
         if (n != (cold ? PRE_RET(hop) : 1)) return -1;
         if (n == 1) {
-            if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0)
+            if (dfn2_life_frame_open(p, &inputs, &outputs) != 0)
                 return -1;
             fake_run(&inputs, &outputs);
-            if (dfn2_prepost_frame_finish(p) != 0) return -1;
+            if (dfn2_life_frame_finish(p) != 0) return -1;
         }
         if (tpost(p, out + (size_t)hop * DFN2_HOP_LEN,
                                       &written) != 0) return -1;
@@ -531,11 +531,11 @@ static int open_first_frame_freq(DFN2Prepost *p, const float *re,
     int t;
     for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
         float out_re[DFN2_N_BINS], out_im[DFN2_N_BINS];
-        if (dfn2_prepost_pre_process_freq(p, re, im) != 0) return -1;
+        if (dfn2_life_pre_process_freq(p, re, im) != 0) return -1;
         if (check_no_frame(p) != 0 ||
-            dfn2_prepost_post_process_freq(p, out_re, out_im, NULL) != 0) return -1;
+            dfn2_life_post_process_freq(p, out_re, out_im, NULL) != 0) return -1;
     }
-    return dfn2_prepost_pre_process_freq(p, re, im) == 1 ? t + 1 : -1;
+    return dfn2_life_pre_process_freq(p, re, im) == 1 ? t + 1 : -1;
 }
 
 /* ---- equiv: the class vs the hand-composed path ---------------------- */
@@ -687,14 +687,14 @@ static int case_freq(void) {
         int n, valid = -1;
         ainr_test_hop_analysis(&caller_hop, pcm_in + (size_t)hop * DFN2_HOP_LEN,
                                spec_re, spec_im);
-        n = dfn2_prepost_pre_process_freq(p_freq, spec_re, spec_im);
+        n = dfn2_life_pre_process_freq(p_freq, spec_re, spec_im);
         CHECK(n == PRE_RET(hop));
         if (n == 1) {
-            CHECK(dfn2_prepost_frame_open(p_freq, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p_freq, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs);
-            CHECK(dfn2_prepost_frame_finish(p_freq) == 0);
+            CHECK(dfn2_life_frame_finish(p_freq) == 0);
         }
-        CHECK(dfn2_prepost_post_process_freq(p_freq, enh_re, enh_im,
+        CHECK(dfn2_life_post_process_freq(p_freq, enh_re, enh_im,
                                              &valid) == 0);
         if (hop < LOOKAHEAD) {
             /* Warm-up: not merely "ignore this", but a defined all-zero
@@ -874,11 +874,11 @@ static int dual_step(DFN2Prepost *p, int n, float *out_re, float *out_im,
     DFN2PrepostInputs inputs;
     DFN2PrepostOutputs outputs;
     if (n == 1) {
-        if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0) return -1;
+        if (dfn2_life_frame_open(p, &inputs, &outputs) != 0) return -1;
         fake_run(&inputs, &outputs);
-        if (dfn2_prepost_frame_finish(p) != 0) return -1;
+        if (dfn2_life_frame_finish(p) != 0) return -1;
     }
-    return dfn2_prepost_post_process_freq(p, out_re, out_im, valid);
+    return dfn2_life_post_process_freq(p, out_re, out_im, valid);
 }
 
 /* est == app must be the single-input entry, byte for byte, including the
@@ -907,8 +907,8 @@ static int case_dual_identity(void) {
     for (t = 0; t < SHORT_HOPS; ++t) {
         int na, nb, va = -1, vb = -1;
         long long fa = -2, fb = -2;
-        na = dfn2_prepost_pre_process_freq(pa, in_re[t], in_im[t]);
-        nb = dfn2_prepost_pre_process_freq_dual(pb, in_re[t], in_im[t],
+        na = dfn2_life_pre_process_freq(pa, in_re[t], in_im[t]);
+        nb = dfn2_life_pre_process_freq_dual(pb, in_re[t], in_im[t],
                                                 in_re[t], in_im[t]);
         CHECK(na == PRE_RET(t) && nb == na);
         CHECK(dual_step(pa, na, got_a_re, got_a_im, &va) == 0);
@@ -971,8 +971,8 @@ static int case_dual_split(void) {
                (size_t)(DFN2_N_BINS - DFN2_DF_BINS) * sizeof(float));
         memset(app_im + DFN2_DF_BINS, 0,
                (size_t)(DFN2_N_BINS - DFN2_DF_BINS) * sizeof(float));
-        ns = dfn2_prepost_pre_process_freq(ps, est_re[t], est_im[t]);
-        nd = dfn2_prepost_pre_process_freq_dual(pd, est_re[t], est_im[t],
+        ns = dfn2_life_pre_process_freq(ps, est_re[t], est_im[t]);
+        nd = dfn2_life_pre_process_freq_dual(pd, est_re[t], est_im[t],
                                                 app_re, app_im);
         CHECK(ns == nd && ns == PRE_RET(t));
         CHECK(dual_step(ps, ns, got_s_re, got_s_im, &vs) == 0);
@@ -1018,29 +1018,29 @@ static int case_dual_guards(void) {
     frame_spectrum(0, re, im);
 
     /* NULL arguments. */
-    CHECK(dfn2_prepost_pre_process_freq_dual(NULL, re, im, re, im) == -1);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, NULL, im, re, im) == -1);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, NULL, re, im) == -1);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, NULL, im) == -1);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, NULL) == -1);
+    CHECK(dfn2_life_pre_process_freq_dual(NULL, re, im, re, im) == -1);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, NULL, im, re, im) == -1);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, re, NULL, re, im) == -1);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, re, im, NULL, im) == -1);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, re, im, re, NULL) == -1);
     /* The first mask_lookahead hops carry no job: nothing is opened, the frame-level calls are refused, and the
      * hop emits nothing. */
     {
         int w, valid = -1;
         for (w = 0; w < DFN2_MASK_LOOKAHEAD; ++w) {
-            CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 0);
+            CHECK(dfn2_life_pre_process_freq_dual(pf, re, im, re, im) == 0);
             CHECK(check_no_frame(pf) == 0);
-            CHECK(dfn2_prepost_post_process_freq(pf, got_re, got_im, &valid) == 0 && valid == 0);
+            CHECK(dfn2_life_post_process_freq(pf, got_re, got_im, &valid) == 0 && valid == 0);
         }
     }
     /* The first hop with heads: a frame open refuses a second pre-stage of
      * either kind; taken as the identity the hop closes normally. */
     frame_spectrum(1, re, im);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 1);
-    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == -1);
-    CHECK(dfn2_prepost_pre_process_freq(pf, re, im) == -1);
-    CHECK(dfn2_prepost_frame_bypass(pf) == 0);
-    CHECK(dfn2_prepost_post_process_freq(pf, got_re, got_im, NULL) == 0);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, re, im, re, im) == 1);
+    CHECK(dfn2_life_pre_process_freq_dual(pf, re, im, re, im) == -1);
+    CHECK(dfn2_life_pre_process_freq(pf, re, im) == -1);
+    CHECK(dfn2_life_frame_bypass(pf) == 0);
+    CHECK(dfn2_life_post_process_freq(pf, got_re, got_im, NULL) == 0);
 
     stop(pf);
     free(pool_f);
@@ -1074,7 +1074,7 @@ static void stub_reset(void *user) { ++((StubModel *)user)->resets; }
 static void snapshot_state(DFN2Prepost *p, float *gru, float *convp) {
     DFN2PrepostInputs in;
     DFN2PrepostOutputs out;
-    (void)dfn2_prepost_frame_open(p, &in, &out);
+    (void)dfn2_life_frame_open(p, &in, &out);
     memcpy(gru, in.gru_hidden,
            (size_t)TEST_GRU_ELEMENTS * sizeof(float));
     memcpy(convp, in.df_convp_window,
@@ -1118,28 +1118,28 @@ static int case_model_run(void) {
     model.io_descriptor = &descriptor;
 
     /* Contract errors: no frame open, NULL model, no infer callback. */
-    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&model, p) == -1);
     for (t = 0; t < DFN2_MASK_LOOKAHEAD; ++t) {
-        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 0);
-        CHECK(dfn2_model_run_frame(&model, p) == -1);   /* no frame is open: the model does not run */
-        CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0 && valid == 0);
+        CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 0);
+        CHECK(dfn2_life_model_run_frame(&model, p) == -1);   /* no frame is open: the model does not run */
+        CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0 && valid == 0);
     }
     CHECK(stub.calls == 0);
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_model_run_frame(NULL, p) == -1);
-    CHECK(dfn2_model_run_frame(&model, NULL) == -1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_model_run_frame(NULL, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&model, NULL) == -1);
     memset(&bad, 0, sizeof(bad));
-    CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&bad, p) == -1);
     /* No published graph contract, or one of another lookahead pair: refused
      * before infer() runs, the frame stays open. */
     bad = model;
     bad.io_descriptor = NULL;
-    CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&bad, p) == -1);
     descriptor.mask_lookahead ^= 1;
-    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&model, p) == -1);
     descriptor.mask_lookahead ^= 1;
     descriptor.df_lookahead ^= 1;
-    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    CHECK(dfn2_life_model_run_frame(&model, p) == -1);
     descriptor.df_lookahead ^= 1;
     /* The instance holds its grid as a run-time value: a descriptor made for a
      * valid grid that differs in any one value is refused the same way, and a
@@ -1151,24 +1151,24 @@ static int case_model_run(void) {
         CHECK(dfn2_model_io_descriptor_default(&grid, &other) == 0);
         bad = model;
         bad.io_descriptor = &other;
-        CHECK(dfn2_model_run_frame(&bad, p) == -1);
+        CHECK(dfn2_life_model_run_frame(&bad, p) == -1);
     }
     CHECK(stub.calls == 0);
     /* A full write commits and steps the recurrent state. */
     snapshot_state(p, gru0, convp0);
-    CHECK(dfn2_model_run_frame(&model, p) == 1);
+    CHECK(dfn2_life_model_run_frame(&model, p) == 1);
     CHECK(stub.calls == 1);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == (t >= LOOKAHEAD));   /* the lookahead warm-up emits nothing */
     /* Committed hops until the next hop emits, so the refused ones below are
      * emitting hops whatever the lookahead pair. */
     while (t + 1 < LOOKAHEAD) {
         ++t;
-        CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-        CHECK(dfn2_model_run_frame(&model, p) == 1);
+        CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+        CHECK(dfn2_life_model_run_frame(&model, p) == 1);
     }
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru1, convp1);
     CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
     /* infer() returning STREAM_RUN_NOT_STARTED ran nothing: the frame is the identity and the hop still emits, but
@@ -1176,13 +1176,13 @@ static int case_model_run(void) {
     stub.mode = 3;
     calls = stub.calls;
     gen = dfn2_prepost_state_generation(p);
-    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(dfn2_life_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == calls + 1);
     CHECK(dfn2_prepost_state_generation(p) == gen);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(identical(gru0, gru1, TEST_GRU_ELEMENTS));
     CHECK(identical(convp0, convp1, TEST_CONVP_WINDOW_ELEMENTS));
@@ -1191,46 +1191,46 @@ static int case_model_run(void) {
     stub.mode = 1;
     calls = stub.calls;
     gen = dfn2_prepost_state_generation(p);
-    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(dfn2_life_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == calls + 1);
     CHECK(dfn2_prepost_state_generation(p) == gen + 1u);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(all_zero(gru0, TEST_GRU_ELEMENTS));
     CHECK(all_zero(convp0, TEST_CONVP_WINDOW_ELEMENTS));
     CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     stub.mode = 0;
-    CHECK(dfn2_model_run_frame(&model, p) == 1);   /* a full write steps the zeroed state again */
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(dfn2_life_model_run_frame(&model, p) == 1);   /* a full write steps the zeroed state again */
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru1, convp1);
     CHECK(!all_zero(gru1, TEST_GRU_ELEMENTS));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     /* A partial write (one head left unwritten) is refused by commit and
      * taken as the identity the same way -- but the accelerator already wrote
      * the state in place, so the refusal zeroes both recurrent tensors. */
     stub.mode = 2;
     calls = stub.calls;
-    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(dfn2_life_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == calls + 1);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
     CHECK(valid == 1);
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     snapshot_state(p, gru0, convp0);
     CHECK(all_zero(gru0, TEST_GRU_ELEMENTS));
     CHECK(all_zero(convp0, TEST_CONVP_WINDOW_ELEMENTS));
     CHECK(!identical(gru0, gru1, TEST_GRU_ELEMENTS));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
 
     /* A model that always refuses is exactly the all-skip stream. */
     treset(p);
@@ -1238,15 +1238,15 @@ static int case_model_run(void) {
     stub.mode = 1;
     for (t = 0; t < SHORT_HOPS; ++t) {
         int np, nq, vp = -1, vq = -1;
-        np = dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]);
-        nq = dfn2_prepost_pre_process_freq(q, in_re[t], in_im[t]);
+        np = dfn2_life_pre_process_freq(p, in_re[t], in_im[t]);
+        nq = dfn2_life_pre_process_freq(q, in_re[t], in_im[t]);
         CHECK(np == nq);
         if (np == 1) {
-            CHECK(dfn2_model_run_frame(&model, p) == 0);
-            CHECK(dfn2_prepost_frame_bypass(q) == 0);
+            CHECK(dfn2_life_model_run_frame(&model, p) == 0);
+            CHECK(dfn2_life_frame_bypass(q) == 0);
         }
-        CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &vp) == 0);
-        CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &vq) == 0);
+        CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &vp) == 0);
+        CHECK(dfn2_life_post_process_freq(q, ref_re, ref_im, &vq) == 0);
         CHECK(vp == vq);
         CHECK(identical(got_re, ref_re, DFN2_N_BINS));
         CHECK(identical(got_im, ref_im, DFN2_N_BINS));
@@ -1367,8 +1367,8 @@ static int case_lifecycle(void) {
      * is a genuine no-op and therefore idempotent -- the instance still runs
      * afterwards.  (Repeating it on a CREATED instance would be a
      * use-after-free, exactly as for fft_destroy; see fft_wrapper.h.) */
-    dfn2_prepost_destroy(stack);
-    dfn2_prepost_destroy(stack);
+    dfn2_life_destroy(stack);
+    dfn2_life_destroy(stack);
     treset(stack);
     CHECK(drive_time(stack, pcm_in, out_b, SHORT_HOPS) == 0);
     CHECK(identical(out_a, out_b, (size_t)SHORT_HOPS * DFN2_HOP_LEN));
@@ -1393,7 +1393,7 @@ static int case_lifecycle(void) {
 
     /* _create refuses exactly what _get_mem_size refuses, and allocates
      * nothing when it does. */
-    CHECK(dfn2_prepost_create(NULL) == NULL);
+    CHECK(dfn2_life_create(NULL) == NULL);
     CHECK(dfn2_prepost_config_defaults(&bad, dfn2_test_grid()) == 0);
     CHECK(make_class(&bad) == NULL);               /* no ERB               */
     bad.erb_fwd = &erb_fwd[0][0];
@@ -1409,7 +1409,7 @@ static int case_lifecycle(void) {
     /* Accessors on NULL. */
     CHECK(dfn2_prepost_grid(NULL) == NULL);
     CHECK(dfn2_prepost_output_frame_index(NULL, &frame) == -1);
-    dfn2_prepost_reset(NULL);
+    dfn2_life_reset(NULL);
     return 0;
 }
 
@@ -1633,17 +1633,17 @@ static int case_reject(void) {
         DFN2PrepostInputs inputs;
         DFN2PrepostOutputs outputs;
         CHECK(p != NULL);
-        CHECK(dfn2_prepost_pre_process_freq(NULL, pcm_in, pcm_in) == -1);
-        CHECK(dfn2_prepost_frame_open(NULL, &inputs, &outputs) == -1);
-        CHECK(dfn2_prepost_frame_open(p, NULL, &outputs) == -1);
-        CHECK(dfn2_prepost_frame_open(p, &inputs, NULL) == -1);
-        CHECK(dfn2_prepost_frame_finish(NULL) == -1);
-        CHECK(dfn2_prepost_frame_bypass(NULL) == -1);
+        CHECK(dfn2_life_pre_process_freq(NULL, pcm_in, pcm_in) == -1);
+        CHECK(dfn2_life_frame_open(NULL, &inputs, &outputs) == -1);
+        CHECK(dfn2_life_frame_open(p, NULL, &outputs) == -1);
+        CHECK(dfn2_life_frame_open(p, &inputs, NULL) == -1);
+        CHECK(dfn2_life_frame_finish(NULL) == -1);
+        CHECK(dfn2_life_frame_bypass(NULL) == -1);
 
         /* Nothing is open yet. */
-        CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == -1);
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
-        CHECK(dfn2_prepost_frame_bypass(p) == -1);
+        CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == -1);
+        CHECK(dfn2_life_frame_finish(p) == -1);
+        CHECK(dfn2_life_frame_bypass(p) == -1);
 
         /* post_process before any frame ran: a full, defined, silent hop. */
         {
@@ -1659,9 +1659,9 @@ static int case_reject(void) {
         CHECK(tpost(p, out_a, NULL) == -1);
         /* An accelerator that never wrote leaves the NaN prefill in place,
          * so the transaction refuses rather than committing garbage. */
-        CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
-        CHECK(dfn2_prepost_frame_bypass(p) == 0);
+        CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(dfn2_life_frame_finish(p) == -1);
+        CHECK(dfn2_life_frame_bypass(p) == 0);
     }
 
     free(pool);
@@ -1704,10 +1704,10 @@ static int case_reset(void) {
         DFN2PrepostOutputs outputs;
         treset(p);
         CHECK(open_first_frame_time(p) >= 0);
-        CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+        CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
         treset(p);
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
-        CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == -1);
+        CHECK(dfn2_life_frame_finish(p) == -1);
+        CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == -1);
         CHECK(drive_time(p, pcm_in, out_b, SHORT_HOPS) == 0);
         CHECK(identical(out_a, out_b, (size_t)SHORT_HOPS * DFN2_HOP_LEN));
     }
@@ -1769,10 +1769,10 @@ static int case_skip(void) {
      * MASK_LOOKAHEAD + DF_LOOKAHEAD frames. */
     for (t = 0; t < SKIP_FRAMES; ++t) {
         int n, valid = -1;
-        n = dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]);
+        n = dfn2_life_pre_process_freq(p, in_re[t], in_im[t]);
         CHECK(n == PRE_RET(t));
-        if (n == 1) CHECK(dfn2_prepost_frame_bypass(p) == 0);
-        CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+        if (n == 1) CHECK(dfn2_life_frame_bypass(p) == 0);
+        CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid) == 0);
         if (t < LOOKAHEAD) {
             CHECK(valid == 0);
             CHECK(all_zero(got_re, DFN2_N_BINS));
@@ -1795,11 +1795,11 @@ static int case_skip(void) {
      * and re-masks a frame already emitted; it shapes the emission
      * DFN2_DF_LOOKAHEAD hops later (skip_emission_ok). */
     t = SKIP_FRAMES;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
     fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(p) == 0);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(dfn2_life_frame_finish(p) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, NULL) == 0);
     CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
                            got_re, got_im, in_re, in_im));
 
@@ -1810,8 +1810,8 @@ static int case_skip(void) {
      * state in place, so the skip cannot roll it back: it keeps what the
      * accelerator wrote. */
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
     memcpy(snap_gru, inputs.gru_hidden, sizeof snap_gru);
     memcpy(snap_convp, inputs.df_convp_window, sizeof snap_convp);
     memcpy(snap_erb_window, inputs.erb_window, sizeof snap_erb_window);
@@ -1827,8 +1827,8 @@ static int case_skip(void) {
     CHECK(!identical(wrote_gru, snap_gru, TEST_GRU_ELEMENTS));
     CHECK(!identical(wrote_convp, snap_convp,
                      TEST_CONVP_WINDOW_ELEMENTS));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, NULL) == 0);
     /* Whether this hop's emission is the identity follows the same rule, and
      * asserting the difference where the rule predicts one is the point: the
      * emission that source frame was masked into by the REAL heads proves
@@ -1841,8 +1841,8 @@ static int case_skip(void) {
      * wrote them -- not restored to the snapshot, not zeroed -- while the two
      * feature windows are the framing clock and must still have slid. */
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
     CHECK(identical(inputs.gru_hidden, wrote_gru,
                     inputs.gru_hidden_elements));
     CHECK(identical(inputs.df_convp_window, wrote_convp,
@@ -1858,13 +1858,13 @@ static int case_skip(void) {
 
     /* A skip over a frame on which the accelerator never ran writes nothing,
      * so the state stays frozen exactly as it is. */
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, NULL) == 0);
     CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
                            got_re, got_im, in_re, in_im));
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
     CHECK(identical(inputs.gru_hidden, wrote_gru,
                     inputs.gru_hidden_elements));
     CHECK(identical(inputs.df_convp_window, wrote_convp,
@@ -1873,138 +1873,21 @@ static int case_skip(void) {
     /* ...and a commit here DOES move them, so the freeze above is not
      * measuring a constant. */
     fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(p) == 0);
-    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    CHECK(dfn2_life_frame_finish(p) == 0);
+    CHECK(dfn2_life_post_process_freq(p, got_re, got_im, NULL) == 0);
     CHECK(skip_emission_ok(t, SKIP_FRAMES, SKIP_FRAMES + 3,
                            got_re, got_im, in_re, in_im));
     ++t;
-    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
     CHECK(!identical(inputs.gru_hidden, wrote_gru,
                      inputs.gru_hidden_elements));
     CHECK(!identical(inputs.df_convp_window, wrote_convp,
                      inputs.df_convp_window_elements));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
 
     stop(p);
     free(pool);
-    return 0;
-}
-
-/* ---- guard: the frame-state-machine contract gates ------------------- */
-
-static int case_guard(void) {
-    static float re_a[DFN2_N_BINS], im_a[DFN2_N_BINS];
-    static float re_b[DFN2_N_BINS], im_b[DFN2_N_BINS];
-    static float hop_scratch[DFN2_HOP_LEN];
-    DFN2PrepostConfig cfg_time, cfg_freq;
-    DFN2PrepostMemReq req_time, req_freq;
-    DFN2PrepostInputs inputs;
-    DFN2PrepostOutputs outputs;
-    DFN2Prepost *pt, *pf;
-    void *pool_time, *pool_freq;
-
-    /* Two instances: pt is driven through the host's hop-in / hop-out framing, pf
-     * through spectra it supplies itself. */
-    config_freq(&cfg_time);
-    config_freq(&cfg_freq);
-    CHECK(dfn2_prepost_get_mem_size(&cfg_time, &req_time) == 0);
-    CHECK(dfn2_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
-    pool_time = alloc_aligned(req_time.alignment, (size_t)req_time.bytes);
-    pool_freq = alloc_aligned(req_freq.alignment, (size_t)req_freq.bytes);
-    CHECK(pool_time != NULL && pool_freq != NULL);
-    pt = start(pool_time, (size_t)req_time.bytes, &cfg_time);
-    pf = start(pool_freq, (size_t)req_freq.bytes, &cfg_freq);
-    CHECK(pt != NULL && pf != NULL);
-    frame_spectrum(0, re_a, im_a);
-    frame_spectrum(1, re_b, im_b);
-
-    /* (1) A second pre_process with a frame open is refused, and the refusal
-     * does not eat the open frame: it is still committable afterwards. */
-    {
-        int next = open_first_frame_time(pt);
-        CHECK(next >= 0);
-        CHECK(tpre(pt, pcm_in + (size_t)next * DFN2_HOP_LEN) == -1);
-    }
-    /* The setters are between-hops operations. With the frame open they
-     * are refused, so a swap can never land inside one transaction (between
-     * the features just taken and the compose still pending), and the
-     * refusal leaves the frame committable. */
-    CHECK(dfn2_prepost_set_erb_matrices(pt, &erb_fwd[0][0],
-                                        &erb_inv[0][0]) == -1);
-    CHECK(dfn2_prepost_set_atten_lim(pt, -12.0f) == -1);
-    CHECK(dfn2_prepost_frame_open(pt, &inputs, &outputs) == 0);
-    fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(pt) == 0);
-    CHECK(dfn2_prepost_set_erb_matrices(pt, &erb_fwd[0][0],
-                                        &erb_inv[0][0]) == 0);
-    CHECK(dfn2_prepost_set_atten_lim(pt, 0.0f) == 0);
-
-    CHECK(open_first_frame_freq(pf, re_b, im_b) >= 0);
-    CHECK(dfn2_prepost_pre_process_freq(pf, re_a, im_a) == -1);
-    /* Same refusal on the spectrum entry: the guard is keyed to the frame, not to
-     * who owns the transform. */
-    CHECK(dfn2_prepost_set_erb_matrices(pf, &erb_fwd[0][0],
-                                        &erb_inv[0][0]) == -1);
-    CHECK(dfn2_prepost_set_atten_lim(pf, -12.0f) == -1);
-    CHECK(dfn2_prepost_frame_open(pf, &inputs, &outputs) == 0);
-    fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(pf) == 0);
-    CHECK(dfn2_prepost_set_atten_lim(pf, 0.0f) == 0);
-
-    /* (2) A commit with no frame_open behind it is refused: an accelerator
-     * that never ran must not be able to pass untouched buffers off as a
-     * result.  The frame stays open and commits normally afterwards. */
-    treset(pt);
-    CHECK(open_first_frame_time(pt) >= 0);
-    CHECK(dfn2_prepost_frame_finish(pt) == -1);
-    CHECK(dfn2_prepost_frame_open(pt, &inputs, &outputs) == 0);
-    fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(pt) == 0);
-
-    /* (3) A commit that failed on a non-finite output DISARMS the
-     * transaction: retrying it without a fresh frame_open is refused,
-     * and the fresh frame_open NaN-refills every writable element. */
-    treset(pt);
-    CHECK(open_first_frame_time(pt) >= 0);
-    CHECK(dfn2_prepost_frame_open(pt, &inputs, &outputs) == 0);
-    fake_run(&inputs, &outputs);
-    {
-        /* Keep the good value so the retry below can be made perfectly
-         * committable again.  Retrying while the NaN is still in place
-         * would be refused by the finiteness preflight whether or not the
-         * transaction was disarmed, and would prove nothing. */
-        const size_t poison = TEST_COEFS_ELEMENTS / 2;
-        float good = outputs.coefs[poison];
-        CHECK(isfinite(good));
-        outputs.coefs[poison] = (float)NAN;
-        CHECK(dfn2_prepost_frame_finish(pt) == -1);
-        /* Repaired in place through the stale view: the only thing left
-         * that can refuse this commit is the disarm itself. */
-        outputs.coefs[poison] = good;
-        CHECK(dfn2_prepost_frame_finish(pt) == -1);
-    }
-    CHECK(dfn2_prepost_frame_open(pt, &inputs, &outputs) == 0);
-    /* The fresh frame_open NaN-refills the heads only. The state is the
-     * accelerator's input, so it is not prefilled: the refused commit left it
-     * zero, and it is the same memory as the outputs' state tensors. */
-    CHECK(heads_all_nan(&outputs));
-    CHECK(state_aliased(&inputs, &outputs));
-    CHECK(state_all_zero(&inputs));
-    fake_run(&inputs, &outputs);
-    CHECK(dfn2_prepost_frame_finish(pt) == 0);
-
-    /* (4) frame_bypass is exactly the accelerator-never-ran path, so it needs
-     * no frame_open behind it. */
-    treset(pt);
-    CHECK(open_first_frame_time(pt) >= 0);
-    CHECK(dfn2_prepost_frame_bypass(pt) == 0);
-    CHECK(tpost(pt, hop_scratch, NULL) == 0);
-
-    stop(pt);
-    stop(pf);
-    free(pool_time);
-    free(pool_freq);
     return 0;
 }
 
@@ -2025,7 +1908,7 @@ static int txn_reference(DFN2Prepost *p, float *out, int mode) {
         if (n == 1) {
             if (hop == TXN_PRE && mode != 1) {
                 if (mode == 2) {
-                    if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0)
+                    if (dfn2_life_frame_open(p, &inputs, &outputs) != 0)
                         return -1;
                     fake_run(&inputs, &outputs);
                     memset(outputs.gru_hidden_next, 0,
@@ -2033,12 +1916,12 @@ static int txn_reference(DFN2Prepost *p, float *out, int mode) {
                     memset(outputs.df_convp_window_next, 0,
                            outputs.df_convp_window_elements * sizeof(float));
                 }
-                if (dfn2_prepost_frame_bypass(p) != 0) return -1;
+                if (dfn2_life_frame_bypass(p) != 0) return -1;
             } else {
-                if (dfn2_prepost_frame_open(p, &inputs, &outputs) != 0)
+                if (dfn2_life_frame_open(p, &inputs, &outputs) != 0)
                     return -1;
                 fake_run(&inputs, &outputs);
-                if (dfn2_prepost_frame_finish(p) != 0) return -1;
+                if (dfn2_life_frame_finish(p) != 0) return -1;
             }
         }
         if (tpost(p, out + (size_t)hop * DFN2_HOP_LEN,
@@ -2062,7 +1945,7 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
         if (n == 1 && hop == TXN_PRE) {
             float *target;
             size_t count = 0;
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
             memcpy(snap_erb_window, inputs.erb_window,
                    sizeof snap_erb_window);
             memcpy(snap_spec_window, inputs.spec_window,
@@ -2071,7 +1954,7 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             target = output_tensor(&outputs, tensor, &count);
             CHECK(index < count);
             target[index] = (float)NAN;
-            CHECK(dfn2_prepost_frame_finish(p) == -1);
+            CHECK(dfn2_life_frame_finish(p) == -1);
             /* (a) the frame is STILL OPEN -- neither emitting nor opening
              * the next one is allowed while it is. */
             CHECK(tpost(p, hop_scratch, NULL) == -1);
@@ -2081,7 +1964,7 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
              * refusal cannot restore it: both recurrent tensors are zero
              * whichever of the five outputs was poisoned. The feature
              * windows are CPU-owned and unchanged. */
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
             CHECK(state_aliased(&inputs, &outputs));
             CHECK(state_all_zero(&inputs));
             CHECK(identical(inputs.erb_window, snap_erb_window,
@@ -2089,11 +1972,11 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             CHECK(identical(inputs.spec_window, snap_spec_window,
                             inputs.spec_window_elements));
             /* (c) the documented recovery: take the identity. */
-            CHECK(dfn2_prepost_frame_bypass(p) == 0);
+            CHECK(dfn2_life_frame_bypass(p) == 0);
         } else if (n == 1) {
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs);
-            CHECK(dfn2_prepost_frame_finish(p) == 0);
+            CHECK(dfn2_life_frame_finish(p) == 0);
         }
         CHECK(tpost(p, out + (size_t)hop * DFN2_HOP_LEN,
                                         NULL) == 0);
@@ -2144,7 +2027,7 @@ static int case_txn(void) {
             probe_p = start(pool, (size_t)req.bytes, &cfg);
             CHECK(probe_p != NULL);
             CHECK(open_first_frame_time(probe_p) >= 0);
-            CHECK(dfn2_prepost_frame_open(probe_p, &probe, &shape) == 0);
+            CHECK(dfn2_life_frame_open(probe_p, &probe, &shape) == 0);
             (void)output_tensor(&shape, tensor, &count);
             CHECK(count > 0u);
             index = (which == 0) ? 0u
@@ -2192,17 +2075,17 @@ static int case_huge_head(void) {
             p = start(pool, (size_t)req.bytes, &cfg);
             CHECK(p != NULL);
             CHECK(open_first_frame_time(p) >= 0);
-            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs);
             target = output_tensor(&outputs, tensor, &count);
             target[count / 2u] = values[k];
             gen = dfn2_prepost_state_generation(p);
             if (k < 2) {                              /* over the bound: refused, the state restarts */
-                CHECK(dfn2_prepost_frame_finish(p) == -1);
+                CHECK(dfn2_life_frame_finish(p) == -1);
                 CHECK(dfn2_prepost_state_generation(p) == gen + 1u);
-                CHECK(dfn2_prepost_frame_bypass(p) == 0);
+                CHECK(dfn2_life_frame_bypass(p) == 0);
             } else {                                  /* exactly at the bound: accepted */
-                CHECK(dfn2_prepost_frame_finish(p) == 0);
+                CHECK(dfn2_life_frame_finish(p) == 0);
             }
             CHECK(tpost(p, hop_scratch, NULL) == 0);
             {
@@ -2277,7 +2160,7 @@ static int case_state_inplace(void) {
     p = make_class(&cfg);
     CHECK(p != NULL);
     CHECK(open_first_frame_freq(p, re, im) >= 0);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     a = in.df_convp_window;
     CHECK(state_aliased(&in, &out));
     CHECK(in.df_convp_window_elements == out.df_convp_window_elements);
@@ -2287,29 +2170,29 @@ static int case_state_inplace(void) {
      * view: there is no second copy to commit. */
     CHECK(any_nonzero(a, in.df_convp_window_elements));
     CHECK(any_nonzero(in.gru_hidden, in.gru_hidden_elements));
-    CHECK(dfn2_prepost_frame_finish(p) == 0);
+    CHECK(dfn2_life_frame_finish(p) == 0);
     CHECK(any_nonzero(a, in.df_convp_window_elements));
     for (frame = 0; frame < 3; ++frame) {
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
         CHECK(in.df_convp_window == a);
         CHECK(out.df_convp_window_next == a);
         CHECK(state_aliased(&in, &out));
         if (frame == 0) {
             /* A refused commit zeroes the state in place; no address moves. */
-            CHECK(dfn2_prepost_frame_finish(p) == -1);
+            CHECK(dfn2_life_frame_finish(p) == -1);
             CHECK(state_all_zero(&in));
-            CHECK(dfn2_prepost_frame_bypass(p) == 0);
+            CHECK(dfn2_life_frame_bypass(p) == 0);
         } else if (frame == 1) {
             fake_run(&in, &out);
-            CHECK(dfn2_prepost_frame_finish(p) == 0);
+            CHECK(dfn2_life_frame_finish(p) == 0);
         } else {
-            CHECK(dfn2_prepost_frame_bypass(p) == 0);
+            CHECK(dfn2_life_frame_bypass(p) == 0);
         }
     }
     treset(p);
     CHECK(open_first_frame_freq(p, re, im) >= 0);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     CHECK(in.df_convp_window == a);
     CHECK(state_aliased(&in, &out));
     CHECK(state_all_zero(&in));
@@ -2336,12 +2219,12 @@ static int case_inplace_nan(void) {
         CHECK(p != NULL);
         CHECK(open_first_frame_freq(p, re, im) >= 0);
         /* A healthy frame first, so the state is non-zero going in. */
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+        CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
         fake_run(&in, &out);
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
+        CHECK(dfn2_life_frame_finish(p) == 0);
         CHECK(!state_all_zero(&in));
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
         fake_run(&in, &out);
         switch (tensor) {
         case 0: poison = &out.gru_hidden_next[(size_t)DFN2_TEST_GRU_ROW_ENCODER *
@@ -2368,17 +2251,17 @@ static int case_inplace_nan(void) {
         }
         CHECK(isfinite(*poison));
         *poison = (float)NAN;
-        CHECK(dfn2_prepost_frame_finish(p) == -1);
+        CHECK(dfn2_life_frame_finish(p) == -1);
         CHECK(state_all_zero(&in));
         /* Zeroed through the same memory the accelerator wrote. */
         CHECK(*poison == 0.0f);
         /* The frame is still open, and the next healthy frame works. */
-        CHECK(dfn2_prepost_frame_bypass(p) == 0);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+        CHECK(dfn2_life_frame_bypass(p) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
         CHECK(state_all_zero(&in));
         fake_run(&in, &out);
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
+        CHECK(dfn2_life_frame_finish(p) == 0);
         CHECK(!state_all_zero(&in));
         stop(p);
     }
@@ -2408,7 +2291,7 @@ static int case_generation(void) {
 
     /* The first mask_lookahead hops open no frame and move nothing. */
     for (hop = 0; hop < DFN2_MASK_LOOKAHEAD; ++hop) {
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
@@ -2417,51 +2300,51 @@ static int case_generation(void) {
     ++g;
     CHECK(dfn2_prepost_state_generation(p) == g);
     for (hop = 0; hop < DFN2_MASK_LOOKAHEAD; ++hop) {
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     fake_run(&in, &out);
-    CHECK(dfn2_prepost_frame_finish(p) == 0);
+    CHECK(dfn2_life_frame_finish(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);   /* a real frame's commit moves nothing */
     CHECK(!state_all_zero(&in));
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);
 
     /* A non-finite state element. */
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     fake_run(&in, &out);
     out.gru_hidden_next[(size_t)DFN2_TEST_GRU_ROW_DF * DFN2_TEST_GRU_HIDDEN] = (float)NAN;
-    CHECK(dfn2_prepost_frame_finish(p) == -1);
+    CHECK(dfn2_life_frame_finish(p) == -1);
     CHECK(state_all_zero(&in));
     ++g;
     CHECK(dfn2_prepost_state_generation(p) == g);
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);
 
     /* A non-finite head over a finite, non-zero state still restarts it. */
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     fake_run(&in, &out);
     CHECK(!state_all_zero(&in));
     out.alpha[0] = (float)NAN;
-    CHECK(dfn2_prepost_frame_finish(p) == -1);
+    CHECK(dfn2_life_frame_finish(p) == -1);
     CHECK(state_all_zero(&in));
     ++g;
     CHECK(dfn2_prepost_state_generation(p) == g);
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
 
     /* A second refusal of the same open frame counts again, a skip does not. */
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
-    CHECK(dfn2_prepost_frame_finish(p) == -1);   /* heads still NaN */
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_frame_finish(p) == -1);   /* heads still NaN */
     ++g;
     CHECK(dfn2_prepost_state_generation(p) == g);
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);
 
     treset(p);
@@ -2477,7 +2360,7 @@ static int case_generation(void) {
 static DFN2Prepost *warm_instance(int registered) {
     DFN2PrepostConfig cfg;
     config_freq(&cfg);
-    return registered ? make_class(&cfg) : dfn2_prepost_create(&cfg);
+    return registered ? make_class(&cfg) : dfn2_life_create(&cfg);
 }
 
 /* The row `back` rows before the newest of an input window of rows of `width` elements. */
@@ -2521,7 +2404,7 @@ static int case_warmup(void) {
     config_freq(&cfg);
     bufs = next_bufs();
     register_state(&cfg, bufs);
-    p = dfn2_prepost_create(&cfg);
+    p = dfn2_life_create(&cfg);
     CHECK(p != NULL);
     g = dfn2_prepost_state_generation(p);
     CHECK(g == 1u);
@@ -2533,11 +2416,11 @@ static int case_warmup(void) {
         frame_spectrum(t, re, im);
         dfn2_compute_features(&ref_st, re, im, feat_erb, feat_spec);
         CHECK(dfn2_model_io_push_features(&ref_io, feat_erb, feat_spec) == 0);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(bufs->gru[0] == 123.0f && bufs->convp[0] == 123.0f);
         CHECK(dfn2_prepost_state_generation(p) == g);
-        CHECK(dfn2_prepost_post_process_freq(p, hop_re, hop_im, &valid) == 0);
+        CHECK(dfn2_life_post_process_freq(p, hop_re, hop_im, &valid) == 0);
         CHECK(valid == 0 && all_zero(hop_re, DFN2_N_BINS) && all_zero(hop_im, DFN2_N_BINS));
         CHECK(dfn2_prepost_output_frame_index(p, &frame) == -1);
     }
@@ -2547,18 +2430,18 @@ static int case_warmup(void) {
     frame_spectrum(m, re, im);
     dfn2_compute_features(&ref_st, re, im, feat_erb, feat_spec);
     CHECK(dfn2_model_io_push_features(&ref_io, feat_erb, feat_spec) == 1);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     CHECK(in.gru_hidden[0] == 123.0f && in.df_convp_window[0] == 123.0f);
     CHECK(identical(in.erb_window, ref_io.erb_window, in.erb_window_elements));
     CHECK(identical(in.spec_window, ref_io.spec_window, in.spec_window_elements));
     CHECK(heads_all_nan(&out));
     CHECK(any_nonzero(window_row(in.erb_window, DFN2_N_ERB, 0), DFN2_N_ERB));
-    CHECK(dfn2_prepost_frame_finish(p) == -1);        /* heads NaN: a frame with a job reads them */
+    CHECK(dfn2_life_frame_finish(p) == -1);        /* heads NaN: a frame with a job reads them */
     CHECK(dfn2_prepost_state_generation(p) == g + 1u);
     CHECK(state_all_zero(&in));
     ++g;
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     CHECK(dfn2_prepost_state_generation(p) == g);
     stop(p);
 
@@ -2568,15 +2451,15 @@ static int case_warmup(void) {
     g = dfn2_prepost_state_generation(p);
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
     frame_spectrum(m, re, im);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     CHECK(in.gru_hidden == NULL && in.gru_hidden_elements == 0u);
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     stop(p);
 
     /* A reset starts the count again: m hops without a job, the state a frame with a job left is kept until the
@@ -2585,11 +2468,11 @@ static int case_warmup(void) {
     CHECK(p != NULL);
     for (t = 0; t < m + 3; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == PRE_RET(t));
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == PRE_RET(t));
         if (t < m) continue;
-        CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+        CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
         fake_run(&in, &out);
-        CHECK(dfn2_prepost_frame_finish(p) == 0);
+        CHECK(dfn2_life_frame_finish(p) == 0);
         CHECK(!state_all_zero(&in));
     }
     g = dfn2_prepost_state_generation(p);
@@ -2597,39 +2480,39 @@ static int case_warmup(void) {
     CHECK(dfn2_prepost_state_generation(p) == ++g);
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
     frame_spectrum(m, re, im);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     CHECK(state_all_zero(&in));
     fake_run(&in, &out);
-    CHECK(dfn2_prepost_frame_finish(p) == 0);
+    CHECK(dfn2_life_frame_finish(p) == 0);
     CHECK(!state_all_zero(&in));
     CHECK(dfn2_prepost_state_generation(p) == g);
     frame_spectrum(m + 1, re, im);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     fake_run(&in, &out);
     treset(p);
     ++g;
-    CHECK(dfn2_prepost_frame_finish(p) == -1);
-    CHECK(dfn2_prepost_frame_bypass(p) == -1);
+    CHECK(dfn2_life_frame_finish(p) == -1);
+    CHECK(dfn2_life_frame_bypass(p) == -1);
     CHECK(dfn2_prepost_state_generation(p) == g);
     /* the stream starts over: the hops without a job are due in full again */
     for (t = 0; t < m; ++t) {
         frame_spectrum(t, re, im);
-        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_life_pre_process_freq(p, re, im) == 0);
         CHECK(check_no_frame(p) == 0);
         CHECK(dfn2_prepost_state_generation(p) == g);
     }
     frame_spectrum(m, re, im);
-    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
-    CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+    CHECK(dfn2_life_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
     CHECK(state_all_zero(&in));
-    CHECK(dfn2_prepost_frame_bypass(p) == 0);
+    CHECK(dfn2_life_frame_bypass(p) == 0);
     stop(p);
     free(state_block);
     free(io_block);
@@ -2655,11 +2538,11 @@ static int case_frame_fail(void) {
     q = warm_instance(1);
     CHECK(p != NULL && q != NULL);
     /* contract: NULL, and no open frame (nothing moves) */
-    CHECK(dfn2_prepost_frame_fail(NULL, 1) == -1);
-    CHECK(dfn2_prepost_frame_fail(NULL, 0) == -1);
+    CHECK(dfn2_life_frame_fail(NULL, 1) == -1);
+    CHECK(dfn2_life_frame_fail(NULL, 0) == -1);
     g = dfn2_prepost_state_generation(p);
-    CHECK(dfn2_prepost_frame_fail(p, 1) == -1);
-    CHECK(dfn2_prepost_frame_fail(p, 0) == -1);
+    CHECK(dfn2_life_frame_fail(p, 1) == -1);
+    CHECK(dfn2_life_frame_fail(p, 0) == -1);
     CHECK(dfn2_prepost_state_generation(p) == g);
 
     for (started = 1; started >= 0; --started) {
@@ -2668,22 +2551,22 @@ static int case_frame_fail(void) {
         g = dfn2_prepost_state_generation(p);
         for (t = 0; t < m + 6; ++t) {   /* m hops without a job, then steady ones; every frame closes on frame_fail */
             frame_spectrum(t, re, im);
-            CHECK(dfn2_prepost_pre_process_freq(p, re, im) == PRE_RET(t));
-            CHECK(dfn2_prepost_pre_process_freq(q, re, im) == PRE_RET(t));
+            CHECK(dfn2_life_pre_process_freq(p, re, im) == PRE_RET(t));
+            CHECK(dfn2_life_pre_process_freq(q, re, im) == PRE_RET(t));
             if (t < m) {   /* no frame: frame_fail is refused and nothing moves; the hop is the same silence */
-                CHECK(dfn2_prepost_frame_fail(p, started) == -1);
+                CHECK(dfn2_life_frame_fail(p, started) == -1);
                 CHECK(dfn2_prepost_state_generation(p) == g);
-                CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid_p) == 0);
-                CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
+                CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid_p) == 0);
+                CHECK(dfn2_life_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
                 CHECK(valid_p == 0 && valid_q == 0);
                 CHECK(identical(got_re, ref_re, DFN2_N_BINS) && identical(got_im, ref_im, DFN2_N_BINS));
                 continue;
             }
-            CHECK(dfn2_prepost_frame_open(p, &in, &out) == 0);
+            CHECK(dfn2_life_frame_open(p, &in, &out) == 0);
             fake_run(&in, &out);                              /* the accelerator moved the state in place */
             memcpy(gru_before, in.gru_hidden, sizeof gru_before);
             memcpy(convp_before, in.df_convp_window, sizeof convp_before);
-            CHECK(dfn2_prepost_frame_fail(p, started) == 0);
+            CHECK(dfn2_life_frame_fail(p, started) == 0);
             if (started) {
                 CHECK(state_all_zero(&in));
                 CHECK(dfn2_prepost_state_generation(p) == g + 1u);
@@ -2694,13 +2577,13 @@ static int case_frame_fail(void) {
                 CHECK(!state_all_zero(&in));
                 CHECK(dfn2_prepost_state_generation(p) == g);
             }
-            CHECK(dfn2_prepost_frame_fail(p, started) == -1);   /* closed: refused, nothing moves */
+            CHECK(dfn2_life_frame_fail(p, started) == -1);   /* closed: refused, nothing moves */
             CHECK(dfn2_prepost_state_generation(p) == g);
-            CHECK(dfn2_prepost_frame_open(q, &in, &out) == 0);
+            CHECK(dfn2_life_frame_open(q, &in, &out) == 0);
             fake_run(&in, &out);
-            CHECK(dfn2_prepost_frame_bypass(q) == 0);
-            CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid_p) == 0);
-            CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
+            CHECK(dfn2_life_frame_bypass(q) == 0);
+            CHECK(dfn2_life_post_process_freq(p, got_re, got_im, &valid_p) == 0);
+            CHECK(dfn2_life_post_process_freq(q, ref_re, ref_im, &valid_q) == 0);
             CHECK(valid_p == valid_q);
             CHECK(identical(got_re, ref_re, DFN2_N_BINS) && identical(got_im, ref_im, DFN2_N_BINS));
         }
@@ -2733,13 +2616,13 @@ static int case_warmup_synthesis(void) {
         float *slot = out_b + (size_t)hop * DFN2_HOP_LEN;
         int valid = -1;
         ainr_test_hop_analysis(&caller_hop, pcm_in + (size_t)hop * DFN2_HOP_LEN, enh_re, enh_im);
-        CHECK(dfn2_prepost_pre_process_freq(p_all, enh_re, enh_im) == PRE_RET(hop));
+        CHECK(dfn2_life_pre_process_freq(p_all, enh_re, enh_im) == PRE_RET(hop));
         if (hop >= DFN2_MASK_LOOKAHEAD) {
-            CHECK(dfn2_prepost_frame_open(p_all, &inputs, &outputs) == 0);
+            CHECK(dfn2_life_frame_open(p_all, &inputs, &outputs) == 0);
             fake_run(&inputs, &outputs);
-            CHECK(dfn2_prepost_frame_finish(p_all) == 0);
+            CHECK(dfn2_life_frame_finish(p_all) == 0);
         }
-        CHECK(dfn2_prepost_post_process_freq(p_all, enh_re, enh_im, &valid) == 0);
+        CHECK(dfn2_life_post_process_freq(p_all, enh_re, enh_im, &valid) == 0);
         CHECK(valid == (hop >= LOOKAHEAD));
         ainr_test_hop_synthesis(&caller_hop, enh_re, enh_im, slot);   /* no valid test */
         if (!valid) CHECK(all_zero(slot, DFN2_HOP_LEN));
@@ -2859,7 +2742,6 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "reject") == 0)    status = case_reject();
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset();
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
-    else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
     else if (strcmp(argv[1], "txn") == 0)       status = case_txn();
     else if (strcmp(argv[1], "huge_head") == 0) status = case_huge_head();
     else if (strcmp(argv[1], "erb_tables") == 0) status = case_erb_tables();
@@ -3019,17 +2901,6 @@ def test_frame_bypass_is_exact_identity_and_freezes_the_state(driver):
     accelerator never ran writes nothing; and a following commit does move
     the state -- so the freeze is not measuring a constant."""
     _run(driver, 'skip')
-
-
-def test_frame_state_machine_guards(driver):
-    """The contract gates: a second pre-stage with a frame open is refused
-    without eating the frame; the ERB and attenuation setters are refused while
-    a frame is open and accepted again after it closes; a commit with no
-    frame_open behind it is refused; a commit that failed on a non-finite
-    output disarms the transaction until a fresh frame_open NaN-refills the
-    three heads (the state is the accelerator's input and is not prefilled);
-    and frame_bypass needs no frame_open behind it."""
-    _run(driver, 'guard')
 
 
 def test_failed_commit_zeroes_the_state_and_leaves_the_frame_open(driver):

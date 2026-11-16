@@ -544,7 +544,7 @@ static int ainr_open_pcm(AinrCore *c, const int16_t *pcm_in, DFN2HopIO *hio)
 }
 
 /* Spectrum -> spectrum: converts the caller's n audio-scale est/app frames to MODEL scale in `scratch` before the
- * stream's _freq_dual entry. */
+ * stream's _freq_dual entry; a bin the stream refuses as out of range is AINR_ERR_NONFINITE_INPUT. */
 static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
                           const float *app_re, const float *app_im, DFN2HopIO *hio)
 {
@@ -566,6 +566,7 @@ static int ainr_open_freq(AinrCore *c, const float *est_re, const float *est_im,
     rc = c->n == 1
         ? dfn2_stream_pre_process_freq_dual(c->inner, s_est_re, s_est_im, s_app_re, s_app_im, hio)
         : dfn2_stream_pre_process_packet_freq_dual(c->inner, s_est_re, s_est_im, s_app_re, s_app_im, hio);
+    if (rc == DFN2_STREAM_ERR_RANGE) return AINR_ERR_NONFINITE_INPUT;
     return rc == 1 ? AINR_OK : AINR_ERR_SEQUENCE;
 }
 
@@ -617,32 +618,20 @@ int ainr_postprocess(AinrCtx *ctx, int run_status, int16_t *pcm_out)
     return rc < 0 ? AINR_ERR_SEQUENCE : AINR_OK;
 }
 
-/* True when every bin of the block's n frames (frame-major, contiguous) passes the stream's guard at the model scale
- * ainr_open_freq() applies; a refusal maps to AINR_ERR_NONFINITE_INPUT, not the stream's sequence error. */
-static int ainr_freq_block_in_range(const AinrCore *c, const float *est_re, const float *est_im,
-                                    const float *app_re, const float *app_im)
-{
-    size_t count = (size_t)c->n * (size_t)c->grid.n_bins;
-    float scale = dfn2_stft_scale(c->grid.n_fft);
-
-    return dfn2_stream_bins_in_range(est_re, count, scale) && dfn2_stream_bins_in_range(est_im, count, scale) &&
-           (app_re == est_re || dfn2_stream_bins_in_range(app_re, count, scale)) &&
-           (app_im == est_im || dfn2_stream_bins_in_range(app_im, count, scale));
-}
-
 int ainr_preprocess_freq(AinrFreqCtx *ctx, const float *est_re, const float *est_im,
                          const float *app_re, const float *app_im, StreamWork *work)
 {
     AinrCore *c;
     DFN2HopIO hio;
+    int status;
 
     if (!ctx || !est_re || !est_im || !app_re || !app_im || !work) return AINR_ERR_NULL;
     c = &ctx->core;
     if (c->block_open) return AINR_ERR_SEQUENCE;
-    /* The whole block is checked before any frame enters the stream, so a refusal leaves the
-     * normaliser state, the queue and the generation untouched and opens no block. */
-    if (!ainr_freq_block_in_range(c, est_re, est_im, app_re, app_im)) return AINR_ERR_NONFINITE_INPUT;
-    if (ainr_open_freq(c, est_re, est_im, app_re, app_im, &hio) != AINR_OK) return AINR_ERR_SEQUENCE;
+    /* The stream checks the whole block before any frame enters, so a refusal leaves the normaliser state, the
+     * queue and the generation untouched and opens no block. */
+    status = ainr_open_freq(c, est_re, est_im, app_re, app_im, &hio);
+    if (status != AINR_OK) return status;
 
     ainr_prepare_work(&c->grid, &hio, work);
     c->block_open = 1;

@@ -339,7 +339,7 @@ $(OBJ_DIR)/array_sample_beam.o: array_sample_beam.c array_sample_beam.h | _cfg_g
 $(OBJ_DIR)/ainr_bridge.o: $(BRIDGE_DIR)/ainr_bridge.c $(BRIDGE_DIR)/ainr_bridge.h $(STREAM_COMMON_DIR)/stream_mem.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
+$(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(STREAM_COMMON_DIR)/stream_range.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
@@ -348,7 +348,7 @@ $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h
 $(OBJ_DIR)/dfn2_model_io.o: $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h $(STREAM_COMMON_DIR)/stream_run.h | _cfg_guard
+$(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 # aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with

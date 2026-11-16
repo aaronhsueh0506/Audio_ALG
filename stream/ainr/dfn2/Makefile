@@ -84,7 +84,7 @@ CORE_HEADERS := ../../../lib/ainr/dfn2/dfn2_grid.h \
 	../../../lib/ainr/dfn2/dfn2_prepost.h
 
 STREAM_SOURCES := dfn2_stream.c
-STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h ../../common/stream_run.h
+STREAM_HEADERS := dfn2_stream.h ../../common/stream_mem.h ../../common/stream_range.h ../../common/stream_run.h
 TEST_HEADERS := tests/erb_fixture.h
 
 LIB := $(OBJ_DIR)/libdfn2_stream.a
@@ -129,7 +129,11 @@ FREQ_ROWS_SOURCES := tests/freq_rows.c $(CORE_SOURCES) dfn2_stream.c
 PACKET_EQUIV_BIN := $(OBJ_DIR)/packet_equiv
 PACKET_EQUIV_SOURCES := tests/packet_equiv.c $(CORE_SOURCES) dfn2_stream.c
 
-.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
+# The call lifecycle (gates, refused runs per tensor, generation table, warm-up) on a freq_only context.
+LIFECYCLE_BIN := $(OBJ_DIR)/lifecycle
+LIFECYCLE_SOURCES := tests/lifecycle.c $(CORE_SOURCES) dfn2_stream.c
+
+.PHONY: all lib print-lib-path print-cflags print-sources test smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle erb-partition test-variant-guard check-header-cxx audit-no-stdio clean _cfg_guard
 
 all: lib
 
@@ -217,6 +221,13 @@ $(PACKET_EQUIV_BIN): $(PACKET_EQUIV_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $
 packet-equiv: $(PACKET_EQUIV_BIN)
 	"$(PACKET_EQUIV_BIN)"
 
+$(LIFECYCLE_BIN): $(LIFECYCLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(LIFECYCLE_SOURCES) "$(COMMON_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+lifecycle: $(LIFECYCLE_BIN)
+	"$(LIFECYCLE_BIN)"
+
 $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
@@ -224,7 +235,7 @@ $(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS)
 erb-partition: $(ERB_PARTITION_BIN)
 	"$(ERB_PARTITION_BIN)"
 
-test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv erb-partition test-variant-guard check-header-cxx
+test: smoke check-erb-file verify-vs-sample fail-table pool-size freq-only freq-rows packet-equiv lifecycle erb-partition test-variant-guard check-header-cxx
 
 # check-header-cxx: a C++ consumer of the DFN2 headers (tests/cxx_consumer.cpp) must reference no mangled symbol;
 # a generated probe calling one C++-linkage function must show one, so the scan is shown able to fail.

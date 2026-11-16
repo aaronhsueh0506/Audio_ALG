@@ -298,6 +298,7 @@ _GUARD_DRIVER = r'''
 #include <string.h>
 
 #include "dfn2_prepost.h"
+#include "tests/dfn2_lifecycle_driver.h"
 
 #define SR 16000
 #define N_FFT 256
@@ -379,9 +380,9 @@ static void stale_pool(const Pair *a, const Pair *b)
     stale = ra;
     stale.bytes = rb.bytes;
     pool = aligned_pool((size_t)rb.bytes, &raw);
-    by_stale = dfn2_prepost_init_ex(pool, (size_t)rb.bytes, &cb, &stale) != NULL;
-    by_exact = dfn2_prepost_init_ex(pool, (size_t)rb.bytes, &cb, &rb) != NULL;
-    by_plain = dfn2_prepost_init_ex(pool, (size_t)rb.bytes, &cb, NULL) != NULL;
+    by_stale = dfn2_life_init_ex(pool, (size_t)rb.bytes, &cb, &stale) != NULL;
+    by_exact = dfn2_life_init_ex(pool, (size_t)rb.bytes, &cb, &rb) != NULL;
+    by_plain = dfn2_life_init_ex(pool, (size_t)rb.bytes, &cb, NULL) != NULL;
     printf("stale a=%d/%d b=%d/%d same_hash=%d same_bytes=%d stale=%d exact=%d "
            "plain=%d\n",
            a->grid.mask_lookahead, a->grid.df_lookahead,
@@ -402,7 +403,7 @@ static void descriptor(const Pair *a, const Pair *b)
     int valid, run1, run2 = -9, calls1, calls2, i, ready = 0, bad = 0;
     if (dfn2_model_io_descriptor_default(&a->grid, &da) ||
         dfn2_model_io_descriptor_default(&b->grid, &db) ||
-        make_config(&cb, &b->grid) || !(p = dfn2_prepost_create(&cb))) {
+        make_config(&cb, &b->grid) || !(p = dfn2_life_create(&cb))) {
         printf("descriptor error\n");
         return;
     }
@@ -413,22 +414,22 @@ static void descriptor(const Pair *a, const Pair *b)
         DFN2PrepostInputs in;
         DFN2PrepostOutputs out;
         unsigned gen = dfn2_prepost_state_generation(p);
-        if (dfn2_prepost_pre_process_freq(p, zero_bins, zero_bins) != 0 ||
-            dfn2_prepost_frame_open(p, &in, &out) != -1 || dfn2_prepost_state_generation(p) != gen)
+        if (dfn2_life_pre_process_freq(p, zero_bins, zero_bins) != 0 ||
+            dfn2_life_frame_open(p, &in, &out) != -1 || dfn2_prepost_state_generation(p) != gen)
             bad = 1;
     }
-    ready = dfn2_prepost_pre_process_freq(p, zero_bins, zero_bins);
+    ready = dfn2_life_pre_process_freq(p, zero_bins, zero_bins);
     if (bad) ready = -1;
     memset(&model, 0, sizeof model);
     model.infer = infer;
     model.io_descriptor = &da;
     infer_calls = 0;
-    run1 = dfn2_model_run_frame(&model, p);
+    run1 = dfn2_life_model_run_frame(&model, p);
     calls1 = infer_calls;
     if (run1 == -1) {
         /* The frame is still open: the matching descriptor runs it. */
         model.io_descriptor = &db;
-        run2 = dfn2_model_run_frame(&model, p);
+        run2 = dfn2_life_model_run_frame(&model, p);
     }
     calls2 = infer_calls;
     printf("descriptor a=%d/%d b=%d/%d valid=%d ready=%d run1=%d calls1=%d "
@@ -436,7 +437,7 @@ static void descriptor(const Pair *a, const Pair *b)
            a->grid.mask_lookahead, a->grid.df_lookahead,
            b->grid.mask_lookahead, b->grid.df_lookahead, valid, ready, run1,
            calls1, run2, calls2);
-    dfn2_prepost_destroy(p);
+    dfn2_life_destroy(p);
 }
 
 static void edited(const Pair *a, const char *what, const DFN2Grid *g)

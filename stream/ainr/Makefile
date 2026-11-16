@@ -62,7 +62,7 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-mask$(MASK_ONLY)-$(CFG_SIG)
 # ainr.c dispatches by model_id (DFN2 full/lite today) -- it lives here, one level above dfn2/,
 # instead of inside its own build. It only needs dfn2/'s headers, never recompiles dfn2's core.
 STREAM_SOURCES :=
-STREAM_HEADERS := ainr.h ainr_test.h ainr_product.h dfn2/dfn2_stream.h ../../lib/ainr/dfn2/dfn2_grid.h ../common/stream_mem.h ../common/stream_run.h
+STREAM_HEADERS := ainr.h ainr_test.h ainr_product.h dfn2/dfn2_stream.h ../../lib/ainr/dfn2/dfn2_grid.h ../common/stream_mem.h ../common/stream_range.h ../common/stream_run.h
 LIB := $(OBJ_DIR)/libainr.a
 LIB_OBJECTS :=
 ifeq ($(NO_STDIO),0)

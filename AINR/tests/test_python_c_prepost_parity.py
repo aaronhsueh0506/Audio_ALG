@@ -420,7 +420,7 @@ def test_gtcrn_host_boundary_matches_python(c_prepost):
 
 def test_dfn2_process_compiles_alone_without_the_class_symbols(tmp_path):
     """dfn2_process.c is the parity unit and must stay linkable on its own:
-    the accelerator callback boundary (DFN2Model, dfn2_model_run_frame) lives
+    the accelerator callback boundary (DFN2Model) lives
     in dfn2_prepost, and a future move of it into dfn2_process.h would drag
     dfn2_model_io/dfn2_prepost into this build. The object's undefined
     symbols must not name either sibling."""
@@ -452,6 +452,7 @@ _FRAMING_PROLOGUE = r'''
 
 #include "dfn2_prepost.h"
 #include "dfn3_prepost.h"
+#include "tests/dfn2_lifecycle_driver.h"
 #include "tests/ainr_test_hop.h"
 '''
 
@@ -471,7 +472,7 @@ typedef struct {
 void framing_dfn@N@_destroy(void *host) {
     Framing@N@ *f = (Framing@N@ *)host;
     if (!f) return;
-    dfn@N@_prepost_destroy(f->p);
+    @L@destroy(f->p);
     ainr_test_hop_close(&f->hop);
     free(f->re);
     free(f);
@@ -492,7 +493,7 @@ void *framing_dfn@N@_create(const int *g, const float *norm, const float *fwd,
         dfn@N@_prepost_config_defaults(&cfg, &f->grid) != 0) goto fail;
     cfg.erb_fwd = fwd;
     cfg.erb_inv = inv;
-    f->p = dfn@N@_prepost_create(&cfg);
+    f->p = @L@create(&cfg);
     f->re = (float *)malloc(2u * (size_t)f->grid.n_bins * sizeof(float));
     if (!f->p || !f->re) goto fail;
     f->im = f->re + f->grid.n_bins;
@@ -514,14 +515,14 @@ int framing_dfn@N@_push(void *host, const float *pcm_hop, float *erb_window,
     DFN@N@PrepostOutputs out;
     int n;
     ainr_test_hop_analysis(&f->hop, pcm_hop, f->re, f->im);
-    n = dfn@N@_prepost_pre_process_freq(f->p, f->re, f->im);
+    n = @L@pre_process_freq(f->p, f->re, f->im);
     if (n != 1) return n;
-    if (dfn@N@_prepost_frame_open(f->p, &in, &out) != 0 ||
+    if (@L@frame_open(f->p, &in, &out) != 0 ||
         in.erb_window_elements != 3u * (size_t)f->grid.n_erb ||
         in.spec_window_elements != 6u * (size_t)f->grid.df_bins) return -1;
     memcpy(erb_window, in.erb_window, in.erb_window_elements * sizeof(float));
     memcpy(spec_window, in.spec_window, in.spec_window_elements * sizeof(float));
-    return dfn@N@_prepost_frame_bypass(f->p) == 0 ? 1 : -1;
+    return @L@frame_bypass(f->p) == 0 ? 1 : -1;
 }
 
 /* One spectrum through AcIstft: one hop of samples. */
@@ -544,14 +545,15 @@ def _framing_wrapper():
     # stft unscale) per family: DFN2's seven normaliser settings and its stft scale/unscale
     # are fixed constants/helpers now (dfn2_grid.h), not spec/grid fields, so its generated
     # copy neither fills them into the spec nor reads them off the grid; DFN3's is unchanged.
+    # (DFN2 drives the per-frame functions through tests/dfn2_lifecycle_driver.h; DFN3 keeps its class.)
     per_family = {
         2: ('        .frames_per_call = 1,\n', '    (void)norm;\n', '',
-            'dfn2_stft_scale(f->grid.n_fft)', 'dfn2_stft_unscale(f->grid.n_fft)'),
-        3: ('', '', _NORM_FIELDS_DFN3, 'f->grid.stft_scale', 'f->grid.stft_unscale'),
+            'dfn2_stft_scale(f->grid.n_fft)', 'dfn2_stft_unscale(f->grid.n_fft)', 'dfn2_life_'),
+        3: ('', '', _NORM_FIELDS_DFN3, 'f->grid.stft_scale', 'f->grid.stft_unscale', 'dfn3_prepost_'),
     }
     body = []
-    for n, (frames, norm_unused, norm_fields, scale, unscale) in per_family.items():
-        body.append(_FRAMING_TEMPLATE.replace('@N@', str(n))
+    for n, (frames, norm_unused, norm_fields, scale, unscale, lib) in per_family.items():
+        body.append(_FRAMING_TEMPLATE.replace('@L@', lib).replace('@N@', str(n))
                     .replace('@FRAMES@', frames)
                     .replace('@NORM_UNUSED@', norm_unused)
                     .replace('@NORM_FIELDS@', norm_fields)

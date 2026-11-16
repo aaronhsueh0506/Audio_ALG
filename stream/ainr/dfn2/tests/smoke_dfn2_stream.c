@@ -146,7 +146,7 @@ static int run_smoke(int frames_per_call) {
             return 1;
         }
 
-        /* Same cadence as dfn2_prepost_pre_process_freq(): every hop from hop mask_lookahead. */
+        /* Same cadence as the first window of heads: every hop from hop mask_lookahead. */
         ready_expected = i >= grid.mask_lookahead;
         if ((io.action == STREAM_WORK_SUBMIT) != ready_expected) {
             fprintf(stderr, "action=%d at hop %d, expected %d (N=%d)\n",
