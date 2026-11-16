@@ -1,6 +1,6 @@
 /* Only includes aiaec.h and links against the already-built libaiaec.a plus the model stream
  * archives (never recompiling any core/stream source) -- confirms the shipped archive actually
- * exports the customer entry points and constructs its one delivered row. The archive's product is
+ * exports the customer entry points and constructs its delivered rows. The archive's product is
  * the default binding (DeepVQE-S in a build that contains both models). */
 
 #include <stdint.h>
@@ -20,16 +20,17 @@ int main(void) {
     StreamMemReq req;
     int rc, status = 0;
 
-    cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = 128;
-    rc = aiaec_get_mem_size(&cfg, &req);
-    printf("link_only_aiaec: aiaec_get_mem_size(16k/256) rc=%d (%s)\n", rc, aiaec_status_text(rc));
-
-    /* The one row with a delivered graph (DeepVQE-S, 16kHz/512, N=1), against THIS production
-     * archive (no placeholder paths anywhere). */
     cfg.sr = 16000; cfg.fft = 512; cfg.hop_in = 256;
     rc = aiaec_get_mem_size(&cfg, &req);
+    printf("link_only_aiaec: aiaec_get_mem_size(16k/512) rc=%d (%s)\n", rc, aiaec_status_text(rc));
+    if (rc != AIAEC_OK) status = 1;
+
+    /* A row with a delivered graph (DeepVQE-S, 16kHz/256, N=1), against THIS production
+     * archive (no placeholder paths anywhere). */
+    cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = 128;
+    rc = aiaec_get_mem_size(&cfg, &req);
     if (rc != AIAEC_OK) {
-        fprintf(stderr, "link_only_aiaec: FAIL shipped 16kHz/512/N=1 row: rc=%d (%s)\n", rc, aiaec_status_text(rc));
+        fprintf(stderr, "link_only_aiaec: FAIL shipped 16kHz/256/N=1 row: rc=%d (%s)\n", rc, aiaec_status_text(rc));
         status = 1;
     } else {
         void *pool = NULL, *pool_f = NULL;
@@ -50,13 +51,13 @@ int main(void) {
             } else {
                 StreamWork work;
                 AiaecInput in;
-                int16_t mic[256] = {0}, far[256] = {0}, out[256];
-                printf("link_only_aiaec: shipped 16kHz/512/N=1 row constructs via %s\n", info.graph_path);
+                int16_t mic[128] = {0}, far[128] = {0}, out[128];
+                printf("link_only_aiaec: shipped 16kHz/256/N=1 row constructs via %s\n", info.graph_path);
                 memset(&in, 0, sizeof in);
-                in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = 256;
+                in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = 128;
                 in.u.deepvqe_s.mic_in = mic; in.u.deepvqe_s.far_in = far;
                 if (aiaec_preprocess(ctx, &in, &work) != AIAEC_OK || work.input_count != 2 ||
-                    work.output_count != 1 || work.inputs[0].w != 257u || work.outputs[0].w != 18u ||
+                    work.output_count != 1 || work.inputs[0].w != 129u || work.outputs[0].w != 18u ||
                     aiaec_postprocess(ctx, 0, out) != AIAEC_OK) {
                     fprintf(stderr, "link_only_aiaec: FAIL shipped row block round trip\n");
                     status = 1;

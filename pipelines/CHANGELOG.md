@@ -3,6 +3,13 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-16 — AIAEC: the production catalog registers the 16 kHz / 256 and 16 kHz / 512 graphs of both models
+
+- **Production catalog** (`stream/aiaec/aiaec.c`). DeepVQE-S 16k/256 N=1 and 16k/512 N=1 resolve to `/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin`; Align-ULCNet 16k/256 N=1 and 16k/512 N=1 resolve to `/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin`. Each path is written once (one macro per model). The card holds one graph per model, which runs only at its own `--fft-size`: the sample's `graph_io_check_ports()` refuses the other grid at init, before any inference. Every N=8 row, N=2 and a `hop_in` that is not a model-hop multiple are refused (`AIAEC_ERR_FRAMES_PER_CALL`, `AIAEC_ERR_IN_HOP`). The test catalog is unchanged.
+- **Board samples** `alg_ai3_deepvqes.c` and `alg_ai3_alignulcnet.c` default to 16 kHz / fft 256 / `hop_in` 128 (129 bins, D = 63); `--fft-size 512` selects 16 kHz / 512 / 256 (257 bins, D = 32).
+- **Tests**: `test_aiaec_catalog` checks, per product, both delivered rows (graph path string, `_freq` info, first pre call; DeepVQE-S views `[1,2,1,bins]` / `[1,1,bins,18]`) and the rows that are refused; `link_only_aiaec` constructs a DeepVQE-S row against the production archive.
+- **Docs**: `docs/html/models/{index,deepvqe-s/index,align-ulcnet/index}.html`, `docs/html/models/deepvqe-s/reference/core.html`, `docs/html/models/align-ulcnet/reference/core.html` (delivered rows, board paths, default sample command line, per-grid timing), `docs/maintenance/graph-wiring.md`.
+
 ## [Unreleased] — 2026-11-15 — `stream/common/stream_run.h`: the run contract of the AI model streams
 
 - **New header** `stream/common/stream_run.h` (header-only, SDK-free): `StreamTensorIn` / `StreamTensorOut`, `StreamWorkAction` (`STREAM_WORK_BYPASS`, `STREAM_WORK_SUBMIT`), `StreamWork` (up to `STREAM_WORK_MAX_INPUTS` = 5 inputs and `STREAM_WORK_MAX_OUTPUTS` = 3 outputs, `state_generation`) and the run statuses `STREAM_RUN_OK` (0), `STREAM_RUN_NOT_STARTED` (0x4E53), `STREAM_RUN_FAILED` (-1). Nothing includes it yet; `ainr.h` and `aiaec.h` take it over in their own changes.

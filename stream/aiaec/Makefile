@@ -178,8 +178,8 @@ define RUN_PER_PRODUCT
 	done
 endef
 
-# test_aiaec_catalog: the PRODUCTION catalog (no AIAEC_TEST_CATALOG): refusal order, the 16k/256
-# rows without a delivered graph, and the one delivered 16k/512 row.
+# test_aiaec_catalog: the PRODUCTION catalog (no AIAEC_TEST_CATALOG): refusal order, the rows without
+# a delivered graph, and the delivered rows (DeepVQE-S 16k/256 and 16k/512 N=1, Align-ULCNet 16k/256 N=1).
 test-aiaec-catalog: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_catalog,)
 

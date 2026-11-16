@@ -296,7 +296,7 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <h3>內部：存在且可改，但不建議開放</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
-<tr><td>出貨 grid</td><td>16000／512／256／257 bins</td><td><code>config.ini [signal]</code>、匯出的 graph</td><td>模型只訓練並驗證過這一組；頻率階梯 257→129→65→33→17 由此導出。函式庫不限定（run-time grid），但 graph 的頻率軸形狀隨 grid 變</td></tr>
+<tr><td>板端 grid</td><td>預設 16000／256／128／129 bins；另登錄 16000／512／256／257 bins</td><td><code>config.ini [signal]</code>、匯出的 graph</td><td>graph 的頻率軸形狀隨 grid 變，一張 graph 只能在它自己的 grid 跑；本頁的 shape 與頻率階梯 257→129→65→33→17 以 16000／512 為例。函式庫不限定（run-time grid）</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code></td><td>4（1–3 已退役）</td><td><code>deepvqe_prepost.h</code></td><td>與 exporter 的 <code>DEEPVQE_C_LAYOUT_VERSION</code> 互鎖，在匯出與 host 測試擋下不符的圖（板端 sample 不讀版號）。刻意不與 ULCNet 版號共用</td></tr>
 <tr><td><code>DEEPVQE_COMPRESSION_EXP</code></td><td>0.3</td><td><code>deepvqe_prepost.h</code></td><td>host 前端與訓練共用；<code>export_onnx.py</code> 拒絕其他指數的 checkpoint</td></tr>
 <tr><td><code>DEEPVQE_TIME_ORDER</code>／<code>DEEPVQE_FREQ_TAPS</code>、<code>deepvqe_prepost_taps_elements(grid)</code></td><td>3／3、n_bins×3×3×2</td><td><code>deepvqe_process.h</code>、<code>deepvqe_prepost.h</code></td><td>CCM 形狀；taps 末軸 <code>[time][frequency][RI]</code> 與 C 陣列同一塊記憶體</td></tr>
@@ -364,7 +364,7 @@ k     pre_process_packet -> open -------------------------------> 替身回 -1, 
 <h2 id="section-10">I/O 表</h2>
 <div class="tbl"><table>
 <tr><th>方向</th><th>名稱</th><th>型別／shape</th><th>一次呼叫</th><th>對應時域樣本</th></tr>
-<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 N × <code>deepvqe_stream_hop_size(s)</code></td><td>每包 1 次</td><td>N hop（16 kHz／512、N=1 時為 256 samples）</td></tr>
+<tr><td>輸入</td><td><code>mic_in</code>、<code>far_in</code></td><td><code>const int16_t*</code>，各長度 N × <code>deepvqe_stream_hop_size(s)</code></td><td>每包 1 次</td><td>N hop（16 kHz／256、N=1 時為 128 samples；16 kHz／512 為 256 samples）</td></tr>
 <tr><td>輸入（可選）</td><td><code>io.inputs</code>（<code>DeepVqePrepostInputs</code>）</td><td><code>mic</code>／<code>far</code> 各 <code>[1,2,N,BINS]</code>（壓縮後平面複數），16 組 state 視圖（<code>DeepVqeStateId</code>）</td><td><code>pre_process_packet</code> 回 1 時有效</td><td>—</td></tr>
 <tr><td>輸出</td><td><code>io.outputs</code>（<code>DeepVqePrepostOutputs</code>）</td><td><code>taps</code> <code>[1,N,BINS,TIME_ORDER*FREQ_TAPS*2]</code>（NaN 預填），16 組 <code>state_out</code></td><td>加速器寫一次</td><td>—</td></tr>
 <tr><td>輸出</td><td><code>pcm_out</code></td><td><code>int16_t*</code>，長度同 <code>mic_in</code></td><td>每包 1 次，永遠寫滿</td><td>N hop</td></tr>
@@ -386,6 +386,7 @@ k     pre_process_packet -> open -------------------------------> 替身回 -1, 
 <tr><td>hop</td><td>256 samples = 16 ms</td><td>實測（見下方 pool 量測）</td></tr>
 <tr><td>模型延遲</td><td>0（每 hop 一幀，<code>deepvqe_prepost.h</code>：「no latency beyond it」）</td><td><code>deepvqe_prepost.h</code></td></tr>
 <tr><td>合成啟動</td><td>無首拍特例：每一包的輸出就是該包 N 個 frame 的合成，hop 0 即為真實合成輸出（前半窗疊加的歷史為零，可能有聲）</td><td><code>deepvqe_stream.h</code> 檔頭</td></tr>
+<tr><td>板端預設 grid</td><td>16 kHz／256：hop 128 samples = 8 ms，delay_depth = 63，129 bins；其餘各列同上</td><td><code>aiaec.c</code> 登錄表（D = ceil(0.5 s / hop)）</td></tr>
 <tr><td>CCM ring 部分零歷史</td><td>前 <code>TIME_ORDER-1</code> = 2 個 hop</td><td>模型自身啟動行為，非延遲</td></tr>
 </table></div>
 </main>

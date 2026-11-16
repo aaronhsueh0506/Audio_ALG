@@ -1,11 +1,10 @@
 /* The PRODUCTION catalog through the real public API: this file is built without
  * -DAIAEC_TEST_CATALOG, so only the rows with a delivered graph resolve. Built once per product.
  *
- *   DeepVQE-S: the 16k/256 rows (N=1, N=8) are registered but have no delivered graph, so
- *     get_mem_size / init refuse them with AIAEC_ERR_FRAMES_PER_CALL before any SDK
- *     call and ctx / info are left untouched; the 16k/512 row with N=1 is delivered and constructs; N=8
- *     there is refused. The refusal order is model, grid, hop_in, frames_per_call.
- *   Align-ULCNet: every row, N=8 included, is refused with AIAEC_ERR_FRAMES_PER_CALL (no delivered graph).
+ *   Each model: 16k/256 N=1 and 16k/512 N=1 resolve, both to the one graph path of that model; N=8 on
+ *     either grid is refused with AIAEC_ERR_FRAMES_PER_CALL before any SDK call, ctx / info untouched.
+ *   Both: N=2 and a hop_in that is not a multiple of the model hop are refused. The refusal order is model,
+ *     grid, hop_in, frames_per_call.
  * The test-catalog behavior (every row resolving, work views, N derivation) is test_aiaec_graph_io.c. */
 
 #include <stdint.h>
@@ -63,21 +62,18 @@ static void section_refusal_order(void) {
     c = cfg_of(16000, 512, 255);    expect_refused(&c, AIAEC_ERR_IN_HOP, "hop_in 255 at 16k/512");
     /* grid precedes hop_in: an unregistered grid with a bad hop_in is a grid error */
     c = cfg_of(48000, 1024, 129);   expect_refused(&c, AIAEC_ERR_GRID, "grid before hop_in");
-    /* the registered grids without a delivered graph */
-    c = cfg_of(16000, 256, 128);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/256 N=1");
+    /* registered grids and frames_per_call values without a delivered graph */
     c = cfg_of(16000, 256, 1024);   expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/256 N=8");
     c = cfg_of(16000, 256, 256);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/256 N=2 (not in the catalog)");
+    c = cfg_of(16000, 512, 512);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/512 N=2 (not in the catalog)");
     c = cfg_of(16000, 512, 2048);   expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/512 N=8");
-#if !PRODUCT_DV
-    c = cfg_of(16000, 512, 256);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "Align 16k/512 N=1 (no delivered graph)");
-#endif
     printf("section_refusal_order: done\n");
 }
 
-#if PRODUCT_DV
-/* The one delivered row: DeepVQE-S 16k/512 N=1. */
-static void section_shipped_row(void) {
-    AiaecConfig cfg = cfg_of(16000, 512, 256);
+/* One delivered row: constructs, reports `path`, and its first pre call carries the row's work. */
+static void expect_row(int fft, int hop_in, const char *path) {
+    AiaecConfig cfg = cfg_of(16000, fft, hop_in);
+    const unsigned bins = (unsigned)(fft / 2 + 1);
     StreamMemReq req, req_f;
     AiaecInfo info, info_f;
     AiaecCtx *ctx = NULL;
@@ -86,52 +82,77 @@ static void section_shipped_row(void) {
     int rc;
 
     rc = aiaec_get_mem_size(&cfg, &req);
-    CHECK(rc == AIAEC_OK, "shipped row: get_mem_size rc=%d (%s)", rc, aiaec_status_text(rc));
+    CHECK(rc == AIAEC_OK, "row %d/%d: get_mem_size rc=%d (%s)", fft, hop_in, rc, aiaec_status_text(rc));
     if (rc != AIAEC_OK) return;
-    CHECK(posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) == 0, "shipped row: pool");
+    CHECK(posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) == 0, "row %d/%d: pool", fft, hop_in);
     rc = aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, &info);
-    CHECK(rc == AIAEC_OK && ctx != NULL, "shipped row: init rc=%d (%s)", rc, aiaec_status_text(rc));
+    CHECK(rc == AIAEC_OK && ctx != NULL, "row %d/%d: init rc=%d (%s)", fft, hop_in, rc, aiaec_status_text(rc));
     if (ctx) {
-        CHECK(info.graph_path && strcmp(info.graph_path, "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin") == 0,
-              "shipped row: graph path %s", info.graph_path ? info.graph_path : "(null)");
-        CHECK(aiaec_state_generation(ctx) == 0u, "shipped row: generation after init");
-        {   /* the delivered graph's views: mic, far [1,2,1,257]; CCM taps [1,1,257,18] */
-            static const int16_t zeros[256];
-            AiaecInput in;
-            StreamWork work;
-            memset(&in, 0, sizeof(in));
-            in.kind = AIAEC_INPUT_DEEPVQE_S; in.samples = 256;
-            in.u.deepvqe_s.mic_in = zeros; in.u.deepvqe_s.far_in = zeros;
-            CHECK(aiaec_preprocess(ctx, &in, &work) == AIAEC_OK && work.action == STREAM_WORK_SUBMIT &&
-                  work.input_count == 2 && work.output_count == 1 &&
-                  work.inputs[0].b == 1u && work.inputs[0].c == 2u && work.inputs[0].h == 1u && work.inputs[0].w == 257u &&
-                  work.inputs[0].elements == 514u && work.inputs[1].w == 257u && work.inputs[1].elements == 514u &&
-                  work.outputs[0].b == 1u && work.outputs[0].c == 1u && work.outputs[0].h == 257u && work.outputs[0].w == 18u &&
-                  work.outputs[0].elements == 4626u,
-                  "shipped row: work views (%d in, %d out)", work.input_count, work.output_count);
-            aiaec_reset(ctx);   /* closes the open block and restarts */
-            CHECK(aiaec_state_generation(ctx) != 0u, "shipped row: a reset advances the generation");
-        }
-        CHECK(aiaec_get_mem_size_freq(&cfg, &req_f) == AIAEC_OK &&
-              posix_memalign(&pool_f, (size_t)req_f.alignment, (size_t)req_f.bytes) == 0, "shipped row: freq pool");
-        CHECK(aiaec_init_freq(&cfg, pool_f, (size_t)req_f.bytes, &cf, &info_f) == AIAEC_OK && cf != NULL &&
-              memcmp(&info, &info_f, sizeof(info)) == 0, "shipped row: the _freq family reports the same info");
+#if PRODUCT_DV
+        static const int16_t zeros16[512];
+#else
+        static const float zeros_f[512];
+        AiaecAlignEvent no_event;
+#endif
+        AiaecInput in;
+        StreamWork work;
+
+        CHECK(info.graph_path && strcmp(info.graph_path, path) == 0, "row %d/%d: graph path %s, want %s", fft, hop_in,
+              info.graph_path ? info.graph_path : "(null)", path);
+        CHECK(aiaec_state_generation(ctx) == 0u, "row %d/%d: generation after init", fft, hop_in);
+        memset(&in, 0, sizeof(in));
+        in.samples = hop_in;
+#if PRODUCT_DV
+        in.kind = AIAEC_INPUT_DEEPVQE_S;
+        in.u.deepvqe_s.mic_in = zeros16; in.u.deepvqe_s.far_in = zeros16;
+#else
+        memset(&no_event, 0, sizeof(no_event));
+        in.kind = AIAEC_INPUT_ALIGN_ULCNET;
+        in.u.align_ulcnet.residual_in = zeros_f; in.u.align_ulcnet.far_in = zeros_f;
+        in.u.align_ulcnet.events = &no_event; in.u.align_ulcnet.event_count = 1;
+#endif
+        CHECK(aiaec_preprocess(ctx, &in, &work) == AIAEC_OK && work.action == STREAM_WORK_SUBMIT &&
+              work.output_count >= 1 && work.inputs[0].w == bins,
+              "row %d/%d: work (%d in, %d out)", fft, hop_in, work.input_count, work.output_count);
+#if PRODUCT_DV
+        /* mic, far [1,2,1,bins]; CCM taps [1,1,bins,18] */
+        CHECK(work.input_count == 2 && work.output_count == 1 &&
+              work.inputs[0].b == 1u && work.inputs[0].c == 2u && work.inputs[0].h == 1u &&
+              work.inputs[0].elements == 2u * bins && work.inputs[1].w == bins && work.inputs[1].elements == 2u * bins &&
+              work.outputs[0].b == 1u && work.outputs[0].c == 1u && work.outputs[0].h == bins && work.outputs[0].w == 18u &&
+              work.outputs[0].elements == 18u * bins,
+              "row %d/%d: DeepVQE-S work views", fft, hop_in);
+#endif
+        aiaec_reset(ctx);   /* closes the open block and restarts */
+        CHECK(aiaec_state_generation(ctx) != 0u, "row %d/%d: a reset advances the generation", fft, hop_in);
     }
-    CHECK(aiaec_init(NULL, pool, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL && ctx == NULL, "shipped row: NULL cfg");
-    CHECK(aiaec_init(&cfg, NULL, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL, "shipped row: NULL pool");
-    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, NULL, &info) == AIAEC_ERR_NULL, "shipped row: NULL ctx");
-    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, NULL) == AIAEC_ERR_NULL && ctx == NULL, "shipped row: NULL info");
+    CHECK(aiaec_get_mem_size_freq(&cfg, &req_f) == AIAEC_OK &&
+          posix_memalign(&pool_f, (size_t)req_f.alignment, (size_t)req_f.bytes) == 0, "row %d/%d: freq pool", fft, hop_in);
+    CHECK(aiaec_init_freq(&cfg, pool_f, (size_t)req_f.bytes, &cf, &info_f) == AIAEC_OK && cf != NULL &&
+          memcmp(&info, &info_f, sizeof(info)) == 0, "row %d/%d: the _freq family reports the same info", fft, hop_in);
+    CHECK(aiaec_init(NULL, pool, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL && ctx == NULL, "row %d/%d: NULL cfg", fft, hop_in);
+    CHECK(aiaec_init(&cfg, NULL, (size_t)req.bytes, &ctx, &info) == AIAEC_ERR_NULL, "row %d/%d: NULL pool", fft, hop_in);
+    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, NULL, &info) == AIAEC_ERR_NULL, "row %d/%d: NULL ctx", fft, hop_in);
+    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, NULL) == AIAEC_ERR_NULL && ctx == NULL, "row %d/%d: NULL info", fft, hop_in);
     free(pool);
     free(pool_f);
-    printf("section_shipped_row: DeepVQE-S 16k/512 N=1 constructs and reports its info\n");
 }
+
+static void section_delivered_rows(void) {
+#if PRODUCT_DV
+    expect_row(256, 128, "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin");
+    expect_row(512, 256, "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin");
+    printf("section_delivered_rows: DeepVQE-S 16k/256 N=1 and 16k/512 N=1 construct and report their info\n");
+#else
+    expect_row(256, 128, "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin");
+    expect_row(512, 256, "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin");
+    printf("section_delivered_rows: Align-ULCNet 16k/256 N=1 and 16k/512 N=1 construct and report their info\n");
 #endif
+}
 
 int main(void) {
     section_refusal_order();
-#if PRODUCT_DV
-    section_shipped_row();
-#endif
+    section_delivered_rows();
     printf("test_aiaec_catalog[%s]: %s\n", PRODUCT_DV ? "deepvqe_s" : "align_ulcnet", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

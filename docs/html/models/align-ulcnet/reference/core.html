@@ -95,7 +95,7 @@ sample 端的埠檢查（<code>stream_check_ports()</code>）在第一次送件�
   enhanced = 逆冪( (zr,zi)·mask ) → StreamISTFT.push → HOP samples
 
 K = n_fft/2+1（16k: 257、48k: 513）；TA = ceil(K/10)（16k: 26、48k: 52）；
-HOP = n_fft/2（16k: 256、48k: 512）；D = max_delay_frames（16 kHz 出貨 config 為 32）。
+HOP = n_fft/2（16k: 256、48k: 512）；D = max_delay_frames（16 kHz／512 為 32，16 kHz／256 為 63）。
 上圖 joint2 的 [B,96,1,7] 與 fgru 的 [B,64,1,7] 是 16 kHz 值，48 kHz 為 …,13（TA 之後兩次
 ceil-halving：26→13→7、52→26→13）。subband split = (ceil(w/2), w//2)，兩顆 GRU 各出 128、
 concat 恆為 256，所以 mask_fc1/fc2 的輸入寬度與 grid 無關，只有輸出寬度是 K。</pre>

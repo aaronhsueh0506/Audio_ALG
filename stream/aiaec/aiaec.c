@@ -67,8 +67,7 @@ typedef struct AiaecModelEntry {
 } AiaecModelEntry;
 
 /* AIAEC_TEST_CATALOG: defined only by this directory's test builds. Substitutes placeholder graph
- * paths so a test binary can drive the real gated public API end to end. The production catalog has
- * a delivered graph for only one row. */
+ * paths so a test binary can drive the real gated public API end to end. */
 #ifdef AIAEC_TEST_CATALOG
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
     { 1, "test://aiaec/deepvqe_s/16k_fft256_n1" },
@@ -87,22 +86,24 @@ static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
     { 8, (const char *)0 },
 };
 #else
+/* Board graph path per model, shared by its 16k/256 and 16k/512 rows: the card holds one graph, which
+ * runs only at its own --fft-size; the sample's graph_io_check_ports() refuses the other grid at init. */
+#define AIAEC_DEEPVQE_S_GRAPH "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin"
+#define AIAEC_ULCNET_GRAPH    "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin"
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
-    { 1, (const char *)0 },   /* exported with random weights only; no trained/quantized graph yet */
+    { 1, AIAEC_DEEPVQE_S_GRAPH },
     { 8, (const char *)0 },
 };
-/* Shipped 16k/512 grid (hop 256). N == 1 only; the default 16x16 quantization's path. */
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
-    { 1, "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin" },
+    { 1, AIAEC_DEEPVQE_S_GRAPH },
     { 8, (const char *)0 },
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
-    { 1, (const char *)0 },
+    { 1, AIAEC_ULCNET_GRAPH },
     { 8, (const char *)0 },
 };
-/* Registered grid without a delivered graph: refused at init until one is. */
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
-    { 1, (const char *)0 },
+    { 1, AIAEC_ULCNET_GRAPH },
     { 8, (const char *)0 },
 };
 #endif

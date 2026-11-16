@@ -18,7 +18,7 @@
 
 `ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。
 
-接線表登錄的組態比函式庫目前交付的 graph 多：AIAEC 的正式目錄（`aiaec.c`）現在只有 DeepVQE-S 16 kHz／fft 512／N=1 帶 graph 路徑，DeepVQE-S 其餘兩列與 Align-ULCNet 的三列有接線、沒有交付的 graph，正式建置在 init 就拒絕它們（測試目錄 `-DAIAEC_TEST_CATALOG` 才接受，見 `stream/aiaec/tests/test_aiaec_graph_io.c`）。
+接線表登錄的組態比函式庫目前交付的 graph 多：AIAEC 的正式目錄（`aiaec.c`）只有兩個模型的 16 kHz／fft 256／N=1 與 16 kHz／fft 512／N=1 帶 graph 路徑（同一個模型的兩個 grid 共用一個路徑），兩個模型的 N=8 有接線、沒有交付的 graph，正式建置在 init 就拒絕它們（測試目錄 `-DAIAEC_TEST_CATALOG` 才接受，見 `stream/aiaec/tests/test_aiaec_graph_io.c`）。
 
 ## 規則
 

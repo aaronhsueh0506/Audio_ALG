@@ -8,9 +8,8 @@
  *   -DAIAEC_TEST_OTHER_BOUND=1 with -DAIAEC_PRODUCT_MODEL_ID=<the model this build does NOT contain>:
  *     every entry refuses with AIAEC_ERR_MODEL_ID.
  *
- * Compiled with -DAIAEC_TEST_CATALOG so the enabled model's row has a graph path (the production
- * catalog has none for the rows used here). The nm -u proof that the other model's symbols are
- * absent is the Makefile's, not this program's. */
+ * Compiled with -DAIAEC_TEST_CATALOG so the enabled model's row has a placeholder graph path. The nm -u
+ * proof that the other model's symbols are absent is the Makefile's, not this program's. */
 
 #include <stdint.h>
 #include <stdio.h>
