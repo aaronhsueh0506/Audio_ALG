@@ -632,8 +632,8 @@ static int section_bind_and_pool(int fft, int n) {
         sc.ola = AC_OLA_ACCUMULATE;
         framing = ck_align16_size(fft_get_mem_size(fft)) + 2u * ck_align16_size(ac_stft_get_mem_size(&sc)) +
                   ck_align16_size(ac_istft_get_mem_size(&sc)) +
-                  ck_align16_size((3u * (size_t)hop + 6u * plane) * sizeof(float));
-        pinned = PRODUCT_DV ? (fft == 512 ? 35744u : n == 8 ? 119376u : 18336u) : (fft == 512 ? 15072u : 7904u);
+                  ck_align16_size(((PRODUCT_DV ? 3u : 1u) * (size_t)hop + 6u * plane) * sizeof(float));
+        pinned = PRODUCT_DV ? (fft == 512 ? 35744u : n == 8 ? 119376u : 18336u) : (fft == 512 ? 15056u : 7888u);
         CHECK(rb.bytes - rf.bytes == framing, "pool(fft=%d N=%d): block %llu - _freq %llu is not the framing %zu", fft, n,
                   (unsigned long long)rb.bytes, (unsigned long long)rf.bytes, framing);
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
