@@ -106,8 +106,16 @@ endef
 
 .PHONY: print-deps-sh bootstrap-deps check-deps-pins
 
+# The directories reach the recipes through the environment (P_*), never as text inside the shell command: a name with an
+# apostrophe, a backtick or parentheses is data there.
+print-deps-sh check-deps-pins: export P_AEC_DIR = $(AEC_DIR)
+print-deps-sh check-deps-pins: export P_NR_DIR = $(NR_DIR)
+print-deps-sh check-deps-pins: export P_AUDIOLIB_DIR = $(AUDIOLIB_DIR)
+print-deps-sh check-deps-pins: export P_COMMON_DIR = $(COMMON_DIR)
+check-deps-pins: export P_ALG_ROOT = $(AUDIO_ALG_ROOT)
+
 print-deps-sh:
-	@printf 'AEC_DIR=%s\nNR_DIR=%s\nAUDIOLIB_DIR=%s\nCOMMON_DIR=%s\n' '$(AEC_DIR)' '$(NR_DIR)' '$(AUDIOLIB_DIR)' '$(COMMON_DIR)'
+	@printf 'AEC_DIR=%s\nNR_DIR=%s\nAUDIOLIB_DIR=%s\nCOMMON_DIR=%s\n' "$$P_AEC_DIR" "$$P_NR_DIR" "$$P_AUDIOLIB_DIR" "$$P_COMMON_DIR"
 
 # Clones each of AEC_REPO_DIR / NR_REPO_DIR / AUDIOLIB_DIR from its pinned URL at its pinned
 # commit, but only when that directory does not already exist -- an existing checkout at a
@@ -184,21 +192,21 @@ bootstrap-deps:
 # caller-invoked report with the same exit-nonzero-on-mismatch behavior.
 check-deps-pins:
 	@ok=1; \
-	have_aec="$$(git -C '$(AEC_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_aec" = "$(AEC_COMMIT)" ]; then echo "check-deps-pins: AEC ($(AEC_DIR)) $$have_aec matches lib/aec.pin"; \
-	else echo "check-deps-pins: FAIL AEC ($(AEC_DIR)) is $$have_aec, lib/aec.pin expects $(AEC_COMMIT)" >&2; ok=0; fi; \
-	have_nr="$$(git -C '$(NR_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_nr" = "$(NR_COMMIT)" ]; then echo "check-deps-pins: NR ($(NR_DIR)) $$have_nr matches lib/nr.pin"; \
-	else echo "check-deps-pins: FAIL NR ($(NR_DIR)) is $$have_nr, lib/nr.pin expects $(NR_COMMIT)" >&2; ok=0; fi; \
-	have_ac="$$(git -C '$(AUDIOLIB_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_ac" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib ($(AUDIOLIB_DIR)) $$have_ac matches lib/audiolib.pin"; \
-	else echo "check-deps-pins: FAIL audiolib ($(AUDIOLIB_DIR)) is $$have_ac, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
-	have_common="$$(git -C '$(COMMON_DIR)' rev-parse HEAD 2>/dev/null || echo unknown)"; \
-	if [ "$$have_common" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib common ($(COMMON_DIR)) $$have_common matches lib/audiolib.pin"; \
-	else echo "check-deps-pins: FAIL audiolib common ($(COMMON_DIR)) is $$have_common, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
-	if [ -e '$(AUDIO_ALG_ROOT)/lib/aec/.git' ]; then \
-	  gl_rec="$$(git -C '$(AUDIO_ALG_ROOT)' ls-files -s -- lib/aec 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
-	  gl_have="$$(git -C '$(AUDIO_ALG_ROOT)/lib/aec' rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	have_aec="$$(git -C "$$P_AEC_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_aec" = "$(AEC_COMMIT)" ]; then echo "check-deps-pins: AEC ($$P_AEC_DIR) $$have_aec matches lib/aec.pin"; \
+	else echo "check-deps-pins: FAIL AEC ($$P_AEC_DIR) is $$have_aec, lib/aec.pin expects $(AEC_COMMIT)" >&2; ok=0; fi; \
+	have_nr="$$(git -C "$$P_NR_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_nr" = "$(NR_COMMIT)" ]; then echo "check-deps-pins: NR ($$P_NR_DIR) $$have_nr matches lib/nr.pin"; \
+	else echo "check-deps-pins: FAIL NR ($$P_NR_DIR) is $$have_nr, lib/nr.pin expects $(NR_COMMIT)" >&2; ok=0; fi; \
+	have_ac="$$(git -C "$$P_AUDIOLIB_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_ac" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib ($$P_AUDIOLIB_DIR) $$have_ac matches lib/audiolib.pin"; \
+	else echo "check-deps-pins: FAIL audiolib ($$P_AUDIOLIB_DIR) is $$have_ac, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
+	have_common="$$(git -C "$$P_COMMON_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ "$$have_common" = "$(AUDIOLIB_COMMIT)" ]; then echo "check-deps-pins: audiolib common ($$P_COMMON_DIR) $$have_common matches lib/audiolib.pin"; \
+	else echo "check-deps-pins: FAIL audiolib common ($$P_COMMON_DIR) is $$have_common, lib/audiolib.pin expects $(AUDIOLIB_COMMIT)" >&2; ok=0; fi; \
+	if [ -e "$$P_ALG_ROOT/lib/aec/.git" ]; then \
+	  gl_rec="$$(git -C "$$P_ALG_ROOT" ls-files -s -- lib/aec 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
+	  gl_have="$$(git -C "$$P_ALG_ROOT/lib/aec" rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	  if [ "$$gl_rec" = "$$gl_have" ] && [ "$$gl_have" = "$(AEC_COMMIT)" ]; then \
 	    echo "check-deps-pins: lib/aec gitlink $$gl_have matches lib/aec.pin (step 5 ready on this axis)"; \
 	  else \
@@ -207,9 +215,9 @@ check-deps-pins:
 	else \
 	  echo "check-deps-pins: lib/aec submodule not initialized (not needed for the default sibling build)"; \
 	fi; \
-	if [ -e '$(AUDIO_ALG_ROOT)/lib/nr/.git' ]; then \
-	  gl_rec="$$(git -C '$(AUDIO_ALG_ROOT)' ls-files -s -- lib/nr 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
-	  gl_have="$$(git -C '$(AUDIO_ALG_ROOT)/lib/nr' rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	if [ -e "$$P_ALG_ROOT/lib/nr/.git" ]; then \
+	  gl_rec="$$(git -C "$$P_ALG_ROOT" ls-files -s -- lib/nr 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
+	  gl_have="$$(git -C "$$P_ALG_ROOT/lib/nr" rev-parse HEAD 2>/dev/null || echo unknown)"; \
 	  if [ "$$gl_rec" = "$$gl_have" ] && [ "$$gl_have" = "$(NR_COMMIT)" ]; then \
 	    echo "check-deps-pins: lib/nr gitlink $$gl_have matches lib/nr.pin (step 5 ready on this axis)"; \
 	  else \

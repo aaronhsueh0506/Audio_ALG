@@ -24,5 +24,16 @@ if [ "$AEC_DIR" = "$hostile" ]; then ck ok "hostile AEC_DIR read back verbatim";
 if [ ! -e "$T/MARK" ]; then ck ok "nothing ran while reading it"; else ck no "the directory name was executed"; fi
 if [ -n "$NR_DIR" ] && [ -n "$COMMON_DIR" ] && [ -n "$AUDIOLIB_DIR" ]; then ck ok "the other three keys resolved"; else ck no "a key is empty"; fi
 
+# 3. A name with an apostrophe, a backtick and parentheses is data too, in print-deps-sh and in check-deps-pins.
+quoted="$T/q'x;touch $T/MARK2;'\`touch $T/MARK3\`(y)"
+deps="$(AEC_DIR="$quoted" make -s --no-print-directory -f "$ROOT/lib/deps.mk" print-deps-sh 2>/dev/null)"
+got="$(printf '%s\n' "$deps" | sed -n 's/^AEC_DIR=//p')"
+if [ "$got" = "$quoted" ]; then ck ok "AEC_DIR with ' \` ( ) read back verbatim"; else ck no "AEC_DIR with ' \` ( ) read back as '$got'"; fi
+others="$(printf '%s\n' "$deps" | grep -Ec '^(NR_DIR|AUDIOLIB_DIR|COMMON_DIR)=.')"
+if [ "$others" = 3 ]; then ck ok "the other three keys still resolve beside it"; else ck no "only $others of the other three keys resolved"; fi
+pins="$(AEC_DIR="$quoted" make -s --no-print-directory -f "$ROOT/lib/deps.mk" check-deps-pins 2>&1 || true)"
+if [ ! -e "$T/MARK2" ] && [ ! -e "$T/MARK3" ]; then ck ok "nothing ran in print-deps-sh or check-deps-pins"; else ck no "a directory name was executed"; fi
+if printf '%s\n' "$pins" | grep -qF "AEC ($quoted)"; then ck ok "check-deps-pins reports the name verbatim"; else ck no "check-deps-pins altered the name"; fi
+
 if [ "$fail" -eq 0 ]; then echo "test_deps_env_safe: PASS"; exit 0; fi
 echo "test_deps_env_safe: FAIL ($fail)"; exit 1
