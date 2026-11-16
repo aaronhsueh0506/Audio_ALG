@@ -6,7 +6,7 @@ CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # EXTRA_CFLAGS is the supported hook for a caller's own flags (e.g. a cross-compile -arch/--target); same
 # convention as the sibling stream Makefiles (stream/ainr/dfn2, stream/ainr).
 EXTRA_CFLAGS ?=
-override CFLAGS += -ffp-contract=off -fno-math-errno -I. $(EXTRA_CFLAGS)
+override CFLAGS += -ffp-contract=off -fno-math-errno -I. -I../../common $(EXTRA_CFLAGS)
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
@@ -50,7 +50,7 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
 LIB := $(OBJ_DIR)/libainr_bridge.a
 LIB_OBJECTS := $(OBJ_DIR)/ainr_bridge.o
-HEADERS := ainr_bridge.h
+HEADERS := ainr_bridge.h ../../common/stream_mem.h
 COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
 
 TEST_BIN := $(OBJ_DIR)/test_ainr_bridge

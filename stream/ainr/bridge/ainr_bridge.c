@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "ainr_bridge.h"
+#include "stream_mem.h"
 #include "utility/mem_align.h"
 #include "audio_resampler.h"
 #include "fft_wrapper.h"
@@ -64,18 +65,10 @@ struct AinrBridge {
     void *owned_heap;
 };
 
+/* ck_align16_size() with 0 for an overflow: no region of this layout has size 0. */
 static size_t align_up(size_t v) {
-    if (v > SIZE_MAX - (BRIDGE_ALIGN - 1u)) return 0u;
-    return (v + BRIDGE_ALIGN - 1u) & ~(size_t)(BRIDGE_ALIGN - 1u);
-}
-
-static uint32_t fnv_u32(uint32_t h, uint32_t v) {
-    int i;
-    for (i = 0; i < 4; ++i) {
-        h ^= (v >> (8 * i)) & 0xffu;
-        h *= 16777619u;
-    }
-    return h;
+    size_t aligned = ck_align16_size(v);
+    return MEM_SIZE_INVALID(aligned) ? 0u : aligned;
 }
 
 /* Capability gate: the three host grids the resamplers, FIFO capacities and
@@ -173,16 +166,16 @@ static int resolve(const AinrBridgeConfig *cfg, Resolved *r) {
 static void fill_descriptor(const AinrBridgeConfig *cfg, const Resolved *r,
                             AinrBridgeMemReq *out) {
     uint32_t h = 2166136261u;
-    h = fnv_u32(h, AINR_BRIDGE_LAYOUT_VERSION);
-    h = fnv_u32(h, (uint32_t)cfg->sample_rate);
-    h = fnv_u32(h, (uint32_t)r->fft_n);
-    h = fnv_u32(h, (uint32_t)cfg->lookahead_frames);
-    h = fnv_u32(h, (uint32_t)FIFO48_CAP);
-    h = fnv_u32(h, (uint32_t)OUT_FIFO_CAP);
+    h = stream_fnv1a_u32(h, AINR_BRIDGE_LAYOUT_VERSION);
+    h = stream_fnv1a_u32(h, (uint32_t)cfg->sample_rate);
+    h = stream_fnv1a_u32(h, (uint32_t)r->fft_n);
+    h = stream_fnv1a_u32(h, (uint32_t)cfg->lookahead_frames);
+    h = stream_fnv1a_u32(h, (uint32_t)FIFO48_CAP);
+    h = stream_fnv1a_u32(h, (uint32_t)OUT_FIFO_CAP);
     /* The resamplers' pool sizes: a pool recorded against another resampler layout
      * is refused on the hash. */
-    h = fnv_u32(h, (uint32_t)r->up_bytes);
-    h = fnv_u32(h, (uint32_t)r->down_bytes);
+    h = stream_fnv1a_u32(h, (uint32_t)r->up_bytes);
+    h = stream_fnv1a_u32(h, (uint32_t)r->down_bytes);
     memset(out, 0, sizeof(*out));
     out->descriptor_version = AINR_BRIDGE_DESCRIPTOR_VERSION;
     out->layout_version = AINR_BRIDGE_LAYOUT_VERSION;

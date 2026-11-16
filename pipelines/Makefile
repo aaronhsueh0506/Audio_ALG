@@ -602,8 +602,8 @@ $(OBJ_DIR)/test_array_sample_post.o: 4ch/tests/test_array_sample_post.c 4ch/arra
 $(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c dfn/dfn_hop.h dfn/dfn_hop_pool.h $(STREAM_ULCNET_DIR)/ulcnet_stream.h mono/aec_nr_res/tests/conv_chain_mono.h dfn/tests/dfn_test_fixture.h dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) $(ULCNET_STREAM_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/ainr_bridge.o: $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(STREAM_BRIDGE_DIR) -MD -MP -c -o $@ $<
+$(OBJ_DIR)/ainr_bridge.o: $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_BRIDGE_DIR)/ainr_bridge.h $(STREAM_COMMON_DIR)/stream_mem.h | _cfg_guard
+	$(CC) $(CFLAGS) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
