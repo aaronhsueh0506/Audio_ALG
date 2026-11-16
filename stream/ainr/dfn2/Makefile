@@ -252,12 +252,11 @@ check-header-cxx: tests/cxx_consumer.cpp $(CORE_HEADERS) $(STREAM_HEADERS)
 test-variant-guard:
 	@$(MAKE) --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
 	@$(MAKE) --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
-	@full_info="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path print-cflags)"; \
-	lite_info="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path print-cflags)"; \
-	full_lib="$$(printf '%s\n' "$$full_info" | sed -n 1p)"; \
-	full_cflags="$$(printf '%s\n' "$$full_info" | sed -n 2p)"; \
-	lite_lib="$$(printf '%s\n' "$$lite_info" | sed -n 1p)"; \
-	lite_cflags="$$(printf '%s\n' "$$lite_info" | sed -n 2p)"; \
+	@full_lib="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
+	full_cflags="$$($(MAKE) -s --no-print-directory MASK_ONLY=0 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-cflags)"; \
+	lite_lib="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
+	lite_cflags="$$($(MAKE) -s --no-print-directory MASK_ONLY=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-cflags)"; \
+	test -n "$$full_lib" && test -n "$$lite_lib" || { echo "FAIL: print-lib-path returned nothing" >&2; exit 1; }; \
 	full_obj="$$(dirname "$$full_lib")"; lite_obj="$$(dirname "$$lite_lib")"; \
 	$(CC) $$full_cflags -c tests/variant_consumer.c -o "$$full_obj/variant_consumer_full.o" || exit 1; \
 	$(CC) $$lite_cflags -c tests/variant_consumer.c -o "$$lite_obj/variant_consumer_lite.o" || exit 1; \
