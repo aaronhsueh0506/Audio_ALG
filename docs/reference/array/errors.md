@@ -15,7 +15,7 @@
 | 正常 `aec_process_linear()` → `aec_process_residual()` | 兩者皆 `AEC_OK`(0) | 視圖有效至下一次 `aec_process_linear()`／`aec_reset()`／`aec_destroy()` |
 | 連續兩次 `aec_process_linear()`（不 residual） | 兩次皆 `AEC_OK` | 後一次取代待處理的前一幀，前一幀的視圖作廢。這是正常用法（STATE 陣列每 hop 都這樣） |
 | 建構或 `aec_reset()` 之後、尚未 `aec_process_linear()` 就 `aec_process_residual()` | `AEC_ERR_SEQUENCE`(−3) | 不變 |
-| `aec_process_linear()` 在接受引數後失敗（`AEC_ERR_DSP`），之後 `aec_process_residual()` | `AEC_ERR_SEQUENCE`(−3) | 陣列已被自動 `aec_reset()`；沒有可融合的幀 |
+| `aec_process_linear()` 在接受引數後失敗（`AEC_ERR_DSP`），之後 `aec_process_residual()` | `AEC_ERR_SEQUENCE`(−3) | 陣列已被自動 `aec_reset()`；沒有可融合的幀；`aec_get_residual()` 同樣回 `AEC_ERR_SEQUENCE`，直到下一個 hop |
 | `aec_process_linear()` 因非有限輸入回 `AEC_ERR_ARG`（引數檢查階段被拒） | `AEC_ERR_ARG`(−1) | 什麼都不改：上一個 hop 的視圖仍可讀，之後的 `aec_process_residual()` 照常處理上一個待處理的幀 |
 | `aec_process_residual()` 傳入全零 / 非有限的 weights | `AEC_ERR_ARG`(−1) | **linear 幀保留**，你可以修正 weights 後重試同一 hop |
 | STATE 陣列呼叫 `aec_process_residual()` | `AEC_ERR_MODE`(−2) | 不變（沒有融合緩衝） |
@@ -31,7 +31,7 @@
 | 1 | `a` 為 NULL、`mics` 或 `ref` 為 NULL；陣列已 destroy | `AEC_ERR_ARG`(−1) | 無 |
 | 2 | `mics`（`hop*4` 個）或 `ref`（`hop` 個）含非有限值 | `AEC_ERR_ARG`(−1) | 什麼都不改：耗時記錄、linear 有效旗標、上一個 hop 的視圖與自適應狀態（lane、estimator、ring）都保持原樣 |
 | 3 | 內部 render 對齊失敗（防禦性檢查：ring 的容量是 estimator 可回報的最大延遲加 hop，採用的延遲不會超出） | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
-| 4 | 某條 lane 的 linear 或殘餘階段拒絕（與單聲道相同的檢查：結果不是有限值，例如有限但極大的 mic／ref sample；`STATE` 也檢查），或其視圖綁定失敗 | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
+| 4 | 某條 lane 的 linear 或殘餘階段拒絕（與單聲道相同的檢查：結果不是有限值，例如有限但極大的 mic／ref sample；`STATE` 也檢查；門檻隨場景而變，量測：任一路 mic 約 1.9e19 起，ref 在 `STATE` 約 1.3e19 起、`ESTIMATE`／`FULL` 約 3e13 到 6e14 起，PCM16 輸入到不了；mic 的極大 sample 在帶它的那個 hop 被拒，ref 的則是經對齊環到達各 lane 時才被拒，晚數個 hop），或其視圖綁定失敗 | `AEC_ERR_DSP`(−4) | **陣列已被自動 reset** |
 
 `aec_process_linear()` **不會**檢查 buffer 長度 —— `hop*4` 與 `hop` 是你的責任。`aec_get_array()` 在沒有待處理的 linear 幀時回 `AEC_ERR_SEQUENCE`，`struct_size` 短於 `sizeof(AecArrayView)` 時回 `AEC_ERR_ARG`（`out` 保持原樣）。
 

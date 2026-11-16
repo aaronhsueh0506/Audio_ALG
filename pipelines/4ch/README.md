@@ -208,7 +208,7 @@ The Python twin has the same classes under `Mcab*` names: `McabConfig`, `McabPip
 `AecConfig`, stamps the contract onto it, and defaults to `mcab_lane_config()` (a PBFDKF lane with a 52 ms filter at
 16 kHz and 64 ms at 48 kHz; the C default lane is the balanced level). The Python grid is chosen by
 `McabConfig.frame_size` / `hop_size`, and the Python shared delay is always the MATCHED estimator.
-The Python `McabConfig` carries the grid, `capture_proxy_channel`, `max_delay_ms` (1024 ms; the C array has no such value, its ring is the estimator's reach plus one hop) and the backward-quarantine pair; it
+The Python `McabConfig` carries the grid, `capture_proxy_channel`, `max_delay_ms` (1024 ms, Python only) and the backward-quarantine pair; it
 has no `delay_mode`, `delay_num_filters`, `fixed_delay_samples`, `delay_est_period_s` or `enable_post` (C: `AecConfig.residual`). The matched-filter
 duty cycle is C-only and internal to the library: its tuning leaves it off (every hop is analysed) and `AecConfig` cannot set it. `tests/test_delay_parity.py` drives the C flow (`dump_delay_parity`) and
 `pipeline.py` from one synthetic scene and compares the applied delay, `solid`,

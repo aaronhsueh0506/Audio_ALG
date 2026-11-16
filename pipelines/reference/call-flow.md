@@ -312,6 +312,8 @@ array_sample_beam_fuse(b, &v);    /* aec_process_residual() with this hop's beam
 Neither the helper nor the application builds a RES: the array's gain stage (`AecConfig.residual = AEC_RESIDUAL_FULL`) computes the one `G_res`
 over the fused spectra and `aec_apply_gain()` applies it (`4ch_static.c` and `4ch_external_static.c` do).
 
+`aec_process_linear()` refuses a hop (`AEC_ERR_DSP`, array reset) when a lane's result is not finite: a microphone sample that is finite but huge is refused on the hop that carried it, a reference sample only when it reaches the lanes through the alignment ring, hops later. After a refused hop `aec_get_residual()` is `AEC_ERR_SEQUENCE` until the next hop.
+
 `aec_process_residual()` needs a linear frame processed since the last reset (otherwise
 `AEC_ERR_SEQUENCE`, nothing changed), refuses an all-zero or non-finite weight set
 (`AEC_ERR_ARG`, nothing changed) and an `AEC_RESIDUAL_STATE` array (`AEC_ERR_MODE`), and resets the array (lanes and
