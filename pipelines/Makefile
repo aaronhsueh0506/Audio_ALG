@@ -1369,7 +1369,7 @@ clean-libs: clean-all
 DFN_LEGAL_PAIRS := $(foreach m,0 1 2,$(foreach d,0 1 2 3 4,$(m)/$(d)))
 DFN_TEST_PAIRS ?= 0/0 0/1 2/0 2/4
 DFN_PAIR_TESTS := test_dfn_res_stage test_dfn_rate_bridge test_dfn_hop test_mono_dfn test_readme_flow
-DFN_PAIR_MEASURED := test_dfn_res_stage test_mono_dfn
+DFN_PAIR_MEASURED := test_dfn_res_stage test_dfn_hop test_mono_dfn
 .PHONY: test-pairs
 test-pairs:
 	$(if $(strip $(DFN_TEST_PAIRS)),,$(error DFN_TEST_PAIRS is empty: name at least one mask/df pair))

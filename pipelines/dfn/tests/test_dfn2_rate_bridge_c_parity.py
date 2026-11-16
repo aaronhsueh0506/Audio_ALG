@@ -27,39 +27,57 @@ from pipelines.dfn.tests.dfn2_pairs import C_PAIRS, SHIPPED, pair_config, pair_d
 
 DFN = ROOT / 'lib' / 'ainr' / 'dfn2'  # moved from AINR/DeepFilterNet2
 PIPELINES = ROOT / 'pipelines'
-BRIDGE = ROOT / 'stream' / 'ainr' / 'bridge'  # the bridge dfn_rate_bridge.c adapts
+BRIDGE = ROOT / 'stream' / 'ainr' / 'bridge'  # the bridge the hop's path drives
 STREAM_COMMON = ROOT / 'stream' / 'common'  # stream_run.h
+STREAM_DFN2 = ROOT / 'stream' / 'ainr' / 'dfn2'  # the model stream the hop drives
 
 _SHIM = r'''
+#include <stdlib.h>
 #include <string.h>
-#include "dfn/dfn_rate_bridge.h"
+#include "dfn/dfn_hop.h"
+#include "dfn/dfn_hop_pool.h"
 #include "dfn/tests/dfn_test_grid.h"
 
-/* The model grid is the test scaffolding's (dfn_test_grid.h): the pair comes from the -D overrides
- * the build gives, the rest is the shipped 48 kHz grid. */
-void *bridge_parity_create(int sample_rate, int fft_size, const float *fwd,
-                           const float *inv) {
-    DfnRateBridgeConfig cfg = dfn_rate_bridge_default_config(sample_rate, dfn_test_grid());
-    cfg.fft_size = fft_size;
-    cfg.stage.erb_fwd = fwd;
-    cfg.stage.erb_inv = inv;
-    return dfn_rate_bridge_create(&cfg);
+/* The C side is the DfnHop bridge path (stream/ainr/bridge's AinrBridge around dfn2_stream) with no
+ * model: every frame the identity, as the Python twin's IdentityHeads. The model grid is the test
+ * scaffolding's (dfn_test_grid.h): the pair comes from the -D overrides the build gives, the rest is
+ * the shipped 48 kHz grid. */
+typedef struct Shim { DfnHop hop; void *pool; int n_freqs; } Shim;
+
+void *bridge_parity_create(int sample_rate, int fft_size, const float *fwd, const float *inv) {
+    DfnHopPoolPlan plan;
+    Shim *s = (Shim *)calloc(1, sizeof(*s));
+    const int fft = fft_size ? fft_size : 256;   /* the host grid's default at 8 and 16 kHz */
+    if (!s) return NULL;
+    dfn_hop_pool_plan_init(&plan, dfn_test_grid());
+    plan.stream_cfg.erb_fwd = fwd;
+    plan.stream_cfg.erb_inv = inv;
+    if (dfn_hop_pool_plan(&plan, sample_rate, fft_size) != 0 || !plan.use_bridge) { free(s); return NULL; }
+    s->n_freqs = fft / 2 + 1;
+    s->pool = aligned_alloc(16, (dfn_hop_pool_bytes(&plan) + 15u) & ~(size_t)15u);
+    if (!s->pool) { free(s); return NULL; }
+    memset(s->pool, 0, dfn_hop_pool_bytes(&plan));
+    if (dfn_hop_pool_build(&plan, (unsigned char *)s->pool, s->n_freqs, fft / 2, 0, &s->hop) != 0) {
+        free(s->pool); free(s); return NULL;
+    }
+    return s;
 }
-void bridge_parity_destroy(void *b) { dfn_rate_bridge_destroy((DfnRateBridge *)b); }
-int bridge_parity_hop(void *b) { return dfn_rate_bridge_hop_size((DfnRateBridge *)b); }
+void bridge_parity_destroy(void *b) { Shim *s = (Shim *)b; if (s) { free(s->pool); free(s); } }
+int bridge_parity_hop(void *b) { return ainr_bridge_hop_size(((Shim *)b)->hop.bridge); }
 int bridge_parity_added_delay(void *b) {
-    return dfn_rate_bridge_added_delay_samples((DfnRateBridge *)b);
+    return ainr_bridge_added_delay_samples(((Shim *)b)->hop.bridge);
 }
 int bridge_parity_added_delay_exact(void *b, int *numerator, int *denominator) {
-    return dfn_rate_bridge_added_delay_exact((DfnRateBridge *)b, numerator, denominator);
+    return ainr_bridge_added_delay_exact(((Shim *)b)->hop.bridge, numerator, denominator);
 }
 int bridge_parity_reset_synthesis(void *b) {
-    return dfn_rate_bridge_reset_synthesis((DfnRateBridge *)b);
+    return ainr_bridge_reset_synthesis(((Shim *)b)->hop.bridge);
 }
 int bridge_parity_host_hops(void *b, float *estimate, float *apply) {
     const float *e, *p;
-    int hop = dfn_rate_bridge_hop_size((DfnRateBridge *)b);
-    if (dfn_rate_bridge_get_host_hops((DfnRateBridge *)b, &e, &p) != 0) return -1;
+    AinrBridge *br = ((Shim *)b)->hop.bridge;
+    int hop = ainr_bridge_hop_size(br);
+    if (ainr_bridge_get_host_hops(br, &e, &p) != 0) return -1;
     memcpy(estimate, e, (size_t)hop * sizeof(float));
     memcpy(apply, p, (size_t)hop * sizeof(float));
     return 0;
@@ -67,12 +85,13 @@ int bridge_parity_host_hops(void *b, float *estimate, float *apply) {
 int bridge_parity_process(void *b, const float *est_re, const float *est_im,
                           const float *app_re, const float *app_im, float *out) {
     Complex est[257], app[257];
-    int n = dfn_rate_bridge_n_freqs((DfnRateBridge *)b), k;
-    for (k = 0; k < n; ++k) {
+    Shim *s = (Shim *)b;
+    int k;
+    for (k = 0; k < s->n_freqs; ++k) {
         est[k].r = est_re[k]; est[k].i = est_im[k];
         app[k].r = app_re[k]; app[k].i = app_im[k];
     }
-    return dfn_rate_bridge_process((DfnRateBridge *)b, est, app, out);
+    return dfn_hop_process(&s->hop, est, app, out);
 }
 '''
 
@@ -94,12 +113,11 @@ def assets(pair, tmp_path_factory):
 def c_lib(pair, tmp_path_factory):
     lib = build_shim(
         tmp_path_factory.mktemp('dfn2_rate_bridge_c_parity'), 'shim', _SHIM,
-        extra_sources=[PIPELINES / 'dfn' / 'dfn_rate_bridge.c', BRIDGE / 'ainr_bridge.c',
-                       PIPELINES / 'dfn' / 'dfn_res_stage.c',
+        extra_sources=[BRIDGE / 'ainr_bridge.c', STREAM_DFN2 / 'dfn2_stream.c',
                        DFN / 'dfn2_process.c', DFN / 'dfn2_model_io.c',
                        DFN / 'dfn2_prepost.c'],
-        extra_includes=[PIPELINES, DFN, BRIDGE, STREAM_COMMON],
-        defines=['AUDIO_PIPELINE_BACKEND_STR="ne10"'] + pair_defines(pair))
+        extra_includes=[PIPELINES, DFN, BRIDGE, STREAM_DFN2, STREAM_COMMON],
+        defines=pair_defines(pair))
     fp = ctypes.POINTER(ctypes.c_float)
     lib.bridge_parity_create.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp]
     lib.bridge_parity_create.restype = ctypes.c_void_p
@@ -229,7 +247,7 @@ def test_an_impulse_lands_at_the_exact_added_delay(c_lib, assets, sample_rate, f
 
 @pytest.mark.parametrize('sample_rate,fft', [(16000, 256), (16000, 512), (8000, 256)])
 def test_the_synthesis_only_reset_matches_the_c_bridge(c_lib, assets, sample_rate, fft):
-    """dfn_rate_bridge_reset_synthesis() / Dfn2RateBridge.reset_synthesis() before hops 41 and 77: the native-grid
+    """ainr_bridge_reset_synthesis() / Dfn2RateBridge.reset_synthesis() before hops 41 and 77: the native-grid
     hops and the output agree to float round-off in both bridges, the clear lands on the hop it names (the host
     hops differ from the uncleared run there and nowhere else), and the Python bridge keeps its frame counters
     (the reset leaves DFN2, the resamplers and the FIFOs running)."""

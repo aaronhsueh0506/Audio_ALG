@@ -3,10 +3,9 @@
  * phased behaviours (run, fail, left open, never fetched), the sequence guards, the refusals of the
  * pool plan and reset.
  *
- * Two twins drive the same spectra with a model whose heads depend on the windows it is shown, bit
+ * A twin drives the same spectra with a model whose heads depend on the windows it is shown, bit
  * for bit: a hand-written recipe on a second dfn2_stream (plain scalar scaling, dfn2_stream_*_freq,
- * and for the bridge path ainr_bridge_* with an explicit frame loop), and the stage and the rate
- * bridge that the archive still ships (dfn_res_stage.h, dfn_rate_bridge.h), which the hop replaced.
+ * and for the bridge path ainr_bridge_* with an explicit frame loop).
  * The unit ERB partition makes every fail-open path an exact identity, so the four behaviours must
  * agree bit for bit; a half-mask model then shows that only the run behaviour commits. Build and
  * run: `make test` in pipelines/. */
@@ -18,8 +17,6 @@
 
 #include "dfn/dfn_hop.h"
 #include "dfn/dfn_hop_pool.h"
-#include "dfn/dfn_rate_bridge.h"
-#include "dfn/dfn_res_stage.h"
 #include "dfn/dfn_unit_partition.h"
 #include "dfn/tests/dfn_test_fixture.h"
 
@@ -221,76 +218,53 @@ static void twin_free(Twin* t) {
     t->pool = NULL;
 }
 
-/* --- twin 2: the stage and the rate bridge the archive still ships ------------------------------ */
-
-static DfnResStageConfig legacy_stage_config(DFN2Model model) {
-    DfnResStageConfig cfg = dfn_res_stage_default_config(dfn_test_grid());
-    cfg.erb_fwd = g_erb_fwd;
-    cfg.erb_inv = g_erb_inv;
-    cfg.model = model;
-    return cfg;
-}
-
 enum { SC_PLAIN, SC_ATTEN_START, SC_MODEL_FAIL, SC_UNWRITTEN, SC_RESET, SC_ATTEN_CHANGE, SC_COUNT };
 static const char* const SC_NAME[SC_COUNT] = { "plain", "attenuation limit 12 dB from the start",
     "model reports failure (3 frames)", "heads left unwritten (3 frames)", "reset at hop 20",
     "attenuation change at hop 20" };
 
-/* The hop under test against both twins over `hops` hops with the hash model (each context has its
+/* The hop under test against the twin over `hops` hops with the hash model (each context has its
  * own call counter) on one host grid and scenario. Returns the number of mismatching hops. */
 static int compare_with_twins(int host_rate, int fft, int scenario, int hops, int* energy_seen, int* first_nonzero) {
     const int bridge_mode = host_rate != DFN2_SR;
     Rig a;
     Twin t;
-    HashUser ua = {0, 0}, ut = {0, 0}, ul = {0, 0};
+    HashUser ua = {0, 0}, ut = {0, 0};
     Complex e[MAXB], p[MAXB], tmp[MAXB];
-    static float oa[MAXB], ot[MAXB], ol[MAXB];
+    static float oa[MAXB], ot[MAXB];
     int bad = 0, h, k;
-    DfnResStage* stage = NULL;
-    DfnRateBridge* bridge = NULL;
     AcIstft* istft_t = NULL;
-    AcIstft* istft_l = NULL;
     void* istft_mem_t = NULL;
-    void* istft_mem_l = NULL;
     AinrBridge* tb = NULL;
     void* tb_mem = NULL;
     DFN2Model mt;
-    DfnResStageConfig lcfg;
     AcStftConfig scfg;
     size_t isz;
 
-    if (scenario == SC_MODEL_FAIL) ua.fail_mode = ut.fail_mode = ul.fail_mode = 1;
-    if (scenario == SC_UNWRITTEN) ua.fail_mode = ut.fail_mode = ul.fail_mode = 2;
+    if (scenario == SC_MODEL_FAIL) ua.fail_mode = ut.fail_mode = 1;
+    if (scenario == SC_UNWRITTEN) ua.fail_mode = ut.fail_mode = 2;
     mt = model_of(hash_infer, &ut);
-    lcfg = legacy_stage_config(model_of(hash_infer, &ul));
     *energy_seen = 0;
     *first_nonzero = -1;
     if (rig_init_grid(&a, host_rate, fft, model_of(hash_infer, &ua)) != 0 || twin_init(&t) != 0) return 1000;
     if (bridge_mode) {
-        DfnRateBridgeConfig bc = dfn_rate_bridge_default_config(host_rate, dfn_test_grid());
         AinrBridgeConfig tc = ainr_bridge_default_config(host_rate, dfn_hop_lookahead_frames(dfn_test_grid()));
         AinrBridgeMemReq treq;
-        bc.fft_size = fft;
         tc.fft_size = fft;
-        bc.stage = lcfg;
-        bridge = dfn_rate_bridge_create(&bc);
-        if (!bridge || ainr_bridge_get_mem_requirements(&tc, &treq) != 0 ||
+        if (ainr_bridge_get_mem_requirements(&tc, &treq) != 0 ||
             aligned_alloc16(&tb_mem, (size_t)treq.bytes) != 0)
             return 1000;
         tb = ainr_bridge_init_ex(tb_mem, (size_t)treq.bytes, &tc, &treq);
         if (!tb) return 1000;
     } else {
-        stage = dfn_res_stage_create(&lcfg);
         ac_stft_config_default(&scfg, DFN2_N_FFT);
         isz = ac_istft_get_mem_size(&scfg);
-        if (!stage || aligned_alloc16(&istft_mem_t, isz) != 0 || aligned_alloc16(&istft_mem_l, isz) != 0) return 1000;
+        if (aligned_alloc16(&istft_mem_t, isz) != 0) return 1000;
         istft_t = ac_istft_init(istft_mem_t, isz, &scfg);
-        istft_l = ac_istft_init(istft_mem_l, isz, &scfg);
-        if (!istft_t || !istft_l) return 1000;
+        if (!istft_t) return 1000;
     }
     if (scenario == SC_ATTEN_START) {
-        if (dfn_hop_set_atten_lim(&a.h, 12.0f) != 0 || dfn2_stream_set_atten_lim(t.stream, 12.0f) != 0 ||
-            dfn_res_stage_set_atten_lim(bridge ? dfn_rate_bridge_stage(bridge) : stage, 12.0f) != 0)
+        if (dfn_hop_set_atten_lim(&a.h, 12.0f) != 0 || dfn2_stream_set_atten_lim(t.stream, 12.0f) != 0)
             return 1000;
     }
 
@@ -301,17 +275,16 @@ static int compare_with_twins(int host_rate, int fft, int scenario, int hops, in
         if (h == 20 && scenario == SC_RESET) {
             dfn_hop_reset(&a.h);
             dfn2_stream_reset(t.stream);
-            if (bridge_mode) { ainr_bridge_reset(tb); dfn_rate_bridge_reset(bridge); }
-            else { ac_istft_reset(istft_t); dfn_res_stage_reset(stage); ac_istft_reset(istft_l); }
+            if (bridge_mode) ainr_bridge_reset(tb);
+            else ac_istft_reset(istft_t);
         }
         if (h == 20 && scenario == SC_ATTEN_CHANGE) {
-            if (dfn_hop_set_atten_lim(&a.h, 9.0f) != 0 || dfn2_stream_set_atten_lim(t.stream, 9.0f) != 0 ||
-                dfn_res_stage_set_atten_lim(bridge ? dfn_rate_bridge_stage(bridge) : stage, 9.0f) != 0)
+            if (dfn_hop_set_atten_lim(&a.h, 9.0f) != 0 || dfn2_stream_set_atten_lim(t.stream, 9.0f) != 0)
                 bad_here = 1;
         }
         if (dfn_hop_process(&a.h, e, p, oa) != 0) bad_here = 1;
         if (bridge_mode) {
-            /* twin 1: bridge + stream with an explicit frame loop; twin 2: the shipped rate bridge */
+            /* the twin: bridge + stream with an explicit frame loop */
             AinrBridgeFrame f;
             int r;
             if (ainr_bridge_begin(tb, e, p) != 0) bad_here = 1;
@@ -320,15 +293,11 @@ static int compare_with_twins(int host_rate, int fft, int scenario, int hops, in
                 if (ainr_bridge_model_end(tb) != 0) bad_here = 1;
             }
             if (r < 0 || ainr_bridge_finish(tb, ot) != 0) bad_here = 1;
-            if (dfn_rate_bridge_process(bridge, e, p, ol) != 0) bad_here = 1;
         } else {
             if (twin_frame(&t, e, p, mt, tmp) != 0) bad_here = 1;
             (void)ac_istft_push(istft_t, tmp, ot);
-            if (dfn_res_stage_process(stage, e, p, tmp) < 0) bad_here = 1;
-            (void)ac_istft_push(istft_l, tmp, ol);
         }
         if (memcmp(oa, ot, (size_t)a.hop * sizeof(float)) != 0) bad_here = 1;
-        if (memcmp(oa, ol, (size_t)a.hop * sizeof(float)) != 0) bad_here = 1;
         for (k = 0; k < a.hop; ++k)
             if (oa[k] != 0.0f) {
                 *energy_seen = 1;
@@ -336,10 +305,8 @@ static int compare_with_twins(int host_rate, int fft, int scenario, int hops, in
             }
         bad += bad_here;
     }
-    if (ua.calls != ut.calls || ua.calls != ul.calls) ++bad;   /* every context ran the model equally often */
-    if (bridge) dfn_rate_bridge_destroy(bridge);
-    if (stage) dfn_res_stage_destroy(stage);
-    free(istft_mem_t); free(istft_mem_l); free(tb_mem);
+    if (ua.calls != ut.calls) ++bad;   /* both contexts ran the model equally often */
+    free(istft_mem_t); free(tb_mem);
     twin_free(&t);
     rig_free(&a);
     return bad;
@@ -399,13 +366,15 @@ static int run_behaviours(int bridge_mode, int (*infer)(void*, const DFN2Prepost
     return bad;
 }
 
+static int g_measured_latency = -1;   /* the first hop whose output carries signal, direct path, plain scenario (make test-pairs reads it) */
+
 static void test_path(int bridge_mode) {
     int bad_process, energy_seen, first_nonzero, h, k;
     const char* tag = bridge_mode ? "bridge" : "stage";
     char msg[112];
     Complex e[MAXB], p[MAXB];
 
-    /* dfn_hop_process against both twins, bit for bit, on a model that reads its windows: every host
+    /* dfn_hop_process against the twin, bit for bit, on a model that reads its windows: every host
      * grid of the path, every scenario */
     {
         static const int grids[4][2] = { { DFN2_SR, 0 }, { 16000, 256 }, { 16000, 512 }, { 8000, 256 } };
@@ -413,11 +382,12 @@ static void test_path(int bridge_mode) {
         for (g = bridge_mode ? 1 : 0; g < (bridge_mode ? 4 : 1); ++g)
             for (sc = 0; sc < SC_COUNT; ++sc) {
                 bad_process = compare_with_twins(grids[g][0], grids[g][1], sc, 60, &energy_seen, &first_nonzero);
-                snprintf(msg, sizeof msg, "%s %d Hz, %s: dfn_hop_process equals the stream recipe and the shipped stage / bridge bit for bit",
+                snprintf(msg, sizeof msg, "%s %d Hz, %s: dfn_hop_process equals the stream recipe bit for bit",
                          tag, grids[g][0], SC_NAME[sc]);
                 CHECK(bad_process == 0, msg);
                 CHECK(energy_seen, "the output carries signal");
                 /* the model's lookahead is silent: output hop f is the frame built L hops earlier */
+                if (!bridge_mode && sc == SC_PLAIN) g_measured_latency = first_nonzero;
                 CHECK(bridge_mode || sc == SC_RESET ||
                       first_nonzero == dfn_hop_lookahead_frames(dfn_test_grid()),
                       "direct path: the first lookahead hops are exactly zero, the next one carries signal");
@@ -657,7 +627,7 @@ static void test_model_hooks(void) {
         }
     }
 
-    /* the pool plan refuses what the shipped stage refused */
+    /* the pool plan refuses what a model stream cannot run */
     plan_for(&plan, model_of(counting_identity_infer, NULL));
     CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, 0) == 0, "plan: the shipped configuration");
     {   /* the plan's stream is a freq_only one: smaller than the stream with the PCM entries (the Twin's kind) */
@@ -802,8 +772,8 @@ int main(void) {
         printf("FAIL: model descriptor\n");
         return 1;
     }
-    dfn_test_report_pair("dfn_hop", -1);
     test_path(0);
+    dfn_test_report_pair("dfn_hop", g_measured_latency);
     if (DFN2_SR == 48000 && DFN2_N_FFT == 1024) test_path(1);
     else printf("dfn_hop: the test grid is not 48 kHz / 1024, so the bridge path (which needs it) is skipped\n");
     test_model_hooks();
