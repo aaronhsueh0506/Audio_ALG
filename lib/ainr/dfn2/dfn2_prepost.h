@@ -198,9 +198,13 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p, const float *est_re,
 int dfn2_prepost_frame_open(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs);
 
+/* Largest |value| of an erb_mask or coefs element that frame_finish() accepts (a sigmoid mask is at most 1). */
+#define DFN2_PREPOST_HEAD_LIMIT 1.0e6f
+
 /* Check the accelerator's output, then build the enhanced spectrum once per frame of the call (oldest
- * first); needs frame_open(). A non-finite head or registered state zeroes the registered tensors, advances
- * the generation, leaves the frame open and returns -1: call frame_bypass() or redo via frame_open(). */
+ * first); needs frame_open(). A non-finite head or state, or an erb_mask / coefs element beyond
+ * DFN2_PREPOST_HEAD_LIMIT, zeroes the registered tensors, advances the generation, leaves the frame open and
+ * returns -1: call frame_bypass() or redo via frame_open(). */
 int dfn2_prepost_frame_finish(DFN2Prepost *p);
 
 /* Give up on the open frame and pass the noisy spectrum through for every frame of the call (unit ERB mask,

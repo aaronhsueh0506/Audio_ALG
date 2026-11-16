@@ -2158,6 +2158,57 @@ static int case_txn(void) {
     return 0;
 }
 
+/* A finite head whose gain times the spectrum overflows is refused like a non-finite one: the mask and the
+ * deep-filter coefficients are bounded by DFN2_PREPOST_HEAD_LIMIT (a sigmoid mask and the filter taps never come
+ * near it), so the enhanced spectrum is finite whatever the accelerator wrote. */
+static int case_huge_head(void) {
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *p;
+    void *pool;
+    int tensor, k;
+    static float hop_scratch[DFN2_HOP_LEN];
+    const float values[3] = {3.0e38f, 2.0f * DFN2_PREPOST_HEAD_LIMIT, DFN2_PREPOST_HEAD_LIMIT};
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool != NULL);
+    for (tensor = 0; tensor < 2; ++tensor) {         /* 0: erb_mask, 1: coefs */
+        for (k = 0; k < 3; ++k) {
+            DFN2PrepostInputs inputs;
+            DFN2PrepostOutputs outputs;
+            size_t count = 0;
+            unsigned gen;
+            float *target;
+            p = start(pool, (size_t)req.bytes, &cfg);
+            CHECK(p != NULL);
+            CHECK(open_first_frame_time(p) >= 0);
+            CHECK(dfn2_prepost_frame_open(p, &inputs, &outputs) == 0);
+            fake_run(&inputs, &outputs);
+            target = output_tensor(&outputs, tensor, &count);
+            target[count / 2u] = values[k];
+            gen = dfn2_prepost_state_generation(p);
+            if (k < 2) {                              /* over the bound: refused, the state restarts */
+                CHECK(dfn2_prepost_frame_finish(p) == -1);
+                CHECK(dfn2_prepost_state_generation(p) == gen + 1u);
+                CHECK(dfn2_prepost_frame_bypass(p) == 0);
+            } else {                                  /* exactly at the bound: accepted */
+                CHECK(dfn2_prepost_frame_finish(p) == 0);
+            }
+            CHECK(tpost(p, hop_scratch, NULL) == 0);
+            {
+                int i, finite = 1;
+                for (i = 0; i < DFN2_HOP_LEN; ++i) if (!isfinite(hop_scratch[i])) finite = 0;
+                CHECK(finite);
+            }
+        }
+    }
+    printf("huge_head: erb_mask and coefs, 3 values each\n");
+    free(pool);
+    return 0;
+}
+
 /* ---------------------------------------------------------------------- */
 
 /* The recurrent state is ONE buffer per tensor: the input view and the
@@ -2760,6 +2811,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard();
     else if (strcmp(argv[1], "txn") == 0)       status = case_txn();
+    else if (strcmp(argv[1], "huge_head") == 0) status = case_huge_head();
     else if (strcmp(argv[1], "dual_identity") == 0) status = case_dual_identity();
     else if (strcmp(argv[1], "dual_split") == 0)    status = case_dual_split();
     else if (strcmp(argv[1], "dual_guards") == 0)   status = case_dual_guards();
@@ -2939,6 +2991,13 @@ def test_failed_commit_zeroes_the_state_and_leaves_the_frame_open(driver):
     one that committed it and from one that skipped without zeroing. Swept
     over all five output tensors at three indices."""
     assert 'txn:' in _run(driver, 'txn')
+
+
+def test_a_finite_head_beyond_the_bound_is_refused_like_a_non_finite_one(driver):
+    """An erb_mask or coefs element above DFN2_PREPOST_HEAD_LIMIT (3e38 and twice the limit) refuses the commit,
+    restarts the state and leaves the frame open for the bypass; a value exactly at the limit commits; the hop's
+    output is finite in every case."""
+    assert 'huge_head:' in _run(driver, 'huge_head')
 
 
 def test_dual_entry_with_one_spectrum_is_the_single_entry(driver):

@@ -530,7 +530,7 @@ static void test_path(int bridge_mode) {
     }
 }
 
-/* Writes a finite but enormous mask: the heads pass the finite check, the applied spectrum overflows. */
+/* Writes a finite mask far beyond DFN2_PREPOST_HEAD_LIMIT: frame_finish refuses it, so the hop takes the identity. */
 static int huge_mask_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
     size_t i;
     (void)user;
@@ -541,7 +541,8 @@ static int huge_mask_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostO
     return 0;
 }
 
-/* check_finite: a non-finite output is refused at the end of the hop, and only when asked for. */
+/* An enormous finite head never reaches the output, with or without check_finite: the library refuses the commit
+ * (state restarted, generation advanced), the hop takes the identity and every output stays finite. */
 static void test_check_finite(void) {
     int pass;
     for (pass = 0; pass < 2; ++pass) {
@@ -549,10 +550,12 @@ static void test_check_finite(void) {
         Complex e[MAXB], p[MAXB];
         float out[MAXB];
         int h, k, refused = 0, inf_seen = 0;
+        unsigned gen0;
         g_build_check_finite = pass;   /* through the pool build, as the 4-channel example asks for it */
         CHECK(rig_init(&r, 0, model_of(huge_mask_infer, NULL)) == 0, "finite rig");
         g_build_check_finite = 0;
         CHECK(r.h.check_finite == pass, "the pool build hands check_finite to the hop");
+        gen0 = dfn_hop_state_generation(&r.h);
         g_lcg = 11u;
         for (h = 0; h < 12; ++h) {
             make_frame(e, p, r.n);
@@ -560,8 +563,8 @@ static void test_check_finite(void) {
             if (dfn_hop_process(&r.h, e, p, out) != 0) ++refused;
             else for (k = 0; k < r.hop; ++k) if (!isfinite(out[k])) inf_seen = 1;
         }
-        if (pass) CHECK(refused > 0, "check_finite: an overflowing output is refused");
-        else CHECK(refused == 0 && inf_seen, "without check_finite the overflow reaches the output (the control for the row above)");
+        CHECK(refused == 0 && !inf_seen, "an enormous finite mask is refused by the library: the output is finite");
+        CHECK(dfn_hop_state_generation(&r.h) > gen0, "each refused commit advances the state generation");
         rig_free(&r);
     }
 }

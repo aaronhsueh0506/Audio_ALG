@@ -12,14 +12,14 @@
  * except that the first grid.mask_lookahead hops after a start need no model frame (begin returns 0, the
  * model does not run): the audio is that of a stream whose model starts at its first real frame.
  *
- * Fail-open: no model (model.infer == NULL), a nonzero run status, or an unwritten/non-finite
- * output takes the frame as an identity through the cascade (clocks advance either way); the
+ * Fail-open: no model (model.infer == NULL), a nonzero run status, or an unwritten/non-finite/over-limit
+ * output (DFN2_PREPOST_HEAD_LIMIT) takes the frame as an identity through the cascade (clocks advance either way); the
  * output is P delayed by L hops. Run status (stream_run.h): 0 = every head written;
  * STREAM_RUN_NOT_STARTED = the device state was not touched (no model, or a callback that ran nothing); any other
  * value = it may be dirty. The library advances the state generation whenever the device state may no longer be
  * the one to continue from (reset, refused commit, a dirty status, a model restart). Before a run, zero the
- * accelerator's state when the generation differs from the value at the last zeroing. An unwritten/non-finite
- * output is a refused commit (frame_finish()'s own finite check).
+ * accelerator's state when the generation differs from the value at the last zeroing. An unwritten/non-finite/over-limit
+ * output is a refused commit (frame_finish()'s own check).
  *
  * Reset: whole-pipeline resets only; an AEC delay change must not reset the stage. Grid: the
  * DFN2Grid in the config (dfn2_grid_make(); the shipped one is 48 kHz / 1024 / 512, hop 512, 513

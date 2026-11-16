@@ -92,7 +92,7 @@ Specific to this one:
   `df_convp_window_next`) to the same address as its input and the output of one invocation is the input of the next with no copy;
   it must read all state inputs before it writes any state output. A board registers nothing (NULL and 0 in the views): its
   accelerator holds the state;
-- a commit that finds a non-finite head or state value zeroes the registered tensors, advances the state generation and returns -1
+- a commit that finds a non-finite head or state value, or an `erb_mask` / `coefs` element beyond `DFN2_PREPOST_HEAD_LIMIT` (1e6; a sigmoid mask is at most 1), zeroes the registered tensors, advances the state generation and returns -1
   with the frame still open; `dfn2_prepost_frame_bypass()` then passes the noisy spectrum through;
 - a run that did not succeed closes the frame with `dfn2_prepost_frame_fail(p, run_started)`: the same noisy-spectrum output as
   `frame_bypass()`; `run_started != 0` (the accelerator may have rewritten its state) zeroes the registered tensors and advances the

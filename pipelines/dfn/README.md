@@ -38,7 +38,7 @@ the host rate, the model grid in `DfnHopPoolPlan.stream_cfg.grid`); the hop's co
 `DfnHop` takes audio-scale spectra and applies those two scales itself (the model stream works at model scale), so the caller's `AcStft` / `AcIstft`
 keep audiolib's default `spec_scale` / `ispec_scale` of 1. Nothing here registers recurrent state: a float model callback owns it, a
 board's accelerator holds it and reloads quantized zeros at start and whenever `job.state_generation`
-(`dfn_hop_state_generation()`, the stream's `dfn2_stream_state_generation()`) changes. A reset, a refused commit (a non-finite head) and a run status that is neither 0 nor
+(`dfn_hop_state_generation()`, the stream's `dfn2_stream_state_generation()`) changes. A reset, a refused commit (a non-finite head, or a mask or coefficient beyond `DFN2_PREPOST_HEAD_LIMIT`) and a run status that is neither 0 nor
 `STREAM_RUN_NOT_STARTED` (`stream/common/stream_run.h`; a started run that failed, `STREAM_RUN_FAILED` or any other nonzero value)
 advance it; no model and `STREAM_RUN_NOT_STARTED` (the callback ran nothing) do not. A frame the caller leaves open reports `STREAM_RUN_FAILED`, a frame never
 fetched `STREAM_RUN_NOT_STARTED`. A block with a non-finite bin, or one beyond 2^63 at model scale, is refused whole (`DFN_HOP_INVALID`) and leaves the model state untouched. Every hop runs begin, model, end, except that the first M hops (`grid.mask_lookahead`) after a start or reset need no model frame (`dfn_hop_nn_begin()` returns 0 and the model does not run), so the audio is that of a model started at its first real frame.

@@ -77,12 +77,12 @@
 | `PL` pipelines（mono、DFN、4ch、ULCNet 範例）與其 Python 參考 | 279 | 54 | 34 | 20 | 225 | 0 | 55 | 18 |
 | `TP` audiolib (doa/bf/VAD/common/utility) | 61 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
 | `AC` audiolib | 292 | 39 | 19 | 20 | 253 | 0 | 0 | 12 |
-| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 146 | 49 | 25 | 24 | 97 | 0 | 2 | 17 |
+| `AINR` AINR（DFN2、GTCRN、RNNoise-ERB） | 147 | 49 | 25 | 24 | 98 | 0 | 2 | 17 |
 | `AIAEC` AIAEC（Align-ULCNet、DeepVQE-S、共用 helper） | 98 | 35 | 14 | 21 | 63 | 0 | 0 | 15 |
-| `TOTAL` 合計 | 876 | 177 | 92 | 85 | 699 | 0 | 57 | 62 |
+| `TOTAL` 合計 | 877 | 177 | 92 | 85 | 700 | 0 | 57 | 62 |
 <!-- map:stats:end -->
 
-讀法：876 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；699 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
+讀法：877 個 C 函式中，177 個有 Python 對應（mirror 92、partial 85），其中 62 個的配對是推論；700 個是 C-only；未能判斷 0 個。另有 57 個 Python 符號只在 Python。
 
 「已對應」是**索引**，不是「已驗證一致」。真正量過數值的只有「對拍工具／測試」欄標（C↔Py）的項目，以及備註內註明為一次性量測的數字；其餘靠「已知落差」欄的編號。
 
@@ -162,7 +162,7 @@
 | `audiolib/common/src/hpf.c` | all | 8 |
 | `lib/ainr/dfn2/dfn2_model_io.c` | all | 18 |
 | `lib/ainr/dfn2/dfn2_model_io_priv.h` | all | 1 |
-| `lib/ainr/dfn2/dfn2_prepost.c` | all | 36 |
+| `lib/ainr/dfn2/dfn2_prepost.c` | all | 37 |
 | `lib/ainr/dfn2/dfn2_prepost.h` | all | 6 |
 | `lib/ainr/dfn2/dfn2_process.c` | all | 24 |
 | `lib/ainr/gtcrn/gtcrn_process.c` | all | 29 |
@@ -324,7 +324,7 @@
 | AINR-DFN2-19 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_prepost_output_frame_index` | `pipelines/dfn/dfn2_stage.py:StageOutput.frame_index` | partial | — | — | （推論）C 是存取函式，Python 把來源 frame 序號放在 `StageOutput.frame_index`。 |
 | AINR-DFN2-20 | `lib/ainr/dfn2/dfn2_prepost.h: dfn2_prepost_latency_frames` | `pipelines/dfn/dfn2_stage.py:MODEL_LOOKAHEAD` | partial | — | — | （推論）C 是 grid 的 inline 函式，Python 是常數。N 個 frame 每次 invocation 時 C 回 M+D+N-1（`dfn2_prepost_latency_frames(grid)`，標頭內的 inline 函式，取 grid 的兩個 lookahead 與 `frames_per_call`），`dfn2_stage.py` 的 `MODEL_LOOKAHEAD` 仍是 M+D，因為 pipelines 固定 N=1。 |
 | AINR-DFN2-23 | `lib/ainr/dfn2/dfn2_prepost.c: dfn2_model_run_frame` | `pipelines/dfn/dfn2_stage.py:Dfn2Heads.__call__` | partial | — | — | （推論）加速器 callback 邊界；Python 端是 heads 可呼叫物件。 |
-| AINR-DFN2-25 | `lib/ainr/dfn2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_grid, pp_all_finite, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查（含已註冊遞迴狀態的全有或全無）、build hash（折入整個 grid：lookahead pair、frames_per_call、兩個 alpha、兩組正規化器設定，加變體與版本）、生命週期、存取函式（`dfn2_prepost_grid()` 回傳實例持有的 grid）。 |
+| AINR-DFN2-25 | `lib/ainr/dfn2/dfn2_prepost.c: pp_carve, pp_fnv1a_u32, pp_fnv1a_str, pp_build_hash, pp_layout, dfn2_prepost_config_defaults, pp_check_config, dfn2_prepost_get_mem_size, pp_reset_states, pp_clear_frame, pp_zero_staging, dfn2_prepost_init_ex, dfn2_prepost_init, dfn2_prepost_create, dfn2_prepost_destroy, dfn2_prepost_state_generation, dfn2_prepost_grid, pp_all_finite, pp_all_within, pp_fill_nan` | — | C-only | T-14 | — | 記憶體池佈局、設定檢查（含已註冊遞迴狀態的全有或全無）、build hash（折入整個 grid：lookahead pair、frames_per_call、兩個 alpha、兩組正規化器設定，加變體與版本）、生命週期、存取函式（`dfn2_prepost_grid()` 回傳實例持有的 grid）。 |
 | AINR-DFN2-26 | `lib/ainr/dfn2/dfn2_model_io.c: dfn2_model_io_frame_slot`<br>`lib/ainr/dfn2/dfn2_prepost.c: pp_input_slot, pp_deliver_slot, pp_deliver` | `AINR/DeepFilterNet2/export_onnx.py:feature_chunk_windows` | partial | — | `AINR/tests/test_dfn2_frames_per_call_c.py`（C 對 C） | （推論）每次 invocation N 個 frame：最後一個推入 frame 完成的是第幾個 head（`index % N`）、輸入視窗與輸出 head 的槽位，以及一次 `frame_finish` 後把 N 個 frame 依序合成並逐 hop 交出；Python 側只有匯出端的 N+2 視窗切法，沒有 host 孿生（`dfn2_stage.py` 固定 N=1）。N=1 時槽位恆為 0。 |
 | AINR-DFN2-27 | `lib/ainr/dfn2/dfn2_process.c: dfn2_norm_alpha` | `AINR/DeepFilterNet2/train.py:make_norm_alpha` | mirror | — | `AINR/tests/test_dfn2_grid.py`（C↔Py） | 兩個 EMA 係數 = exp(−(hop／sr)／tau) 取三位小數、進位到 1.0 就多一位。C 以 `fma` 對確切的二進位值取捨並平手取偶數，重現 Python `round()`（輔助函式 `round_decimals`，Python 內建函式，表中無對應符號）。tau 取自 grid 的 `erb_norm_tau_sec`／`spec_norm_tau_sec`（出貨模型為 1.0 s）。 |
 | AINR-DFN2-28 | `lib/ainr/dfn2/dfn2_process.c: dfn2_grid_make, dfn2_grid_validate` | `AINR/DeepFilterNet2/train.py:validate_signal_config`<br>`AINR/DeepFilterNet2/train.py:analysis_scale` | partial | — | `AINR/tests/test_dfn2_grid.py`（C↔Py） | （推論）由 `DFN2GridSpec` 的 8 個欄位（sample_rate、n_fft、n_erb、df_bins、df_order、兩個 lookahead、frames_per_call；正規化器設定已改為 `dfn2_grid.h` 內的固定常數）推導 hop、bins、ring 與兩個 alpha，並拒絕非法 grid。Python 的 `validate_signal_config` 檢查同一批規則（n_erb 為 4 的倍數、df_bins 範圍、lookahead 範圍），但 `win_len`／`hop_len` 可另設；C 固定 hop = n_fft／2，另外只有 C 檢查 n_fft 是否為 audiolib 接受的大小、2·n_erb ≤ n_bins、df_order 與 frames_per_call 的範圍、兩個 alpha 嚴格落在 (0, 1)，以及推導欄位一致性。`analysis_scale` = 1／√n_fft 對應 `dfn2_stft_scale(n_fft)`（應用端 AcStft 的 `spec_scale`；`dfn2_stft_unscale(n_fft)` 給 AcIstft 的 `ispec_scale`）。 |
