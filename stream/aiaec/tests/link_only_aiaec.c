@@ -1,7 +1,8 @@
 /* Only includes aiaec.h and links against the already-built libaiaec.a plus the model stream
  * archives (never recompiling any core/stream source) -- confirms the shipped archive actually
- * exports the customer entry points and constructs its delivered rows. The archive's product is
- * the default binding (DeepVQE-S in a build that contains both models). */
+ * exports the customer entry points, constructs one delivered row (DeepVQE-S 16k/256 N=1) and
+ * size-checks the 16k/512 row. The archive's product is the default binding (DeepVQE-S in a
+ * build that contains both models). */
 
 #include <stdint.h>
 #include <stdio.h>
