@@ -107,7 +107,7 @@ aec_get_linear(aec, &amp;lctx);           /* lctx.delay_state    ← 對齊事�
 <p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——應用自己用兩個 <code>AcStft</code>(<code>center</code> 0,<code>ac_stft_push_planar()</code>,rolling,不是 centered)分析 <code>formed_hop</code> 與原始 ref,再交給 <code>ulcnet_stream_pre_process_freq()</code>,AEC 的 <code>error_spec</code> 完全不用。4ch<b>不做 error 分析</b>:<code>beam.spectrum</code> 拆成平面後直接當 error 頻譜,只有 far 走應用自己的 <code>AcStft</code>。頻譜進出口不做任何 STFT／ISTFT。</p>
 <h3>邊界偵測與 reprime</h3>
 <pre>/* ulcnet_stream.c 的 apply_alignment_edge(): changed = (delay_state == AEC_LINEAR_DELAY_CHANGED); solid = (delay_state != UNLOCKED) */
-if (delay.changed || (s->had_hop && !s->prev_solid && delay.solid)) {   /* 無 generation 事件的模式: 首次轉為可用也算邊界 */
+if (delay.changed || (!s->prev_solid && delay.solid)) {   /* 無 generation 事件的模式: 首次轉為可用也算邊界 */
     ulcnet_stream_reset(s);                                 /* state generation +1: 通知 NN 丟棄跨 frame 狀態 */
     s->reprime_remaining = ULCNET_STREAM_REPRIME_FRAMES;    /* mono=1, 4ch=1: 同一個常數 */
 }</pre>
