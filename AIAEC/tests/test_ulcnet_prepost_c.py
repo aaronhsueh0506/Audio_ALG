@@ -7,8 +7,9 @@ object, so the gate is that the class reproduces the hand-composed path SAMPLE
 FOR SAMPLE: every comparison is ``memcmp`` on fp32, never a tolerance. The
 framing is built from audiolib directly (sqrt-Hann, center 0, hop = n_fft / 2)
 with envelope-normalised synthesis; the application's contract is
-AC_OLA_ACCUMULATE. Both paths use the same synthesis, so the mode cannot
-change the verdict. The state is the
+AC_OLA_ACCUMULATE. Both paths use the same synthesis, but the hop-0 checks
+(nothing is written on hop 0) hold only for the envelope-normalised mode, so
+the mode is part of the verdict. The state is the
 application's too: the driver is a float host that owns four NaN-filled
 buffers per instance and registers them.
 
@@ -274,8 +275,8 @@ static HopSpectra specs[HOPS];
 static HopOut outs_a[HOPS], outs_b[HOPS];
 
 /* Test framing from audiolib: sqrt-Hann, center 0, hop = n_fft / 2, unnormalised spectra, AC_OLA_ENV_NORM
- * synthesis (hop 0 emits nothing; the checks below expect it). The contract (ulcnet_prepost.h) is
- * AC_OLA_ACCUMULATE; both paths use the same synthesis, so the mode cannot change the verdict. */
+ * synthesis (hop 0 emits nothing; the hop-0 checks below expect it, so the mode is part of the verdict). The contract
+ * (ulcnet_prepost.h) is AC_OLA_ACCUMULATE, which writes a full hop on hop 0. */
 typedef struct Framing {
     AcStft *error, *far;
     AcIstft *synthesis;

@@ -87,9 +87,8 @@ void ulcnet_prepost_destroy(UlcnetPrepost *p);
  * Every pointer, the registration, the config and the pool stay; NULL is ignored. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
 
-/* Counter of state restarts: advances on reset, when frame_finish() refused a frame and in the frame_fail() cases,
- * registered or not; 0 for a fresh instance or NULL. A fixed-point accelerator loads quantized zeros at start and on every
- * change. */
+/* Counter of state restarts (registered state or not): advances on reset, a refused frame_finish() and the frame_fail()
+ * cases; 0 for a fresh instance or NULL. A fixed-point accelerator reloads quantized zeros when it changes. */
 uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 /* Built from the config's grid and layout; the five interior fields are 0. */
@@ -130,10 +129,9 @@ int ulcnet_prepost_frame_finish(UlcnetPrepost *p);
  * if no frame is open. */
 int ulcnet_prepost_frame_bypass(UlcnetPrepost *p);
 
-/* Closes the open frame after a run that did not succeed, with the frame_bypass() output. run_started != 0: the run may
- * have touched the accelerator's state, so the registered state is zeroed and the generation advances. run_started == 0:
- * only a frame_open()ed packet with an event frame restarts the model (generation +1), the restart its graph would have
- * applied. Not for a frame whose frame_finish() was refused. Returns 0, or -1 if no frame is open. */
+/* Closes the open frame as frame_bypass() does, after a run that did not succeed. run_started != 0: the registered state
+ * is zeroed and the generation advances; 0: only a packet with an event frame advances it (+1, as its graph restarts).
+ * Not for a frame whose frame_finish() was refused. Returns 0, or -1 if no frame is open. */
 int ulcnet_prepost_frame_fail(UlcnetPrepost *p, int run_started);
 
 /* The enhanced spectrum (n_bins bins; a packet: N * n_bins) of the frame just finished or bypassed. Returns 0, or -1. */

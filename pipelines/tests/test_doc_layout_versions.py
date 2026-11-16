@@ -12,7 +12,8 @@ descriptor 的 ``bytes`` 只是下界，擋得住成長、擋不住等量的語�
 只檢查**具名巨集**的宣稱（``AEC_LAYOUT_VERSION = N``）。文件裡另有
 「layout vN 起新增…」這類**沿革**敘述不是在陳述目前值，刻意不納入；
 AIAEC 兩個 C 類別的版號（``ULCNET_MODEL_IO_LAYOUT_VERSION``、
-``DEEPVQE_PREPOST_LAYOUT_VERSION``）以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
+``DEEPVQE_PREPOST_LAYOUT_VERSION``）與 Align-ULCNet 模型串流的
+``ULCNET_STREAM_LAYOUT_VERSION`` 以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
 """
 
 import os
@@ -41,6 +42,8 @@ _SOURCES = {
         'lib/aiaec/ulcnet/ulcnet_model_io.h',
     'DEEPVQE_PREPOST_LAYOUT_VERSION':
         'lib/aiaec/deepvqe_s/deepvqe_prepost.h',
+    'ULCNET_STREAM_LAYOUT_VERSION':
+        'stream/aiaec/ulcnet/ulcnet_stream.h',
 }
 
 _AEC_SOURCES = {
@@ -68,7 +71,7 @@ def _declared_version(macro: str) -> int:
     source = (_aec_include() / _AEC_SOURCES[macro] if macro in _AEC_SOURCES
               else _REPO / _SOURCES[macro])
     text = source.read_text(encoding='utf-8')
-    match = re.search(r'^#define\s+%s\s+(\d+)u?\s*$' % re.escape(macro),
+    match = re.search(r'^#define\s+%s\s+(\d+)u?\s*(?:/\*.*\*/\s*)?$' % re.escape(macro),
                       text, re.MULTILINE)
     assert match is not None, (
         '%s 沒有在 %s 找到 #define；巨集被改名或搬家了，'

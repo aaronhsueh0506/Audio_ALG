@@ -151,7 +151,7 @@ ac_istft_push_planar(istft, out_re, out_im, out);   /* 應用端合成剛好一�
 <tr><th>函式庫物件</th><th>目前版本</th></tr>
 <tr><td><code>Aec</code>(單支與 4ch array;<code>AecMemReq</code>,涵蓋整個 pool)</td><td><code>AEC_LAYOUT_VERSION</code> = 4</td></tr>
 <tr><td>DFN2 stage／rate bridge</td><td><code>DFN_RES_STAGE_LAYOUT_VERSION</code> = 6、<code>DFN_RATE_BRIDGE_LAYOUT_VERSION</code> = 7</td></tr>
-<tr><td>Align-ULCNet 模型串流(<code>UlcnetStreamMemReq</code>)</td><td><code>ULCNET_STREAM_LAYOUT_VERSION</code>(<code>stream/aiaec/ulcnet/ulcnet_stream.h</code>)</td></tr>
+<tr><td>Align-ULCNet 模型串流(<code>UlcnetStreamMemReq</code>)</td><td><code>ULCNET_STREAM_LAYOUT_VERSION</code> = 5(<code>stream/aiaec/ulcnet/ulcnet_stream.h</code>)</td></tr>
 <tr><td><code>AnrDenoiser</code>、<code>AcIstft</code>、<code>DfnHop</code>、4ch helper</td><td>沒有 descriptor、沒有 layout version(函式庫物件只提供大小查詢;hop／helper 為範例碼)</td></tr>
 </table></div>
 <p class="small">規則:pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一。</p>

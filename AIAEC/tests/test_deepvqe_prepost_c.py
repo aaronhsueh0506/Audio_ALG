@@ -7,8 +7,9 @@ every numeric comparison is ``memcmp`` on fp32, and every "identical" claim is
 paired with a "not trivially identical" one so no gate passes on silence. The
 framing is built from audiolib directly (sqrt-Hann, center 0, hop = n_fft / 2)
 with envelope-normalised synthesis; the application's contract is
-AC_OLA_ACCUMULATE. Both paths use the same synthesis, so the mode cannot
-change the verdict. The recurrent state is the
+AC_OLA_ACCUMULATE. Both paths use the same synthesis, but the hop-0 checks
+(nothing is written on hop 0) hold only for the envelope-normalised mode, so
+the mode is part of the verdict. The recurrent state is the
 application's too: the driver is a float host that owns the sixteen NaN-filled
 buffers of every instance and registers them; the state shapes are a table of
 the driver (the library knows none), pinned to the exported graph below.

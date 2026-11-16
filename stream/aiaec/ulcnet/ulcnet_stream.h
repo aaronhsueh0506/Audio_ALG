@@ -113,20 +113,19 @@ int ulcnet_stream_pre_process_f32(UlcnetStream *s, const float *err_in, const fl
 int ulcnet_stream_pre_process(UlcnetStream *s, const int16_t *err_in, const int16_t *far_in,
                               UlcnetStreamDelay delay, UlcnetHopIO *io);
 
-/* Closes the hop: ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail OPEN); a
- * reprime hop is already bypassed. pcm_out is a full hop (return 1), an alignment-event hop included (its frame is the
- * error spectrum). -1 with zeros on a post_process_freq() error. Once per pre_process. A freq_only stream: -1, pcm_out
- * untouched and the hop still open (post_process_freq() closes it). */
+/* Once per pre_process. ai_rc is read only if pre_process returned 1 (STREAM_RUN_OK commits, anything else bypasses, fail
+ * OPEN). pcm_out is a full hop (return 1), a reprime or alignment-event hop included (its frame is the error spectrum).
+ * -1 with zeros on a post_process_freq() error; a freq_only stream: -1, pcm_out untouched, hop still open. */
 int ulcnet_stream_post_process(UlcnetStream *s, int ai_rc, int16_t *pcm_out);
 
-/* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then the job; the PCM equals N
- * one-hop calls, event hops included. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a call before the
- * matching post). */
+/* N hops of full-scale float err_in and far_in (N * hop samples each), analysed hop by hop, then one job; the PCM equals N
+ * one-hop calls, event hops included. Returns 1, or -1 on a contract error (NULL args, a one-hop or freq_only stream, a
+ * call before the matching post). */
 int ulcnet_stream_pre_process_packet_f32(UlcnetStream *s, const float *err_in, const float *far_in,
                                          const UlcnetStreamDelay *delay, UlcnetHopIO *io);
 
-/* As the f32 packet entry with the N hops' spectra supplied (frame-major, N * n_bins per plane, the stream's scale), for
- * either kind of stream. ulcnet_stream_reset() restarts everything, generation included. */
+/* As the f32 packet entry with the N hops' spectra supplied (frame-major, N * n_bins per plane, the stream's scale), on
+ * either kind of stream. */
 int ulcnet_stream_pre_process_packet_freq(UlcnetStream *s, const float *err_re, const float *err_im,
                                           const float *far_re, const float *far_im,
                                           const UlcnetStreamDelay *delay, UlcnetHopIO *io);

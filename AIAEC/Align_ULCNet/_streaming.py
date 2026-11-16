@@ -211,7 +211,7 @@ def main(args, load_model_fn=None):
     # reset only at the frames --events marks (the C stage's alignment edge,
     # alignment_events.EdgeTracker); the Python PBFDKF has no event accessor, so
     # without --events it runs continuously (README, "C/Python inference
-    # parity"; function map D-44).
+    # parity").
     for start in range(0, length, grid.hop_len):
         stop = min(start + grid.hop_len, length)
         primary_hop = primary[:, start:stop]

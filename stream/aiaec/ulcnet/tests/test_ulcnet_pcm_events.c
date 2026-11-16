@@ -213,8 +213,8 @@ static void run_grid(int sample_rate, int n_fft) {
           "%d Hz: the N = 8 packet differs from the one-hop stream through the events", sample_rate);
     CHECK(f_pkt.jobs == HOPS / NF, "%d Hz: %ld packet jobs", sample_rate, f_pkt.jobs);
 
-    /* An event hop carries signal (it used to be exactly zero). Hop #0 is the start of the stream, whose analysis has no
-     * history either way, so it is left out of the count. */
+    /* An event hop carries signal. Hop #0 is the start of the stream, whose analysis has no history, so it is left out
+     * of the count. */
     for (h = 1, i = 0; h < HOPS; ++h) {
         if (is_edge_hop(h)) {
             const long long e = energy(pcm_f32 + (size_t)h * g.hop, g.hop);
