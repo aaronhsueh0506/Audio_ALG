@@ -20,8 +20,9 @@ endif
 ifneq ($(filter-out 0 1,$(SIMD)),)
 $(error SIMD must be exactly 0 or 1)
 endif
-# ainr_bridge.c has no stdio; NO_STDIO is accepted (and keyed) so that a build that forwards it to every
-# stream directory finds this one in step with the rest.
+# ainr_bridge.c has no stdio; NO_STDIO is accepted (and validated) so that a build that forwards it to every
+# stream directory finds this one in step with the rest, but it does not change the object and is not part of the
+# configuration signature.
 NO_STDIO ?= 0
 override NO_STDIO := $(strip $(NO_STDIO))
 ifneq ($(filter-out 0 1,$(NO_STDIO)),)
@@ -43,7 +44,7 @@ endif
 
 BUILD_DIR := build
 override CC_TARGET_SIG := $(shell sh $(COMMON_DIR)/scripts/target_abi_signature.sh $(CC) $(CPPFLAGS) $(CFLAGS))
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
