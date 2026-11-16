@@ -123,9 +123,8 @@ typedef struct Rig {
     Aec *aec;
     Complex *post;                    /* P */
     uint32_t reset_serial;            /* the aec_post_reset_serial() value already handled */
-    uint32_t reset_pending;           /* bit k: a hard reset was seen k hops ago (the direct path's delay line) */
     int enable_cng;
-    int reset_delay;                  /* hops the direct path delays a frame by (the model's lookahead) */
+    DfnResetFollow follow;            /* the synthesis clear that follows a hard reset */
     DfnHop hop;                       /* hop.bridge / hop.istft: the bridge, or the synthesis */
 } Rig;
 
@@ -144,7 +143,7 @@ static int rig_build(Rig *r, const Plan *p) {
     cur += ALIGN16(p->aec_bytes);
     if (!r->aec) goto fail;
     r->enable_cng = p->enable_cng;
-    r->reset_delay = dfn_hop_lookahead_frames(&p->dfn.stream_cfg.grid);
+    dfn_reset_follow_init(&r->follow, &p->dfn.stream_cfg.grid);
     r->post = (Complex *)cur;     cur += p->spec_bytes;
     r->reset_serial = aec_post_reset_serial(r->aec);
     if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop) != 0)
@@ -159,7 +158,7 @@ fail:
 static void rig_reset(Rig *r) {
     aec_reset(r->aec);
     r->reset_serial = aec_post_reset_serial(r->aec);
-    r->reset_pending = 0;
+    dfn_reset_follow_clear(&r->follow);
     dfn_hop_reset(&r->hop);
 }
 
@@ -175,10 +174,7 @@ static void follow_post_reset(Rig *r) {
     uint32_t serial = aec_post_reset_serial(r->aec);
     uint32_t moved = serial != r->reset_serial;
     r->reset_serial = serial;
-    if (moved && r->hop.bridge) (void)ainr_bridge_reset_synthesis(r->hop.bridge);   /* between hops: cannot refuse */
-    if (!r->hop.istft) return;
-    r->reset_pending = (r->reset_pending << 1) | moved;
-    if ((r->reset_pending >> r->reset_delay) & 1u) ac_istft_reset(r->hop.istft);
+    (void)dfn_reset_follow(&r->follow, &r->hop, moved != 0);   /* between hops: cannot refuse */
 }
 
 /* One host hop: P = B * G_res, B the rendering base, plus comfort noise on the bins the RES cut when
