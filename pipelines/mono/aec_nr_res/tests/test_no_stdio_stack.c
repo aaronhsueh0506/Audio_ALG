@@ -16,8 +16,6 @@
 #include "utility/mem_align.h"
 #include "utility/simd_kernels.h"
 
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
-
 /* Static pool: sized for the 16 kHz configs this gate runs; the runtime check against the
  * plan keeps this honest if a future config outgrows it. */
 static uint8_t g_pool[1u << 20] __attribute__((aligned(16)));
@@ -47,7 +45,7 @@ static int hop(Aec* aec, Post* q, const float* mic, const float* ref, float* out
         ac_istft_reset(q->istft);
     }
     if (v.r2 && v.usable_linear) {
-        sk_scale_f32(q->extra, v.r2, PSD_SCALE_INV, v.n_freqs);
+        sk_scale_f32(q->extra, v.r2, AEC_PSD_SCALE_INV_F, v.n_freqs);
         residual_psd_audio = q->extra;
     }
     if (!(nr = anr_process_gain_with_residual_psd(q->nr, v.base_spec, residual_psd_audio))) return -1;

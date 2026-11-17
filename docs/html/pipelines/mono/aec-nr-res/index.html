@@ -33,7 +33,7 @@
 <li>任何一步被拒、(若你檢查)輸出非有限、或換串流:<code>aec_reset()</code>、<code>anr_reset()</code>、<code>ac_istft_reset()</code> 一起 reset,並更新你記的 <code>aec_post_reset_serial()</code>(不重驗 alignment／size;comfort-noise 種子由 AEC 自己重設)。</li>
 <li>結束:<code>anr_destroy()</code>、<code>aec_destroy()</code>(對 caller pool 不釋放記憶體),最後由應用釋放 pool。</li>
 </ol>
-<p>最小 C 範例(識別字皆為現行 API;<code>platform_alloc()</code> 是平台的對齊配置函式,<code>stream_next()</code> 是你的 I/O;<code>PSD_SCALE_INV</code> 是範例檔頭自己的 <code>#define</code>(1/32768²,值見 <code>mono/aec_nr_res/main.c</code>);comfort noise 的種子與 −10 dB 下限是函式庫的 <code>AEC_CNG_SEED</code>／<code>AEC_CNG_NR_GAIN_FLOOR</code>,由 <code>aec_apply_cng()</code> 使用;已在 <code>-Wall -Wextra -Werror</code> 下編譯並執行。header:<code>aec.h</code>、<code>anr.h</code>、<code>audio_stft.h</code>、<code>utility/mem_align.h</code>、<code>utility/simd_kernels.h</code>、<code>utility/simd_kernel_nn.h</code>):</p>
+<p>最小 C 範例(識別字皆為現行 API;<code>platform_alloc()</code> 是平台的對齊配置函式,<code>stream_next()</code> 是你的 I/O;<code>AEC_PSD_SCALE_INV_F</code> 是 <code>aec.h</code> 的常數(1/32768²);comfort noise 的種子與 −10 dB 下限是函式庫的 <code>AEC_CNG_SEED</code>／<code>AEC_CNG_NR_GAIN_FLOOR</code>,由 <code>aec_apply_cng()</code> 使用;已在 <code>-Wall -Wextra -Werror</code> 下編譯並執行。header:<code>aec.h</code>、<code>anr.h</code>、<code>audio_stft.h</code>、<code>utility/mem_align.h</code>、<code>utility/simd_kernels.h</code>、<code>utility/simd_kernel_nn.h</code>):</p>
 <pre>const int sample_rate = 16000;
 AecSignalGrid grid;  AecConfig aec_cfg;
 if (aec_resolve_signal_grid(sample_rate, aec_default_fft_size(sample_rate), &amp;grid) != AEC_OK) return -1;   /* AEC_ERR_ARG = 沒有這組格點 */
@@ -73,7 +73,7 @@ while (stream_next(&amp;mic, &amp;ref, out)) {
             ac_istft_reset(istft);
         }
         if (v.r2 &amp;&amp; v.usable_linear) {                             /* 殘餘回音功率折進 NR 噪聲底 */
-            sk_scale_f32(extra_noise, v.r2, PSD_SCALE_INV, grid.n_freqs);
+            sk_scale_f32(extra_noise, v.r2, AEC_PSD_SCALE_INV_F, grid.n_freqs);
             residual_psd_audio = extra_noise;
         }
         nr_gain = anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio);
@@ -128,7 +128,7 @@ return 0;
  │      v.error_spec / near_spec / far_spec / r2 / comfort_noise / res_gain / usable_linear(借用)
  ├─ mono_form(rig, &amp;v)(main.c; 逐 hop 串接寫在 main 內):
  │    ├─ nr_gain = mono_nr_gain(): use_r2 且 v.r2 非 NULL 且 v.usable_linear 時
- │    │      residual_psd_audio[k] = v.r2[k]*PSD_SCALE_INV (1/32768²) 折進噪聲底;anr_process_gain_with_residual_psd;無 NR 時 nr_gain = NULL
+ │    │      residual_psd_audio[k] = v.r2[k]*AEC_PSD_SCALE_INV_F (1/32768²) 折進噪聲底;anr_process_gain_with_residual_psd;無 NR 時 nr_gain = NULL
  │    ├─ aec_apply_gain(aec, nr_gain, spec)     spec = B * min(nr_gain, v.res_gain)   (--no-res: aec_apply_gain_spec 配 unity)
  │    └─ aec_apply_cng(aec, nr_gain, spec)
  │           (enable_cng 且有 RES 增益): k=1..n-2: spec[k] += sqrt(cn/32768²) * sqrt(1-res_gain²)

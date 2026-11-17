@@ -60,6 +60,7 @@ from lib.aec.python.aec import AecConfig, AecMode, AecPreset, AecResContext  # n
 from pipelines.mono.aec_nr_res.pipeline import (  # noqa: E402
     _project_grid, apply_gain, rendering_base, run_aec_linear, synth_window,
 )
+from lib.nr.python.utils.audio_io import write_audio  # noqa: E402
 from pipelines.mono.cng_aec3 import Aec3ComfortNoise  # noqa: E402
 from pipelines.dfn.dfn2_rate_adapter import Dfn2RateBridge  # noqa: E402
 from pipelines.dfn.dfn2_stage import (  # noqa: E402
@@ -325,7 +326,7 @@ def main():
         use_res=not args.no_res,
         realtime_timing=args.realtime_timing,
         output_length=len(mic_signal))
-    sf.write(args.output, final, native_rate)
+    write_audio(args.output, final, native_rate)
     print(f'Done: {args.output} ({len(final)} samples, '
           f'{stage.heads_calls} head evaluations, {stage.skips} skips)')
 

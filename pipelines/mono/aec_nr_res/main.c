@@ -57,10 +57,6 @@
 #define AEC_NR_POOL_SPLIT 0
 #endif
 
-/* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
- * the reciprocal is a power of two, so the multiply is exact. */
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
-
 /* --nr-level is the option; --nr-preset is the same option under its earlier name. */
 static int is_nr_level_option(const char* arg) {
     return strcmp(arg, "--nr-level") == 0 || strcmp(arg, "--nr-preset") == 0;
@@ -262,7 +258,7 @@ static void follow_post_reset(Rig* r) {
 static const float* mono_nr_gain(Rig* r, const AecResidualView* v) {
     const float* residual_psd_audio = NULL;
     if (r->plan.use_r2 && v->r2 && v->usable_linear) {
-        sk_scale_f32(r->extra_noise, v->r2, PSD_SCALE_INV, r->plan.n_freqs);
+        sk_scale_f32(r->extra_noise, v->r2, AEC_PSD_SCALE_INV_F, r->plan.n_freqs);
         residual_psd_audio = r->extra_noise;
     }
     return anr_process_gain_with_residual_psd(r->nr, v->base_spec, residual_psd_audio);

@@ -291,8 +291,8 @@ array 的增益級（<code>residual = FULL</code>）算 RES 增益，ULCNet 的 
 <tr><td>傳統前級（mono：線性 AEC，RES 增益在 <code>aec_process_residual()</code> 內算出，經 <code>aec_get_residual()</code> 的 <code>res_gain</code> 取得；
 4ch：array 的共用 delay → 4 lane → SRP-PHAT → BF 逐 bin 加權 → <code>aec_process_residual()</code>（經 helper 則為 <code>array_sample_beam_fuse()</code>），RES 增益由 array 內的增益級對融合後頻譜算，同樣經
 <code>aec_get_residual()</code> 的 <code>res_gain</code> 取得；兩者皆可再用 <code>aec_apply_cng()</code> 加 comfort noise）</td>
-<td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES，即 <code>dfn_hop_begin()</code> 的 E，模型串流的 est 輸入）與
-post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 P，模型串流的 app 輸入）</td></tr>
+<td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>base_spec</code>（B，pre-RES 的渲染基底；輸出守衛未觸發時就是 <code>error_spec</code>/<code>beamformed_error</code> = E；傳給 <code>dfn_hop_begin()</code> 的 E 參數，模型串流的 est 輸入）與
+post-RES 頻譜（P = B·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 P，模型串流的 app 輸入）</td></tr>
 <tr><td><code>DfnHop</code> 的尺度換算</td><td>+0 hop</td>
 <td>入 <code>dfn2_stft_scale(n_fft)</code>、出 <code>dfn2_stft_unscale(n_fft)</code>（= 1/sqrt(n_fft) 與其反數；出貨 grid 為 <code>2^-5</code>／<code>2^5</code>）：pipeline 頻譜是 audio-scale
 未正規化 STFT，DFN2 邊界要 <code>torch.stft(normalized=True)</code>。出貨 grid 下兩者是精確的 2 的次方，

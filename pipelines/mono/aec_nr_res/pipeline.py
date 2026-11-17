@@ -46,6 +46,8 @@ from lib.aec.python.aec import (
 from lib.nr.python.denoisers import MmseLsaDenoiser
 from lib.nr.python.core.nr_strength import apply_strength
 from lib.nr.python.process_audio import build_v3_2_base_params, load_config
+from lib.nr.python.utils.audio_io import write_audio
+
 
 # The post-NR RES is a pure frequency multiply on the AEC3 seam
 # (AecConfig.return_res_context exposes the linear error spectrum and the
@@ -510,7 +512,7 @@ Switches:
             use_res=True, combine='min')
 
     # Save
-    sf.write(args.output, final_output, sample_rate)
+    write_audio(args.output, final_output, sample_rate)
     print(f"\nDone! Output: {args.output} ({len(final_output)} samples)")
 
 

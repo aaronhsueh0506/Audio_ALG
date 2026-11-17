@@ -75,7 +75,7 @@ mono:  mic/ref ─► Aec ─► AecResidualView { error_spec, near_spec, far_sp
 4-ch:  mics/ref ─► aec_process_linear + aec_get_array ─► beamformer ─► aec_process_residual ─► AecResidualView { error_spec, near_spec, far_spec, r2, comfort_noise, res_gain, base_spec, formed_hop = NULL, ... }
                       │
         gain stages   ├─ G_nr: anr_process_gain_with_residual_psd(nr, S, residual_psd_audio)    (residual_psd_audio = R² / 32768², while the linear estimate is usable)
-                      │        S = B for mono; S = E = v.error_spec for 4-ch (array_sample_anr_gain()); the gain is applied on B in both
+                      │        S = B = v.base_spec for mono and 4-ch (4-ch: array_sample_anr_gain()); the gain is applied on B
                       ├─ G_res: v.res_gain (mono: the AEC's own; 4-ch: the array's one gain stage over the fused spectra; applied by aec_apply_gain)
         combination   └─ aec_apply_gain → aec_apply_cng → ac_istft_push → out   (the same two calls for both)
 ```
@@ -105,8 +105,8 @@ the rendering base. Which stages exist, in which order, is read straight from ea
 function ([`main.c`](../mono/aec_nr_res/main.c) `process_hop()` / `mono_form()`,
 [`4ch_raw.c`](../4ch/4ch_raw.c) `raw_post()` / `array_sample_stages_chain()`). The 4-channel
 programs share two small header-only helpers, [`array_sample_post.h`](../4ch/array_sample_post.h)
-(`array_sample_anr_gain()`, `array_sample_post_reset_due()`, `ARRAY_SAMPLE_PSD_SCALE_INV`; tested by `test_array_sample_post`) and [`array_sample_unit.h`](../4ch/array_sample_unit.h) (the array + helper unit and the stages behind the fuse, shared by `4ch_raw` and `4ch_static`); the mono examples keep their own
-`#define` (`PSD_SCALE_INV`) in the file; the comfort noise of both is the `Aec`'s own generator
+(`array_sample_anr_gain()`, `array_sample_post_reset_due()`; tested by `test_array_sample_post`) and [`array_sample_unit.h`](../4ch/array_sample_unit.h) (the array + helper unit and the stages behind the fuse, shared by `4ch_raw` and `4ch_static`); both
+use `AEC_PSD_SCALE_INV_F` from `aec.h`; the comfort noise of both is the `Aec`'s own generator
 (`aec_apply_cng()`: seed `AEC_CNG_SEED`, floor `AEC_CNG_NR_GAIN_FLOOR`).
 
 Only the multi-channel shared delay, the four lanes and the fusion with its gain stage are one object (the `Aec` array, `n_mics = 4`); every other stage (the beamformer and the denoiser
@@ -146,7 +146,7 @@ int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
         ac_istft_reset(c->istft);
     }
     if (f.r2 && f.usable_linear) {                      /* residual-echo powers into the noise floor */
-        sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
+        sk_scale_f32(c->g_nr_scratch, f.r2, AEC_PSD_SCALE_INV_F, f.n_freqs);
         residual_psd_audio = c->g_nr_scratch;
     }
     const float* nr_gain = anr_process_gain_with_residual_psd(c->nr, f.base_spec, residual_psd_audio);
@@ -173,9 +173,9 @@ Rules the chain relies on:
   The 4-channel array behaves the same way: its generator restarts at `AEC_CNG_SEED` on a lane's hard reset and on `aec_reset()`.
 - `v.error_spec` / `v.formed_hop` are the analysis seam and are never rendered; the chain renders the
   rendering base `v.base_spec` (the same spectrum `aec_process()` multiplies by its gain, `E`
-  bit for bit on every hop the output guard leaves alone). Mono: the denoiser estimates on that same spectrum. 4-channel:
-  it estimates on `v.error_spec` (`array_sample_anr_gain()`; the two differ only on output-guard hops, see the 4ch README,
-  "Analysis and rendering spectra") and its gain is applied on `v.base_spec`.
+  bit for bit on every hop the output guard leaves alone). The denoiser estimates on that same spectrum, mono and
+  4-channel alike (4-channel: `array_sample_anr_gain()`; on the array `v.base_spec` differs from `v.error_spec` only on
+  hops where a contributing lane's output guard fired, see the 4ch README, "Analysis and rendering spectra").
 - A spectrum-type stage (the 4-channel beamformer) is a function that takes the
   lane spectra and returns a spectrum; it replaces the error spectrum (`error_spec` of the
   `AecResidualView`) in the chain. The sample helper hands the BF spectrum to `aec_process_residual()` inside

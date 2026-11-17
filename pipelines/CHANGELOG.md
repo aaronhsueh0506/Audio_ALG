@@ -3,6 +3,27 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-17 — One float-to-int16 rule; pins follow audiolib, AEC and NR
+
+- **Pins.** `lib/audiolib.pin`, `lib/aec.pin`, `lib/nr.pin` and the `lib/aec` and `lib/nr` gitlinks name the heads with the one PCM16 rule: audiolib's `sk_clip_scale_to_s16` family and `wav_io.h` writer scale by 32768, clip and round half away from zero exactly (NaN to 0; the NR writer style is gone), NR's `write_audio` quantizes the same way, and the AEC docs say both shipped chains estimate NR and DFN2 on `base_spec`. No pool or layout version moves.
+- **Python writers.** `mono/aec_nr_res/pipeline.py` and `mono/aec_dfn_res/pipeline.py` write their output with NR's `write_audio` (`lib/nr/python/utils/audio_io.py`) instead of letting soundfile quantize float data, so the Python and C PCM16 files follow the same rule.
+- **Test oracles.** `stream/common/tests/s16_oracle.h` computes the rule exactly in double; the `verify_vs_sample` tests of DeepVQE-S, Align-ULCNet and DFN2 and `test_aiaec_block` use it instead of a float add of 0.5.
+- **Docs.** The function map drops `wav_io_round_s16_half_away` (AC-WAV-01, D-29 and the statistics follow); `docs/maintenance/{dependencies,publish}.md` no longer list `test_wav_nr_style`; `test_readme_flow.c` and `reference/call-flow.md` use `AEC_PSD_SCALE_INV_F`.
+
+## [Unreleased] — 2026-11-17 — The four-channel NR and DFN2 estimate on the rendering base B, like mono
+
+- **Behaviour change (4ch C).** `array_sample_anr_gain()` (`4ch/array_sample_post.h`) hands the denoiser `v->base_spec` instead of `v->error_spec` and refuses a view whose `base_spec` is NULL; the r2 fold is unchanged. `4ch/aec_bf_dfn_res/main.c` passes `base_spec` as the DFN2 estimate spectrum (`dfn_hop_process()`). The two spectra differ only on a hop where a contributing lane's output guard fired; the output is bit-identical up to the first such hop, and after it the denoiser state and the overlap-add carry the difference forward. The array's gain stage (G_res) still reads `error_spec`.
+- **Python.** No code change: `run_nr_spectrum()` and `run_dfn2_res()` already read the fused `output_base_spec`; the docstrings of `4ch/pipeline.py` and `4ch/aec_bf_dfn_res/pipeline.py` now say so. `pyc_parity.py`'s `py_nr` hands Python the recorded B for every seam kind (the 4ch special case that handed E is gone).
+- **Constant.** `ARRAY_SAMPLE_PSD_SCALE_INV` is removed; `array_sample_post.h` and the mono branch of `pyc_drv.c` use `AEC_PSD_SCALE_INV_F` (`aec.h`, 2^-30, bit-identical).
+- **Tests.** The oracle `4ch/tests/conv_chain_4ch.h` and `test_4ch_dfn.c` estimate on `base_spec`; `test_array_sample_post.c` sets `base_spec` and points `error_spec` at a different spectrum, so the gain equal to the direct call on `base_spec` shows which one is read; the NULL check is on `base_spec`.
+- **Docs.** The comments of `4ch_external_static.c`, `array_sample_unit.h` and `dfn/dfn_hop.h` (no code change), the 4ch README, `4ch/aec_bf_dfn_res/README.md`, `4ch/reference/c-api.md`, `reference/call-flow.md`, the mono README's note on the 4ch chain, `docs/reference/{array,board,mono}`, the 4ch and DFN2 HTML pages, `start/reference/{integration,timing,grids,architecture}.html` and the PL-STAGE-02 row of the function map follow.
+
+## [Unreleased] — 2026-11-17 — `DfnHop` loses `check_finite`; the mono NR examples use `AEC_PSD_SCALE_INV_F`
+
+- **`dfn_hop.h` / `dfn_hop_pool.h` (example headers, no ABI).** `DfnHop.check_finite` and the `check_finite` argument of `dfn_hop_pool_build()` are gone, with the two rescans in `dfn_hop_end()`. The direct path's output is finite without them: the stream refuses a non-finite or beyond-2^63 input bin, `validate_run` refuses a mask or coefficient beyond `DFN2_PREPOST_HEAD_LIMIT` or a non-finite alpha, so the enhanced spectrum stays far below the float range before and after the synthesis. A caller passes one argument fewer; `dfn_hop_end()` no longer returns `DFN_HOP_INVALID` for a non-finite hop (the 4ch driver's own `check_finite` on its output hop is unchanged). `test_dfn_hop` replaces `test_check_finite` with `test_output_finite`: the enormous-mask case and the largest accepted head (mask and coefficients at the limit, alpha 1) on a large input, finite output in both.
+- **Constant.** `mono/aec_nr_res/main.c`, `example_board_adapter.c` and the two mono tests use `AEC_PSD_SCALE_INV_F` (`aec.h`, exactly 2^-30 in float) instead of a local `PSD_SCALE_INV`; the multiplier is bit-identical.
+- **Docs.** The mono DFN2 page cites `test_dfn_hop.c` only (the equivalence test left with `DfnResStage`); the `uvc_audio_live2a` row of the DFN2 model page says the sample sets `dfn_atten_lim_db` through `ainr_set_atten_lim_freq()` at start.
+
 ## [Unreleased] — 2026-11-16 — Unused Python evaluators, the released-pointer bump guard, a broken makefile test and an unused conftest are removed
 
 - **Removed (no caller in the build, the tests or the docs).** `pipelines/4ch/evaluate_recordings.py`, `pipelines/4ch/evaluate_external_recordings.py`, their tests `pipelines/4ch/tests/test_evaluator.py` and `test_external_evaluator.py`, and `pipelines/tools/eval_dfn2_4ch_inputs.py`. `pipelines/4ch/README.md` loses the recording-test commands and the fixture-alignment paragraph, `pipelines/4ch/aec_bf_dfn_res/README.md` the input-arm command; `pipelines/requirements.txt` keeps `scipy` (the pyc-parity input generator imports it).

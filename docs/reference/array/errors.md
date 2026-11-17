@@ -96,7 +96,7 @@ destroy 之後，caller-owned pool 的 instance 的每個入口都拒絕該 hand
 `pipelines/4ch/` 本身沒有函式庫 archive。sample 層檔案（範例碼，**不在**任何 archive 內，沒有 ABI、沒有 layout version，可整份複製改寫）：
 `array_sample_beam.{h,c}`（SRP-PHAT ＋ BF ＋ 備援 VAD 的 helper，另一份手冊；`array_sample_default_config()` 也在這裡）、
 `array_sample_driver.{h,c}`（範例的命令列與 hop 迴圈骨架）、`array_sample_post.h`（header-only：`aec_get_residual()` 之後與降噪器之間的銜接，
-`array_sample_anr_gain()` 呼叫降噪器並可折入 `r2`、`array_sample_post_reset_due()`，以及 `ARRAY_SAMPLE_PSD_SCALE_INV`）。`array_sample_beam.o` 由 `make libs` 編出。
+`array_sample_anr_gain()` 在 `base_spec` 上呼叫降噪器並可折入 `r2`（尺度用 `aec.h` 的 `AEC_PSD_SCALE_INV_F`）、`array_sample_post_reset_due()`）。`array_sample_beam.o` 由 `make libs` 編出。
 
 ### 6.2 參考執行檔（全部都有 `main()`，**沒有任何一個會進產品**）
 
@@ -162,7 +162,7 @@ linear / residual 協定：
 - [ ] mic / ref 內容都是有限值（NaN/Inf 會被 `AEC_ERR_ARG` 拒絕）
 - [ ] hop / n_freqs 是查來的，不是寫死的
 - [ ] 同一個 instance 沒有被多 thread 同時處理
-- [ ] 鏈的順序：`anr_process_gain`（4ch 鏈估計用 `error_spec`，即 beamformer 輸出 E；單聲道鏈用 `base_spec`）→ `aec_apply_gain` → `aec_apply_cng` → `ac_istft_push`；兩個 apply 都傳同一個 NR 增益；缺席的增益來源傳 NULL
+- [ ] 鏈的順序：`anr_process_gain`（單聲道與 4ch 鏈都在 `base_spec` 上估計）→ `aec_apply_gain` → `aec_apply_cng` → `ac_istft_push`；兩個 apply 都傳同一個 NR 增益；缺席的增益來源傳 NULL
 
 收尾：
 

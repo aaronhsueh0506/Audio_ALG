@@ -22,6 +22,7 @@
 #include "aiaec_product.h"
 #include "deepvqe_stream.h"
 #include "ulcnet_stream.h"
+#include "tests/s16_oracle.h"
 
 #define PRODUCT_DV (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S)
 #define PRODUCT_AL (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_ALIGN_ULCNET)
@@ -608,12 +609,8 @@ static int section_trim_align(void) {
     pcm_out = calloc((size_t)hop, sizeof(int16_t));
     expect_pcm = calloc((size_t)hop * blocks, sizeof(int16_t));
     for (k = 0; k < hop * blocks; ++k) {
-        float v;
         residual[k] = 0.001f * (float)(((k * 977) % 20001) - 10000);
-        v = residual[k] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        expect_pcm[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        expect_pcm[k] = s16_oracle(residual[k]);
     }
     for (bidx = 0; bidx < blocks; ++bidx) {
         AiaecInput input;

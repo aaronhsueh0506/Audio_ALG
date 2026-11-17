@@ -9,7 +9,7 @@
  *     plan.stream_cfg.erb_fwd = ...;  plan.stream_cfg.erb_inv = ...;  plan.model = ...;
  *     dfn_hop_pool_plan(&plan, host_rate, fft_size);          // sizes
  *     total = <front end and P buffers> + dfn_hop_pool_bytes(&plan);
- *     dfn_hop_pool_build(&plan, cur, n_freqs, hop, check_finite, &hop_driver);
+ *     dfn_hop_pool_build(&plan, cur, n_freqs, hop, &hop_driver);
  *
  * The tail follows the caller's front end and P buffers in the pool; its order is the stream, the
  * conversion buffers, then the bridge, or the synthesis and the output spectrum. Nothing in it
@@ -89,11 +89,10 @@ static inline size_t dfn_hop_pool_bytes(const DfnHopPoolPlan* p) {
 }
 
 /* Carves the tail at `cur` and wires `hop`; the front end's grid must be the bridge's, or the
- * model's when the host runs the model's grid. `check_finite` applies to the direct path. 0, or -1
- * when an init is refused: a pool or grid that does not match the plan, or ERB matrices
- * that fail dfn2_erb_tables_valid() (dfn2_process.h). */
+ * model's when the host runs the model's grid. 0, or -1 when an init is refused: a pool or grid
+ * that does not match the plan, or ERB matrices that fail dfn2_erb_tables_valid() (dfn2_process.h). */
 static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur, int n_freqs,
-                                     int hop_size, int check_finite, DfnHop* hop) {
+                                     int hop_size, DfnHop* hop) {
     const DFN2Grid* grid = &p->stream_cfg.grid;
     DFN2Stream* stream;
     float* planar;
@@ -120,7 +119,6 @@ static inline int dfn_hop_pool_build(const DfnHopPoolPlan* p, unsigned char* cur
         if (!istft) return -1;
         out_spec = (Complex*)cur;
         if (dfn_hop_init_direct(hop, stream, grid, &p->model, istft, out_spec, planar) != 0) return -1;
-        hop->check_finite = check_finite;
     }
     return 0;
 }

@@ -2,7 +2,7 @@
  * libraries behind it (not part of a delivered archive). Header-only, no ABI: copy and adapt.
  *
  * Per hop, after aec_process_residual(aec, &beam) and aec_get_residual(aec, &v):
- *     G_nr = array_sample_anr_gain(nr, &v, scratch, use_r2);              // estimated on E (v.error_spec)
+ *     G_nr = array_sample_anr_gain(nr, &v, scratch, use_r2);              // estimated on B (v.base_spec)
  *     if (array_sample_post_reset_due(&handled, &v)) ac_istft_reset(istft);
  *     aec_apply_gain(aec, G_nr, P);                                       // P = B * min(G_nr, G_res), B = v.base_spec
  *     aec_apply_cng(aec, G_nr, P);                                        // comfort noise on the bins the gain cut
@@ -24,23 +24,18 @@
 extern "C" {
 #endif
 
-/* The residual-echo powers are on the int16^2 scale, the denoiser's input on the audio scale;
- * the reciprocal is a power of two, so the multiply is exact. */
-#define ARRAY_SAMPLE_PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
-
-/** The denoiser gain of one fused hop. With use_r2 the residual-echo powers v->r2 fold into the
- * noise floor as r2 / 32768^2 through `scratch` (n_freqs floats); use_r2 = 0, NULL r2/scratch
- * or v->usable_linear = 0 selects plain noise reduction. Returns n_freqs gains owned by the
- * denoiser, valid until its next call; NULL for a NULL argument or a refused hop. */
+/** Denoiser gain of one fused hop, estimated on v->base_spec. With use_r2, r2 * AEC_PSD_SCALE_INV_F folds into the
+ * noise floor through `scratch` (n_freqs floats); use_r2 = 0, NULL r2/scratch or usable_linear = 0 gives plain NR.
+ * Returns n_freqs gains owned by the denoiser until its next call; NULL for a NULL argument or a refused hop. */
 static inline const float* array_sample_anr_gain(AnrDenoiser* nr, const AecResidualView* v,
                                                 float* scratch, int use_r2) {
     const float* residual_psd_audio = NULL;
-    if (!nr || !v || !v->error_spec) return NULL;
+    if (!nr || !v || !v->base_spec) return NULL;
     if (use_r2 && v->r2 && scratch && v->usable_linear) {
-        sk_scale_f32(scratch, v->r2, ARRAY_SAMPLE_PSD_SCALE_INV, v->n_freqs);
+        sk_scale_f32(scratch, v->r2, AEC_PSD_SCALE_INV_F, v->n_freqs);
         residual_psd_audio = scratch;
     }
-    return anr_process_gain_with_residual_psd(nr, v->error_spec, residual_psd_audio);
+    return anr_process_gain_with_residual_psd(nr, v->base_spec, residual_psd_audio);
 }
 
 /** 1 when the view's post_reset_serial differs from *handled (a lane had a hard post-chain

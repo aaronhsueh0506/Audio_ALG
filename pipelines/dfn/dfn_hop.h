@@ -1,8 +1,8 @@
 /* dfn_hop.h -- example: one DeepFilterNet2 hop behind an AEC + RES chain. Header-only, no ABI:
  * copy and adapt.
  *
- * The host forms E (the linear-AEC error) and P (E after the RES gain, plus comfort noise when
- * enabled; the DFN example mains show it) before the hop begins. DFN2 then runs on (E, P) through
+ * The host forms E (the estimate spectrum, the AEC's rendering base B in both example mains) and P
+ * (B after the RES gain, plus comfort noise when enabled) before the hop begins. DFN2 runs on (E, P) through
  * the model-stream layer (stream/ainr/dfn2: dfn2_stream_pre_process_freq_dual /
  * dfn2_stream_post_process_freq in memory mode); this header adds what that layer leaves to its
  * caller: the audio-scale spectra in and out (dfn2_stft_scale in, dfn2_stft_unscale out), the
@@ -36,7 +36,6 @@
 #ifndef PIPELINES_DFN_DFN_HOP_H
 #define PIPELINES_DFN_DFN_HOP_H
 
-#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -50,7 +49,7 @@ extern "C" {
 #endif
 
 enum {
-    DFN_HOP_INVALID = -1,         /* NULL argument, a refused block, or a non-finite hop */
+    DFN_HOP_INVALID = -1,         /* NULL argument, or a refused block */
     DFN_HOP_SEQUENCE_ERROR = -2   /* a call out of begin / nn_begin / nn_end / end order */
 };
 
@@ -67,7 +66,6 @@ typedef struct DfnHop {
     int n_bins;                   /* the model grid's */
     int hop_size;                 /* direct path: the model grid's hop */
     float scale, unscale;         /* dfn2_stft_scale / dfn2_stft_unscale of the model grid's fft */
-    int check_finite;             /* direct path: refuse a non-finite out_spec or hop at end */
 
     int phase;                    /* 0 idle, 1 hop begun, 2 model frame open */
     DfnHopJob job;                /* the frame begun, until fetched */
@@ -266,7 +264,6 @@ static inline int dfn_hop_nn_end(DfnHop* h, int model_rc) {
 /* Emits one host hop into out. A frame left open (STREAM_RUN_FAILED: the caller may have run it) or never fetched
  * (STREAM_RUN_NOT_STARTED) is the identity; a hop with no model frame needs no nn_begin or nn_end. */
 static inline int dfn_hop_end(DfnHop* h, float* out) {
-    int k;
     if (!h || !out) return DFN_HOP_INVALID;
     if (h->phase == 0) return DFN_HOP_SEQUENCE_ERROR;
     if (h->bridge) {
@@ -288,16 +285,7 @@ static inline int dfn_hop_end(DfnHop* h, float* out) {
     }
     h->phase = 0;
     h->job_pending = 0;
-    if (h->check_finite) {
-        for (k = 0; k < h->n_bins; ++k)
-            if (!isfinite(h->out_spec[k].r) || !isfinite(h->out_spec[k].i))
-                return DFN_HOP_INVALID;
-    }
     (void)ac_istft_push(h->istft, h->out_spec, out);
-    if (h->check_finite) {
-        for (k = 0; k < h->hop_size; ++k)
-            if (!isfinite(out[k])) return DFN_HOP_INVALID;
-    }
     return 0;
 }
 

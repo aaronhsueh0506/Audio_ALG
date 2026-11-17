@@ -15,8 +15,9 @@ The post-beam residual gain is a separate stage, owned by the caller::
 
 The remaining stages (NR gain, min, apply, comfort noise, synthesis) are the
 functions of pipelines/mono/aec_nr_res/pipeline.py over that context: the
-gains are estimated on the analysis beam ``error_spec`` and applied to the
-rendering base ``output_base_spec`` (see ``_fuse_contexts``).
+RES gain is estimated on the analysis beam ``error_spec``, the NR gain on the
+rendering base ``output_base_spec``, and both are applied to the rendering
+base (see ``_fuse_contexts``).
 
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
@@ -472,13 +473,14 @@ def _fuse_contexts(
     and per-lane gains are intentionally ignored.
 
     ``error_spec`` / ``near_spec`` / ``echo_spec`` are the ANALYSIS beam (what
-    the RES and NR estimators read).  ``output_base_spec`` is the RENDERING
+    the RES estimator reads).  ``output_base_spec`` is the RENDERING
     base: the same weights over each lane's own rendering base (its output
-    guard, evaluated once per lane by the library), so the synthesis renders
-    ``output_base_spec * gain``.  When no contributing lane's guard fired it
-    is ``error_spec`` itself.  There is no second guard after the beam, and no
-    per-lane energy bound is claimed for the beam (complex weights mix the
-    lanes).  ``guard_active``: a contributing lane's guard fired.
+    guard, evaluated once per lane by the library); the NR and DFN2 estimate
+    on it and the synthesis renders ``output_base_spec * gain``.  When no
+    contributing lane's guard fired it is ``error_spec`` itself.  There is no
+    second guard after the beam, and no per-lane energy bound is claimed for
+    the beam (complex weights mix the lanes).  ``guard_active``: a
+    contributing lane's guard fired.
     ``post_reset_serial``: the four lanes' hard post-chain reset counters
     summed modulo 2**32; it moves whenever any lane's moves, and the one
     synthesizer of the fused output follows it.

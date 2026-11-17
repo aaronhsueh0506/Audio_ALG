@@ -123,7 +123,7 @@ static MonoDfn *mdfn_create(int sample_rate, int fft_size, int enable_cng, const
         m->dfn_pool = NULL;
         goto fail;
     }
-    if (dfn_hop_pool_build(&plan, (unsigned char *)m->dfn_pool, grid.n_freqs, grid.hop_size, 0, &m->hop) != 0)
+    if (dfn_hop_pool_build(&plan, (unsigned char *)m->dfn_pool, grid.n_freqs, grid.hop_size, &m->hop) != 0)
         goto fail;
     m->reset_serial = aec_post_reset_serial(m->aec);
     return m;

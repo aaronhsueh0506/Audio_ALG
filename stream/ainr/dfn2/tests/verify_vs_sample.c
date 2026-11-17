@@ -21,6 +21,7 @@
 #include "audio_stft.h"
 #include "hpf.h"
 #include "erb_fixture.h"
+#include "tests/s16_oracle.h"
 
 /* ---- shared deterministic fake accelerator: pure function of (global hop, fail_status) ---- */
 static int shared_fake(long long ghop, int fail_status, DFN2PrepostOutputs *out) {
@@ -132,10 +133,7 @@ static int board_post(BoardDriver *d, int job, int ai_rc, int16_t *pcm_out, int 
         memset(d->hop_out, 0, (size_t)hop * sizeof(float));
     }
     for (k = 0; k < hop; ++k) {
-        float v = d->hop_out[k] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        pcm_out[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);   /* round half away from zero */
+        pcm_out[k] = s16_oracle(d->hop_out[k]);
     }
     if (valid_out) *valid_out = valid;
     return valid ? 1 : 0;

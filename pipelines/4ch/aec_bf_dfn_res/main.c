@@ -9,11 +9,11 @@
  *     array_sample_beam_fuse(unit, &frame);                         // aec_process_residual + aec_get_residual
  *     aec_apply_gain(aec, NULL, P);                                // P = B * G_res (estimated on E)
  *     aec_apply_cng(aec, NULL, P);                                 // optional comfort noise
- *     dfn_hop_process(&hop, frame.error_spec, P, out);             // estimated on E, applied on P
+ *     dfn_hop_process(&hop, frame.base_spec, P, out);              // estimated on B, applied on P
  *
- * B is E except on hops where a contributing lane's output guard fired (aec.h); there P carries
- * that lane's capture while the model still estimates on E. The array reseeds its comfort noise
- * on a lane's post-chain reset (frame.post_reset_serial moved) before P is formed. On the bridge path
+ * B is E except on hops where a contributing lane's output guard fired (aec.h); there B and P carry
+ * that lane's capture. The array reseeds its comfort noise on a lane's post-chain reset
+ * (frame.post_reset_serial moved) before P is formed. On the bridge path
  * (host rate differs from the model grid) the host-grid synthesis is inside the bridge and runs at
  * the top of its begin(), so ainr_bridge_reset_synthesis() on that hop clears just its
  * overlap-add tail (DFN2 and the resamplers keep running, no delay line). On the direct path (host
@@ -209,7 +209,7 @@ static int dfn_build(DfnSample *s) {
     s->post=(Complex *)cur;     cur+=s->spec_bytes;
     s->reset_handled=0u;
     dfn_reset_follow_init(&s->follow,&s->args.model_grid);
-    return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,1,&s->hop);
+    return dfn_hop_pool_build(&s->dfn,cur,s->grid.n_freqs,s->grid.hop_size,&s->hop);
 }
 
 static int dfn_setup(void *user, ArraySampleHopView *view) {
@@ -219,7 +219,7 @@ static int dfn_setup(void *user, ArraySampleHopView *view) {
         return 1;
 
     /* The residual gain stage (balanced, in the array) is always on; the comfort-noise fill is the
-     * program's switch: E and P must share a phase for the DFN2 hop, so it is off unless asked for. */
+     * program's switch: B and P must share a phase for the DFN2 hop, so it is off unless asked for. */
     array_sample_default_config(&s->unit_cfg, s->args.sample_rate);
     s->unit_bp = array_sample_beam_default_params();
     s->unit_cfg.delay_mode = s->args.delay_mode;
@@ -289,7 +289,7 @@ static int dfn_process(void *user, int frame) {
         dfn_reset(s);
         return 1;
     }
-    if (dfn_hop_process(&s->hop,spec.error_spec,s->post,output) != 0) {
+    if (dfn_hop_process(&s->hop,spec.base_spec,s->post,output) != 0) {
         dfn_reset(s);
         return 1;
     }

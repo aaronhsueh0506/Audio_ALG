@@ -125,9 +125,6 @@ static void plan_for(DfnHopPoolPlan* plan, DFN2Model model) {
     plan->model = model;
 }
 
-/* The check_finite argument rig_init_grid() hands to dfn_hop_pool_build(). */
-static int g_build_check_finite;
-
 /* host_rate == the model grid's: the direct path; else the bridge on that host grid (fft 0: the rate's default). */
 static int rig_init_grid(Rig* r, int host_rate, int fft, DFN2Model model) {
     DfnHopPoolPlan plan;
@@ -142,7 +139,7 @@ static int rig_init_grid(Rig* r, int host_rate, int fft, DFN2Model model) {
     }
     if (dfn_hop_pool_plan(&plan, host_rate, fft) != 0) return -1;
     if (aligned_alloc16(&r->pool, dfn_hop_pool_bytes(&plan)) != 0) return -1;
-    return dfn_hop_pool_build(&plan, (unsigned char*)r->pool, r->n, r->hop, g_build_check_finite, &r->h);
+    return dfn_hop_pool_build(&plan, (unsigned char*)r->pool, r->n, r->hop, &r->h);
 }
 
 static int rig_init(Rig* r, int bridge_mode, DFN2Model model) {
@@ -499,7 +496,7 @@ static void test_path(int bridge_mode) {
         rig_free(&r);
     }
 
-    /* reset restores a fresh instance; check_finite does not change a valid stream */
+    /* reset restores a fresh instance */
     {
         Rig r, fresh;
         static float o1[MAXB], o2[MAXB];
@@ -507,7 +504,6 @@ static void test_path(int bridge_mode) {
         HashUser c1 = {0, 0}, c2 = {0, 0};
         CHECK(rig_init(&r, bridge_mode, model_of(hash_infer, &c1)) == 0 &&
               rig_init(&fresh, bridge_mode, model_of(hash_infer, &c2)) == 0, "reset rig");
-        r.h.check_finite = 1;
         g_lcg = 5u;
         for (h = 0; h < 25; ++h) { make_frame(e, p, r.n); (void)dfn_hop_process(&r.h, e, p, o1); }
         dfn_hop_reset(&r.h);
@@ -518,7 +514,7 @@ static void test_path(int bridge_mode) {
             if (dfn_hop_process(&r.h, e, p, o1) != 0 || dfn_hop_process(&fresh.h, e, p, o2) != 0) bad_reset++;
             if (memcmp(o1, o2, (size_t)r.hop * sizeof(float)) != 0) bad_reset++;
         }
-        CHECK(bad_reset == 0, "reset equals a fresh instance (and check_finite leaves a valid stream alone)");
+        CHECK(bad_reset == 0, "reset equals a fresh instance");
         for (k = 0; k < r.hop; ++k) if (o1[k] != 0.0f) break;
         CHECK(k < r.hop, "the compared stream carries signal");
         rig_free(&r);
@@ -537,9 +533,21 @@ static int huge_mask_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostO
     return 0;
 }
 
-/* An enormous finite head never reaches the output, with or without check_finite: the library refuses the commit
- * (state restarted, generation advanced), the hop takes the identity and every output stays finite. */
-static void test_check_finite(void) {
+/* Writes the largest head the library accepts: mask and coefficients at DFN2_PREPOST_HEAD_LIMIT, alpha 1. */
+static int limit_head_infer(void* user, const DFN2PrepostInputs* in, DFN2PrepostOutputs* out) {
+    size_t i;
+    (void)user;
+    (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = DFN2_PREPOST_HEAD_LIMIT;
+    for (i = 0; i < out->coefs_elements; ++i) out->coefs[i] = DFN2_PREPOST_HEAD_LIMIT;
+    for (i = 0; i < out->alpha_elements; ++i) out->alpha[i] = 1.0f;
+    return 0;
+}
+
+/* The direct path's output is finite without a check of its own: an enormous finite mask is refused by the library
+ * (state restarted, generation advanced, the hop takes the identity), and the largest accepted head on the largest
+ * accepted input (2^63 at model scale) stays finite through the synthesis. */
+static void test_output_finite(void) {
     int pass;
     for (pass = 0; pass < 2; ++pass) {
         Rig r;
@@ -547,20 +555,22 @@ static void test_check_finite(void) {
         float out[MAXB];
         int h, k, refused = 0, inf_seen = 0;
         unsigned gen0;
-        g_build_check_finite = pass;   /* through the pool build, as the 4-channel example asks for it */
-        CHECK(rig_init(&r, 0, model_of(huge_mask_infer, NULL)) == 0, "finite rig");
-        g_build_check_finite = 0;
-        CHECK(r.h.check_finite == pass, "the pool build hands check_finite to the hop");
+        CHECK(rig_init(&r, 0, model_of(pass ? limit_head_infer : huge_mask_infer, NULL)) == 0, "finite rig");
         gen0 = dfn_hop_state_generation(&r.h);
         g_lcg = 11u;
         for (h = 0; h < 12; ++h) {
             make_frame(e, p, r.n);
-            for (k = 0; k < r.n; ++k) { e[k].r *= 1e13f; e[k].i *= 1e13f; p[k].r *= 1e13f; p[k].i *= 1e13f; }
+            for (k = 0; k < r.n; ++k) {
+                const float big = pass ? 1.0e20f : 1.0e13f;   /* the bound is 2^63 / scale ~ 3e20 */
+                e[k].r *= big; e[k].i *= big; p[k].r *= big; p[k].i *= big;
+            }
             if (dfn_hop_process(&r.h, e, p, out) != 0) ++refused;
             else for (k = 0; k < r.hop; ++k) if (!isfinite(out[k])) inf_seen = 1;
         }
-        CHECK(refused == 0 && !inf_seen, "an enormous finite mask is refused by the library: the output is finite");
-        CHECK(dfn_hop_state_generation(&r.h) > gen0, "each refused commit advances the state generation");
+        CHECK(refused == 0 && !inf_seen, pass ? "the largest accepted head on a large input: the output is finite"
+                                              : "an enormous finite mask is refused by the library: the output is finite");
+        if (!pass) CHECK(dfn_hop_state_generation(&r.h) > gen0, "each refused commit advances the state generation");
+        else CHECK(dfn_hop_state_generation(&r.h) == gen0, "the accepted head leaves the generation alone");
         rig_free(&r);
     }
 }
@@ -661,13 +671,13 @@ static void test_model_hooks(void) {
         CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, 0) == 0 &&
               aligned_alloc16(&pool, dfn_hop_pool_bytes(&plan)) == 0, "partition rig");
         g_erb_inv[7] *= 1.0001f;
-        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN, 0, &hop) == -1,
+        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN, &hop) == -1,
               "build: an inverse ERB matrix that is not a partition of unity");
         dfn_unit_partition(g_erb_fwd, g_erb_inv, dfn_test_grid());
-        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN, 0, &hop) == 0,
+        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN, &hop) == 0,
               "build: the same pool with the partition restored");
-        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS + 1, DFN2_HOP_LEN, 0, &hop) == -1 &&
-              dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN / 2, 0, &hop) == -1,
+        CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS + 1, DFN2_HOP_LEN, &hop) == -1 &&
+              dfn_hop_pool_build(&plan, (unsigned char*)pool, DFN2_N_BINS, DFN2_HOP_LEN / 2, &hop) == -1,
               "build: a front-end grid that is not the model's");
         free(pool);
     }
@@ -717,10 +727,10 @@ static void test_model_hooks(void) {
                 DfnHop hop;
                 CHECK(dfn_hop_pool_plan(&plan, 16000, 256) == 0 &&
                       aligned_alloc16(&pool, dfn_hop_pool_bytes(&plan)) == 0, "bridge build rig");
-                CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS + 1, BRIDGE_HOP, 0, &hop) == -1 &&
-                      dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS, BRIDGE_HOP * 2, 0, &hop) == -1,
+                CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS + 1, BRIDGE_HOP, &hop) == -1 &&
+                      dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS, BRIDGE_HOP * 2, &hop) == -1,
                       "build: a front-end grid that is not the bridge's");
-                CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS, BRIDGE_HOP, 0, &hop) == 0 &&
+                CHECK(dfn_hop_pool_build(&plan, (unsigned char*)pool, BRIDGE_BINS, BRIDGE_HOP, &hop) == 0 &&
                       hop.bridge != NULL && hop.istft == NULL, "build: the bridge's own grid");
                 free(pool);
             }
@@ -784,7 +794,7 @@ int main(void) {
     if (DFN2_SR == 48000 && DFN2_N_FFT == 1024) test_path(1);
     else printf("dfn_hop: the test grid is not 48 kHz / 1024, so the bridge path (which needs it) is skipped\n");
     test_model_hooks();
-    test_check_finite();
+    test_output_finite();
     test_frames_per_call_guard();
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");

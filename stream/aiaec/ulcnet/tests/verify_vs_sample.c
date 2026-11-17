@@ -22,6 +22,7 @@
 #include "fft_wrapper.h"
 #include "audio_stft.h"
 #include "stream_run.h"
+#include "tests/s16_oracle.h"
 
 #define ULCNET_SR   16000
 #define ULCNET_FFT  512
@@ -228,10 +229,7 @@ static int board_post(BoardDriver *d, int pre_rc, int ai_rc, int16_t *pcm_out, i
         return 0;
     }
     for (k = 0; k < hop; ++k) {
-        float v = d->hop_out[k] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        pcm_out[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);   /* round half away from zero */
+        pcm_out[k] = s16_oracle(d->hop_out[k]);
     }
     return 1;
 }

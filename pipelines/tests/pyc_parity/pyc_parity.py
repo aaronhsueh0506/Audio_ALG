@@ -417,10 +417,8 @@ def quiet():
 def py_nr(cx, seam, usable, nr_preset='balanced'):
     """mono.aec_nr_res.pipeline.run_nr_spectrum over a recorded seam, usable_linear from `usable`.
 
-    run_nr_spectrum estimates on output_base_spec. The mono chain's denoiser reads the rendering base B; the 4ch
-    denoiser reads the analysis beam E (array_sample_anr_gain), so a 4ch seam hands Python E there."""
-    est = seam.B if seam.kind == 0 else seam.E
-    ctxs = [types.SimpleNamespace(error_spec=seam.E[h], output_base_spec=est[h], r2=seam.R2[h],
+    run_nr_spectrum estimates on output_base_spec, the recorded rendering base B (the mono and 4ch denoisers read B)."""
+    ctxs = [types.SimpleNamespace(error_spec=seam.E[h], output_base_spec=seam.B[h], r2=seam.R2[h],
                                   usable_linear=bool(usable[h]))
             for h in range(seam.nh)]
     with quiet():
@@ -544,7 +542,7 @@ def sec_a(cx, g, sr, fft, want):
         g_cflag = py_nr(cx, base, base.usable)
         m = stats(base.Gnr, g_cflag)
         rows.append(make_row(pre + 'glue_cflag', 1, 'NR glue: Python run_nr_spectrum(C fused frame, usable = C frame flag) vs C G_nr',
-                             prod_c + '; run_nr_spectrum(C E, C R2, C flag)', gate=m['max_abs'] <= tol, metrics=m,
+                             prod_c + '; run_nr_spectrum(C B, C R2, C flag)', gate=m['max_abs'] <= tol, metrics=m,
                              tol={'max_abs': tol}, grid=g, ref='Python',
                              note='usable_linear hops in the C frame: %d of %d' % (int(base.usable.sum()), base.nh)))
     need_py = any(want(pre + k) for k in ('glue_fold', 'verdict_flag', 'gnr_e2e'))
@@ -559,7 +557,7 @@ def sec_a(cx, g, sr, fft, want):
             m = stats(rep.Gnr, g_pyv)
             rows.append(make_row(pre + 'glue_fold', 1,
                                  'NR glue with the R^2 fold active: Python NR vs C array_sample_anr_gain over the same frame, usable = Python verdict',
-                                 'pyc_drv_4ch_replay replay (usable = Python verdict); run_nr_spectrum(C E, C R2, Python verdict)',
+                                 'pyc_drv_4ch_replay replay (usable = Python verdict); run_nr_spectrum(C B, C R2, Python verdict)',
                                  gate=m['max_abs'] <= tol, metrics=m, tol={'max_abs': tol}, grid=g, ref='Python',
                                  note='verdict true on %d of %d hops (this row exercises the array_sample_post.h r2 fold)' % (int(verdict.sum()), n)))
         if want(pre + 'verdict_flag'):
@@ -576,7 +574,7 @@ def sec_a(cx, g, sr, fft, want):
             g_pyv = py_nr(cx, base, np.concatenate([verdict, np.zeros(base.nh - n, np.uint8)]))
             m = stats(base.Gnr, g_pyv)
             rows.append(make_row(pre + 'gnr_e2e', 1, 'NR gain the Python reference would apply (Python verdict) vs the C G_nr',
-                                 prod_c + '; run_nr_spectrum(C E, C R2, Python verdict)', gate=m['max_abs'] <= tol,
+                                 prod_c + '; run_nr_spectrum(C B, C R2, Python verdict)', gate=m['max_abs'] <= tol,
                                  metrics=m, tol={'max_abs': tol}, grid=g, ref='Python'))
     if want(pre + 'legacy_amin'):
         leg = c_chain(cx, 1, g, sr, fft, tag='leg1', legacy_amin=1)
@@ -755,7 +753,7 @@ def sec_d(cx, g, sr, fft, want):
         g_py = py_nr(cx, nocng, nocng.usable)
         m = stats(nocng.Gnr, g_py)
         rows.append(make_row(pre + 'nr_glue', 1, 'mono NR glue: Python run_nr_spectrum(C AEC seam, C usable flag) vs C G_nr',
-                             prod + ' enable_cng=0; run_nr_spectrum(C E, C R2, C flag)', gate=m['max_abs'] <= tol, metrics=m,
+                             prod + ' enable_cng=0; run_nr_spectrum(C B, C R2, C flag)', gate=m['max_abs'] <= tol, metrics=m,
                              tol={'max_abs': tol}, grid=g, ref='Python',
                              note='usable_linear hops: %d of %d (this row exercises the r2 fold)' % (int(nocng.usable.sum()), nocng.nh)))
     if want(pre + 'min_apply_ola'):

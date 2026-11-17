@@ -82,8 +82,6 @@ static float lcg_sample(void) {
  * one block holding the AEC, the denoiser, the synthesis and the gain/spectrum buffers.
  * --------------------------------------------------------------------------------------- */
 
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
-
 /* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
  * initialised, after the pool is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
  * synthesis the same; this one stands in until rig_carve_post() installs the AEC's. */
@@ -272,7 +270,7 @@ static int rig_hop(Rig* r, const float* mic, const float* ref, float* out) {
     if (r->nr) {
         const float* residual_psd_audio = NULL;
         if (r->use_r2 && v.r2 && v.usable_linear) {
-            sk_scale_f32(r->extra_noise, v.r2, PSD_SCALE_INV, r->n_freqs);
+            sk_scale_f32(r->extra_noise, v.r2, AEC_PSD_SCALE_INV_F, r->n_freqs);
             residual_psd_audio = r->extra_noise;
         }
         if (!(nr = anr_process_gain_with_residual_psd(r->nr, v.base_spec, residual_psd_audio))) return -1;

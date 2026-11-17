@@ -40,7 +40,7 @@ mic 3 ──> linear AEC 3 ─┘  sharing" below)
                               │    aec_process_residual(&AecBeam{weights, beamformed_error}) + aec_get_residual()   → AecResidualView
                               v
         the array's one gain stage (residual = FULL): G_res over the fused spectra   → AecResidualView.res_gain
-        application: array_sample_anr_gain (NR on error_spec) ─ aec_apply_gain(aec, G_nr, P) ─ aec_apply_cng(aec, G_nr, P)
+        application: array_sample_anr_gain (NR on base_spec) ─ aec_apply_gain(aec, G_nr, P) ─ aec_apply_cng(aec, G_nr, P)
               ─ ac_istft_push → mono hop          (the application's own code)
 ```
 
@@ -137,7 +137,7 @@ Array + your beamformer     App   Aec array (n_mics = 4)   your BF   AnrDenoiser
  per hop                     |-- aec_process_linear(mics, ref) ; aec_get_array(&front) -->|
                              |-- front.lane_error_spec --------------------->| weights [4][n_freqs]
                              |-- aec_process_residual(&{weights, NULL|beamformed_error}) ; aec_get_residual(&v)   (residual STATE: not called)
-                             |-- array_sample_anr_gain --> G_nr  (on v.error_spec = E)
+                             |-- array_sample_anr_gain --> G_nr  (on v.base_spec = B)
                              |-- v.post_reset_serial moved: ac_istft_reset (array_sample_post_reset_due)
                              |-- aec_apply_gain(aec, G_nr, P) ; aec_apply_cng(aec, G_nr, P) ; ac_istft_push --> out (1 hop behind the input)
  refused / non-finite        |-- aec_reset (resets the lanes, the estimator and the gain stage), anr_reset, ac_istft_reset
@@ -149,7 +149,7 @@ Array + sample beam helper  App   ArraySampleBeam (SRP-PHAT + BF)   AnrDenoiser 
  per hop                     |-- array_sample_beam_process_front --> (mask, vad_raw, vad_out) --> array_sample_beam_process_beam
                              |       or array_sample_beam_process_with_activity, or array_sample_beam_process (built-in energy VAD)
                              |-- array_sample_beam_fuse(&v) : aec_process_residual + aec_get_residual
-                             |-- array_sample_anr_gain --> G_nr  (on v.error_spec)
+                             |-- array_sample_anr_gain --> G_nr  (on v.base_spec)
                              |-- v.post_reset_serial moved: ac_istft_reset (array_sample_post_reset_due)
                              |-- aec_apply_gain ; aec_apply_cng ; ac_istft_push --> out (1 hop behind the input)
  cfg.residual = STATE        |-- no fuse (AEC_ERR_MODE), no gain; beam.spectrum (the analysis beam) --> ulcnet_stream_pre_process_freq
@@ -167,7 +167,8 @@ beam. Which spectrum feeds what:
 | Consumer | Reads | Field |
 |---|---|---|
 | SRP-PHAT / BF (advanced once per hop) | the lanes' analysis spectra | `AecArrayView.lane_error_spec` |
-| the array's gain stage, NR estimator (`array_sample_anr_gain`), the DFN2 estimate | the analysis beam `E` and the projected `near`, `R^2`, `N^2` | `AecResidualView.error_spec`, `.near_spec`, `.r2`, `.comfort_noise` |
+| the array's gain stage | the analysis beam `E` and the projected `near`, `R^2`, `N^2` | `AecResidualView.error_spec`, `.near_spec`, `.r2`, `.comfort_noise` |
+| the NR estimator (`array_sample_anr_gain`, `R^2` folded into its noise floor), the DFN2 estimate | the rendering base `B` (below) | `AecResidualView.base_spec` (and `.r2`) |
 | synthesis (`P = B * min(G_nr, G_res)` + comfort noise), the DFN2 `P` | the rendering base `B = sum_ch W_ch * B_ch` with the same hop's weights | `AecResidualView.base_spec` |
 | Align-ULCNet on the beam (`residual = STATE`) | the analysis beam (as a network on one lane reads its error spectrum) | `beam.spectrum` |
 
@@ -196,7 +197,7 @@ Public header: `aec.h` (the "Array instance" section: `AecBeam`, `AecArrayView`,
 Sample-layer headers (in no archive):
 `array_sample_beam.h` (with `array_sample_default_config()`), `array_sample_driver.h`, and the header-only `array_sample_post.h`
 and `array_sample_unit.h` (the array + helper unit and the stages behind the fuse, shared by `4ch_raw` and `4ch_static`)
-(`array_sample_anr_gain()` runs the denoiser on a fused view, `array_sample_post_reset_due()` and `ARRAY_SAMPLE_PSD_SCALE_INV`; it needs `anr.h`).
+(`array_sample_anr_gain()` runs the denoiser on a fused view's `base_spec`, folding `r2` with `aec.h`'s `AEC_PSD_SCALE_INV_F`, and `array_sample_post_reset_due()`; it needs `anr.h`).
 Internal, do not include: `aec_array_internal.h`, `aec_view_internal.h`, `bf.h`, `srp.h`.
 
 ## Python reference seam

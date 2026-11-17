@@ -30,10 +30,10 @@ The deployable C seam is the array instance of the AEC library:
   `aec_process_residual()` and fills the `AecResidualView` for the frequency-domain stages. NR, comfort noise and
   synthesis are not inside it. An application with its own beamformer calls the `aec_*` functions directly;
 - [`array_sample_post.h`](../array_sample_post.h): header-only sample code (in no archive) between `aec_get_residual()` and the
-  libraries behind it -- `array_sample_anr_gain()` runs the denoiser on a fused view (folding `r2` into the noise floor
-  when asked), `array_sample_post_reset_due()` tells the synthesis to follow a lane's post-chain reset, and
-  `ARRAY_SAMPLE_PSD_SCALE_INV`; the estimators read `error_spec`, the synthesis renders `base_spec` (README:
-  "Analysis and rendering spectra"). The comfort-noise floor is `AEC_CNG_NR_GAIN_FLOOR` and the generator is the array's;
+  libraries behind it -- `array_sample_anr_gain()` runs the denoiser on a fused view's `base_spec` (folding `r2` into the
+  noise floor with `aec.h`'s `AEC_PSD_SCALE_INV_F` when asked), and `array_sample_post_reset_due()` tells the synthesis to
+  follow a lane's post-chain reset; the array's gain stage reads `error_spec`, the denoiser and the synthesis `base_spec`
+  (README: "Analysis and rendering spectra"). The comfort-noise floor is `AEC_CNG_NR_GAIN_FLOOR` and the generator is the array's;
 - [`array_sample_unit.h`](../array_sample_unit.h): header-only sample code shared by `4ch_raw` and `4ch_static` -- the array
   plus beam helper unit (`array_sample_unit_plan()` / `_init()` / `_destroy()`) and the stages behind the fuse
   (`array_sample_stages_plan()` / `_init()` / `_chain()` / `_reset()`: NR gain, `aec_apply_gain()`, `aec_apply_cng()`, synthesis);
@@ -131,7 +131,7 @@ aec_get_residual(array, &v);
 
 /* The application chains its own stages over v (4ch_external_static.c post_hop() is the
  * example, tests/conv_chain_4ch.h the independent reference): */
-nr = array_sample_anr_gain(my_nr, &v, scratch, 1);  /* array_sample_post.h; scratch: v.n_freqs floats; on v.error_spec */
+nr = array_sample_anr_gain(my_nr, &v, scratch, 1);  /* array_sample_post.h; scratch: v.n_freqs floats; on v.base_spec */
 if (array_sample_post_reset_due(&handled, &v))      /* a lane had a post-chain reset */
     ac_istft_reset(my_istft);                      /* the array reseeds its own comfort noise */
 aec_apply_gain(array, nr, spec);                   /* P = v.base_spec * min(G_nr, G_res) */
@@ -201,7 +201,7 @@ AcIstft *istft = ac_istft_init((uint8_t *)post_pool + ALIGN16(nr_b), sy_b, &sy_c
 
 /* per hop: array_sample_beam_process_with_activity() (or array_sample_beam_process_front() + array_sample_beam_process_beam()),
  * array_sample_beam_fuse(beam, &view), then
- * array_sample_anr_gain(nr_inst, &view, ...) (on view.error_spec),
+ * array_sample_anr_gain(nr_inst, &view, ...) (on view.base_spec),
  * array_sample_post_reset_due() (ac_istft_reset when it returns 1), aec_apply_gain(), aec_apply_cng(), ac_istft_push()
  * as array_sample_stages_chain() writes them. A refused call:
  * array_sample_beam_reset(beam), anr_reset(nr_inst), ac_istft_reset(istft) together. Strength:

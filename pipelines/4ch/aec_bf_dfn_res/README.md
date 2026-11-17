@@ -17,11 +17,12 @@ the network between the post-RES spectrum and the synthesis:
 mics/ref -> array_sample_beam_process(unit, mics, far, &beam, NULL)
             aec_process_linear() + aec_get_array(): shared delay, four lanes; helper: SRP-PHAT, beamformer (bf)
          -> array_sample_beam_fuse(unit, &v)         = aec_process_residual(aec, &{weights, E}) + aec_get_residual(aec, &v)
-              E = beamformed error spectrum (v.error_spec)   -> DFN2 feature input
+              E = beamformed error spectrum (v.error_spec)   -> the array's gain stage
+              B = rendering base (v.base_spec; E unless a lane guard fired) -> DFN2 feature input
          -> G_res = the array's gain stage, applied by aec_apply_gain(aec, NULL, P)
          -> P = B * G_res (B = v.base_spec)         P = B * G_res (+ comfort noise) -> DFN2 applied here
                                                    (dfn_form(): aec_apply_gain + aec_apply_cng)
-         -> dfn_hop_begin(&hop, v.error_spec, P)
+         -> dfn_hop_begin(&hop, v.base_spec, P)
          -> while (dfn_hop_nn_begin(&hop, &job) > 0) { run the model on the job; dfn_hop_nn_end(&hop, rc) }
          -> dfn_hop_end(&hop, out)                  -> enhanced P, frame t-L (L = M + D, 2 for the shipped pair),
                                                        the host's iFFT / OLA
@@ -29,12 +30,12 @@ mics/ref -> array_sample_beam_process(unit, mics, far, &beam, NULL)
 
 The skeleton uses the helper's own SRP-PHAT and BF, so `array_sample_beam_fuse()` hands the array the
 BF's spectrum and weights. An application with its own beamformer calls `aec_process_linear()` and
-`aec_process_residual(aec, &{W, E})` instead. `dfn_hop_process(&hop, v.error_spec, P, out)` is the sequence of
+`aec_process_residual(aec, &{W, E})` instead. `dfn_hop_process(&hop, v.base_spec, P, out)` is the sequence of
 the `dfn_hop_*` calls with the model callback (`dfn_hop_infer()` here) as the runner. The RES
 strength is `aec_set_level(aec, level)` on the array. The array owns the RES gain stage and the
 comfort-noise generator; the example owns the P buffer and the ISTFT in the `DfnHop`, and a refused call resets
 the helper (and with it the array, gain stage and comfort-noise generator) and the `DfnHop` together (`dfn_reset()` in `main.c`). The
-network estimates from the beamformed error and is applied to the post-RES
+network estimates from the rendering base B (the beamformed error E unless a lane guard fired) and is applied to the post-RES
 spectrum. The comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in
 the RES-cut bins, which breaks the estimate/apply phase consistency the
@@ -121,16 +122,16 @@ App          Aec (array)                   ArraySampleBeam   DfnHop + DFN2Stream
  |     then ac_istft_init + dfn_hop_init_direct (48 kHz) or ainr_bridge_* + dfn_hop_init_bridge (16 kHz)
  |   per hop: array_sample_beam_process --> array_sample_beam_fuse (the array's gain stage runs on E)
  |            --> v.post_reset_serial moved: ainr_bridge_reset_synthesis (16 kHz) | ac_istft_reset of the hop's synthesis dfn_hop_lookahead_frames() hops later (48 kHz) (the array reseeds its comfort noise) --> P = B * G_res (dfn_form())
- |            --> dfn_hop_begin(E, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
+ |            --> dfn_hop_begin(B, P) --> while (dfn_hop_nn_begin == 1) { model; dfn_hop_nn_end } --> dfn_hop_end --> out
  |   refused call: array_sample_beam_reset (helper + array) + dfn_hop_reset   (dfn_reset())
  |   never reset the hop on the shared aligner's delay change
  |-- array_sample_beam_destroy; aec_destroy; release the pool (the DFN tail owns nothing else)
 ```
 
-The model estimates on the analysis beam `E` (`v.error_spec`) and is applied on `P`, formed over the rendering base
-`B` (`v.base_spec`, see [the 4ch README](../../4ch/README.md), "Analysis and rendering spectra"). `B` is
-`E` except on hops where a contributing lane's output guard fired; there `P` carries that lane's capture while the
-estimate stays on `E`. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
+The model estimates on the rendering base `B` (`v.base_spec`, see [the 4ch README](../../4ch/README.md), "Analysis and
+rendering spectra") and is applied on `P`, formed over the same `B`; the array's gain stage reads the analysis beam `E`
+(`v.error_spec`). `B` is `E` except on hops where a contributing lane's output guard fired; there `B` and `P` carry
+that lane's capture. A lane's post-chain reset reseeds the comfort noise and clears the synthesis. At 16 kHz that is
 `ainr_bridge_reset_synthesis()` on the hop of the event (the bridge synthesises the host-grid spectra at the top of
 its `begin()`; DFN2, the resamplers and the FIFOs keep running, no delay line). At 48 kHz the synthesis follows the model
 by its lookahead: the frame built on the hop of the event is pushed `dfn_hop_lookahead_frames()` hops later, so the example

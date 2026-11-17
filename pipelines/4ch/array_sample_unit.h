@@ -97,7 +97,7 @@ static inline int array_sample_stages_init(ArraySampleStages* ps, void* mem) {
     return ps->nr && ps->istft ? 0 : -1;
 }
 
-/** One hop after the fuse into `out`: G_res (the array's), G_nr (estimated on E), P = B * min(G_nr, G_res)
+/** One hop after the fuse into `out`: G_res (the array's), G_nr (estimated on B), P = B * min(G_nr, G_res)
  * over the rendering base B, comfort noise on the bins the gain cut, synthesis (cleared first when a lane
  * had a post-chain reset). 0, or -1 when the denoiser or the array refuses the hop. */
 static inline int array_sample_stages_chain(ArraySampleStages* ps, Aec* aec, const AecResidualView* v,

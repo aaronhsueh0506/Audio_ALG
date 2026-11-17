@@ -119,8 +119,8 @@ static int post_init(Post* q, void* mem) {
     return 0;
 }
 
-/* One hop after the fuse into out: G_nr estimated on E, P = B * min(G_nr, G_res) over the rendering
- * base B (G_res = 1 without the gain stage), comfort noise on the bins the gain cut, synthesis (cleared
+/* One hop after the fuse into out: G_nr estimated on the rendering base B, P = B * min(G_nr, G_res)
+ * (G_res = 1 without the gain stage), comfort noise on the bins the gain cut, synthesis (cleared
  * first when a lane had a post-chain reset). 0, or -1 when a stage refuses the hop. */
 static int post_hop(Post* q, Aec* aec, const AecResidualView* v, float* out) {
     const float* nr = array_sample_anr_gain(q->nr, v, q->extra_noise, q->use_r2);

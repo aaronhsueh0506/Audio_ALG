@@ -23,8 +23,8 @@ Firmware         Aec (mono: 1 mic | 4ch: n_mics = 4)       AnrDenoiser          
    |-- aec_get_residual -->|  v{error_spec, base_spec, r2, comfort_noise, res_gain (FULL), post_reset_serial, ...}
    |      (error_spec is the analysis seam; the gain is applied to base_spec; 4ch: the one G_res is computed over the fused spectra)
    |-- v.post_reset_serial moved: ac_istft_reset (before the CNG draw and the push; the library reseeds its own comfort noise)
-   |-- anr_process_gain_with_residual_psd (mono: on base_spec, the spectrum the gain is applied to; 4ch: array_sample_anr_gain, on error_spec = the beam E) -->|  G_nr
-   |      (the two spectra differ only on a hop where an output guard fired; board samples outside the repository may feed error_spec in mono: a known difference)
+   |-- anr_process_gain_with_residual_psd (on base_spec, the spectrum the gain is applied to; 4ch: array_sample_anr_gain) -->|  G_nr
+   |      (base_spec differs from error_spec only on a hop where an output guard fired)
    |-- aec_apply_gain(aec, G_nr, P), aec_apply_cng(aec, G_nr, P)   (P = base * min(G_nr, G_res) + comfort noise)
    |-- ac_istft_push ------------------------------------------------>|  out[hop]   (1 hop behind the input)
    |== refused call or non-finite output =======================================
@@ -199,7 +199,8 @@ lanes, the shared estimator, the alignment ring, the fusion buffers and the gain
 The ULCNet and DFN2 examples split the hop around the model call so the
 accelerator runs between two calls (DFN2: `nn_begin` and `nn_end`, and the model config then needs
 no `infer` callback; Align-ULCNet: `ulcnet_stream_pre_process_freq` and `ulcnet_stream_post_process_freq`).
-Both are fed the error (or beam) spectrum; the Align-ULCNet
+Align-ULCNet is fed the error (or beam) spectrum; DFN2 estimates on the rendering base B
+(`v.base_spec`) and applies to P = B·G_res (plus comfort noise). The Align-ULCNet
 stream's spectrum entries take spectra only (the error or beam spectrum and the spectrum of the raw far hop, which
 the application analyses with its own `AcStft`) and return one output spectrum for the
 application's `AcIstft`; the DFN2 hop glue emits one hop of samples. The model
@@ -219,7 +220,7 @@ ulcnet_stream_post_process_freq(stream, rc, out_re, out_im);       // rc != 0 or
 ac_istft_push_planar(ulc_istft, out_re, out_im, out);              // the application's WOLA, exactly one hop
 
 // DFN2 (dfn/dfn_hop.h): up to two frames per hop through the rate bridge
-dfn_hop_begin(&hop, e, p);               // P = E.G_res formed first (by the example main)
+dfn_hop_begin(&hop, b, p);               // b = v.base_spec; P = B.G_res formed first (by the example main)
 while (dfn_hop_nn_begin(&hop, &job) == 1)
     dfn_hop_nn_end(&hop, run_npu(&job));
 dfn_hop_end(&hop, out);

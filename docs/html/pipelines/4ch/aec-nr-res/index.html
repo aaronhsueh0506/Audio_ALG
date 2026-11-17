@@ -58,7 +58,7 @@ while (stream_next4(&amp;mics, &amp;ref, out)) {
     int vad = product_vad(mics);                            /* 沒有產品 VAD 時改呼叫 array_sample_beam_process() (內建 energy VAD) */
     int rc = array_sample_beam_process_with_activity(b, mics, ref, vad, vad, NULL, &amp;beam, &amp;info);
     if (rc == AEC_OK) rc = array_sample_beam_fuse(b, &amp;v);    /* aec_process_residual + aec_get_residual;STATE 的 array 回 AEC_ERR_MODE */
-    if (rc == AEC_OK) g_nr = array_sample_anr_gain(nr, &amp;v, extra_noise, 1);   /* NR 在 v.error_spec(E)上估計;NULL = 被拒 */
+    if (rc == AEC_OK) g_nr = array_sample_anr_gain(nr, &amp;v, extra_noise, 1);   /* NR 在 v.base_spec(B)上估計;NULL = 被拒 */
     if (g_nr) {
         if (array_sample_post_reset_due(&amp;handled, &amp;v))       /* 某條 lane 本 hop 硬重置:在 CNG 第一次抽樣之前清合成尾巴(種子由 array 自己重設) */
             ac_istft_reset(istft);
@@ -81,7 +81,7 @@ return 0;</pre>
 <p>有 VAD 用 <code>process_with_activity()</code>(如上),沒有則 <code>array_sample_beam_process()</code>(內建 energy VAD)。要由 lane 頻譜算 mask／VAD 時拆成 <code>array_sample_beam_process_front(b, mics, ref, &amp;front)</code> → 在 <code>front.lane_error_spec</code> 上算 mask → <code>array_sample_beam_process_beam(b, &amp;front, vad_raw, vad_out, mask, &amp;beam, &amp;info)</code>。外部 NN 後級(如 ULCNet)用 <code>cfg.residual = AEC_RESIDUAL_STATE</code>、不呼叫 <code>array_sample_beam_fuse()</code>,把 <code>beam.spectrum</code> 拆成 re／im 平面交給 <code>ulcnet_stream_pre_process_freq()</code>(<a href="../align-ulcnet/index.html">四聲道 · Align-ULCNet</a>)。</p>
 <h3>只用 array + 自備 beamformer</h3>
 <p>產品的波束器在別處時不需要 helper:<code>aec_process_linear()</code> + <code>aec_get_array()</code> → 自己的 beamformer → <code>aec_process_residual(a, &amp;beam)</code> + <code>aec_get_residual()</code> → 同樣的後級。完整、已語法檢查的範例在 <a href="reference/configuration.html#diagnostics">四聲道 參數與診斷</a>;可執行範例是 <code>4ch_external_static.c</code>。</p>
-<p><b>換用別的後級(例如 DFN2)。</b>array 只交出 <code>AecResidualView</code>(<code>error_spec</code> 是 pre-RES 誤差頻譜,<code>base_spec</code> 是渲染基底 B,輸出守衛未觸發時等於 E,<code>comfort_noise</code>／<code>r2</code> 是同一次投影的 PSD);神經後濾波用 <code>aec_apply_gain(aec, NULL, P)</code> 自己組 <code>P = B · G_res (+ comfort noise)</code>(B = <code>base_spec</code>;估計仍用 <code>error_spec</code>),現成消費者是 <a href="../dfn2/index.html">四聲道 · DFN2</a>。</p>
+<p><b>換用別的後級(例如 DFN2)。</b>array 只交出 <code>AecResidualView</code>(<code>error_spec</code> 是 pre-RES 誤差頻譜,<code>base_spec</code> 是渲染基底 B,輸出守衛未觸發時等於 E,<code>comfort_noise</code>／<code>r2</code> 是同一次投影的 PSD);神經後濾波用 <code>aec_apply_gain(aec, NULL, P)</code> 自己組 <code>P = B · G_res (+ comfort noise)</code>(B = <code>base_spec</code>;估計也用 <code>base_spec</code>),現成消費者是 <a href="../dfn2/index.html">四聲道 · DFN2</a>。</p>
 <p>強度只有一處:array 唯一的增益級(<code>aec_set_level(aec, level)</code>)與你擁有的降噪器(<code>anr_set_level()</code>);helper 沒有 setter,四條 lane 自己的 level 是無效操作。呼叫表、ramp 與逐階段耗時診斷(<code>aec_array_get_timing()</code>)見 <a href="reference/configuration.html#diagnostics">四聲道 參數與診斷</a>。</p>
 
 <h2>流程時序圖</h2>

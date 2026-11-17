@@ -6,20 +6,23 @@ context) and its post-beam residual suppressor are the
 ``4ch/pipeline.py`` reference.  This module adds the
 spectrum-to-hop tail after ``res_gain`` in two flavours:
 
-* ``post_conventional``: MMSE-LSA on the fused pre-RES spectrum,
-  ``min(G_nr, G_res)``, comfort noise, WOLA -- the post chain of the C
-  application (``4ch_external_static.c``);
-* ``post_dfn2``: ``P = E * G_res`` plus comfort noise (the conventional
+* ``post_conventional``: MMSE-LSA on the fused rendering base ``B``
+  (``output_base_spec``), ``min(G_nr, G_res)`` applied on ``B``, comfort
+  noise, WOLA -- the post chain of the C application
+  (``4ch_external_static.c``);
+* ``post_dfn2``: ``P = B * G_res`` plus comfort noise (the conventional
   post spectrum with the denoiser off), the dual-input DFN2 stage estimated
-  on ``E`` (the beamformed spectrum) and applied on ``P``, WOLA -- the
-  ``4ch_aec_bf_dfn_res`` C wrapper.
+  on ``B`` and applied on ``P``, WOLA -- the ``4ch_aec_bf_dfn_res`` C
+  wrapper.
 
 Both consume the same fused ``AecResContext`` stream, so the two tails differ
-only in the stage under test.  The C wrapper hands the stage the beamformer's output
-directly (``trusted_beamformed_error``); here ``E`` is the coherent projection
-``sum_ch w_ch * error_spec_ch`` the Python reference builds from the adapter's
-weights, which is the same signal when the adapter's weights are the ones the
-beamformer actually applied.
+only in the stage under test.  ``B`` is the analysis beam ``E``
+(``error_spec``, what the post-beam RES reads) except on a hop where a
+contributing lane's output guard fired.  The C wrapper hands the array the
+beamformer's output directly (``trusted_beamformed_error``); here ``E`` is the
+coherent projection ``sum_ch w_ch * error_spec_ch`` the Python reference
+builds from the adapter's weights, which is the same signal when the adapter's
+weights are the ones the beamformer actually applied.
 """
 
 from __future__ import annotations
@@ -74,9 +77,9 @@ def run_front_end(microphones: np.ndarray, render: np.ndarray,
 
     The one post-beam suppressor is owned here (the pipeline fuses the context
     and leaves ``res_gain`` None).  Returns the fused per-hop contexts
-    (``error_spec`` = the beamformed pre-RES spectrum, ``res_gain`` = the one
-    post-beam suppression gain, ``comfort_noise``/``r2`` fused), which both
-    tails consume.
+    (``error_spec`` = the beamformed pre-RES spectrum, ``output_base_spec`` =
+    the rendering base, ``res_gain`` = the one post-beam suppression gain,
+    ``comfort_noise``/``r2`` fused), which both tails consume.
     """
     pipeline = McabPipeline(config, beamformer or EqualWeightBeamformer())
     hop = pipeline.hop_size
@@ -98,7 +101,7 @@ def _post_config(sample_rate: int, hop: int, enable_cng: bool) -> AecConfig:
 def post_conventional(contexts: Sequence[AecResContext], sample_rate: int,
                       nr_preset: str = 'balanced', enable_cng: bool = True,
                       inject_echo_psd: bool = True) -> np.ndarray:
-    """MMSE-LSA on E, min(G_nr, G_res), comfort noise, WOLA."""
+    """MMSE-LSA on B, min(G_nr, G_res) applied on B, comfort noise, WOLA."""
     hop = int(contexts[0].error_spec.size - 1)
     nr_gains = run_nr_spectrum(contexts, sample_rate, nr_preset=nr_preset,
                                inject_echo_psd=inject_echo_psd)
@@ -110,8 +113,9 @@ def post_conventional(contexts: Sequence[AecResContext], sample_rate: int,
 def post_dfn2(contexts: Sequence[AecResContext], sample_rate: int, stage: Dfn2Stage,
               estimate_source: str = 'pre_res',
               enable_cng: bool = False, realtime_timing: bool = False) -> np.ndarray:
-    """P = E * G_res (+ comfort noise when enabled), DFN2 estimated on E and
-    applied on P, WOLA. Comfort noise is off by default, as in the C wrapper."""
+    """P = B * G_res (+ comfort noise when enabled), DFN2 estimated on B
+    (``estimate_source='pre_res'``, the fused ``output_base_spec``) and applied
+    on P, WOLA. Comfort noise is off by default, as in the C wrapper."""
     hop = int(contexts[0].error_spec.size - 1)
     return run_dfn2_res(contexts, _post_config(sample_rate, hop, enable_cng), stage,
                         estimate_source=estimate_source,

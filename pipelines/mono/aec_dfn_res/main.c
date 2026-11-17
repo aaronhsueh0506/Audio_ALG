@@ -146,7 +146,7 @@ static int rig_build(Rig *r, const Plan *p) {
     dfn_reset_follow_init(&r->follow, &p->dfn.stream_cfg.grid);
     r->post = (Complex *)cur;     cur += p->spec_bytes;
     r->reset_serial = aec_post_reset_serial(r->aec);
-    if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, 0, &r->hop) != 0)
+    if (dfn_hop_pool_build(&p->dfn, cur, p->grid.n_freqs, p->grid.hop_size, &r->hop) != 0)
         goto fail;
     return 0;
 fail:

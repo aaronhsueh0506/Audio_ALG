@@ -9,5 +9,5 @@
 # Moved from pipelines/audiolib.pin (same key, same value -- a working-tree relocation, not a new
 # pin) so the three dependencies' pins live in one place (lib/) read by one lib/deps.mk, instead of
 # this one file alone sitting in pipelines/ beside two unpinned submodule gitlinks.
-AUDIOLIB_COMMIT=672fbd5cc8363de5f841d4e12635e5731193f247
+AUDIOLIB_COMMIT=7c5591f7792438919dbfc2d48a39b82afb68375a
 AUDIOLIB_URL=https://github.com/aaronhsueh0506/audio_common.git

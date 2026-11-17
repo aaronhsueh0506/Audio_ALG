@@ -37,8 +37,6 @@ static float lcg(void) {
     return ((float)(int)(g_lcg >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))   /* int16^2 -> audio scale, exact */
-
 /* The mono lane every example below starts from: the grid (fft_size 0: the rate's default) and
  * the AEC keeping its own gain in the residual view (AEC_RESIDUAL_FULL). */
 static int derive_mono_lane(int sample_rate, int fft_size, AecSignalGrid* grid,
@@ -115,7 +113,7 @@ static int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
         ac_istft_reset(c->istft);
     }
     if (f.r2 && f.usable_linear) {         /* residual-echo powers into the noise floor */
-        sk_scale_f32(c->g_nr_scratch, f.r2, PSD_SCALE_INV, f.n_freqs);
+        sk_scale_f32(c->g_nr_scratch, f.r2, AEC_PSD_SCALE_INV_F, f.n_freqs);
         residual_psd_audio = c->g_nr_scratch;
     }
     nr_gain = anr_process_gain_with_residual_psd(c->nr, f.base_spec, residual_psd_audio);
@@ -287,7 +285,7 @@ static int dfn_host_build(DfnHost* d, const DFN2Model* model) {
     d->aec = aec_init(cur, aec_b, &aec_cfg);  cur += ALIGN16(aec_b);
     d->post = (Complex*)cur;                   cur += cvec;
     if (!d->aec) return -1;
-    return dfn_hop_pool_build(&plan, cur, grid.n_freqs, grid.hop_size, 0, &d->hop);
+    return dfn_hop_pool_build(&plan, cur, grid.n_freqs, grid.hop_size, &d->hop);
 }
 
 static void dfn_host_free(DfnHost* d) {

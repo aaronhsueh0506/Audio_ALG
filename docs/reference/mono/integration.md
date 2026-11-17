@@ -29,7 +29,7 @@
  │ aec_get_residual(aec,&v) ◄───────│            v{error_spec,near_spec,r2,comfort_noise,res_gain,base_spec,guard_active,...}
  │                                  │            v.base_spec = 渲染基底 B（E；守衛觸發的 hop 為 E+echo）
  │ aec_post_reset_serial(aec) 變了？  → ac_istft_reset(istft)   （在 push 之前；Aec 自己重設 comfort noise 的種子；降噪器不動）
- │ sk_scale_f32(residual_psd_audio,v.r2,PSD_SCALE_INV,n)   （use_r2 且 v.usable_linear 時：回聲功率摺進 noise floor）
+ │ sk_scale_f32(residual_psd_audio,v.r2,AEC_PSD_SCALE_INV_F,n)   （use_r2 且 v.usable_linear 時：回聲功率摺進 noise floor）
  │ anr_process_gain_with_residual_psd(nr,v.base_spec,residual_psd_audio) ─►│ G_nr（NULL = 被拒）
  │ aec_apply_gain(aec,G_nr,spec)      （spec = B × min(G_nr, G_res)；沒有降噪器時 extra 傳 NULL；--no-res 改用 aec_apply_gain_spec 配 unity 向量）
  │ aec_apply_cng(aec,G_nr,spec)       （CNG 開、有 RES 增益時；與上一行同一個 extra 增益）
@@ -141,12 +141,12 @@ mono 的 RES 是明確的例外：它在 `Aec` 的呼叫裡（`aec_process_resid
 
 0. `aec_post_reset_serial(aec)` 與已處理的值不同（AEC 在這個 hop 內做了硬重置）時，在 `ac_istft_push()` 之前 `ac_istft_reset(istft)`（Aec 自己的 comfort noise 產生器已在同一個事件重設種子）；不要因此重置 AEC，降噪器也不動。
 1. `aec_process_linear()` 與 `aec_process_residual()` 都回 `AEC_OK`，`aec_get_residual()` 回 `AEC_OK` 且 `v.res_gain` 非 NULL；任一個不是就視為拒絕該 hop。
-2. NR 增益：`use_r2` 開著、`v.r2` 非 NULL 且 `v.usable_linear` 時，先 `sk_scale_f32(extra_noise, v.r2, PSD_SCALE_INV, n_freqs)` 得到殘留回音 PSD（audio 功率尺度）；再 `anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio)`（`v.base_spec` 是渲染基底 B，與要套增益的是同一張頻譜，所以降噪器判斷的就是它要濾的訊號；未觸發守衛的 hop 上 B 與 `v.error_spec` 逐位元相同；回傳降噪器擁有的 `n_freqs` 個增益，NULL = 降噪器拒絕該 hop；不用殘留回音 PSD 時傳 NULL）。沒有降噪器時 `nr` 用 NULL。
+2. NR 增益：`use_r2` 開著、`v.r2` 非 NULL 且 `v.usable_linear` 時，先 `sk_scale_f32(extra_noise, v.r2, AEC_PSD_SCALE_INV_F, n_freqs)` 得到殘留回音 PSD（audio 功率尺度）；再 `anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio)`（`v.base_spec` 是渲染基底 B，與要套增益的是同一張頻譜，所以降噪器判斷的就是它要濾的訊號；未觸發守衛的 hop 上 B 與 `v.error_spec` 逐位元相同；回傳降噪器擁有的 `n_freqs` 個增益，NULL = 降噪器拒絕該 hop；不用殘留回音 PSD 時傳 NULL）。沒有降噪器時 `nr` 用 NULL。
 3. `aec_apply_gain(aec, nr, spec)`：`spec = B × min(nr, G_res)`（`nr` 為 NULL 時是 `B × G_res`）。`v.error_spec`／`v.formed_hop` 是分析 seam（永不被輸出守衛改動；AI 模型的分析輸入讀它），不在這裡渲染。git 之外的板端 sample（例如 `alg_audio_aec_nr.c`）目前把 `v.error_spec` 交給降噪器，這是已知差異，不是建議。`--no-res` 時 G_res 視為全 1：`aec_apply_gain_spec(spec, v.base_spec, unity, nr, n_freqs)`。
 4. CNG 開著（`aec_cfg.enable_cng` 且沒有 `--no-cng`）且有 RES gain 時 `aec_apply_cng(aec, nr, spec)`：與上一步同一個 `nr`，由 Aec 自己的產生器（種子 `AEC_CNG_SEED`）抽樣。
 5. `ac_istft_push(istft, spec, out)` 產生這個 hop 的時域輸出。
 
-`PSD_SCALE_INV`（1/32768²，AEC 的功率在 int16² 尺度、降噪器在音訊尺度）是範例檔頭自己的 `#define`，不是函式庫常數；comfort noise 的種子是函式庫的 `AEC_CNG_SEED`（42），降噪器增益的下限 `AEC_CNG_NR_GAIN_FLOOR`（0.31622777f，即 −10 dB）也在 `aec.h`，由 `aec_apply_cng()` 內部套用。
+`AEC_PSD_SCALE_INV_F`（1/32768²，AEC 的功率在 int16² 尺度、降噪器在音訊尺度）是 `aec.h` 的函式庫常數；comfort noise 的種子 `AEC_CNG_SEED`（42），降噪器增益的下限 `AEC_CNG_NR_GAIN_FLOOR`（0.31622777f，即 −10 dB）同樣在 `aec.h`，由 `aec_apply_cng()` 內部套用。
 
 ### 1.2 `--aec-only`
 
@@ -221,7 +221,6 @@ libaudio_common.a
 #include "utility/simd_kernel_nn.h"    /* skn_all_finite_f32() */
 
 /* aec_apply_cng()'s generator belongs to the Aec: it starts from AEC_CNG_SEED (42) and restarts from it on every hard post-chain reset */
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))       /* AEC powers are int16^2, the denoiser's audio scale */
 /* The synthesis borrows the AEC's window (aec_synthesis_window()), which exists only after aec_init();
  * a borrowed table carves nothing, so any non-NULL pointer sizes it the same. */
 static const float k_sizing_window[1] = {0.0f};
@@ -284,7 +283,7 @@ int main(void) {
             }
             const float* residual_psd_audio = NULL;
             if (v.r2 && v.usable_linear) {                        /* echo powers into the noise floor */
-                sk_scale_f32(extra_noise, v.r2, PSD_SCALE_INV, n);
+                sk_scale_f32(extra_noise, v.r2, AEC_PSD_SCALE_INV_F, n);
                 residual_psd_audio = extra_noise;
             }
             gnr = anr_process_gain_with_residual_psd(nr, v.base_spec, residual_psd_audio);   /* G_nr, owned by the denoiser; NULL = refused */

@@ -157,7 +157,7 @@ while (read_block(pcm_in, hop_in)) {
 <tr><th>lite 產品（<code>alg_ai3_dfn_lite.c</code>）</th><td>PCM → PCM</td><td>同樣三個選項與預設（<code>alg_ai3_dfn.c</code> 在定義 <code>DFN2_MASK_ONLY</code> 下的薄包裝）。只有 48000／1024／512 一列，其他組態同樣啟動即被拒。</td></tr>
 <tr><th><code>uvc_ai_nr_stream</code></th><td>PCM → PCM</td><td>固定 48000／1024／512（N=1），沒有選項。sample 自己在前後做 16 ↔ 48 kHz 重採樣；模型設定查不到這個組態的列時拒絕啟動。</td></tr>
 <tr><th><code>alg_ai3_aec_dfn</code></th><td>E／P 頻譜 → 頻譜（<code>_freq</code> 家族）</td><td>模型 grid 由 <code>--ai-sample-rate</code>、<code>--ai-fft-size</code> 給，<code>hop_in</code> 固定為 <code>fft / 2</code>（N=1）：48000／1024（預設）或 16000／256；其他組態以回傳碼訊息被拒，結束碼 2。<code>--sr</code> 是 host（AEC）的取樣率：等於模型的取樣率時 AEC 的頻譜直接進模型，8000／16000 配 48000／1024 的模型時經 <code>AinrBridge</code>（<code>stream/ainr/bridge</code>）往返 48 kHz，其他組合結束碼 1。模型檔取 <code>AinrInfo.graph_path</code>（函式庫依 grid 解出的檔名，每個 grid 一個）；量化由產品 build 決定，sample 沒有 <code>--quant8</code>／<code>--quant16_8</code>。</td></tr>
-<tr><th><code>uvc_audio_live2a</code></th><td>E／P 頻譜 → 頻譜（<code>_freq</code> 家族）</td><td>固定 48000／1024／512（N=1）。pipeline 在 16 kHz 的頻譜經函式庫的 <code>AinrBridge</code>（<code>stream/ainr/bridge</code>）轉成 48 kHz 的 E 與 P 再進模型，輸出轉回原生 hop；模型設定查不到這個組態的列時拒絕啟動。設定中的衰減上限不生效（登錄表固定為 0 dB），非零時 sample 印出提示。</td></tr>
+<tr><th><code>uvc_audio_live2a</code></th><td>E／P 頻譜 → 頻譜（<code>_freq</code> 家族）</td><td>固定 48000／1024／512（N=1）。pipeline 在 16 kHz 的頻譜經函式庫的 <code>AinrBridge</code>（<code>stream/ainr/bridge</code>）轉成 48 kHz 的 E 與 P 再進模型，輸出轉回原生 hop；模型設定查不到這個組態的列時拒絕啟動。設定中的 <code>dfn_atten_lim_db</code> 在啟動時以 <code>ainr_set_atten_lim_freq()</code> 設給模型一次（0 為關閉）；值被拒（非有限）時啟動失敗並印出該值。</td></tr>
 </tbody></table>
 <p>兩支 UVC sample 都不是 N=8 的呼叫端，通用 API 能接受 N=8 不代表 UVC 已經跑過 N=8。它們各自連結 full 或 lite 的 archive 由產品建置決定，本庫未核對。</p>
 

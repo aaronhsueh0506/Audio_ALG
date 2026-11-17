@@ -94,7 +94,7 @@ int mono_dfn_run(void) {
     Aec *aec = aec_init(cur, aec_b, &amp;aec_cfg);              cur += ALIGN16(aec_b);
     Complex *post = (Complex *)cur;                         cur += cvec;    /* P */
     DfnHop hop;                                              /* hop.bridge:bridge(48 kHz host 為 NULL,改有 hop.istft) */
-    if (!aec || dfn_hop_pool_build(&amp;dfn, cur, grid.n_freqs, grid.hop_size, 0, &amp;hop) != 0) {
+    if (!aec || dfn_hop_pool_build(&amp;dfn, cur, grid.n_freqs, grid.hop_size, &amp;hop) != 0) {
         aec_destroy(aec);  free(pool);  return -1;          /* DFN2 尾段不持有 heap:失敗的 build 不留東西需要釋放 */
     }
     uint32_t handled = aec_post_reset_serial(aec);           /* 已處理的重置序號 */
@@ -205,7 +205,7 @@ int four_dfn_run(void) {
     Complex *post = (Complex *)cur;                              cur += cvec;          /* P */
     DfnHop hop;                                                  /* hop.bridge(16 kHz)或 hop.istft(48 kHz) */
     if (!unit ||
-        dfn_hop_pool_build(&amp;dfn, cur, grid.n_freqs, grid.hop_size, 1, &amp;hop) != 0) {
+        dfn_hop_pool_build(&amp;dfn, cur, grid.n_freqs, grid.hop_size, &amp;hop) != 0) {
         if (unit) array_sample_beam_destroy(unit);
         aec_destroy(aec);  free(pool);  return -1;   /* DFN2 尾段不持有 heap,沒有東西要 destroy */
     }
@@ -225,9 +225,9 @@ int four_dfn_run(void) {
                 reset_pending = (reset_pending &lt;&lt; 1) | (uint32_t)moved;
                 if ((reset_pending &gt;&gt; dfn_hop_lookahead_frames(&amp;mg)) &amp; 1u) ac_istft_reset(hop.istft);   /* 只清合成;DFN2 照跑 */
             }
-            if (aec_apply_gain(aec, NULL, post) == AEC_OK &amp;&amp;          /* P = B * G_res,B = v.base_spec;估計輸入仍是 v.error_spec */
+            if (aec_apply_gain(aec, NULL, post) == AEC_OK &amp;&amp;          /* P = B * G_res,B = v.base_spec;估計輸入同為 v.base_spec */
                 (!cng_on || aec_apply_cng(aec, NULL, post) == AEC_OK) &amp;&amp;
-                dfn_hop_process(&amp;hop, v.error_spec, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }
+                dfn_hop_process(&amp;hop, v.base_spec, post, out) == 0) { emit_hop(out, grid.hop_size); continue; }
         }
         array_sample_beam_reset(unit);  handled = aec_post_reset_serial(aec);  reset_pending = 0;  dfn_hop_reset(&amp;hop);  /* 一起 reset */
     }
@@ -276,7 +276,7 @@ int four_dfn_run(void) {
   | aec_init(pool, aec_b, &amp;aec_cfg)                       |                           |
   |--------------------------&gt;|                           |                           |
   |&lt;- Aec* | NULL ------------|                           |                           |
-  | dfn_hop_pool_build(&amp;plan, cur, n_freqs, hop_size, check_finite, &amp;hop)
+  | dfn_hop_pool_build(&amp;plan, cur, n_freqs, hop_size, &amp;hop)
   |------------------------------------------------------&gt;|                           |
   |   dfn2_stream_init_ex(&amp;plan.stream_cfg, mem, bytes, &amp;plan.stream_req)(記憶體模式;erb_inv 不是 partition of unity 在這裡被拒)
   |   ainr_bridge_init_ex(mem, bytes, &amp;plan.bridge_cfg, &amp;plan.bridge_req) + dfn_hop_init_bridge()      8 / 16 kHz host

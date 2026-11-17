@@ -101,7 +101,7 @@ res_gain = v.res_gain                         the AEC's own gain (mono) or the a
 nr_gain  = mono_nr_gain(...)                  gain stages return const float*
            / array_sample_anr_gain(nr, &v, scratch, use_r2)
 spec     = aec_apply_gain(aec, nr_gain, spec) P = v.base_spec * min(nr_gain, res_gain);
-                                              estimators read v.error_spec / v.base_spec, render v.base_spec
+                                              G_res reads v.error_spec, the denoiser v.base_spec; render v.base_spec
 spec    += aec_apply_cng(aec, nr_gain, spec)  comfort noise on the cut bins, same extra gain to both,
                                               the array's / Aec's own generator
                                               (--no-res: aec_apply_gain_spec with the unity vector, no comfort noise)

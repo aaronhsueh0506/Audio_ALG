@@ -57,7 +57,7 @@ void *bridge_parity_create(int sample_rate, int fft_size, const float *fwd, cons
     s->pool = aligned_alloc(16, (dfn_hop_pool_bytes(&plan) + 15u) & ~(size_t)15u);
     if (!s->pool) { free(s); return NULL; }
     memset(s->pool, 0, dfn_hop_pool_bytes(&plan));
-    if (dfn_hop_pool_build(&plan, (unsigned char *)s->pool, s->n_freqs, fft / 2, 0, &s->hop) != 0) {
+    if (dfn_hop_pool_build(&plan, (unsigned char *)s->pool, s->n_freqs, fft / 2, &s->hop) != 0) {
         free(s->pool); free(s); return NULL;
     }
     return s;

@@ -4,7 +4,7 @@
  * sk_min_f32, sk_capply_gain_f32, aec_apply_cng_spec with its own generator) rather than the
  * library-owned aec_apply_gain / aec_apply_cng the applications call.
  *
- *   aec_process_linear -> aec_process_residual -> G_res (FULL array) -> NR gain on E (if enabled)
+ *   aec_process_linear -> aec_process_residual -> G_res (FULL array) -> NR gain on B (if enabled)
  *     -> sk_min_f32 -> [post-chain reset: ac_istft_reset, reseed]
  *     -> sk_capply_gain_f32 over the rendering base -> aec_apply_cng_spec -> ac_istft_push
  *
@@ -150,8 +150,8 @@ static inline void conv_reset(ConvChain* c) {
     c->rng = AEC_CNG_SEED;
 }
 
-/* The denoiser gain over the fused frame; the residual-echo prior is R^2 / 2^30, applied only
- * while the linear estimate is usable. NULL when the denoiser refuses the hop. */
+/* The denoiser gain over the fused frame's rendering base B; the residual-echo prior is R^2 / 2^30,
+ * applied only while the linear estimate is usable. NULL when the denoiser refuses the hop. */
 static inline const float* conv_nr_gain(ConvChain* c) {
     const float* residual_psd_audio = NULL;
     if (!c->nr) return c->unity;
@@ -159,7 +159,7 @@ static inline const float* conv_nr_gain(ConvChain* c) {
         sk_scale_f32(c->extra_noise, c->frame.r2, 0x1p-30f, c->n_freqs);
         residual_psd_audio = c->extra_noise;
     }
-    return anr_process_gain_with_residual_psd(c->nr, c->frame.error_spec, residual_psd_audio);
+    return anr_process_gain_with_residual_psd(c->nr, c->frame.base_spec, residual_psd_audio);
 }
 
 /* The RES gain of the fused frame (the array's gain stage); the unity vector without enable_res.

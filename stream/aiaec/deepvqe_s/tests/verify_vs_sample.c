@@ -35,6 +35,7 @@
 #include "fft_wrapper.h"
 #include "audio_stft.h"
 #include "stream_run.h"
+#include "tests/s16_oracle.h"
 
 /* DEEPVQE_TIME_ORDER itself comes from deepvqe_process.h via deepvqe_stream.h ->
  * deepvqe_prepost.h -> deepvqe_process.h; used directly below instead of a local, driftable
@@ -174,10 +175,7 @@ static int board_post(BoardDriver *d, int ai_rc, int16_t *pcm_out, int *written_
         return 0;
     }
     for (k = 0; k < hop; ++k) {
-        float v = d->hop_out[k] * 32768.0f;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        pcm_out[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);   /* round half away from zero */
+        pcm_out[k] = s16_oracle(d->hop_out[k]);
     }
     return 1;
 }
@@ -485,9 +483,7 @@ static int run_fail_closed_oracle(int kind) {   /* 0 status only, 1 non-finite t
         if (fail) { memset(O.mic_re, 0, (size_t)grid.n_bins * sizeof(float)); memset(O.mic_im, 0, (size_t)grid.n_bins * sizeof(float)); }
         if (ac_istft_push_planar(O.istft, O.mic_re, O.mic_im, O.hop_out) != hop) { bad++; continue; }
         for (k = 0; k < hop; ++k) {
-            float v = O.hop_out[k] * 32768.0f;
-            v = v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v;
-            pcm_o[k] = (int16_t)(int32_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+            pcm_o[k] = s16_oracle(O.hop_out[k]);
         }
 
         if (deepvqe_stream_pre_process(B, mic_in, far_in, &io) != 1) { bad++; continue; }

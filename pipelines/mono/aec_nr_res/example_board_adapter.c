@@ -87,10 +87,6 @@ static void board_mem_free(void* p) {
 
 #define POOL_ALIGNMENT 16u
 
-/* The AEC's residual-echo powers are on the int16^2 scale, the denoiser's on the audio scale;
- * the reciprocal is a power of two, so the multiply is exact. */
-#define PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
-
 /* The synthesis borrows the AEC's own window table (aec_synthesis_window()), which exists once the AEC is
  * initialised, after the pool is sized. A borrowed table carves nothing, so any non-NULL pointer sizes the
  * synthesis the same; this one stands in until mono_init() installs the AEC's. */
@@ -196,7 +192,7 @@ static int mono_hop(MonoStages* s, const float* mic, const float* ref, float* ou
         ac_istft_reset(s->istft);
     }
     if (v.r2 && v.usable_linear) {
-        sk_scale_f32(s->extra_noise, v.r2, PSD_SCALE_INV, v.n_freqs);
+        sk_scale_f32(s->extra_noise, v.r2, AEC_PSD_SCALE_INV_F, v.n_freqs);
         residual_psd_audio = s->extra_noise;
     }
     nr = anr_process_gain_with_residual_psd(s->nr, v.base_spec, residual_psd_audio);

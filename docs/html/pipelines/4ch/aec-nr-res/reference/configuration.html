@@ -129,7 +129,7 @@
 <tr><td><code>AecArrayView.aligned_ref</code></td><td>[hop] 本 hop 實際餵給四條 lane 的 delay-aligned far(ring 未滿時為 raw ref);給外部 NN 後級(Align-ULCNet far branch)用</td><td>同上</td></tr>
 <tr><td><code>AecResidualView</code>(<code>aec_get_residual()</code> 填)</td><td><code>error_spec</code>=beamformed 誤差、<code>near_spec</code>=投影近端、<code>far_spec</code>=lane 0 的 far 頻譜、<code>r2／comfort_noise</code>=投影後的殘餘回音／舒適噪音 PSD、<code>base_spec</code>=渲染基底、<code>res_gain</code>(FULL)、<code>far_hop</code>、<code>max_dt／max_saturation／all_converged／usable_linear</code>(只計對權重有非零響應的 lane)、<code>clock_drift</code>、delay 旗標、<code>guard_lanes</code>、<code>post_reset_serial</code>;<code>formed_hop</code>／<code>echo_spec</code> 恆為 NULL</td><td>借用;<code>error_spec</code> 在傳入 <code>beamformed_error</code> 時別名呼叫端的陣列,否則別名 array 內 buffer;有效至下一次 <code>aec_process_linear()</code>／reset／destroy;不得寫入</td></tr>
 </table>
-<p class="note"><b>分析 seam 與渲染基底是兩個訊號。</b><code>lib/aec</code> 的 formed 序列與 <code>error_spec</code> 一律是被選中的線性殘差(沒有 capture 候選),輸出守衛不改動它們;外部 beamformer 與各估計器讀的就是這個分析 seam。輸出守衛只決定每條 lane 的渲染基底(<code>AecArrayView.lane_base_spec</code>、<code>lane_guard_active</code>),<code>aec_process_residual()</code> 以同一組權重把它們加成 <code>AecResidualView.base_spec</code>;範例鏈渲染 <code>base_spec × gain</code>(<code>aec_apply_gain()</code>)。</p>
+<p class="note"><b>分析 seam 與渲染基底是兩個訊號。</b><code>lib/aec</code> 的 formed 序列與 <code>error_spec</code> 一律是被選中的線性殘差(沒有 capture 候選),輸出守衛不改動它們;外部 beamformer 與 array 的增益級(G_res)讀的就是這個分析 seam。輸出守衛只決定每條 lane 的渲染基底(<code>AecArrayView.lane_base_spec</code>、<code>lane_guard_active</code>),<code>aec_process_residual()</code> 以同一組權重把它們加成 <code>AecResidualView.base_spec</code>;範例鏈的降噪器在 <code>base_spec</code> 上估計,渲染 <code>base_spec × gain</code>(<code>aec_apply_gain()</code>)。</p>
 
 <h2 id="diagnostics">執行期控制與診斷</h2><h3>array + 外部 beamformer 的呼叫範例</h3>
 <p>產品的波束器在別處時不需要 sample helper:<code>aec_process_residual()</code> 吃呼叫端的權重(和可選的 beamformed 頻譜)。RES 增益由 array 內唯一的增益級(<code>residual = FULL</code>)算,應用不需要另建;lane 與 estimator 在 array 的 pool 內,沒有要另外建或另外拆的東西。可執行版本:<code>4ch_external_static.c</code>(權重是每個 bin 皆 1/4 的等權佔位,要換成產品波束器的權重);參考鏈:<code>tests/conv_chain_4ch.h</code>。以下範例已在 <code>-Wall -Wextra -Werror</code> 下編譯並執行(<code>platform_alloc()</code>、<code>stream_next4()</code>、<code>product_beamformer()</code> 是你的平台／I/O／波束器佔位;範例省略了 <code>platform_alloc()</code> 回傳值的檢查與記憶體釋放):</p>
@@ -169,7 +169,7 @@ while (stream_next4(&amp;mics, &amp;ref, out)) {
         rc = aec_process_residual(a, &amp;beam);
         if (rc == AEC_OK) rc = aec_get_residual(a, &amp;v);
     }
-    if (rc == AEC_OK) g_nr = anr_process_gain(nr, v.error_spec);    /* NR 在 E 上估計; NULL = 被拒 */
+    if (rc == AEC_OK) g_nr = anr_process_gain(nr, v.base_spec);     /* NR 在 B 上估計; NULL = 被拒 */
     if (g_nr) {
         if (v.post_reset_serial != handled) { ac_istft_reset(istft); handled = v.post_reset_serial; }
         if (aec_apply_gain(a, g_nr, spec) != AEC_OK ||      /* P = v.base_spec * min(G_nr, G_res) */

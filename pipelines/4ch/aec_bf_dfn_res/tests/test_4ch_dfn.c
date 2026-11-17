@@ -16,7 +16,9 @@
  * The phased hop (begin / nn_begin / nn_end / end) against the callback-driven one, in the four
  * behaviours run / fail / left open / never fetched, on every grid and both error entries.
  * main.c is compiled into this file: the rows named "main.c" drive its own DfnSample (its build, reset and form
- * functions) and count the synthesis clears. */
+ * functions) and count the synthesis clears.
+ * The DFN2 estimate is the rendering base B, not the analysis spectrum E: the bridge's estimate lane is compared with a
+ * synthesis of B on runs with guard hops (where B and E differ), in the composition and in main.c at 16 kHz. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,8 +120,10 @@ static ConvChain *oracle_create(const AecConfig *cfg, int enable_res, int enable
 /* Deliberate defects the array-reset rows plant to show they can fail. LATE_CLEAR is the bridge path's (a clear one hop
  * after the event); NO_CLEAR applies to both paths. NO_DELAY and WHOLE_HOP are the direct path's: the clear on the hop
  * of the event instead of lookahead hops later (a defect only when the lookahead is non-zero), and a reset of the
- * whole DFN hop (stream, model state, synthesis) on the event. */
-enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2, FDFN_SAB_NO_DELAY = 4, FDFN_SAB_WHOLE_HOP = 8 };
+ * whole DFN hop (stream, model state, synthesis) on the event. ERROR_SPEC hands the hop E as its estimate instead of B
+ * (they differ on guard hops). */
+enum { FDFN_SAB_NO_CLEAR = 1, FDFN_SAB_LATE_CLEAR = 2, FDFN_SAB_NO_DELAY = 4, FDFN_SAB_WHOLE_HOP = 8,
+       FDFN_SAB_ERROR_SPEC = 16 };
 
 typedef struct FourDfn {
     ArraySampleBeam *unit;
@@ -134,7 +138,8 @@ typedef struct FourDfn {
     long hops_begun;          /* fdfn_begin() calls so far */
     long clears, last_clear;  /* direct path: ac_istft_reset() calls, and the hop index of the last one */
     long reset_hops;          /* hops on which the serial had moved */
-    const Complex *estimate;  /* E of the last hop (array memory, until the next hop) */
+    long guard_hops;          /* hops on which a lane's output guard fired (B differs from E) */
+    const Complex *estimate;  /* B of the last hop (array memory, until the next hop) */
     int sabotage;             /* negative controls (FDFN_SAB_*), 0 in the composition */
     int bridge_clear_due;     /* FDFN_SAB_LATE_CLEAR only: the event of the previous hop */
     int n_freqs, enable_cng;
@@ -185,7 +190,7 @@ static FourDfn *fdfn_create(int sample_rate, int fft_size, int enable_cng, const
         m->dfn_pool = NULL;
         goto fail;
     }
-    if (dfn_hop_pool_build(&plan, (unsigned char *)m->dfn_pool, n_freqs, m->hop_size, 1, &m->hop) != 0)
+    if (dfn_hop_pool_build(&plan, (unsigned char *)m->dfn_pool, n_freqs, m->hop_size, &m->hop) != 0)
         goto fail;
     return m;
 fail:
@@ -201,7 +206,7 @@ static void fdfn_reset(FourDfn *m) {
     dfn_hop_reset(&m->hop);
 }
 
-/* Unit (array front end, SRP-PHAT, BF), fuse, P = B * G_res (+ comfort noise); the DFN hop begins on (E, P). */
+/* Unit (array front end, SRP-PHAT, BF), fuse, P = B * G_res (+ comfort noise); the DFN hop begins on (B, P). */
 static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     AecResidualView f;
     int due;
@@ -211,7 +216,8 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
         f.res_gain == NULL)
         return -1;
     m->res_gain = f.res_gain;
-    m->estimate = f.error_spec;
+    m->estimate = f.base_spec;
+    if (f.guard_active) ++m->guard_hops;
     due = array_sample_post_reset_due(&m->reset_handled, &f);
     if (due) ++m->reset_hops;
     if (!m->hop.bridge && (m->sabotage & FDFN_SAB_WHOLE_HOP)) {
@@ -231,7 +237,8 @@ static int fdfn_begin(FourDfn *m, const float *mics, const float *ref) {
     }
     if (aec_apply_gain(m->aec, NULL, m->post) != AEC_OK) return -1;
     if (m->enable_cng && aec_apply_cng(m->aec, NULL, m->post) != AEC_OK) return -1;
-    return dfn_hop_begin(&m->hop, f.error_spec, m->post) == 0 ? 0 : -1;
+    return dfn_hop_begin(&m->hop, (m->sabotage & FDFN_SAB_ERROR_SPEC) ? f.error_spec : f.base_spec, m->post) == 0
+        ? 0 : -1;
 }
 
 static int fdfn_process(FourDfn *m, const float *mics, const float *ref, float *out) {
@@ -414,8 +421,9 @@ static int run_native(int sample_rate, int fft_size, int expected_sixths) {
  * reset, which moves AecResidualView.post_reset_serial) and nothing else; the hop, DFN2 and the bridge keep
  * running. The bridge's native-grid synthesis (ainr_bridge_get_host_hops) must equal the
  * hand-written chain (restarted the same way) bit for bit on every hop, the reset hop included, and a
- * bridge that is not cleared, or cleared one hop late, must not. */
-static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets) {
+ * bridge that is not cleared, or cleared one hop late, must not. Its estimate lane equals a synthesis of B. */
+static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *diff_hops, long *resets,
+                           long *guard_hops) {
     FourDfn *dfn = fdfn_create(sample_rate, fft_size, 1, NULL, 1);
     AecConfig ccfg = core_config(sample_rate, fft_size);
     ConvChain *conventional;
@@ -427,13 +435,13 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
     static float mics[512 * AEC_ARRAY_MICS], ref[512], conv_out[512], out[512];
     static float tones[160 * 512];
     int hop, frame, i, ch, e, frames = 160, reset_at = 81;
-    *diff_hops = 0;
+    *diff_hops = *resets = *guard_hops = 0;
     if (!dfn || !dfn->hop.bridge) return 1;
     dfn->sabotage = sabotage;
     conventional = oracle_create(&ccfg, 1, 1);
     if (!conventional) return 2;
     hop = dfn->hop_size;
-    /* the estimate lane's reference: audiolib's default-window synthesis of E, cleared on the event */
+    /* the estimate lane's reference: audiolib's default-window synthesis of B, cleared on the event */
     ac_stft_config_default(&scfg, fft_size ? fft_size : 2 * hop);
     if (posix_memalign(&probe_mem, 16, ac_istft_get_mem_size(&scfg)) != 0) return 6;
     probe = ac_istft_init(probe_mem, ac_istft_get_mem_size(&scfg), &scfg);
@@ -470,6 +478,7 @@ static int run_array_reset(int sample_rate, int fft_size, int sabotage, long *di
         if (r < 0 || dfn_hop_end(&dfn->hop, out) != 0) return 5;
     }
     *resets = dfn->reset_hops;
+    *guard_hops = dfn->guard_hops;
     /* DFN2 kept running through the event: its frame count is the whole stream's, with no gap */
     ainr_bridge_get_counters(dfn->hop.bridge, &stage_frames, NULL);
     if (stage_frames != ((long long)frames * hop * DFN2_SR / sample_rate) / DFN2_HOP_LEN) return 8;
@@ -567,6 +576,68 @@ static int run_main_c(int event_at, int reset_at, int *lookahead, long *clears, 
     *clear_frame = g_istft_reset_frame;
     dfn_cleanup(&s);
     return 0;
+}
+
+/* main.c's own DfnSample at 16 kHz (the bridge path), an event on hop `event_at`: on every hop the bridge's estimate
+ * lane equals a synthesis of the hop's B read back through aec_get_residual(), cleared on the event as the bridge is.
+ * A synthesis of E, run alongside, counts the hops on which an estimate of E would have shown. */
+static int run_main_c_bridge(int event_at, long *diff_hops, long *error_spec_hops, long *guard_hops, long *resets) {
+    DfnSample s;
+    ArraySampleHopView view;
+    char *argv[] = { (char *)"4ch_aec_bf_dfn_res", (char *)"--sample-rate", (char *)"16000" };
+    AcStftConfig scfg;
+    AcIstft *probe[2];                /* [0] synthesises B, [1] E */
+    void *probe_mem[2] = { NULL, NULL };
+    static float tones[160 * 128], probe_hop[2][128];
+    uint32_t serial = 0u;
+    int frame, i, ch, k, e, hop, frames = 160, rc = 0;
+    *diff_hops = *error_spec_hops = *guard_hops = *resets = 0;
+    memset(&s, 0, sizeof s);
+    if (dfn_parse(&s, 3, argv) != 0 || dfn_setup(&s, &view) != 0) return 1;
+    hop = view.hop;
+    if (!s.hop.bridge || hop != 128) { rc = 2; goto done; }
+    ac_stft_config_default(&scfg, 2 * hop);
+    for (k = 0; k < 2; ++k) {
+        if (posix_memalign(&probe_mem[k], 16, ac_istft_get_mem_size(&scfg)) != 0) { probe_mem[k] = NULL; rc = 3; goto done; }
+        probe[k] = ac_istft_init(probe_mem[k], ac_istft_get_mem_size(&scfg), &scfg);
+        if (!probe[k]) { rc = 3; goto done; }
+    }
+    dfn_fixture_multitone(tones, (size_t)frames * hop, 16000);
+    e = (ECHO_DELAY * 16000) / DFN2_SR;
+    for (frame = 0; frame < frames; ++frame) {
+        AecResidualView v;
+        const float *tap_e;
+        for (i = 0; i < hop; ++i) {
+            int t = frame * hop + i;
+            far[i] = tones[t];
+            for (ch = 0; ch < AEC_ARRAY_MICS; ++ch)
+                microphones[(size_t)i * AEC_ARRAY_MICS + (size_t)ch] =
+                    (t >= e ? 0.5f * tones[t - e] : 0.0f) + 0.01f * sinf((float)t * 0.071f + (float)ch);
+        }
+        if (frame == event_at) array_sample_beam_reset(s.unit);
+        memset(&v, 0, sizeof v);
+        v.struct_size = sizeof v;
+        if (dfn_process(&s, frame) != 0 || ainr_bridge_get_host_hops(s.hop.bridge, &tap_e, NULL) != 0 ||
+            aec_get_residual(s.aec, &v) != AEC_OK || !v.base_spec || !v.error_spec) {
+            rc = 10 + frame;
+            goto done;
+        }
+        if (v.guard_active) ++*guard_hops;
+        if (v.post_reset_serial != serial) {
+            serial = v.post_reset_serial;
+            ++*resets;
+            for (k = 0; k < 2; ++k) ac_istft_reset(probe[k]);
+        }
+        (void)ac_istft_push(probe[0], v.base_spec, probe_hop[0]);
+        (void)ac_istft_push(probe[1], v.error_spec, probe_hop[1]);
+        if (memcmp(tap_e, probe_hop[0], (size_t)hop * sizeof(float)) != 0) ++*diff_hops;
+        if (memcmp(tap_e, probe_hop[1], (size_t)hop * sizeof(float)) != 0) ++*error_spec_hops;
+    }
+done:
+    free(probe_mem[0]);
+    free(probe_mem[1]);
+    dfn_cleanup(&s);
+    return rc;
 }
 
 /* The unit serves 16 and 48 kHz only: the composition has no 8 kHz or off-grid host. */
@@ -705,27 +776,31 @@ int main(void) {
     rc = run_native(16000, 512, dfn_fixture_bridge_added_delay_sixths(16000, 256));
     if (rc) { fprintf(stderr, "4ch DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
     {
-        static const int grids[2][2] = {{16000, 256}, {16000, 512}};
-        static const int sabs[] = { FDFN_SAB_NO_CLEAR, FDFN_SAB_LATE_CLEAR };
+        /* guard: the stimulus fires the output guard on that grid, so an estimate of E must show there */
+        static const int grids[2][3] = {{16000, 256, 1}, {16000, 512, 0}};
+        static const int sabs[] = { FDFN_SAB_NO_CLEAR, FDFN_SAB_LATE_CLEAR, FDFN_SAB_ERROR_SPEC };
         int g;
         size_t c;
         for (g = 0; g < 2; ++g) {
-            long diff, resets;
-            rc = run_array_reset(grids[g][0], grids[g][1], 0, &diff, &resets);
-            if (rc || diff != 0 || resets < 1) {
-                fprintf(stderr, "4ch DFN array reset %d Hz/%d: rc %d, %ld hops differ, %ld reset hop(s)\n",
-                        grids[g][0], grids[g][1], rc, diff, resets);
+            long diff, resets, guard;
+            rc = run_array_reset(grids[g][0], grids[g][1], 0, &diff, &resets, &guard);
+            if (rc || diff != 0 || resets < 1 || (grids[g][2] && guard < 1)) {
+                fprintf(stderr, "4ch DFN array reset %d Hz/%d: rc %d, %ld hops differ, %ld reset hop(s), %ld guard hop(s)\n",
+                        grids[g][0], grids[g][1], rc, diff, resets, guard);
                 return 1;
             }
             printf("4ch_aec_bf_dfn_res: array reset %d Hz/%d: the bridge's host synthesis, cleared on the hop of the event, equals the "
-                   "hand-written chain bit for bit (%ld reset hop(s))\n", grids[g][0], grids[g][1], resets);
+                   "hand-written chain bit for bit (%ld reset hop(s), %ld guard hop(s))\n", grids[g][0], grids[g][1], resets, guard);
             for (c = 0; c < sizeof sabs / sizeof sabs[0]; ++c) {
-                rc = run_array_reset(grids[g][0], grids[g][1], sabs[c], &diff, &resets);
+                if (sabs[c] == FDFN_SAB_ERROR_SPEC && !grids[g][2]) continue;
+                rc = run_array_reset(grids[g][0], grids[g][1], sabs[c], &diff, &resets, &guard);
                 if (rc || diff == 0) {
                     fprintf(stderr, "4ch DFN array reset %d Hz/%d: planted defect %d not detected (rc %d)\n",
                             grids[g][0], grids[g][1], sabs[c], rc);
                     return 1;
                 }
+                printf("4ch_aec_bf_dfn_res: array reset %d Hz/%d: planted defect %d reported on %ld hop(s)\n",
+                       grids[g][0], grids[g][1], sabs[c], diff);
             }
         }
     }
@@ -773,6 +848,17 @@ int main(void) {
             return 1;
         }
         printf("4ch_aec_bf_dfn_res: main.c, event on hop 40 then a reset of every stage on hop 41: the reset's own clear only, the event is no longer followed\n");
+    }
+    {
+        long diff, error_spec_hops, guard, resets;
+        rc = run_main_c_bridge(81, &diff, &error_spec_hops, &guard, &resets);
+        if (rc || diff != 0 || guard < 1 || error_spec_hops < 1 || resets < 1) {
+            fprintf(stderr, "4ch DFN main.c 16 kHz, event on hop 81: rc %d, the estimate lane differs from a synthesis of B on %ld "
+                    "hop(s) and of E on %ld, %ld guard hop(s), %ld reset hop(s)\n", rc, diff, error_spec_hops, guard, resets);
+            return 1;
+        }
+        printf("4ch_aec_bf_dfn_res: main.c 16 kHz, event on hop 81: the bridge's estimate lane equals a synthesis of B on every hop "
+               "(%ld guard hop(s), %ld reset hop(s); a synthesis of E differs on %ld)\n", guard, resets, error_spec_hops);
     }
     {
         static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};

@@ -58,15 +58,18 @@ static void test_stage(void) {
     size_t bytes = anr_get_mem_size(&cfg);
     void *pool = aligned_pool(bytes), *pool2 = aligned_pool(bytes), *pool3 = aligned_pool(bytes);
     AnrDenoiser *a, *b, *c;
-    Complex spec[129];
+    Complex spec[129], decoy[129];
     float r2[129], scratch[129], residual_psd_audio[129];
     const float *ga, *gb;
     AecResidualView f;
     int k, m, frame;
 
+    /* the denoiser reads base_spec; error_spec is a different spectrum the gain must not follow */
+    for (k = 0; k < n; ++k) { decoy[k].r = 4000.0f - (float)(k * 29); decoy[k].i = (float)(k * 11) - 900.0f; }
     memset(&f, 0, sizeof(f));
     f.n_freqs = n;
-    f.error_spec = spec;
+    f.base_spec = spec;
+    f.error_spec = decoy;
     f.r2 = r2;
     f.usable_linear = 1;
 
@@ -147,8 +150,8 @@ static void test_stage(void) {
     }
     CHECK(array_sample_anr_gain(NULL, &f, NULL, 0) == NULL, "NULL denoiser");
     CHECK(array_sample_anr_gain(a, NULL, NULL, 0) == NULL, "NULL frame");
-    f.error_spec = NULL;
-    CHECK(array_sample_anr_gain(a, &f, NULL, 0) == NULL, "NULL spectrum");
+    f.base_spec = NULL;
+    CHECK(array_sample_anr_gain(a, &f, NULL, 0) == NULL, "NULL base spectrum");
 
     anr_destroy(a);
     anr_destroy(b);
@@ -181,7 +184,7 @@ static void test_psd_scale(void) {
 
     memset(&f, 0, sizeof f);
     f.n_freqs = n;
-    f.error_spec = spec;
+    f.base_spec = spec;
     f.r2 = r2;
     f.usable_linear = 1;
     CHECK(a != NULL, "psd scale: stage init");
@@ -272,7 +275,7 @@ static void test_nr_set_level(void) {
             AecResidualView f;
             memset(&f, 0, sizeof f);
             f.n_freqs = n;
-            f.error_spec = spec;
+            f.base_spec = spec;
             f.r2 = r2;
             f.usable_linear = 1;
             if (!a || !b || anr_set_level(a, (AnrLevel)m) != 0) { refused++; free(pa); free(pb); continue; }

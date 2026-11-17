@@ -101,11 +101,11 @@ Run from `audiolib/common/`:
 make clean
 make BACKEND=ne10 SIMD=0 WERROR=1
 make BACKEND=ne10 SIMD=0 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
+  test_wav test-wav-ubsan test_zero_heap
 
 make BACKEND=ne10 SIMD=1 WERROR=1
 make BACKEND=ne10 SIMD=1 selftest test_audio_utils test_pool \
-  test_wav test_wav_nr_style test-wav-ubsan test_zero_heap
+  test_wav test-wav-ubsan test_zero_heap
 
 make test_ne10_force_c
 ```

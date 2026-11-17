@@ -50,7 +50,7 @@
    │── aec_process_residual(aec,NULL) ►│ 殘餘階段:AEC 內部 RES 增益、r2、comfort noise
    │── aec_get_residual(aec,&amp;v) ►│ 借用視圖 v: error_spec(分析 seam),r2,comfort_noise,res_gain,base_spec = 渲染基底 B(守衛未觸發時 = error_spec)
    │ v.post_reset_serial != handled → ac_istft_reset、handled = serial   ← 不 reset AEC 與 NR;AEC 自己重設 comfort-noise 種子
-   │── mono_nr_gain: anr_process_gain_with_residual_psd(nr,B,residual_psd_audio) ─►│ r2*PSD_SCALE_INV 折進噪聲底 → G_nr
+   │── mono_nr_gain: anr_process_gain_with_residual_psd(nr,B,residual_psd_audio) ─►│ r2*AEC_PSD_SCALE_INV_F 折進噪聲底 → G_nr
    │── aec_apply_gain(aec,G_nr,spec) ►│ spec = B × min(G_nr, v.res_gain)         ← 增益乘在 B 上
    │── aec_apply_cng(aec,G_nr,spec) ►│ 補 RES 切掉的 bin;選用(AecConfig.enable_cng)、同一個 G_nr
    │── ac_istft_push(istft,spec,out) ───────────────────────────────────────────►│ iFFT + sqrt-Hann OLA → out[hop]
@@ -85,7 +85,7 @@
    │   beam.{spectrum, weights}(借用)        (一次做完前兩步: process_with_activity / process)
    │── array_sample_beam_fuse(b,&amp;v) ►│ aec_process_residual(&amp;AecBeam{weights,spectrum}) + aec_get_residual → v(E, R2, CN, G_res)
    │   v.{error_spec,base_spec,near_spec,far_spec,r2,comfort_noise,res_gain,far_hop,post_reset_serial,...}(借用;base_spec = 渲染基底)
-   │── array_sample_anr_gain(nr,&amp;v,extra,1) ───────────────────────────────►│ G_nr(在 v.error_spec 上估計)
+   │── array_sample_anr_gain(nr,&amp;v,extra,1) ───────────────────────────────►│ G_nr(在 v.base_spec 上估計)
    │ (array_sample_post_reset_due 為真:ac_istft_reset)
    │── aec_apply_gain(aec,G_nr,spec); aec_apply_cng(aec,G_nr,spec) ►│ spec = base_spec × min(G_nr, G_res) + comfort noise
    │── ac_istft_push(istft,spec,out) ─────────────────────────────────────────────────────►│ out[hop]

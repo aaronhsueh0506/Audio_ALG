@@ -76,9 +76,6 @@
 
 #if defined(PYC_WITH_4CH)
 #include "array_sample_post.h"
-#else
-/* The constant of mono/aec_nr_res/main.c. */
-#define PYC_PSD_SCALE_INV (1.0f / (32768.0f * 32768.0f))
 #endif
 #define PYC_CNG_RNG_SEED AEC_CNG_SEED
 /* The floor the Python twins pin; the chain's aec_apply_cng_spec uses the library's, checked in main(). */
@@ -280,9 +277,9 @@ static int post_create(Post* q, int sr, int fft, int res_mode, AecLevel level, i
 
 /* One hop over a view into out: the explicit-array forms of aec.h (aec_apply_gain_spec / aec_apply_cng_spec) that the
  * sample programs' aec_apply_gain / aec_apply_cng wrap (a replay has no live Aec to own the generator). c->base_spec is
- * the rendering base the gain is applied to; the denoiser is estimated on the base (mono) or on the analysis spectrum
- * E (the 4-channel chain, array_sample_anr_gain). `serial` is the post-reset serial after this hop's AEC call: a new
- * value clears the OLA tail and reseeds the comfort noise before the first draw and the push.
+ * the rendering base the denoiser is estimated on (4-channel: array_sample_anr_gain) and the gain is applied to. `serial`
+ * is the post-reset serial after this hop's AEC call: a new value clears the OLA tail and reseeds the comfort noise
+ * before the first draw and the push.
  * 0, or -1 when a stage refuses. */
 static int post_hop(Post* q, const AecResidualView* c, uint32_t serial, float* out) {
     const Complex* base = c->base_spec;
@@ -303,7 +300,7 @@ static int post_hop(Post* q, const AecResidualView* c, uint32_t serial, float* o
 #else
         const float* residual_psd_audio = NULL;
         if (q->use_r2 && c->r2 && c->usable_linear) {
-            sk_scale_f32(q->extra, c->r2, PYC_PSD_SCALE_INV, q->nf);
+            sk_scale_f32(q->extra, c->r2, AEC_PSD_SCALE_INV_F, q->nf);
             residual_psd_audio = q->extra;
         }
         if (!(nr = anr_process_gain_with_residual_psd(q->nr, base, residual_psd_audio))) return -1;

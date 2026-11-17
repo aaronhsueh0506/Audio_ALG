@@ -74,7 +74,7 @@ int main(void) {
         if (status == AEC_OK)
             status = array_sample_beam_fuse(beam, &v);                          /* fuse with that BF's weights */
         if (status == AEC_OK)
-            g_nr = array_sample_anr_gain(nr, &v, scratch, 1);                   /* estimated on v.error_spec */
+            g_nr = array_sample_anr_gain(nr, &v, scratch, 1);                   /* estimated on v.base_spec */
         if (g_nr) {
             if (array_sample_post_reset_due(&handled, &v)) ac_istft_reset(istft);
             if (aec_apply_gain(aec, g_nr, spec) == AEC_OK &&                   /* P = base * min(G_nr, G_res) */

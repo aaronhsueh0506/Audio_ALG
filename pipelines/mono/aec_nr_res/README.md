@@ -38,8 +38,8 @@ ac_istft_push(istft, spec, out);
 ```
 
 `--no-res` skips the two apply calls and renders `aec_apply_gain_spec(spec, v.base_spec, unity, nr, n_freqs)`; the
-comfort noise stays off. `PSD_SCALE_INV` is a `#define` at the top of `main.c` (and of `example_board_adapter.c`),
-not a library constant. The comfort-noise generator belongs to the `Aec` (seed `AEC_CNG_SEED`, 42, restored by every
+comfort noise stays off. The residual-echo scale is `AEC_PSD_SCALE_INV_F` (1/32768²), a constant of `aec.h`.
+The comfort-noise generator belongs to the `Aec` (seed `AEC_CNG_SEED`, 42, restored by every
 hard post-chain reset and by `aec_reset()`); the floor of the denoiser-gain factor is `AEC_CNG_NR_GAIN_FLOOR`
 (-10 dB), applied inside `aec_apply_cng()`.
 
@@ -58,10 +58,9 @@ every hop the guard leaves alone and does not pair with `formed_hop` on a guard 
   `AEC_RESIDUAL_FULL`) sample for sample, comfort noise on or off: the synthesis uses the AEC's window table
   (`aec_synthesis_window()` of the initialised `Aec`), not audiolib's default window, which differs in the last float bit.
 
-The four-channel chain hands the denoiser `error_spec` (the beamformer output E) instead; the gain is still applied to
-`base_spec`, and the two differ only on a hop where a lane's output guard fired. Board samples outside this repository
-(for example `alg_audio_aec_nr.c`) currently feed `error_spec` to the denoiser in mono: a known difference, not a
-recommendation.
+The four-channel chain hands its denoiser the fused `base_spec` as well (`array_sample_anr_gain()`); there it differs
+from `error_spec` (the beamformer output E) only on a hop where a contributing lane's output guard fired. The board
+samples outside this repository (`alg_audio_aec_nr.c`, `uvc_audio_live2.c`) feed `base_spec` to the denoiser too.
 
 ### The hard post-chain reset event
 

@@ -19,7 +19,7 @@ mic hop [hop][4] + ref hop [hop]
    ├─► aec_process_residual()    以那組權重同調融合 near / 殘餘回音 / comfort noise；FULL 時再算唯一一個 G_res
    ├─► aec_get_residual()        AecResidualView（error_spec = E、base_spec = B、near_spec、r2、comfort_noise、旗標…）
    ▼
- 【你的後級 stage】     anr_process_gain_with_residual_psd(E) → aec_apply_gain(G_nr) → aec_apply_cng(G_nr) → ac_istft_push → 1 個 hop 的 mono 輸出
+ 【你的後級 stage】     anr_process_gain_with_residual_psd(B) → aec_apply_gain(G_nr) → aec_apply_cng(G_nr) → ac_istft_push → 1 個 hop 的 mono 輸出
 ```
 
 陣列物件的內容（共用 delay 的 admission、對齊環、四條 lane、權重的同調融合、residual 增益級、comfort-noise 產生器）、
@@ -45,7 +45,7 @@ Consumer 端的事：
 一行就夠 array 本身用。它自己會拉進 `Complex`（`fft_wrapper.h` → `ac_complex.h`）、`AecConfig`、`AecDelayMode`、`AecArrayView`、`AecResidualView`、`AecBeam`。
 要串後級 stage 時另外 include 你用到的函式庫 header：`anr.h`、`audio_stft.h`（`AcIstft`）、`utility/mem_align.h`（`ALIGN16`）、`utility/simd_kernel_nn.h`（`skn_all_finite_f32()`）。
 `array_sample_post.h`（與 `array_sample_beam.h` 同目錄的 header-only 範例碼，沒有 ABI、不進 archive，可整份複製改寫）把 `AecResidualView` 銜接到降噪器：
-`array_sample_anr_gain()` 呼叫降噪器（可選把 `r2` 折進噪聲底）、`array_sample_post_reset_due()` 判斷合成尾巴是否要清，以及 `ARRAY_SAMPLE_PSD_SCALE_INV`。
+`array_sample_anr_gain()` 在 `base_spec` 上呼叫降噪器（可選把 `r2` 以 `aec.h` 的 `AEC_PSD_SCALE_INV_F` 換算後折進噪聲底）、`array_sample_post_reset_due()` 判斷合成尾巴是否要清。
 −10 dB 的 comfort noise 下限是 `aec.h` 的 `AEC_CNG_NR_GAIN_FLOOR`；亂數產生器由陣列持有。
 
 ### 1.3 `Complex` type 從哪來
@@ -174,7 +174,7 @@ int main(void) {
             rc = aec_process_residual(a, &beam);
             if (rc == AEC_OK) rc = aec_get_residual(a, &v);
         }
-        const float* g_nr = rc == AEC_OK ? anr_process_gain(nr, v.error_spec) : NULL;  /* estimated on the beam E; B = E unless a lane guard fired */
+        const float* g_nr = rc == AEC_OK ? anr_process_gain(nr, v.base_spec) : NULL;  /* estimated on B (the beam E unless a lane guard fired) */
         if (g_nr) {
             if (v.post_reset_serial != handled) {              /* a lane hard-reset: clear the OLA tail */
                 ac_istft_reset(istft);
