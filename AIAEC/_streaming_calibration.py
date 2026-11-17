@@ -95,9 +95,8 @@ from AIAEC._export_common import (
     load_checkpoint_model,
     set_alignment_depth,
 )
-from AIAEC._cli_common import require_frames_per_call
+from AIAEC._cli_common import ready_models_text, require_frames_per_call
 from AIAEC._streaming_export import (
-    FRAMES_PER_CALL_READY_MODELS,
     GraphSplit,
     _build,
     host_signal_inputs,
@@ -387,7 +386,7 @@ def main(model_name: str) -> None:
                         help='STFT frames per streaming invocation (default 1): '
                              'the graph and every captured tensor carry N time '
                              'frames, --frames still counts invocations. Only '
-                             '%s support N > 1' % (FRAMES_PER_CALL_READY_MODELS,))
+                             '%s support N > 1' % ready_models_text())
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--events', default=None, metavar='PATH',
                         help='Align_ULCNet only: ' + EVENTS_HELP)

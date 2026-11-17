@@ -25,6 +25,17 @@ output contains one directory per graph input and one numbered file per
 streaming invocation. The `mic`/`far` tensors it records are the host-compressed
 planar spectra the graph binds (layout version 4).
 
+For a graph that runs N frames per call, add `--frames-per-call N` (board
+blocks of 1024 samples: N = 8 at 16 kHz / FFT 256, N = 2 at 48 kHz / FFT 1024).
+The graph and every recorded tensor then carry N frames, and `--frames` counts
+calls, so 1024 calls of 8 frames record 8192 frames, as many as above:
+
+```bash
+python3 inference.py calib --checkpoint checkpoint.pth \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 1024 --frames-per-call 8 --format bin --output calib/deepvqe_s_n8
+```
+
 ## Graph port order
 
 The exported graph lists inputs as the signal inputs (`mic`, `far`) followed by the 16 state inputs, and outputs as the head

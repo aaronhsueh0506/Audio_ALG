@@ -5,6 +5,9 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --device cpu
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
+    # 每次呼叫 N 個 frame (與板端 N > 1 的 graph 同排程)
+    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
+        --frames-per-call 8
 
 目錄批次 (--mic-dir 取代三個位置參數):
     # 沒帶 --ref-dir: reference 為數位靜音, 等同純降噪
@@ -14,10 +17,18 @@
     python3 inference.py checkpoint.pth --mic-dir /path/to/mic \\
         --ref-dir /path/to/lpb --out-dir /path/to/out
 
-Calibration:
+Calibration (also exports the ONNX graph the tensors bind to; the default
+graph path is <output>.onnx, override with --onnx):
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/mic --far-dir /path/to/far \\
         --frames 8192 --format bin --output calib/deepvqe_s
+    # N frames per call (板端 1024 點錄音: 16k/256 用 N=8, 48k/1024 用 N=2).
+    # The graph and every tensor carry N frames; --frames counts calls,
+    # so 1024 calls x 8 = 8192 frames, as many as the example above.
+    python3 inference.py calib --checkpoint checkpoint.pth \\
+        --primary-dir /path/to/mic --far-dir /path/to/far \\
+        --frames 1024 --frames-per-call 8 --format bin \\
+        --output calib/deepvqe_s_n8
 
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before inference when needed; output stays at that model rate.

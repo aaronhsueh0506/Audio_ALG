@@ -53,6 +53,15 @@ self-stamping route:
         --primary-is-mic --frames 8192 --max-delay-frames 8 --format bin \\
         --output calib/align_ulcnet_d8
 
+N frames per call (packet graph, 板端 1024 點錄音: 16k/256 用 N=8, 48k/1024
+用 N=2). The graph and every tensor carry N frames; --frames counts calls, so
+1024 calls x 8 = 8192 frames, as many as above. Without --events every
+frame_reset is 0 and only whole packets are captured:
+    python3 inference.py calib --checkpoint checkpoint.pth \\
+        --primary-dir /path/to/raw_mic --far-dir /path/to/raw_far \\
+        --primary-is-mic --frames 1024 --frames-per-call 8 \\
+        --max-delay-frames 8 --format bin --output calib/align_ulcnet_d8_n8
+
 Alignment events: the Python linear AEC reports no delay state, so the C
 stage's per-hop restarts are replayed from a record file instead:
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\

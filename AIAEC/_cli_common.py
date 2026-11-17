@@ -44,7 +44,7 @@ FRAMES_PER_CALL_HELP = (
 )
 
 
-def _ready_models_text():
+def ready_models_text():
     from AIAEC._streaming_export import (
         FRAMES_PER_CALL_READY_MODELS, PACKET_GRAPH_MODELS)
     return ', '.join(FRAMES_PER_CALL_READY_MODELS + PACKET_GRAPH_MODELS)
@@ -413,7 +413,7 @@ def make_inference_cli(model_name, model_class, description):
         parser.add_argument('--frames-per-call', type=int, default=None,
                             metavar='N',
                             help=FRAMES_PER_CALL_HELP % (
-                                _ready_models_text(),))
+                                ready_models_text(),))
         add_directory_arguments(parser)
         return parser
 

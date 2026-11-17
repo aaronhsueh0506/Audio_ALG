@@ -25,6 +25,12 @@ records the calibration frames against it. Run it from the model directory:
       --frames 8192 --format bin \
       --output calib/model
 
+--frames-per-call N (DeepVQE-S and Align-ULCNet, default 1) records a graph
+that runs N STFT frames per call. The graph and every recorded tensor carry N
+frames and --frames counts calls, so `--frames 1024 --frames-per-call 8`
+records 8192 frames. A file's short last block is dropped, except for
+Align-ULCNet with --events, which keeps it zero-completed.
+
 `export_onnx.py` remains available for a graph-only export:
 
     python3 export_onnx.py \
