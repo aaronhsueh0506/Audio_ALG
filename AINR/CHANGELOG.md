@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Board sample `uvc_ai_nr_stream.c` runs the `_freq` family
+
+- The sample no longer resamples 16 <-> 48 kHz itself or calls the PCM `ainr_*` entries: a 16 kHz / fft 256 / hop 128 host runs its own `AcStft` / `AcIstft`, and `--ai-sample-rate` / `--ai-fft-size` choose the model grid (N = 1; default 48000 / 1024 through `AinrBridge`, 16000 / 256 directly in the full build). Delays and refusal rules are in `DeepFilterNet2/reference/grid.md`. The sample now also builds `stream/ainr/bridge/ainr_bridge.c`.
+- A DFN2 step that fails (a refused block, a postprocess or bridge error) zeroes that hop and restarts the DFN2 side (model stream, analysis, and the synthesis or the bridge) instead of ending the run.
+
 ### `DFN2Prepost` is the per-frame level; `dfn2_stream` sequences the call
 
 - The lib keeps `dfn2_prepost_pre_frame`, `_views`, `_validate_run`, `_post_frame`, `_post_frame_identity` and `_zero_state` and the model state they advance. It no
