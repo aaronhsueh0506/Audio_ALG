@@ -202,6 +202,10 @@ def causal_delay_stack(x: Tensor, delays: int) -> Tensor:
     return padded.unfold(2, delays, 1).flip(-1).permute(0, 1, 2, 4, 3)
 
 
+#: (time frames, delay slots) of the delay-attention score conv.
+DEFAULT_SCORE_KERNEL = (5, 3)
+
+
 class FrameDelayAttention(nn.Module):
     """Per-frame causal cross-attention used by DeepVQE/Align-ULCNet."""
 
@@ -211,8 +215,16 @@ class FrameDelayAttention(nn.Module):
 
     def __init__(self, mic_channels: int, far_channels: int,
                  value_channels: int, similarity_channels: int,
-                 max_delay_frames: int, score_kernel=(5, 3)):
+                 max_delay_frames: int,
+                 score_kernel=DEFAULT_SCORE_KERNEL):
         super().__init__()
+        # (time, delay) of the score conv; the stream keeps `time` logit frames.
+        score_kernel = tuple(int(size) for size in score_kernel)
+        if (len(score_kernel) != 2 or score_kernel[0] < 2
+                or score_kernel[1] < 1 or score_kernel[1] % 2 == 0):
+            raise ValueError(
+                f"score_kernel must be (time >= 2, odd delay >= 1), got "
+                f"{score_kernel!r}")
         self.max_delay_frames = max_delay_frames
         self.query = nn.Conv2d(mic_channels, similarity_channels, 1, bias=False)
         self.key = nn.Conv2d(far_channels, similarity_channels, 1, bias=False)

@@ -1038,7 +1038,7 @@ def test_a_configured_weight_decay_is_not_silently_rounded_away():
 
 def test_shipped_configs_declare_the_model_specific_training_recipes():
     expected = {
-        'Align_ULCNet': ('adam', 'warmup_cosine', 4e-3, 0.0,
+        'Align_ULCNet': ('adam', 'warmup_cosine', 2e-3, 0.0,
                          16, 50, 0),
         'Align_CRUSE': ('adam', 'warmup_cosine', 1.5e-4, 5e-6,
                         16, 50, 0),
@@ -1123,10 +1123,10 @@ class _StopAfterSetup(Exception):
     """Sentinel: main() reached its first epoch, so setup completed."""
 
 
-def _linear_for_training_config(config_path):
+def _linear_for_training_config(config_paths):
     """A fake corpus must match the real trainer grid it is standing in for."""
     cfg = configparser.ConfigParser()
-    assert cfg.read(config_path), config_path
+    assert cfg.read(config_paths), config_paths
     grid, _ = read_grids(cfg)
     return make_linear_aec_contract(grid.sr, frame_size=grid.n_fft)
 
@@ -1137,7 +1137,7 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
     """Execute setup using each shipped config; stub only the epoch body."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
     config = pathlib.Path(training_common.__file__).parent / model_name / 'config.ini'
-    linear = _linear_for_training_config(config)
+    linear = _linear_for_training_config([config])
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
@@ -1178,14 +1178,19 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
     assert type(seen['optimizer']) is expected_type
 
 
-def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_path,
-                          capture, scheduler_box=None):
-    """Run a trainer's real ``main`` far enough to build its objects."""
+def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_paths,
+                          capture, scheduler_box=None, packed_dir='fake'):
+    """Run a trainer's real ``main`` on ``--config config_paths`` far enough
+    to build its objects. ``capture`` receives the ``packed_dir`` opened, the
+    model, the ``aux_loss`` and the contract; returns the contract.
+    ``packed_dir`` None leaves ``--packed-dir`` unset."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    linear = _linear_for_training_config(config_path)
+    config_paths = [str(path) for path in config_paths]
+    linear = _linear_for_training_config(config_paths)
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
+            capture['packed_dir'] = path
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
 
@@ -1199,6 +1204,8 @@ def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_path,
             return 'fake-corpus'
 
     def fake_run_epoch(*args, **kwargs):
+        capture['model'] = args[0]
+        capture['aux_loss'] = kwargs.get('aux_loss')
         capture['contract'] = kwargs['checkpoint_for_halt']['contract']
         raise _StopAfterSetup
 
@@ -1221,9 +1228,9 @@ def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_path,
     monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
     monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
     monkeypatch.chdir(tmp_path)
+    packed = [] if packed_dir is None else ['--packed-dir', packed_dir]
     args = trainer.build_parser().parse_args(
-        ['--config', str(config_path), '--packed-dir', 'fake', '--device', 'cpu']
-    )
+        ['--config', *config_paths, *packed, '--device', 'cpu'])
     with pytest.raises(_StopAfterSetup):
         trainer.main(args)
     return capture['contract']
@@ -1246,7 +1253,7 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     assert cfg.read(shipped), shipped
 
     contract = _drive_main_capturing(
-        model_name, monkeypatch, tmp_path, shipped, {})
+        model_name, monkeypatch, tmp_path, [shipped], {})
     recorded = contract['optimizer']
     assert recorded['name'] == cfg.get('training', 'optimizer').lower()
     assert recorded['lr'] == pytest.approx(cfg.getfloat('training', 'lr'))
@@ -1288,7 +1295,7 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     with open(other_path, 'w', encoding='utf-8') as handle:
         cfg.write(handle)
     other = _drive_main_capturing(
-        model_name, monkeypatch, tmp_path, other_path, {})
+        model_name, monkeypatch, tmp_path, [other_path], {})
     assert other != contract
     with pytest.raises(ValueError):
         require_checkpoint_contract({'contract': other}, contract)
@@ -1312,7 +1319,8 @@ def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
 
     box = {}
     _drive_main_capturing(
-        'Align_ULCNet', monkeypatch, tmp_path, override, {}, scheduler_box=box)
+        'Align_ULCNet', monkeypatch, tmp_path, [override], {},
+        scheduler_box=box)
     assert box['kwargs'].get('min_lr') == pytest.approx(floor), (
         'ReduceLROnPlateau was built without the configured floor')
 
@@ -1362,7 +1370,7 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
         with io.open(path, 'w', encoding='utf-8') as handle:
             cfg.write(handle)
         return _drive_main_capturing(
-            model_name, monkeypatch, tmp_path, path, {})
+            model_name, monkeypatch, tmp_path, [path], {})
 
     base = contract_for()
     for section, key, value in (
@@ -1511,7 +1519,7 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
             return 'fake-corpus'
 
     projected = []
-    real_projection = trainer.stft_consistent_spectrum
+    real_projection = training_common.stft_consistent_spectrum
 
     def recording_projection(*args, **kwargs):
         result = real_projection(*args, **kwargs)
@@ -1519,7 +1527,7 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
         return result
 
     calls = []
-    real_loss = trainer.power_compressed_complex_mse_loss
+    real_loss = training_common.power_compressed_complex_mse_loss
 
     def recording_loss(estimate, target, **kwargs):
         calls.append((any(estimate is spec for spec in projected), kwargs))
@@ -1527,9 +1535,9 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
 
     monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
     monkeypatch.setattr(
-        trainer, 'stft_consistent_spectrum', recording_projection)
+        training_common, 'stft_consistent_spectrum', recording_projection)
     monkeypatch.setattr(
-        trainer, 'power_compressed_complex_mse_loss', recording_loss)
+        training_common, 'power_compressed_complex_mse_loss', recording_loss)
     monkeypatch.chdir(tmp_path)
     args = trainer.build_parser().parse_args(
         ['--config', str(override), '--packed-dir', 'fake', '--device', 'cpu']
@@ -1672,7 +1680,9 @@ def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
 
     def flat_epoch(*args, **kwargs):
         calls.append(1)
-        return 1.0, kwargs.get('global_step', 0) + 1
+        step = kwargs.get('global_step', 0) + 1
+        # Trainers that take aux_loss also return the PLCPA (None when off).
+        return (1.0, step, None) if 'aux_loss' in kwargs else (1.0, step)
 
     saved = []
 
@@ -1780,7 +1790,7 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
 
     def fake_run_epoch(*args, **kwargs):
         calls.append(kwargs.get('optimizer') is not None or len(args) > 5)
-        return 1.0, kwargs.get('global_step', 0) + 1
+        return 1.0, kwargs.get('global_step', 0) + 1, None
 
     saved = []
     real_save = torch.save

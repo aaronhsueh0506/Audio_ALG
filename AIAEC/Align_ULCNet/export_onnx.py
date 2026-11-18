@@ -309,9 +309,10 @@ class AlignUlcnetStreamingExport(nn.Module):
     """Functional, explicit-state twin of ``AlignULCNet.forward_stream``.
 
     K/V windows are newest-first: slot zero is the current frame, slot ``d`` is
-    ``t - d``.  The logit window is chronological: slot four is the current
-    frame and slot zero is ``t - 4``, matching the causal score convolution's
-    input order.
+    ``t - d``.  The logit window is chronological: its last slot is the current
+    frame and slot zero is ``t - (score_window - 1)``, matching the causal score
+    convolution's input order. ``score_window`` is the score kernel's time size
+    (SCORE_WINDOW_FRAMES in the board table; export_graph refuses any other).
     """
 
     input_names = INPUT_NAMES
@@ -356,6 +357,7 @@ class AlignUlcnetStreamingExport(nn.Module):
             )
         self.n_freqs = int(model.grid.n_freqs)
         self.ta_bins = ta_bins_for(model)
+        self.score_window = score_window_for(model)
 
     def forward(self, error_mag: Tensor, far_mag: Tensor, error_cos: Tensor,
                 error_sin: Tensor, key_history: Tensor,
@@ -380,7 +382,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         h_gru1 = h_gru[:, GRU_LAYERS:GRU_SUBBANDS * GRU_LAYERS]
         key_tail = key_history[:, :, :depth - 1]
         value_tail = value_history[:, :, :depth - 1]
-        logit_tail = logit_history[:, :, 1:SCORE_WINDOW_FRAMES]
+        logit_tail = logit_history[:, :, 1:self.score_window]
         if keep is not None:
             h_gru0, h_gru1 = h_gru0 * keep, h_gru1 * keep
             key_tail, value_tail = key_tail * keep, value_tail * keep
@@ -409,9 +411,9 @@ class AlignUlcnetStreamingExport(nn.Module):
             query_now.unsqueeze(3) * key_candidates
         ).sum(dim=-1)
 
-        # Reproduce StreamConv2dCell: the four newest chronological frames of
-        # the window plus current logits, frequency-axis padding only, then
-        # the raw Conv2d. The Concat result is the next window.
+        # Reproduce StreamConv2dCell: the score_window - 1 newest chronological
+        # frames of the window plus current logits, delay-axis padding only,
+        # then the raw Conv2d. The Concat result is the next window.
         score_input = torch.cat((logit_tail, logit_now), dim=2)
         frequency_total = (attention.score.kf - 1) * attention.score.df
         frequency_left = frequency_total // 2
@@ -503,6 +505,7 @@ class AlignUlcnetPacketExport(nn.Module):
         self.delay_depth = self.step.delay_depth
         self.n_freqs = self.step.n_freqs
         self.ta_bins = self.step.ta_bins
+        self.score_window = self.step.score_window
 
     def forward(self, error_mag: Tensor, far_mag: Tensor, error_cos: Tensor,
                 error_sin: Tensor, frame_reset: Tensor, key_history: Tensor,
@@ -537,7 +540,14 @@ def ta_bins_for(model) -> int:
     return model.encoded_width
 
 
-def state_shapes(delay_depth: int, ta_bins: int) -> Dict[str, Tuple[int, ...]]:
+def score_window_for(model) -> int:
+    """The logit frames the score conv reads: its kernel's time size."""
+    return int(model.align.score.kt)
+
+
+def state_shapes(delay_depth: int, ta_bins: int,
+                 score_window: int = SCORE_WINDOW_FRAMES
+                 ) -> Dict[str, Tuple[int, ...]]:
     if not MIN_DELAY_DEPTH <= delay_depth <= MAX_DELAY_DEPTH:
         raise ValueError(
             'delay depth must be in [%d, %d]' %
@@ -547,7 +557,7 @@ def state_shapes(delay_depth: int, ta_bins: int) -> Dict[str, Tuple[int, ...]]:
         'key_history': (1, TA_CHANNELS, delay_depth, ta_bins),
         'value_history': (1, TA_CHANNELS, delay_depth, ta_bins),
         'logit_history': (
-            1, TA_CHANNELS, SCORE_WINDOW_FRAMES, delay_depth
+            1, TA_CHANNELS, score_window, delay_depth
         ),
         GRU_STATE_NAME: (1, GRU_SUBBANDS * GRU_LAYERS, 1, GRU_HIDDEN),
     }
@@ -608,12 +618,13 @@ def graph_signals(model, error_ri: Tensor, far_ri: Tensor) -> Tuple[Tensor, ...]
     return stream_features(model, error_ri, far_ri)[:SIGNAL_INPUTS]
 
 
-def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int
+def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
+                 score_window: int = SCORE_WINDOW_FRAMES
                  ) -> Tuple[Tensor, ...]:
     """Trace inputs for one frame. n_freqs and ta_bins have no defaults on
     purpose: a default would let a caller that forgot them trace one grid's
     graph while believing it had another."""
-    shapes = state_shapes(delay_depth, ta_bins)
+    shapes = state_shapes(delay_depth, ta_bins, score_window)
     signals = (
         torch.randn(1, 1, n_freqs).abs(),          # error_mag
         torch.randn(1, 1, n_freqs).abs(),          # far_mag
@@ -624,9 +635,10 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int
 
 
 def dummy_packet_inputs(frames_per_call: int, delay_depth: int, n_freqs: int,
-                        ta_bins: int) -> Tuple[Tensor, ...]:
+                        ta_bins: int, score_window: int = SCORE_WINDOW_FRAMES
+                        ) -> Tuple[Tensor, ...]:
     """Trace inputs for a packet graph: signals [1, N, F], frame_reset [1, N]."""
-    shapes = state_shapes(delay_depth, ta_bins)
+    shapes = state_shapes(delay_depth, ta_bins, score_window)
     n = frames_per_call
     signals = (
         torch.randn(1, n, n_freqs).abs(),          # error_mag
@@ -780,7 +792,7 @@ def _write_metadata(
         'output_schema': _schema(OUTPUT_NAMES, outputs),
         'k_v_history_order': 'newest_first',
         'logit_history_order': 'oldest_first',
-        'score_window_frames': SCORE_WINDOW_FRAMES,
+        'score_window_frames': score_window_for(model),
         'production_streaming_equivalent': True,
         'c_frontend_postprocess': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
         'c_model_io_state': 'lib/aiaec/ulcnet/ulcnet_model_io.c',
@@ -886,6 +898,13 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
             'exponent would deploy silently wrong'
             % (float(model.compression_exponent), COMPRESSION_EXPONENT)
         )
+    score_window = score_window_for(model)
+    if score_window != SCORE_WINDOW_FRAMES:
+        raise ValueError(
+            f'checkpoint score_kernel time size {score_window} != '
+            f'{SCORE_WINDOW_FRAMES}, the logit window fixed by '
+            'GRAPH_IO_ALIGNULCNET_SCORE_WINDOW (stream/aiaec/'
+            'graph_io_alignulcnet.h); only the delay size may differ')
     checkpoint_data = torch.load(
         checkpoint_path, map_location='cpu', weights_only=False
     )

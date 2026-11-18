@@ -42,7 +42,6 @@ inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse
-import configparser
 import os
 import sys
 import time
@@ -79,6 +78,7 @@ from AIAEC.training_common import (
     halt_on_non_finite,
     make_checkpoint_contract,
     make_scheduler,
+    read_config,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -195,10 +195,7 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
 
 
 def main(args):
-    cfg = configparser.ConfigParser()
-    if not cfg.read(args.config):
-        raise FileNotFoundError(f"config not found: {args.config}")
-    print(f"Config: {os.path.abspath(args.config)}")
+    cfg = read_config(args.config)
 
     set_seed(args.seed)
     device = auto_device(args.device, args.gpu)

@@ -7,6 +7,8 @@
     python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth
     python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth --reset-optimizer
     python3 train.py --config config.ini --seed 123
+    python3 train.py --config config.ini baseline.ini              # default recipe
+    python3 train.py --config config.ini baseline.ini ref_512.ini  # 512/256 reference
     ([loss] stft_consistency = true refuses MPS: pass --device cpu or a CUDA device)
 
 config.ini sections (see the shipped config.ini for every knob, documented):
@@ -19,7 +21,8 @@ config.ini sections (see the shipped config.ini for every knob, documented):
     [model]      every AlignULCNet constructor keyword (see model.py)
     [training]   optimizer, seed, epoch budget, checkpoint/log locations
     [loss]       PLCPA on the iSTFT->STFT-consistent estimate, as DeepVQE_S
-                 and Align_CRUSE train
+                 and Align_CRUSE train; optional aux_stft_weight / aux_n_fft
+                 term (training_common.AuxStftLoss)
 
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
@@ -38,7 +41,6 @@ inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse
-import configparser
 import os
 import sys
 import time
@@ -66,17 +68,22 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
+    aux_loss_version,
+    aux_recipe,
+    aux_stft_loss_from_config,
+    contract_model_kwargs,
     fast_forward_scheduler,
     halt_on_non_finite,
     make_scheduler,
     make_checkpoint_contract,
-    power_compressed_complex_mse_loss,
+    plcpa_log,
+    plcpa_training_loss,
+    read_config,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
     scan_non_finite,
     set_seed,
-    stft_consistent_spectrum,
     training_progress,
 )
 
@@ -108,10 +115,14 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None, scheduler=None):
+             max_epochs=None, scheduler=None, aux_loss=None):
+    """One pass over ``loader``; returns ``(mean loss, global_step, mean
+    PLCPA)``. The PLCPA alone is tracked only while ``aux_loss`` adds its
+    term (None otherwise), so runs with and without it compare on one scale.
+    """
     training = optimizer is not None
     model.train(training)
-    total_loss, n_batches = 0.0, 0
+    total_loss, plcpa_sum, n_batches = 0.0, 0.0, 0
 
     batches = training_progress(
         loader, training=training, epoch=epoch, max_epochs=max_epochs
@@ -121,13 +132,10 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
             output, spectral = forward_batch(
                 model, stems_batch, aec_grid, device
             )
-            estimate = output.enhanced
-            if loss_cfg.getboolean('stft_consistency'):
-                estimate = stft_consistent_spectrum(estimate, aec_grid)
-            loss = power_compressed_complex_mse_loss(
-                estimate, spectral.target,
-                compression=loss_cfg.getfloat('compression'),
-                complex_weight=loss_cfg.getfloat('complex_weight'),
+            loss, plcpa = plcpa_training_loss(
+                output.enhanced, spectral.target, aec_grid, loss_cfg,
+                consistency=loss_cfg.getboolean('stft_consistency'),
+                aux_loss=aux_loss,
             )
 
         if training:
@@ -178,6 +186,8 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
             loss_value = float(loss.detach())
 
         total_loss += loss_value
+        if aux_loss is not None:
+            plcpa_sum = plcpa_sum + plcpa.detach()
         n_batches += 1
         if training:
             batches.set_postfix(
@@ -185,14 +195,13 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                 refresh=False,
             )
 
-    return total_loss / max(1, n_batches), global_step
+    plcpa_mean = (None if aux_loss is None
+                  else float(plcpa_sum) / max(1, n_batches))
+    return total_loss / max(1, n_batches), global_step, plcpa_mean
 
 
 def main(args):
-    cfg = configparser.ConfigParser()
-    if not cfg.read(args.config):
-        raise FileNotFoundError(f"config not found: {args.config}")
-    print(f"Config: {os.path.abspath(args.config)}")
+    cfg = read_config(args.config)
 
     set_seed(args.seed)
     device = auto_device(args.device, args.gpu)
@@ -229,6 +238,8 @@ def main(args):
         'loss_complex_weight': cfg.getfloat('loss', 'complex_weight'),
         'loss_stft_consistency': cfg.getboolean('loss', 'stft_consistency'),
     }
+    aux_loss = aux_stft_loss_from_config(cfg)
+    recipe.update(aux_recipe(aux_loss))
     if recipe['schedule'] == 'warmup_cosine':
         # These two values and the denominator above define the entire step LR
         # curve, so all are checkpoint compatibility fields.
@@ -249,7 +260,8 @@ def main(args):
           f"schedule={recipe['schedule']} early_stop={stop_label}")
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
-        model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
+        model_kwargs=contract_model_kwargs(AlignULCNet, model_kwargs),
+        loss_version=aux_loss_version(LOSS_VERSION, aux_loss),
         data_contract=data_contract, optimizer=recipe,
     )
 
@@ -349,21 +361,24 @@ def main(args):
             'best_val': best_val, 'no_improve': no_improve,
         }
         started = time.time()
-        train_loss, global_step = run_epoch(
+        train_loss, global_step, train_plcpa = run_epoch(
             model, train_loader, aec_grid, device, loss_cfg, optimizer,
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
             max_epochs=max_epochs, scheduler=step_scheduler,
+            aux_loss=aux_loss,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 
-        val_loss = train_loss
+        val_loss, val_plcpa = train_loss, None
         if val_loader is not None:
-            val_loss, _ = run_epoch(
-                model, val_loader, aec_grid, device, loss_cfg
+            val_loss, _, val_plcpa = run_epoch(
+                model, val_loader, aec_grid, device, loss_cfg,
+                aux_loss=aux_loss,
             )
             msg += f" val_loss={val_loss:.4f}"
+        msg += plcpa_log(train=train_plcpa, val=val_plcpa)
         if epoch_scheduler is not None:
             epoch_scheduler.step(val_loss)
         msg += f" lr={optimizer.param_groups[0]['lr']:.4e}"

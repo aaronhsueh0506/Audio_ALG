@@ -107,7 +107,8 @@ def main(args, load_model_fn=None):
         packet_state = tuple(
             value.to(device) for value in packet_export.dummy_packet_inputs(
                 packet_size, packet_wrapper.delay_depth,
-                packet_wrapper.n_freqs, packet_wrapper.ta_bins
+                packet_wrapper.n_freqs, packet_wrapper.ta_bins,
+                packet_wrapper.score_window,
             )[packet_wrapper.signal_inputs:])
 
     pieces = []

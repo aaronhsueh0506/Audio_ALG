@@ -8,6 +8,8 @@ After a failed job the current spectral contribution is zero. Output PCM can sti
 
 The supplied config uses AdamW, peak LR `1.2e-3`, weight decay `5e-7`, batch 8 and 50 epochs. It uses the STFT-consistent PLCPA objective. The three-epoch warm-up and per-step cosine schedule end at `1e-6`. [Training and dataset](../reference/training.md)
 
+`config.ini` ships the hop-128 values and `baseline.ini` / `ref_512.ini` overlay the default recipe and the 512/256 reference ([config overlays and grid options](../reference/training.md)).
+
 ## ONNX and calibration
 
 Run these commands from the model directory.

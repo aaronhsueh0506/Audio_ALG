@@ -8,7 +8,10 @@ is a comparability bug that surfaces only as "one model is mysteriously worse."
 Provided here:
 
 * ``set_seed``                                -- re-exported from AINR.dataset_gen
-* ``read_model_kwargs``                       -- ``[model]`` config -> constructor kwargs
+* ``read_config``                             -- ``--config`` file(s), read in order
+* ``read_model_kwargs`` /
+  ``contract_model_kwargs``                   -- ``[model]`` config -> constructor
+  kwargs, and the subset a checkpoint contract records
 * ``make_checkpoint_contract`` /
   ``require_checkpoint_contract``             -- reject a checkpoint whose grid,
   task, model kwargs or loss version differ from the running config
@@ -27,6 +30,11 @@ Provided here:
 * ``si_snr_loss``                             -- waveform SI-SNR term used by CAGCRN
 * ``stft_consistent_spectrum`` / ``spectrum_to_waveform`` -- differentiable
   shared synthesis boundaries for objectives defined after iSTFT
+* ``plcpa_training_loss``                     -- the DeepVQE-S / Align-ULCNet
+  batch loss: PLCPA plus the optional ``AuxStftLoss``
+* ``AuxStftLoss`` / ``aux_stft_loss_from_config`` / ``aux_loss_version`` /
+  ``aux_recipe`` / ``plcpa_log`` -- optional PLCPA term at a second STFT
+  resolution (``[loss] aux_stft_weight``) and its contract and log fields
 * ``LinearAecEngine``                         -- inference-only continuous-file
   wrapper around the frozen Python PBFDKF whose output is dataset stem five
   (`linear_error`); trainers never execute it
@@ -41,6 +49,9 @@ paper-published when a paper omits it.
 from __future__ import annotations
 
 import argparse
+import configparser
+import dataclasses
+import functools
 import inspect
 import math
 import os
@@ -111,6 +122,8 @@ __all__ = [
     'split_dataset_by_sample',
     'build_plain_loaders',
     'read_model_kwargs',
+    'contract_model_kwargs',
+    'read_config',
     'FAR_INPUT_MODES',
     'FAR_INPUT_MODE_C_VALUES',
     'DEPLOYED_FAR_INPUT_MODE',
@@ -136,6 +149,12 @@ __all__ = [
     'si_snr_loss',
     'stft_consistent_spectrum',
     'spectrum_to_waveform',
+    'plcpa_training_loss',
+    'AuxStftLoss',
+    'aux_stft_loss_from_config',
+    'aux_loss_version',
+    'aux_recipe',
+    'plcpa_log',
     'LinearAecEngine',
     'make_scheduler',
     'fast_forward_scheduler',
@@ -154,7 +173,10 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     pattern -- rather than re-declaring these five.
     """
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument('--config', default='config.ini', help='Config file path')
+    parser.add_argument(
+        '--config', nargs='+', default=['config.ini'], metavar='INI',
+        help='Config file path(s), read in order; a later file overrides '
+             'the keys it sets (e.g. config.ini baseline.ini)')
     parser.add_argument(
         '--packed-dir', default=None,
         help='Packed shard file/directory; overrides [data] packed_dir',
@@ -178,6 +200,21 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
                              'semantics)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     return parser
+
+
+def read_config(paths: Sequence[str]) -> configparser.ConfigParser:
+    """Read the ``--config`` files in order and print what was read.
+
+    Every listed file must exist: ``ConfigParser.read`` skips a missing one
+    silently, which would train the base config under an overlay's name.
+    """
+    cfg = configparser.ConfigParser()
+    read = set(cfg.read(paths))
+    missing = [str(path) for path in paths if os.fspath(path) not in read]
+    if missing:
+        raise FileNotFoundError(f"config not found: {', '.join(missing)}")
+    print(f"Config: {', '.join(os.path.abspath(path) for path in paths)}")
+    return cfg
 
 
 def auto_device(requested: Optional[str], gpu: Optional[int] = None) -> str:
@@ -371,6 +408,24 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
         else:
             kwargs[kwarg] = raw
     return kwargs
+
+
+def contract_model_kwargs(model_cls, model_kwargs: Dict) -> Dict:
+    """``model_kwargs`` without the class's ``optional_contract_kwargs`` that
+    are at their constructor default.
+
+    A default build then writes the contract it wrote before the option
+    existed, so older checkpoints still resume, and a checkpoint that lacks
+    the key loads with the default.
+    """
+    optional = getattr(model_cls, 'optional_contract_kwargs', ())
+    defaults = {
+        name: param.default for name, param
+        in inspect.signature(model_cls.__init__).parameters.items()
+        if name in optional
+    }
+    return {name: value for name, value in model_kwargs.items()
+            if not (name in defaults and value == defaults[name])}
 
 
 # ============================================================
@@ -719,12 +774,17 @@ def spectrum_to_waveform(spectrum: Tensor, grid: AecGrid) -> Tensor:
 _MPS_STFT_BACKWARD_SAFE_SAMPLES = 65536
 
 
+def _mps_stft_backward_unsafe(waveform: Tensor) -> bool:
+    """Whether ``torch.stft`` of ``waveform`` would differentiate wrongly."""
+    return (waveform.device.type == 'mps'
+            and waveform.requires_grad
+            and waveform.shape[-1] > _MPS_STFT_BACKWARD_SAFE_SAMPLES)
+
+
 def stft_consistent_spectrum(spectrum: Tensor, grid: AecGrid) -> Tensor:
     """Project a public ``[B,T,F]`` spectrum through iSTFT -> STFT."""
     waveform = spectrum_to_waveform(spectrum, grid)
-    if (waveform.device.type == 'mps'
-            and waveform.requires_grad
-            and waveform.shape[-1] > _MPS_STFT_BACKWARD_SAFE_SAMPLES):
+    if _mps_stft_backward_unsafe(waveform):
         raise RuntimeError(
             "STFT consistency needs torch.stft's backward, and this build's "
             "MPS backend computes it incorrectly above "
@@ -742,6 +802,117 @@ def stft_consistent_spectrum(spectrum: Tensor, grid: AecGrid) -> Tensor:
             "STFT consistency changed shape: "
             f"{tuple(spectrum.shape)} -> {tuple(consistent.shape)}")
     return consistent
+
+
+@functools.lru_cache(maxsize=None)
+def _aux_analysis(grid: AecGrid, n_fft: int) -> Tuple[AecGrid, float]:
+    """The ``n_fft``-point aux grid and its scale into ``grid``'s units."""
+    aux_grid = AecGrid(grid.sr, n_fft, n_fft, n_fft // 2)
+    energy = [float(g.window().square().sum()) for g in (grid, aux_grid)]
+    return aux_grid, math.sqrt(energy[0] / energy[1])
+
+
+@dataclasses.dataclass(frozen=True)
+class AuxStftLoss:
+    """``weight`` x PLCPA of the synthesized output at a second resolution.
+
+    The estimate is the iSTFT of the model's spectrum (the waveform the
+    consistency projection synthesizes); the target is resynthesized by the
+    same iSTFT, so both have the same length. Both are analysed with an
+    ``n_fft``-point sqrt-Hann STFT, hop ``n_fft / 2``, scaled by
+    ``sqrt(sum w_grid^2 / sum w_aux^2)``: broadband content is in the training
+    grid's units at any ``n_fft`` (a stationary tone weighs
+    ``(n_fft / grid n_fft)^c`` more with sqrt-Hann windows, 1.23x at 512 over
+    256), and at the grid's own ``n_fft`` the term equals the primary PLCPA.
+    """
+
+    weight: float
+    n_fft: int
+    compression: float
+    complex_weight: float
+
+    def __call__(self, enhanced: Tensor, target: Tensor,
+                 grid: AecGrid) -> Tensor:
+        estimate_wave = spectrum_to_waveform(enhanced, grid)
+        if _mps_stft_backward_unsafe(estimate_wave):
+            raise RuntimeError(
+                "[loss] aux_stft_weight puts torch.stft in the backward "
+                "graph, and this build's MPS backend computes it incorrectly "
+                f"above {_MPS_STFT_BACKWARD_SAFE_SAMPLES} samples (got "
+                f"{estimate_wave.shape[-1]}). Use --device cpu or a CUDA "
+                "device, or set [loss] aux_stft_weight = 0.")
+        with torch.no_grad():
+            target_wave = spectrum_to_waveform(target, grid)
+        aux_grid, scale = _aux_analysis(grid, self.n_fft)
+        estimate = stft(estimate_wave, aux_grid).transpose(-2, -1) * scale
+        reference = stft(target_wave, aux_grid).transpose(-2, -1) * scale
+        return self.weight * power_compressed_complex_mse_loss(
+            estimate, reference, compression=self.compression,
+            complex_weight=self.complex_weight)
+
+
+def aux_stft_loss_from_config(cfg, section: str = 'loss'
+                              ) -> Optional[AuxStftLoss]:
+    """``[loss] aux_stft_weight`` (default 0 = off, returns None) and
+    ``aux_n_fft`` (default 512). The term uses the section's ``compression``
+    and ``complex_weight``."""
+    weight = cfg.getfloat(section, 'aux_stft_weight', fallback=0.0)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError(
+            f"[{section}] aux_stft_weight must be finite and >= 0, got {weight}")
+    if weight == 0.0:
+        return None
+    n_fft = cfg.getint(section, 'aux_n_fft', fallback=512)
+    if n_fft < 4 or n_fft & (n_fft - 1):
+        raise ValueError(
+            f"[{section}] aux_n_fft must be a power of two >= 4, got {n_fft}")
+    print(f"Aux STFT loss: weight={weight:g} n_fft={n_fft}")
+    return AuxStftLoss(
+        weight=weight, n_fft=n_fft,
+        compression=cfg.getfloat(section, 'compression'),
+        complex_weight=cfg.getfloat(section, 'complex_weight'),
+    )
+
+
+def aux_loss_version(base: str, aux_loss: Optional[AuxStftLoss]) -> str:
+    """``base``, tagged with the aux term while it is on."""
+    if aux_loss is None:
+        return base
+    return f'{base}+aux_stft{aux_loss.n_fft}_w{aux_loss.weight:g}'
+
+
+def aux_recipe(aux_loss: Optional[AuxStftLoss]) -> Dict:
+    """Checkpoint recipe fields; present only while the aux term is on."""
+    if aux_loss is None:
+        return {}
+    return {'loss_aux_stft_weight': aux_loss.weight,
+            'loss_aux_n_fft': aux_loss.n_fft}
+
+
+def plcpa_log(**plcpa: Optional[float]) -> str:
+    """`` <split>_plcpa=<value>`` for each split whose PLCPA was tracked."""
+    return ''.join(f" {split}_plcpa={value:.4f}"
+                   for split, value in plcpa.items() if value is not None)
+
+
+def plcpa_training_loss(enhanced: Tensor, target: Tensor, grid: AecGrid,
+                        loss_cfg, *, consistency: bool,
+                        aux_loss: Optional[AuxStftLoss] = None
+                        ) -> Tuple[Tensor, Tensor]:
+    """``(total, plcpa)``: the PLCPA of ``enhanced`` (of its iSTFT -> STFT
+    projection when ``consistency``) with ``loss_cfg``'s ``compression`` and
+    ``complex_weight``, plus ``aux_loss`` when given."""
+    estimate = enhanced
+    if consistency:
+        estimate = stft_consistent_spectrum(enhanced, grid)
+    plcpa = power_compressed_complex_mse_loss(
+        estimate, target,
+        compression=loss_cfg.getfloat('compression'),
+        complex_weight=loss_cfg.getfloat('complex_weight'),
+    )
+    if aux_loss is None:
+        return plcpa, plcpa
+    return plcpa + aux_loss(enhanced, target, grid), plcpa
 
 
 # ============================================================

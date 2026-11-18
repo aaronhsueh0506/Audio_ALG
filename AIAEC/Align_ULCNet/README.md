@@ -17,7 +17,9 @@ should not be reported as an upstream checkpoint-equivalent setting.
 
 The historical 16 kHz dataset default uses FFT/window/hop 512/512/256; materialization, packing, training and Python inference also accept 256/256/128. Keep the two corpora/checkpoints separate and match the model grid to its materialized frontend. The streaming ONNX exporter accepts three deployed profiles: 16 kHz/256, 16 kHz/512 and 48 kHz/1024; any other grid is refused. The 48 kHz grid uses 1024/1024/512 and needs a checkpoint trained for its frequency dimensions. The checkpoint, ONNX and runtime must agree on attention history `max_delay_frames` (D). The matched-filter count in the upstream AEC is independent of D. [Delay profiles and memory](reference/delay.md)
 
-The supplied config uses Adam, peak LR `4e-3`, and STFT-consistent PLCPA with power `0.3` and complex weight `0.7`. It selects the best checkpoint by validation. [Training and dataset](../reference/training.md)
+The supplied config uses Adam, peak LR `2e-3` (`baseline.ini`: the paper's `4e-3`), and STFT-consistent PLCPA with power `0.3` and complex weight `0.7`. It selects the best checkpoint by validation. [Training and dataset](../reference/training.md)
+
+`config.ini` ships the hop-128 values and `baseline.ini` / `ref_512.ini` overlay the default recipe and the 512/256 reference ([config overlays and grid options](../reference/training.md)).
 
 ## Release data kept out of the customer manual
 

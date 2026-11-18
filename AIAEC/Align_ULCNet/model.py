@@ -16,6 +16,7 @@ from torch import Tensor, nn
 from AIAEC.aiaec_common import (
     AecOutput,
     CausalConv2d,
+    DEFAULT_SCORE_KERNEL,
     FrameDelayAttention,
     SeparableCausalConv,
     SignalGrid,
@@ -107,10 +108,12 @@ class StreamEncoder(nn.Module):
 class JointConvBlock(nn.Module):
     """The paper's ordinary (not depthwise-separable) joint Conv layer."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int,
+                 frequency_stride: int = 2):
         super().__init__()
         self.conv = CausalConv2d(
-            in_channels, out_channels, (1, 3), stride=(1, 2), bias=False,
+            in_channels, out_channels, (1, 3), stride=(1, frequency_stride),
+            bias=False,
         )
         self.norm = nn.BatchNorm2d(out_channels)
         self.act = nn.ELU()
@@ -157,14 +160,20 @@ class AlignULCNet(nn.Module):
     task = "linear_aec_postfilter_res_nr_dereverb"
     # forward_stream emits the enhanced frame for its own input frame.
     stream_output_delay = 0
+    # Recorded in a checkpoint contract only when set away from the default.
+    optional_contract_kwargs = ('score_kernel', 'joint2_stride')
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  gamma: int = 5, subband_bins: int = 2,
                  compression_exponent: float = 0.3,
-                 max_delay_frames: int | None = None):
+                 max_delay_frames: int | None = None,
+                 score_kernel=DEFAULT_SCORE_KERNEL, joint2_stride: int = 2):
         super().__init__()
         if not 0.0 < compression_exponent <= 1.0:
             raise ValueError("compression_exponent must be in (0,1]")
+        if joint2_stride not in (1, 2):
+            raise ValueError(
+                f"joint2_stride must be 1 or 2, got {joint2_stride!r}")
         self.grid = grid
         self.compression_exponent = compression_exponent
         self.reorient = ChannelSampledReorientation(
@@ -178,19 +187,21 @@ class AlignULCNet(nn.Module):
                                 else grid.delay_frames(max_delay_seconds))
         self.max_delay_frames = int(max_delay_frames)
         self.align = FrameDelayAttention(
-            32, 32, 32, 32, self.max_delay_frames, score_kernel=(5, 3),
+            32, 32, 32, 32, self.max_delay_frames, score_kernel=score_kernel,
         )
         self.joint1 = JointConvBlock(64, 64)
-        self.joint2 = JointConvBlock(64, 96)
+        # 1 keeps joint1's width: on the 256-point grid that is the bottleneck
+        # of the 512-point grid (7 positions, subband GRU inputs 256/192).
+        self.joint2 = JointConvBlock(64, 96, frequency_stride=joint2_stride)
         self.fgru = FrequencyGRU(96)
 
         # Encoder output width and the width of every K/V entry the alignment
         # attention caches; shared by the export and the C descriptor.
         self.encoded_width = math.ceil(self.reorient.width / 2)
 
-        # Width after pool / two stride-2 joint convolutions.
+        # Width after the pool and the two joint convolutions.
         width = math.ceil(self.encoded_width / 2)
-        width = math.ceil(width / 2)
+        width = math.ceil(width / joint2_stride)
         split = (math.ceil(width / 2), width // 2)
         if split[1] == 0:
             raise ValueError("Align-ULCNet grid is too narrow for two subbands")
@@ -270,7 +281,7 @@ class AlignULCNet(nn.Module):
         """Stateful cells for :meth:`forward_stream`.
 
         The only time-extended members are the delay attention (key/value
-        rings plus the (5,3) score conv history) and the two temporal subband
+        rings plus the score conv history) and the two temporal subband
         GRUs.  Every other layer has time kernel 1 and runs per-frame as-is.
         """
         assert_streaming_ready(self)

@@ -69,7 +69,7 @@ deliberately common: three epochs of linear warmup followed by per-step cosine d
 
 | model | optimizer / LR | schedule | objective | shipped batch / epochs |
 |---|---|---|---|---|
-| Align-ULCNet | Adam / 4e-3 | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term (the papers state no formula) | 16 / 50 |
+| Align-ULCNet | Adam / 2e-3 (`baseline.ini`: the paper's 4e-3) | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term (the papers state no formula) | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
@@ -119,5 +119,51 @@ of restoring a stale scheduler horizon.
 The stored project examples are 10-second chunks and one epoch is one complete
 DataLoader pass. Align-ULCNet's paper used random 3-second examples and 20,000
 steps per epoch.
+
+### Config overlays and grid options (DeepVQE-S, Align-ULCNet)
+
+`--config` takes several files, read in order; a later file overrides only the
+keys it sets, and a missing file is an error. Each of the two model
+directories ships `config.ini` with the hop-128 values below set, `baseline.ini`
+(the constructor defaults and the original loss and lr: the control arm) and
+`ref_512.ini`, the 16 kHz 512/256 reference (its `[signal]`, a 512/256
+`packed_dir`, its own `output_dir`; for Align-ULCNet also
+`max_delay_frames = 32`):
+
+    python3 train.py --config config.ini                            # hop-128 values
+    python3 train.py --config config.ini baseline.ini               # default recipe
+    python3 train.py --config config.ini baseline.ini ref_512.ini   # 512/256 reference
+
+Shipped `config.ini` values at hop 128: DeepVQE-S `gru_hidden = 256`,
+`similarity_channels = 8`, `score_kernel = 9,5`, `[loss] aux_stft_weight = 0.5`;
+Align-ULCNet `joint2_stride = 1`, `score_kernel = 9,5`, `[training] lr = 2e-3`.
+
+Constructor options (defaults as listed):
+
+| model | `[model]` key | default | effect |
+|---|---|---|---|
+| DeepVQE-S, Align-ULCNet | `score_kernel` | `5,3` | (time, delay) of the delay-attention score conv |
+| Align-ULCNet | `joint2_stride` | `2` | frequency stride of the second joint conv; `1` at FFT 256 keeps the 512-grid bottleneck |
+
+A checkpoint contract records `ctor_score_kernel` / `ctor_joint2_stride` only
+when they differ from the default, so a default run writes the same contract as
+before and an older checkpoint loads with the defaults. The Align-ULCNet
+exporter (and `inference.py calib`) refuses a score kernel whose time size is
+not 5 (the board table's logit window); such a model still trains and runs in
+Python inference, and `5,5` and `joint2_stride = 1` export with unchanged
+state shapes. A DeepVQE-S graph with other `similarity_channels`, `gru_hidden` or
+`score_kernel` exports, but has no row in `stream/aiaec/graph_io_deepvqes.h`.
+
+`[loss] aux_stft_weight` (default 0, off) adds `weight x` PLCPA of the
+synthesized output at an `aux_n_fft`-point STFT (default 512, hop
+`aux_n_fft/2`), scaled by `sqrt(sum w_grid^2 / sum w_aux^2)`, which puts
+broadband content in the training grid's units (a stationary tone weighs about
+1.23x more at 512 than at 256); at the grid's own FFT size it equals the
+primary PLCPA. On, it
+appends `+aux_stft<N>_w<weight>` to `loss_version` and adds
+`loss_aux_stft_weight` / `loss_aux_n_fft` to the recipe, so a resume across the
+switch is refused; it puts `torch.stft` in the backward graph, so MPS is refused
+as with `stft_consistency`. The log then prints `train_plcpa` / `val_plcpa`, the
+PLCPA alone; checkpoint selection stays on the total.
 
 [返回本主題](../README.md)

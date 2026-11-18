@@ -17,6 +17,7 @@ from AIAEC.aiaec_common import (
     AecOutput,
     CausalConv2d,
     CausalConvBlock,
+    DEFAULT_SCORE_KERNEL,
     FrameDelayAttention,
     FreqUpsample,
     SignalGrid,
@@ -111,10 +112,13 @@ class DeepVQES(nn.Module):
     # Every operator is causal with zero left context at reset, so streaming
     # emits each enhanced frame in the invocation that consumed its inputs.
     stream_output_delay = 0
+    # Recorded in a checkpoint contract only when set away from the default.
+    optional_contract_kwargs = ('score_kernel',)
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  similarity_channels: int = 4, gru_hidden: int = 192,
-                 compression_exponent: float = 0.3):
+                 compression_exponent: float = 0.3,
+                 score_kernel=DEFAULT_SCORE_KERNEL):
         super().__init__()
         self.grid = grid
         self.compression_exponent = compression_exponent
@@ -128,7 +132,7 @@ class DeepVQES(nn.Module):
         self.far2 = CausalConvBlock(8, 24, (4, 3), (1, 2))
         self.align = FrameDelayAttention(
             40, 24, 24, similarity_channels, self.max_delay_frames,
-            score_kernel=(5, 3),
+            score_kernel=score_kernel,
         )
         self.mic3 = CausalConvBlock(40 + 24, 56, (4, 3), (1, 2))
         self.mic4 = CausalConvBlock(56, 24, (4, 3), (1, 2))
