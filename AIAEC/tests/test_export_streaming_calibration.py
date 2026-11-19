@@ -26,6 +26,7 @@ from AIAEC._streaming_calibration import (
     input_range_report,
 )
 from AIAEC._streaming_export import state_precision_policy
+from aiaec_shipped_config import ctor_contract, shipped_model_kwargs
 from calibration_io import (
     calibration_report_path,
     sibling_onnx_path,
@@ -560,14 +561,16 @@ def layout_work(tmp_path_factory):
         'ctor_similarity_channels': 4, 'ctor_gru_hidden': 192,
         'ctor_compression_exponent': 0.3,
     }, 'state_dict': deepvqe.state_dict()}, root / 'dv.pth')
-    ulcnet = AlignULCNet(LAYOUT_GRID, max_delay_seconds=0.5).eval()
+    # Align-ULCNet exports at this grid only with the 16 kHz / FFT 256 config's logit window.
+    ulcnet = AlignULCNet(LAYOUT_GRID, **shipped_model_kwargs(
+        'Align_ULCNet', AlignULCNet)).eval()
     linear = make_linear_aec_contract(sr, frame_size=n_fft)
     torch.save({'contract': {
         'model_name': 'Align_ULCNet', 'task': AlignULCNet.task, 'sr': sr,
         'n_fft': n_fft, 'win_len': n_fft, 'hop_len': hop,
         'loss_version': 'test', 'linear_aec': linear.as_dict(),
         'linear_aec_contract_hash': linear.fingerprint(),
-        'ctor_max_delay_seconds': 0.5,
+        **ctor_contract('Align_ULCNet', AlignULCNet),
     }, 'state_dict': ulcnet.state_dict()}, root / 'al.pth')
     rng = np.random.RandomState(4)
     for name in ('primary', 'far'):

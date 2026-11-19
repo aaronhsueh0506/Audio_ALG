@@ -392,7 +392,8 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
             dummy_inputs,
         )
         wrapper = AlignUlcnetStreamingExport(model).eval()
-        inputs = dummy_inputs(2, wrapper.n_freqs, wrapper.ta_bins)
+        inputs = dummy_inputs(2, wrapper.n_freqs, wrapper.ta_bins,
+                              wrapper.score_window)
         with torch.no_grad():
             outputs = wrapper(*inputs)
         metadata = _write_metadata(

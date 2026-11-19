@@ -165,8 +165,13 @@ __all__ = [
 # CLI
 # ============================================================
 
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
+def build_arg_parser(description: str,
+                     default_config: Optional[str] = 'config.ini'
+                     ) -> argparse.ArgumentParser:
     """The common flags every AIAEC train.py accepts, so they stop drifting.
+
+    ``default_config=None`` makes ``--config`` required (a trainer that ships
+    one config per grid has no default grid).
 
     A candidate whose training genuinely needs an extra flag adds it to the
     parser this returns -- see any train.py's ``build_parser()`` for the
@@ -174,9 +179,11 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
-        '--config', nargs='+', default=['config.ini'], metavar='INI',
+        '--config', nargs='+', metavar='INI',
+        default=None if default_config is None else [default_config],
+        required=default_config is None,
         help='Config file path(s), read in order; a later file overrides '
-             'the keys it sets (e.g. config.ini baseline.ini)')
+             'the keys it sets')
     parser.add_argument(
         '--packed-dir', default=None,
         help='Packed shard file/directory; overrides [data] packed_dir',
@@ -567,7 +574,7 @@ def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'chec
             want = f"<list len={len(want)}>"
         raise ValueError(
             f"{context} {path}={got!r}, but the running config requires "
-            f"{want!r}. Retrain, or fix config.ini before resuming/loading "
+            f"{want!r}. Retrain, or fix the config before resuming/loading "
             f"for inference."
         )
 

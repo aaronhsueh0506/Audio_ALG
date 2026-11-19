@@ -1,4 +1,4 @@
-"""Constructor options, their checkpoint contract, config overlays and the
+"""Constructor options, their checkpoint contract, the shipped per-grid configs and the
 auxiliary STFT loss of DeepVQE-S and Align-ULCNet.
 
 Every option defaults to the existing behaviour; the default path itself is
@@ -73,10 +73,12 @@ def _without_options(model_cls, kwargs):
             if name not in model_cls.optional_contract_kwargs}
 
 
-def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs):
-    """Build ``model_name`` at 16 kHz/256 from ``[model] max_delay_seconds =
-    0.5`` plus ``ctor`` and save it under the contract the trainer writes,
-    recording ``recorded(model_cls, kwargs)``; returns ``(model, contract)``."""
+def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs,
+                       grid=GRID256):
+    """Build ``model_name`` on ``grid`` (16 kHz/256 unless given) from
+    ``[model] max_delay_seconds = 0.5`` plus ``ctor`` and save it under the
+    contract the trainer writes, recording ``recorded(model_cls, kwargs)``;
+    returns ``(model, contract)``."""
     model_cls = CLASSES[model_name]
     cfg = _cfg('[model]\nmax_delay_seconds = 0.5\n' + ''.join(
         '%s = %s\n' % (key, ','.join(map(str, value))
@@ -84,10 +86,10 @@ def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs):
         for key, value in ctor.items()))
     kwargs = read_model_kwargs(cfg, model_cls)
     torch.manual_seed(2)
-    model = model_cls(GRID256, **kwargs).eval()
-    linear = make_linear_aec_contract(16000, frame_size=256)
+    model = model_cls(grid, **kwargs).eval()
+    linear = make_linear_aec_contract(grid.sample_rate, frame_size=grid.n_fft)
     contract = make_checkpoint_contract(
-        model_name=model_name, task=model_cls.task, grid=GRID256,
+        model_name=model_name, task=model_cls.task, grid=grid,
         model_kwargs=recorded(model_cls, kwargs), loss_version='test',
         data_contract={
             'linear_aec': linear.as_dict(),
@@ -225,15 +227,21 @@ def test_a_checkpoint_without_the_option_keys_resumes_and_loads(
 # ---- export ----------------------------------------------------------------
 
 @pytest.mark.parametrize('frames_per_call', [1, 8])
-def test_align_ulcnet_export_refuses_a_score_window_other_than_the_table(
-        tmp_path, frames_per_call):
-    checkpoint = tmp_path / 'k95.pth'
+@pytest.mark.parametrize('grid,kernel,message', [
+    (GRID256, (5, 3), 'score_kernel time size 5 != 9, .*16000 Hz / FFT 256'),
+    (GRID512, (9, 5), 'score_kernel time size 9 != 5, .*16000 Hz / FFT 512'),
+], ids=('fft256-k53', 'fft512-k95'))
+def test_align_ulcnet_export_refuses_a_score_window_other_than_its_grid(
+        tmp_path, frames_per_call, grid, kernel, message):
+    """The window is per grid (SCORE_WINDOW_BY_GRID, the C rows): 9 at
+    16 kHz / FFT 256, 5 elsewhere; the refusal names both and writes
+    nothing."""
+    checkpoint = tmp_path / 'k.pth'
     model, _ = _option_checkpoint(
-        'Align_ULCNet', {'max_delay_frames': 8, 'score_kernel': (9, 5)},
-        checkpoint)
+        'Align_ULCNet', {'max_delay_frames': 8, 'score_kernel': kernel},
+        checkpoint, grid=grid)
     out = tmp_path / 'out'
-    with pytest.raises(ValueError, match='score_kernel time size 9 .*'
-                       'GRAPH_IO_ALIGNULCNET_SCORE_WINDOW'):
+    with pytest.raises(ValueError, match=message):
         ulcnet_export.export_graph(model, str(checkpoint),
                                    str(out / 'graph.onnx'),
                                    frames_per_call=frames_per_call)
@@ -241,34 +249,40 @@ def test_align_ulcnet_export_refuses_a_score_window_other_than_the_table(
 
 
 @pytest.mark.parametrize('frames_per_call', [1, 8])
-def test_align_ulcnet_options_export_with_the_default_graph_boundary(
+def test_align_ulcnet_joint2_stride_changes_no_graph_port(
         tmp_path, frames_per_call):
+    """At 16 kHz / FFT 256, joint2_stride 1 exports the same ports as 2 and
+    the logit window is the grid's 9 (and the delay size is free)."""
     pytest.importorskip('onnx')
     pytest.importorskip('onnxruntime')
     schemas = {}
-    for name, ctor in (('default', {}),
-                       ('options', {'score_kernel': (5, 5),
-                                    'joint2_stride': 1})):
+    for name, ctor in (('stride2', {'score_kernel': (9, 5)}),
+                       ('stride1', {'score_kernel': (9, 5),
+                                    'joint2_stride': 1}),
+                       ('stride1_k93', {'score_kernel': (9, 3),
+                                        'joint2_stride': 1})):
         checkpoint = tmp_path / (name + '.pth')
         model, _ = _option_checkpoint(
             'Align_ULCNet', dict(ctor, max_delay_frames=8), checkpoint)
         _wrapper, _inputs, metadata = ulcnet_export.export_graph(
             model, str(checkpoint), str(tmp_path / (name + '.onnx')),
-            verify=True, frames_per_call=frames_per_call)
+            verify=name == 'stride2', frames_per_call=frames_per_call)
         schemas[name] = (metadata['input_schema'], metadata['output_schema'],
                          metadata['state_layout_version'],
                          metadata['score_window_frames'])
-    assert schemas['options'] == schemas['default']
-    assert schemas['default'][3] == ulcnet_export.SCORE_WINDOW_FRAMES
+    assert schemas['stride1'] == schemas['stride2'] == schemas['stride1_k93']
+    assert schemas['stride2'][3] == 9 == ulcnet_export.SCORE_WINDOW_BY_GRID[
+        (16000, 256)]
+    assert schemas['stride2'][0]['logit_history'] == [1, 32, 9, 8]
 
 
 def test_align_ulcnet_export_cli_accepts_an_option_checkpoint(
         tmp_path, monkeypatch):
     pytest.importorskip('onnx')
     pytest.importorskip('onnxruntime')
-    checkpoint = tmp_path / 'k55.pth'
+    checkpoint = tmp_path / 'k95.pth'
     _option_checkpoint('Align_ULCNet', {'max_delay_frames': 8,
-                                        'score_kernel': (5, 5),
+                                        'score_kernel': (9, 5),
                                         'joint2_stride': 1}, checkpoint)
     out = tmp_path / 'out'
     monkeypatch.setattr(sys, 'argv', [
@@ -463,9 +477,11 @@ def test_aux_loss_reports_the_plcpa_and_reaches_every_gradient(model_name):
     assert all(float(p.grad.abs().sum()) > 0 for p in model.parameters())
 
 
-# ---- config overlays and the trainer contract ------------------------------
+# ---- shipped grid configs and the trainer contract ------------------------------
 
 def test_config_option_takes_several_files_in_order(tmp_path):
+    # A later file overrides the keys it sets; the shipped grid configs are
+    # self-contained and are not meant to be stacked.
     assert build_arg_parser('x').parse_args([]).config == ['config.ini']
     assert build_arg_parser('x').parse_args(
         ['--config', 'a.ini', 'b.ini']).config == ['a.ini', 'b.ini']
@@ -487,69 +503,92 @@ def _setup(model_name, configs, monkeypatch, tmp_path, packed_dir=None):
     return seen
 
 
-HOP128_CONFIG = {
-    'DeepVQE_S': ({'ctor_gru_hidden': 256, 'ctor_similarity_channels': 8,
-                   'ctor_score_kernel': (9, 5)}, 1.2e-3, True),
-    'Align_ULCNet': ({'ctor_joint2_stride': 1, 'ctor_score_kernel': (9, 5)},
-                     2e-3, False),
+# grid -> (n_fft, hop, max_delay_frames, packed_dir, output_dir)
+GRID_FILES = {
+    (16000, 256): ('config_16k_256.ini', 256, 128, 63,
+                   'data_aec_16k_256/packed/all', 'output_16k_256'),
+    (16000, 512): ('config_16k_512.ini', 512, 256, 32,
+                   'data_aec_16k/packed/all', 'output_16k_512'),
+    (48000, 1024): ('config_48k.ini', 1024, 512, 47,
+                    'data_aec_48k/packed/all', 'output_48k'),
 }
-DEFAULT_RECIPE = {
-    'DeepVQE_S': ({'ctor_gru_hidden': 192, 'ctor_similarity_channels': 4},
-                  1.2e-3),
-    'Align_ULCNet': ({}, 4e-3),
+# model -> grid -> (ctor_* keys the contract records, lr, aux loss on)
+SHIPPED_RECIPE = {
+    'DeepVQE_S': {
+        (16000, 256): ({'ctor_gru_hidden': 256, 'ctor_similarity_channels': 8,
+                        'ctor_score_kernel': (9, 5)}, 1.2e-3, True),
+        (16000, 512): ({'ctor_gru_hidden': 192,
+                        'ctor_similarity_channels': 4}, 1.2e-3, False),
+        (48000, 1024): ({'ctor_gru_hidden': 192,
+                         'ctor_similarity_channels': 4}, 1.2e-3, False),
+    },
+    'Align_ULCNet': {
+        (16000, 256): ({'ctor_joint2_stride': 1, 'ctor_score_kernel': (9, 5)},
+                       2e-3, False),
+        (16000, 512): ({}, 4e-3, False),
+        (48000, 1024): ({}, 4e-3, False),
+    },
 }
+GRID_CASES = [(model_name, grid) for model_name in sorted(CLASSES)
+              for grid in GRID_FILES]
 
 
-@pytest.mark.parametrize('model_name', sorted(CLASSES))
-def test_shipped_config_and_overlays_resolve_as_documented(
-        model_name, monkeypatch, tmp_path):
-    folder = AIAEC_DIR / model_name
-    base, baseline, ref = (str(folder / name) for name in
-                           ('config.ini', 'baseline.ini', 'ref_512.ini'))
+GRID_CASE_IDS = [f'{model_name}-{sr // 1000}k-{n_fft}'
+                 for model_name, (sr, n_fft) in GRID_CASES]
+
+
+@pytest.mark.parametrize('model_name, grid', GRID_CASES, ids=GRID_CASE_IDS)
+def test_each_shipped_grid_config_is_self_contained(
+        model_name, grid, monkeypatch, tmp_path):
+    """Every board grid has one config that trains alone: its [signal] is the
+    grid its file name says, its model searches the board row's delay depth,
+    and its corpus and output directories are its own."""
+    name, n_fft, hop, depth, packed, output = GRID_FILES[grid]
+    config = str(AIAEC_DIR / model_name / name)
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    alone = _setup(model_name, [base], monkeypatch, tmp_path)
-    control = _setup(model_name, [base, baseline], monkeypatch, tmp_path)
-    reference = _setup(model_name, [base, baseline, ref], monkeypatch,
-                       tmp_path)
+    seen = _setup(model_name, [config], monkeypatch, tmp_path)
 
-    hop128, hop128_lr, hop128_aux = HOP128_CONFIG[model_name]
-    contract = alone['contract']
-    assert (contract['n_fft'], contract['hop_len']) == (256, 128)
-    assert alone['model'].align.max_delay_frames == 63
-    for key, value in hop128.items():
-        got = contract[key]
-        assert (tuple(got) if isinstance(value, tuple) else got) == value, key
-    assert contract['optimizer']['lr'] == pytest.approx(hop128_lr)
-    assert isinstance(alone['aux_loss'], AuxStftLoss) == hop128_aux
-
-    defaults, default_lr = DEFAULT_RECIPE[model_name]
-    for seen in (control, reference):
-        contract = seen['contract']
-        assert 'ctor_score_kernel' not in contract
-        assert 'ctor_joint2_stride' not in contract
-        for key, value in defaults.items():
-            assert contract[key] == value, key
-        assert contract['optimizer']['lr'] == pytest.approx(default_lr)
-        assert contract['loss_version'] == trainer.LOSS_VERSION
-        assert seen['aux_loss'] is None
-    assert (control['contract']['n_fft'], control['contract']['hop_len']) == (
-        256, 128)
-    contract = reference['contract']
+    cfg = read_config([config])
+    assert (cfg.getint('signal', 'sr'), cfg.getint('signal', 'n_fft')) == grid
+    contract = seen['contract']
     assert (contract['n_fft'], contract['win_len'], contract['hop_len']) == (
-        512, 512, 256)
-    assert reference['model'].align.max_delay_frames == 32
-    assert reference['packed_dir'] == 'data_aec_16k/packed/all'
-    assert read_config([base, baseline]).get(
-        'training', 'output_dir') == 'output_baseline'
-    assert read_config([base, baseline, ref]).get(
-        'training', 'output_dir') == 'output_ref_512'
+        n_fft, n_fft, hop)
+    assert seen['model'].align.max_delay_frames == depth
+    assert seen['packed_dir'] == packed
+    assert cfg.get('training', 'output_dir') == output
+
+    ctor, lr, aux = SHIPPED_RECIPE[model_name][grid]
+    for key in ('ctor_gru_hidden', 'ctor_similarity_channels',
+                'ctor_score_kernel', 'ctor_joint2_stride'):
+        if key in ctor:
+            value = ctor[key]
+            got = contract[key]
+            assert (tuple(got) if isinstance(value, tuple) else got) == value, key
+        else:
+            assert key not in contract, key
+    assert contract['optimizer']['lr'] == pytest.approx(lr)
+    assert contract['loss_version'].startswith(trainer.LOSS_VERSION)
+    assert isinstance(seen['aux_loss'], AuxStftLoss) == aux
+
+
+def test_the_two_grid_trainers_require_a_config_and_the_others_default_it():
+    for model_name in ('DeepVQE_S', 'Align_ULCNet'):
+        parser = importlib.import_module(f'AIAEC.{model_name}.train').build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+        assert parser.parse_args(['--config', 'config_16k_512.ini']
+                                ).config == ['config_16k_512.ini']
+    for model_name in ('Align_CRUSE', 'CAGCRN'):
+        parser = importlib.import_module(f'AIAEC.{model_name}.train').build_parser()
+        assert parser.parse_args([]).config == ['config.ini']
+    with pytest.raises(SystemExit):
+        build_arg_parser('x', default_config=None).parse_args([])
 
 
 @pytest.mark.parametrize('model_name', sorted(CLASSES))
 def test_aux_loss_changes_the_contract_so_resume_across_it_is_refused(
         model_name, monkeypatch, tmp_path):
-    off = [str(AIAEC_DIR / model_name / name)
-           for name in ('config.ini', 'baseline.ini')]
+    off = [str(AIAEC_DIR / model_name / 'config_16k_512.ini')]
     on = tmp_path / 'aux.ini'
     on.write_text('[loss]\naux_stft_weight = 0.5\n')
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')

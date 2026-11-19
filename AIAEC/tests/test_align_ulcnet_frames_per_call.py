@@ -27,6 +27,7 @@ from AIAEC.Align_ULCNet import export_onnx as ex
 from AIAEC.Align_ULCNet import inference as al_inference
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import make_linear_aec_contract
+from aiaec_shipped_config import ctor_contract, shipped_model_kwargs
 
 SR, N_FFT, HOP = 16000, 256, 128
 GRID = SignalGrid(SR, N_FFT, N_FFT, HOP)
@@ -37,7 +38,7 @@ CLIP = SR + 37 * 3 + 5          # 126 frames: not a multiple of 8
 @pytest.fixture(scope='module')
 def model():
     torch.manual_seed(1)
-    return AlignULCNet(GRID, max_delay_seconds=0.5).eval()
+    return AlignULCNet(GRID, **shipped_model_kwargs('Align_ULCNet', AlignULCNet)).eval()
 
 
 @pytest.fixture(scope='module')
@@ -49,7 +50,7 @@ def checkpoint(model, tmp_path_factory):
         'n_fft': N_FFT, 'win_len': N_FFT, 'hop_len': HOP,
         'loss_version': 'test', 'linear_aec': linear.as_dict(),
         'linear_aec_contract_hash': linear.fingerprint(),
-        'ctor_max_delay_seconds': 0.5,
+        **ctor_contract('Align_ULCNet', AlignULCNet),
     }
     path = work / 'al256.pth'
     torch.save({'contract': contract, 'state_dict': model.state_dict()}, path)
@@ -93,7 +94,7 @@ def sequential_reference(model, error_c, far_c, events, state):
 def _zero_state(model, frames=None):
     wrapper = ex.AlignUlcnetStreamingExport(model)
     return ex.dummy_inputs(wrapper.delay_depth, wrapper.n_freqs,
-                           wrapper.ta_bins)[ex.SIGNAL_INPUTS:]
+                           wrapper.ta_bins, wrapper.score_window)[ex.SIGNAL_INPUTS:]
 
 
 EVENT_STREAMS = {
@@ -211,17 +212,19 @@ def test_exported_graph_boundaries(packet_graph):
     def shape(value):
         return [d.dim_value for d in value.type.tensor_type.shape.dim]
 
+    # The logit window is this grid's (config_16k_256.ini's score_kernel time size).
+    assert ex.SCORE_WINDOW_BY_GRID[(SR, N_FFT)] == 9
     assert [(i.name, shape(i)) for i in graph8.input] == [
         ('error_mag', [1, 8, F]), ('far_mag', [1, 8, F]),
         ('error_cos', [1, 8, F]), ('error_sin', [1, 8, F]),
         ('frame_reset', [1, 8]),
         ('key_history', [1, 32, 63, 13]), ('value_history', [1, 32, 63, 13]),
-        ('logit_history', [1, 32, 5, 63]), ('h_gru', [1, 4, 1, 128])]
+        ('logit_history', [1, 32, 9, 63]), ('h_gru', [1, 4, 1, 128])]
     assert [(o.name, shape(o)) for o in graph8.output] == [
         ('output', [1, 2, 8, F]),
         ('key_history_out', [1, 32, 63, 13]),
         ('value_history_out', [1, 32, 63, 13]),
-        ('logit_history_out', [1, 32, 5, 63]), ('h_gru_out', [1, 4, 1, 128])]
+        ('logit_history_out', [1, 32, 9, 63]), ('h_gru_out', [1, 4, 1, 128])]
 
 
 @pytest.mark.parametrize('name', sorted(EVENT_STREAMS))

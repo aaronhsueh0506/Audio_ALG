@@ -64,15 +64,16 @@ typedef struct AiaecModelEntry {
 } AiaecModelEntry;
 
 /* AIAEC_TEST_CATALOG: defined only by this directory's test builds. Substitutes placeholder graph
- * paths so a test binary can drive the real gated public API end to end. */
+ * paths so a test binary can drive the real gated public API end to end; the NULL-path 16k/256 N = 8
+ * variant keeps the "listed but no graph" refusal covered. */
 #ifdef AIAEC_TEST_CATALOG
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
     { 1, "test://aiaec/deepvqe_s/16k_fft256_n1" },
-    { 8, "test://aiaec/deepvqe_s/16k_fft256_n8" },
+    { 8, (const char *)0 },
 };
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
     { 1, "test://aiaec/deepvqe_s/16k_fft512_n1" },
-    { 8, (const char *)0 },
+    { 4, "test://aiaec/deepvqe_s/16k_fft512_n4" },
 };
 static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
     { 1, "test://aiaec/deepvqe_s/48k_fft1024_n1" },
@@ -80,11 +81,11 @@ static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
     { 1, "test://aiaec/align_ulcnet/16k_fft256_n1" },
-    { 8, "test://aiaec/align_ulcnet/16k_fft256_n8" },   /* the packet graph (layout 19) */
+    { 8, (const char *)0 },
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
     { 1, "test://aiaec/align_ulcnet/16k_fft512_n1" },
-    { 8, (const char *)0 },
+    { 4, "test://aiaec/align_ulcnet/16k_fft512_n4" },   /* the packet graph (layout 19) */
 };
 static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
     { 1, "test://aiaec/align_ulcnet/48k_fft1024_n1" },
@@ -97,11 +98,10 @@ static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
 #define AIAEC_ULCNET_GRAPH    "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin"
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
     { 1, AIAEC_DEEPVQE_S_GRAPH },
-    { 8, AIAEC_DEEPVQE_S_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
     { 1, AIAEC_DEEPVQE_S_GRAPH },
-    { 8, (const char *)0 },
+    { 4, AIAEC_DEEPVQE_S_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
     { 1, AIAEC_DEEPVQE_S_GRAPH },
@@ -109,11 +109,10 @@ static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
     { 1, AIAEC_ULCNET_GRAPH },
-    { 8, AIAEC_ULCNET_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
     { 1, AIAEC_ULCNET_GRAPH },
-    { 8, (const char *)0 },
+    { 4, AIAEC_ULCNET_GRAPH },
 };
 static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
     { 1, AIAEC_ULCNET_GRAPH },
@@ -124,13 +123,15 @@ static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
 /* 0.5 s target physical delay span for every row: D = 32 at hop 256, 63 at hop 128, 47 at hop 512 (48 kHz). */
 #define AIAEC_MAX_DELAY_SECONDS 0.5f
 
+#define AIAEC_VARIANTS(v) (v), ((int)(sizeof(v) / sizeof((v)[0])))
+
 static const AiaecModelEntry AIAEC_CATALOG[] = {
-    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_16K_FFT256_VARIANTS, 2 },
-    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_16K_FFT512_VARIANTS, 2 },
-    { AIAEC_MODEL_ID_DEEPVQE_S,    48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_DEEPVQE_48K_FFT1024_VARIANTS, 2 },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_16K_FFT256_VARIANTS,  2 },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_16K_FFT512_VARIANTS,  2 },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_ULCNET_48K_FFT1024_VARIANTS, 2 },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_16K_FFT256_VARIANTS) },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_16K_FFT512_VARIANTS) },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_48K_FFT1024_VARIANTS) },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_16K_FFT256_VARIANTS) },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_16K_FFT512_VARIANTS) },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_48K_FFT1024_VARIANTS) },
 };
 #define AIAEC_CATALOG_ROWS ((int)(sizeof(AIAEC_CATALOG) / sizeof(AIAEC_CATALOG[0])))
 

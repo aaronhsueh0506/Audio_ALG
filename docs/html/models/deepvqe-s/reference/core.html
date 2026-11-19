@@ -128,6 +128,12 @@ graph state 歸應用端（浮點 host 登錄、目標平台由加速器持有�
 <tr><td>11–12</td><td>RES2 / RES3_HISTORY</td><td><code>state_res2/3_history</code></td><td>(1, 32, 4, 65) / (1, 40, 4, 33)</td></tr>
 <tr><td>13–15</td><td>UP1 / UP2 / UP3_HISTORY</td><td><code>state_up1/2/3_history</code></td><td>(1, 32, 4, 65) / (1, 40, 4, 33) / (1, 24, 4, 17)</td></tr>
 </table>
+<p>上表是建構子預設模型（sim 通道 4、score window 5 幀、GRU 192）在 16 kHz／512 的形狀，16 kHz／512 與 48 kHz 的板端列即此模型。
+16 kHz／256 的板端列（<code>stream/aiaec/graph_io_deepvqes.h</code>）依 <code>AIAEC/DeepVQE_S/config_16k_256.ini</code> 的 <code>[model]</code>
+（<code>similarity_channels</code> 8、<code>score_kernel</code> 9,5、<code>gru_hidden</code> 256），有三個 state 不同：
+<code>state_align_key_ring</code> (1, 8, D, 33)、<code>state_align_score_history</code> (1, 8, 9, D)、<code>h_gru</code> (1, 1, 1, 256)（D = 63）；
+其餘 13 個與建構子預設相同，只隨 grid 的頻率軸與 D 改變。以建構子預設在 16 kHz／256 訓練的 graph 與這一列不符，sample 開圖後的
+<code>graph_io_check_ports()</code> 會拒絕它。</p>
 <p>每個 window 輸入由 graph 的 Slice 位移：conv 與 score window 取輸入的 frame <code>1..N−1</code>（Slice axis 2，start 1，end N，step 1）
 再把新一幀 Concat 在後面；attention ring 取輸入的 slot <code>0..D−2</code> 再把新一幀 Concat 在前面。Concat 的結果就是
 <code>*_out</code>，被丟掉的那一格（conv／score window 的 frame 0、ring 的 slot D−1）只讓輸入與輸出 shape 相同，graph 不讀它。
@@ -135,7 +141,7 @@ graph state 歸應用端（浮點 host 登錄、目標平台由加速器持有�
 每個 window 輸入恰有一個 Slice 消費者、沒有 state 輸出由 Slice 產生、metadata 帶 <code>state_binding = in_place_same_address</code>）。</p>
 <p>形狀屬於應用端：函式庫只收 <code>state_elements[id]</code>，不知道形狀；測試 driver 帶一張 16 列的表，
 由 <code>test_c_descriptor_matches_the_built_graph</code> 釘在匯出的 graph 上。頻率階梯 257→129→65→33→17 是 encoder 的 stride-2 halving，
-conv window = causal conv kernel 4 幀（3 幀過去加目前一幀）、alignment score conv 是 (5,3) 所以 window 是 5 幀。head 輸出
+conv window = causal conv kernel 4 幀（3 幀過去加目前一幀）、alignment score conv 是 (5,3) 所以 window 是 5 幀（<code>config_16k_256.ini</code> 的 9,5 為 9 幀）。head 輸出
 <code>output</code> = packed CCM taps <code>[1,1,257,18]</code>；末軸保持
 <code>[time][frequency][RI]</code> 次序，與 <code>deepvqe_process.h</code> 的
 <code>taps[n_bins][3][3][2]</code> 攤平後同一塊記憶體，不需 transpose 或 copy。</p>
@@ -296,16 +302,16 @@ int run_deepvqe(int D, const size_t elems[DEEPVQE_STATE_COUNT],
 <tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D</td><td>checkpoint 的 D</td><td>匯出</td><td>匯出器量測剛建好的 graph 並寫 <code>c_descriptor</code> 到 ONNX props 與旁邊的 JSON</td></tr>
 <tr><td>位置參數與 <code>--device</code>、<code>--verify</code>、<code>--mic-dir</code>／<code>--ref-dir</code>／<code>--out-dir</code></td><td><code>inference.py</code></td><td><code>checkpoint mic.wav far.wav out.wav</code></td><td>—</td><td>離線推論</td><td>目錄模式以檔名配對（mic → lpb）；沒給 <code>--ref-dir</code> 則 reference 為靜音（純降噪）；輸出檔名 <code>*_mic.wav</code> 寫成 <code>*_ours.wav</code>；<code>--verify</code> 只列印差異、不改變結束碼</td></tr>
 <tr><td><code>calib</code> 子命令</td><td><code>inference.py calib</code></td><td><code>--checkpoint</code>／<code>--primary-dir</code>（mic WAV）／<code>--far-dir</code>／<code>--output</code>／<code>--format</code>(bin|npz)／<code>--frames</code>(256)／<code>--max-delay-frames</code>／<code>--seed</code>(42)／<code>--onnx</code>／<code>--pair-replace</code></td><td>—</td><td>PTQ 校正</td><td>錄到的 <code>mic</code>／<code>far</code> 是 host 壓縮後的 planar 頻譜；同 process 匯出並 parity 檢查 graph</td></tr>
-<tr><td><code>[model] max_delay_seconds</code></td><td>訓練 <code>config.ini</code></td><td>秒</td><td>出貨 0.5（建構子預設 1.0）</td><td>訓練</td><td>16 kHz 上 0.5 s ＝ D 32（hop 256）、D 63（hop 128）；訓練 D 與部署 D 可以不同</td></tr>
+<tr><td><code>[model] max_delay_seconds</code></td><td>訓練 <code>config_&lt;grid&gt;.ini</code></td><td>秒</td><td>出貨 0.5（建構子預設 1.0）</td><td>訓練</td><td>0.5 s ＝ D 32（16 kHz hop 256）、D 63（16 kHz hop 128）、D 47（48 kHz hop 512）；訓練 D 與部署 D 可以不同</td></tr>
 </table></div>
 <h3>內部：存在且可改，但不建議開放</h3>
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
-<tr><td>板端 grid</td><td>預設 16000／256／128／129 bins；另登錄 16000／512／256／257 bins</td><td><code>config.ini [signal]</code>、匯出的 graph</td><td>graph 的頻率軸形狀隨 grid 變，一張 graph 只能在它自己的 grid 跑；本頁的 shape 與頻率階梯 257→129→65→33→17 以 16000／512 為例。函式庫不限定（run-time grid）</td></tr>
+<tr><td>板端 grid</td><td>預設 16000／256／128／129 bins；另登錄 16000／512／256／257 bins</td><td>各 grid 的 <code>config_&lt;grid&gt;.ini [signal]</code>、匯出的 graph</td><td>graph 的頻率軸形狀隨 grid 變，一張 graph 只能在它自己的 grid 跑；本頁的 shape 與頻率階梯 257→129→65→33→17 以 16000／512 為例。函式庫不限定（run-time grid）</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_LAYOUT_VERSION</code></td><td>4（1–3 已退役）</td><td><code>deepvqe_prepost.h</code></td><td>與 exporter 的 <code>DEEPVQE_C_LAYOUT_VERSION</code> 互鎖，在匯出與 host 測試擋下不符的圖（板端 sample 不讀版號）。刻意不與 ULCNet 版號共用</td></tr>
 <tr><td><code>DEEPVQE_COMPRESSION_EXP</code></td><td>0.3</td><td><code>deepvqe_prepost.h</code></td><td>host 前端與訓練共用；<code>export_onnx.py</code> 拒絕其他指數的 checkpoint</td></tr>
 <tr><td><code>DEEPVQE_TIME_ORDER</code>／<code>DEEPVQE_FREQ_TAPS</code>、<code>deepvqe_prepost_taps_elements(grid)</code></td><td>3／3、n_bins×3×3×2</td><td><code>deepvqe_process.h</code>、<code>deepvqe_prepost.h</code></td><td>CCM 形狀；taps 末軸 <code>[time][frequency][RI]</code> 與 C 陣列同一塊記憶體</td></tr>
-<tr><td>state 形狀（conv window 4 幀、score window 5 幀、sim 通道 4、value 通道 24、GRU 1 層 192）</td><td>見 State 表</td><td>匯出的 graph</td><td>由 checkpoint 拓撲決定；函式庫不持有，descriptor 的四個 interior 欄位（<code>conv_window_frames</code>、<code>score_window_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
+<tr><td>state 形狀（conv window 4 幀、value 通道 24、GRU 1 層；建構子預設 score window 5 幀、sim 通道 4、GRU 192，16 kHz／256 的板端列依 <code>config_16k_256.ini</code> 為 9 幀、8、256）</td><td>見 State 表</td><td>匯出的 graph</td><td>由 checkpoint 拓撲決定；函式庫不持有，descriptor 的四個 interior 欄位（<code>conv_window_frames</code>、<code>score_window_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
 <tr><td><code>DeepVqeStateId</code> 與 <code>DEEPVQE_STATE_COUNT</code></td><td>16 個，順序固定</td><td><code>deepvqe_prepost.h</code></td><td>就是 graph 在兩個 signal input 之後的 input 順序；按索引綁定的 adapter 依賴它</td></tr>
 <tr><td><code>DEEPVQE_PREPOST_CARVE_VERSION</code> = 9；<code>DEEPVQE_PREPOST_DESCRIPTOR_VERSION</code>／<code>DEEPVQE_PREPOST_ALIGNMENT</code></td><td>1／16</td><td><code>deepvqe_prepost.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
 <tr><td>fail-closed 的 skip 政策</td><td><code>"mute_fail_closed"</code></td><td><code>deepvqe_stream.c</code></td><td>由「stream 0 是原始 mic」這個事實決定，不是偏好設定</td></tr>

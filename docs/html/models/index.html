@@ -20,8 +20,8 @@
 </tbody></table>
 
 <h2>AIAEC</h2><table><thead><tr><th>模型</th><th>C 入口</th><th>訊號</th></tr></thead><tbody>
-<tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td><code>aiaec.h</code>（PCM、頻譜 → 頻譜）、頻域 core</td><td>線性 AEC 的 float 殘差、原始 far 與對齊事件 → 增強 PCM；16 kHz／256／N=1 與 16 kHz／512／N=1 有登錄的 graph。</td></tr>
-<tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td><code>aiaec.h</code>（PCM、頻譜 → 頻譜）、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM；16 kHz／256／N=1 與 16 kHz／512／N=1 有登錄的 graph。</td></tr>
+<tr><th><a href="align-ulcnet/index.html">Align-ULCNet</a></th><td><code>aiaec.h</code>（PCM、頻譜 → 頻譜）、頻域 core</td><td>線性 AEC 的 float 殘差、原始 far 與對齊事件 → 增強 PCM；16 kHz／256／N=1、16 kHz／512／N=1 與 N=4、48 kHz／1024／N=1 與 N=2 有登錄的 graph。</td></tr>
+<tr><th><a href="deepvqe-s/index.html">DeepVQE-S</a></th><td><code>aiaec.h</code>（PCM、頻譜 → 頻譜）、頻域 core</td><td>原始 mic 和 far PCM → 複數濾波 → 增強 PCM；16 kHz／256／N=1、16 kHz／512／N=1 與 N=4、48 kHz／1024／N=1 與 N=2 有登錄的 graph。</td></tr>
 <tr><th><a href="cagcrn/index.html">CAGCRN</a></th><td>無（沒有 C 程式碼）</td><td>原始 mic 和 far。只有 Python 串流與 ONNX 匯出。</td></tr>
 <tr><th><a href="align-cruse/index.html">Align-CRUSE</a></th><td>無（沒有 C 程式碼）</td><td>原始 mic 和 far。只有 Python 串流與 ONNX 匯出。</td></tr>
 </tbody></table>

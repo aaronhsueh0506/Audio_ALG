@@ -1,8 +1,8 @@
 /* The PRODUCTION catalog through the real public API: this file is built without
  * -DAIAEC_TEST_CATALOG, so only the rows with a delivered graph resolve. Built once per product.
  *
- *   Each model: 16k/256 N=1 and N=8, 16k/512 N=1 and 48k/1024 N=1 and N=2 resolve, all to the one graph path of that
- *     model; every other N on those grids (16k/256 N=2, 16k/512 N=8, 48k/1024 N=4) is refused with
+ *   Each model: 16k/256 N=1, 16k/512 N=1 and N=4 and 48k/1024 N=1 and N=2 resolve, all to the one graph path of that
+ *     model; every other N on those grids (16k/256 N=2 and N=8, 16k/512 N=2 and N=8, 48k/1024 N=4) is refused with
  *     AIAEC_ERR_FRAMES_PER_CALL before any SDK call, ctx / info untouched.
  *   Both: a hop_in that is not a multiple of the model hop and a grid that is not registered are refused. The
  *     refusal order is model, grid, hop_in, frames_per_call.
@@ -67,6 +67,7 @@ static void section_refusal_order(void) {
     c = cfg_of(48000, 1024, 513);   expect_refused(&c, AIAEC_ERR_IN_HOP, "hop_in 513 at 48k/1024");
     /* registered grids and frames_per_call values without a delivered graph */
     c = cfg_of(16000, 256, 256);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/256 N=2 (not in the catalog)");
+    c = cfg_of(16000, 256, 1024);   expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/256 N=8 (not in the catalog)");
     c = cfg_of(16000, 512, 512);    expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/512 N=2 (not in the catalog)");
     c = cfg_of(16000, 512, 2048);   expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "16k/512 N=8");
     c = cfg_of(48000, 1024, 2048);  expect_refused(&c, AIAEC_ERR_FRAMES_PER_CALL, "48k/1024 N=4");
@@ -156,11 +157,11 @@ static void section_delivered_rows(void) {
 #define ROW_PATH "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin"
 #endif
     expect_row(16000, 256, 128, ROW_PATH);
-    expect_row(16000, 256, 1024, ROW_PATH);
     expect_row(16000, 512, 256, ROW_PATH);
+    expect_row(16000, 512, 1024, ROW_PATH);
     expect_row(48000, 1024, 512, ROW_PATH);
     expect_row(48000, 1024, 1024, ROW_PATH);
-    printf("section_delivered_rows: %s 16k/256 N=1 and N=8, 16k/512 N=1, 48k/1024 N=1 and N=2 construct and report their info\n",
+    printf("section_delivered_rows: %s 16k/256 N=1, 16k/512 N=1 and N=4, 48k/1024 N=1 and N=2 construct and report their info\n",
            PRODUCT_DV ? "DeepVQE-S" : "Align-ULCNet");
 }
 

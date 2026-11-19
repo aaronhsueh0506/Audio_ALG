@@ -98,7 +98,7 @@ Inputs per invocation (all state tensors are rank 4):
 | `error_sin` | `[1,1,BINS]` | sin of the compressed-domain error phase |
 | `key_history` | `[1,32,D,TA_BINS]` | newest first: slot 0 is t-1, slot D-1 is t-D and is never read |
 | `value_history` | `[1,32,D,TA_BINS]` | newest first: slot 0 is t-1, slot D-1 is never read |
-| `logit_history` | `[1,32,5,D]` | chronological: frame 0 is t-5 and is never read, frame 4 is t-1 |
+| `logit_history` | `[1,32,W,D]` | chronological: frame 0 is t-W and is never read, frame W-1 is t-1; W is the grid's logit window (9 at 16 kHz / FFT 256, 5 at 16 kHz / FFT 512 and 48 kHz) |
 | `h_gru` | `[1,4,1,128]` | NCHW; subband GRU 0 layers, then subband GRU 1 layers, stacked on dim 1 |
 
 Outputs per invocation:
@@ -108,7 +108,7 @@ Outputs per invocation:
 | `output` | `[1,2,1,BINS]` | the learned complex mask, planar (plane 0 real, plane 1 imaginary); multiply the compressed error spectrum by it, apply the inverse signed power (`sign(x) * |x|^(1/0.3)`). `ulcnet_model_io_post_frame()` does both; the application's `AcIstft` does the IFFT and overlap-add |
 | `key_history_out` | `[1,32,D,TA_BINS]` | bound to the address of `key_history` |
 | `value_history_out` | `[1,32,D,TA_BINS]` | bound to the address of `value_history` |
-| `logit_history_out` | `[1,32,5,D]` | bound to the address of `logit_history` |
+| `logit_history_out` | `[1,32,W,D]` | bound to the address of `logit_history` |
 | `h_gru_out` | `[1,4,1,128]` | bound to the address of `h_gru` |
 
 Every state tensor comes back whole with exactly its input's shape, and the
@@ -126,7 +126,7 @@ move then.
 The window shift happens inside the graph, on the input side. K/V (newest
 first) keep the input's slots `0..D-2` through a Slice (axis 2, step 1, end
 `D-1`) and the new frame is concatenated in front; the logit window keeps
-frames `1..4` (end 5) and the new row is concatenated behind. The Concat result
+frames `1..W-1` (end W) and the new row is concatenated behind. The Concat result
 is the attention input and also the output, so no state output is produced by a
 Slice, and the one slot a window drops only keeps the input and output shapes
 equal. `export_graph` checks the written file with

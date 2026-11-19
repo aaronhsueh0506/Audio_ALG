@@ -1,13 +1,14 @@
 /* Binary stdin/stdout driver around the Align-ULCNet _freq family (aiaec_*_freq), for
  * AIAEC/tests/test_aiaec_packet_ort.py: the host runs the accelerator (ONNX Runtime) between a PRE and a POST
- * request. Align-ULCNet product, 16k/256, built with -DAIAEC_TEST_CATALOG (the N=8 row). Native-endian int32 / float32.
+ * request. Align-ULCNet product at 16 kHz, built with -DAIAEC_TEST_CATALOG. Native-endian int32 / float32;
+ * bins = fft / 2 + 1 of the slot.
  *
- *   OPEN  cmd=1, n                            -> rc, state_generation, slot
- *   PRE   cmd=2, slot, err_re err_im far_re far_im [n * 129 floats each], changed[n], solid[n] (int32)
+ *   OPEN  cmd=1, n, fft                       -> rc, state_generation, slot
+ *   PRE   cmd=2, slot, err_re err_im far_re far_im [n * bins floats each], changed[n], solid[n] (int32)
  *                                             -> rc, action, work.state_generation, live generation, input_count,
  *                                                (elements, floats) per input tensor, output elements
  *   POST  cmd=3, slot, run_status, mask_elements, mask floats
- *                                             -> rc, live generation, re[n * 129], im[n * 129]
+ *                                             -> rc, live generation, re[n * bins], im[n * bins]
  *   QUIT  cmd=9
  * Slots share nothing; a slot's pool is allocated at OPEN and kept. */
 
@@ -23,14 +24,13 @@
 #error "packet_driver.c is the Align-ULCNet product's driver"
 #endif
 
-#define BINS 129
 #define MAX_SLOTS 4
 #define MAX_N 64
 
 typedef struct Slot {
     AiaecFreqCtx *ctx;
     void *pool;
-    int n;
+    int n, bins;
     StreamWork work;
 } Slot;
 
@@ -48,18 +48,20 @@ int main(void) {
         if (rd(&cmd, sizeof(cmd)) != 0) return 0;
         if (cmd == 9) return 0;
         if (cmd == 1) {
-            int n, e = 0, rc;
+            int n, fft, e = 0, rc;
             AiaecConfig cfg;
             AiaecInfo info;
             StreamMemReq rq;
-            if (rd(&n, sizeof(n)) != 0) return 2;
-            cfg.sr = 16000; cfg.fft = 256; cfg.hop_in = (n >= 1 && n <= MAX_N) ? 128 * n : 128;
+            if (rd(&n, sizeof(n)) != 0 || rd(&fft, sizeof(fft)) != 0) return 2;
+            if (fft < 2 || fft > 4096) fft = 0;   /* refused by the catalog */
+            cfg.sr = 16000; cfg.fft = fft; cfg.hop_in = (n >= 1 && n <= MAX_N) ? fft / 2 * n : fft / 2;
             rc = aiaec_get_mem_size_freq(&cfg, &rq);
             if (rc != AIAEC_OK || g_slots >= MAX_SLOTS || n < 1 || n > MAX_N) { wri(rc ? rc : -99); wri(0); wri(-1); fflush(stdout); continue; }
             if (posix_memalign(&g_slot[g_slots].pool, 16, (size_t)rq.bytes) != 0) return 2;
             g_slot[g_slots].ctx = NULL;
             e = aiaec_init_freq(&cfg, g_slot[g_slots].pool, (size_t)rq.bytes, &g_slot[g_slots].ctx, &info);
             g_slot[g_slots].n = n;
+            g_slot[g_slots].bins = fft / 2 + 1;
             wri(g_slot[g_slots].ctx ? AIAEC_OK : e);
             wri((int)aiaec_state_generation_freq(g_slot[g_slots].ctx));
             wri(g_slots);
@@ -75,7 +77,7 @@ int main(void) {
 
             if (rd(&slot, sizeof(slot)) != 0 || slot < 0 || slot >= g_slots) return 2;
             s = &g_slot[slot];
-            plane = (size_t)s->n * BINS;
+            plane = (size_t)s->n * (size_t)s->bins;
             for (i = 0; i < 4; ++i) {
                 p[i] = malloc(plane * sizeof(float));
                 if (!p[i] || rd(p[i], plane * sizeof(float)) != 0) return 2;
@@ -110,14 +112,14 @@ int main(void) {
             if (me > 0) {
                 if ((size_t)me != s->work.outputs[0].elements || rd(s->work.outputs[0].data, (size_t)me * sizeof(float)) != 0) return 2;
             }
-            re = calloc((size_t)s->n * BINS, sizeof(float));
-            im = calloc((size_t)s->n * BINS, sizeof(float));
+            re = calloc((size_t)s->n * (size_t)s->bins, sizeof(float));
+            im = calloc((size_t)s->n * (size_t)s->bins, sizeof(float));
             if (!re || !im) return 2;
             rc = aiaec_postprocess_freq(s->ctx, status, re, im);
             wri(rc);
             wri((int)aiaec_state_generation_freq(s->ctx));
-            wr(re, (size_t)s->n * BINS * sizeof(float));
-            wr(im, (size_t)s->n * BINS * sizeof(float));
+            wr(re, (size_t)s->n * (size_t)s->bins * sizeof(float));
+            wr(im, (size_t)s->n * (size_t)s->bins * sizeof(float));
             free(re); free(im);
         } else {
             return 2;

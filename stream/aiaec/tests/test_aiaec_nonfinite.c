@@ -41,7 +41,7 @@ static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) FAIL(__VA_ARGS__); } while (0)
 
 typedef struct Grid { int sr, fft, n; } Grid;
-static const Grid GRIDS[] = { { 16000, 256, 1 }, { 16000, 256, 8 }, { 16000, 512, 1 }, { 48000, 1024, 1 }, { 48000, 1024, 2 } };
+static const Grid GRIDS[] = { { 16000, 256, 1 }, { 16000, 512, 1 }, { 16000, 512, 4 }, { 48000, 1024, 1 }, { 48000, 1024, 2 } };
 #define N_GRIDS ((int)(sizeof(GRIDS) / sizeof(GRIDS[0])))
 
 /* One instance of one family on a pool of exactly its size, and the buffers one block needs. */

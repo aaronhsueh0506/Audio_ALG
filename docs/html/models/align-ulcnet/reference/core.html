@@ -49,7 +49,7 @@
 <tr><th>graph 輸入</th><th>shape</th><th>內容</th></tr>
 <tr><td><code>error_mag</code>/<code>far_mag</code>/<code>error_cos</code>/<code>error_sin</code></td><td><code>(1,1,K)</code> 各一</td><td>host 前端產生（<code>stream_features</code>；C <code>ulcnet_model_io_pre_frame</code>）</td></tr>
 <tr><td><code>key_history</code>/<code>value_history</code></td><td><code>(1,32,D,TA)</code></td><td>newest-first：slot 0 是最新一幀，slot d 是 t−d</td></tr>
-<tr><td><code>logit_history</code></td><td><code>(1,32,5,D)</code></td><td>oldest-first：frame 4 是最新一幀；score conv 的 5 幀輸入</td></tr>
+<tr><td><code>logit_history</code></td><td><code>(1,32,W,D)</code></td><td>oldest-first：frame W−1 是最新一幀；score conv 的 W 幀輸入。W 是 score kernel 的時間長度，每個 grid 固定：16 kHz／256 為 9（<code>config_16k_256.ini</code>），16 kHz／512 與 48 kHz 為 5（建構子預設）</td></tr>
 <tr><td><code>h_gru</code></td><td><code>(1,4,1,128)</code></td><td>subband GRU 0 的兩層，接著 subband GRU 1 的兩層（沿 dim 1 疊；dim 0 是 singleton N，不是疊的軸）</td></tr>
 </table>
 <p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加四個 <code>*_out</code>，每個與同名輸入 shape 完全相同。位移在 graph 內、用輸入端的 Slice 再把新一幀 Concat 進去（K/V 放前面、logit 放後面），沒有 state 輸出由 Slice 產生，所以 runtime 可把每個 <code>*_out</code> 綁到同名輸入的位址、CPU 不搬不複製;<code>export_graph</code> 以 <code>validate_inplace_state_contract</code>（<code>AIAEC/_onnx_contract.py</code>）檢查,任何一項不成立匯出直接失敗。Slice 參數與檢查項目逐條收在 <a href="core.html#calibration">Align-ULCNet 頻域與模型契約</a>。</p>
@@ -137,10 +137,11 @@ tensor，無隱藏 state；四個 state 都歸應用端——浮點 host 登錄�
 <tr><th>state</th><th>graph shape</th><th>16k D=8</th><th>48k D=8</th><th>16k D=64</th><th>48k D=64</th></tr>
 <tr><td>key_history</td><td>(1, 32, D, TA)</td><td>26.00 KB</td><td>52.00 KB</td><td>208.00 KB</td><td>416.00 KB</td></tr>
 <tr><td>value_history</td><td>(1, 32, D, TA)</td><td>26.00 KB</td><td>52.00 KB</td><td>208.00 KB</td><td>416.00 KB</td></tr>
-<tr><td>logit_history</td><td>(1, 32, 5, D)</td><td>5.00 KB</td><td>5.00 KB</td><td>40.00 KB</td><td>40.00 KB</td></tr>
+<tr><td>logit_history</td><td>(1, 32, W, D)</td><td>5.00 KB</td><td>5.00 KB</td><td>40.00 KB</td><td>40.00 KB</td></tr>
 <tr><td>h_gru（subband_gru0 兩層，接 subband_gru1 兩層）</td><td>(1, 4, 1, 128)</td><td>2.00 KB</td><td>2.00 KB</td><td>2.00 KB</td><td>2.00 KB</td></tr>
 <tr><td><b>boundary 小計</b></td><td></td><td><b>59.00 KB</b></td><td><b>111.00 KB</b></td><td><b>458.00 KB</b></td><td><b>874.00 KB</b></td></tr>
 </table>
+<p>上表的 16 kHz 欄是 16 kHz／512，logit window W = 5。16 kHz／256（TA = 13、W = 9）的 logit_history 是 (1, 32, 9, D)，D = 63 時 70.88 KB。</p>
 <p>上表是<b>過邊界的 state tensor</b>，由應用端持有，不在 pool 內。頻譜的 staging 屬於 stream。<code>get_mem_size</code> 的 pool 只含 instance header、四個特徵輸入、壓縮域 error 頻譜、
 <code>output</code>（packet 另有 <code>frame_reset</code>），只隨 grid 走、不隨 D 走（本機量測：D = 4、8、16、32、64 位元組相同；D 只進 <code>build_flags_hash</code>）：</p>
 <table>
@@ -327,7 +328,7 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen, const float *e_re, const float *
 <div class="tbl"><table>
 <tr><th>名稱</th><th>位置</th><th>型別／範圍</th><th>預設</th><th>何時設定</th><th>說明</th></tr>
 <tr><td><code>sample_rate</code>、<code>n_fft</code></td><td><code>UlcnetGridSpec</code></td><td>sample_rate &gt; 0；n_fft 為 audiolib 建得出 framing 的大小</td><td>無（必給）</td><td>init 前</td><td>取自匯出該模型的設定，經 <code>ulcnet_grid_make()</code> 得 <code>UlcnetGrid</code>，複製進 <code>UlcnetPrepostConfig.grid</code>；16 kHz checkpoint 不能當 48 kHz 用（頻率軸張量形狀不同），需另訓</td></tr>
-<tr><td><code>delay_depth</code>（D）</td><td><code>UlcnetGridSpec</code>；<code>UlcnetModelIoDescriptor.delay_depth</code></td><td>整數 2…64</td><td>無（必給）</td><td>init 前；<b>必須等於 export 的 D</b></td><td>決定 K/V／logit window 的長度（即應用端 state 的大小）；不改權重形狀，也不改 pool 大小；跨 grid 不沿用；訓練 <code>config.ini</code> 的 <code>max_delay_seconds</code>（0.5；D 在 hop 256 為 32、hop 128 為 63）與部署 D 可以不同</td></tr>
+<tr><td><code>delay_depth</code>（D）</td><td><code>UlcnetGridSpec</code>；<code>UlcnetModelIoDescriptor.delay_depth</code></td><td>整數 2…64</td><td>無（必給）</td><td>init 前；<b>必須等於 export 的 D</b></td><td>決定 K/V／logit window 的長度（即應用端 state 的大小）；不改權重形狀，也不改 pool 大小；跨 grid 不沿用；訓練 D（<code>config_16k_256.ini</code>／<code>config_48k.ini</code> 的 <code>max_delay_seconds</code> 0.5：hop 128 為 63、hop 512 為 47；<code>config_16k_512.ini</code> 的 <code>max_delay_frames</code> 32）與部署 D 可以不同</td></tr>
 <tr><td><code>key_history</code>／<code>value_history</code>／<code>logit_history</code>／<code>h_gru</code> 與各自的 <code>*_elements</code></td><td><code>UlcnetPrepostConfig</code>；<code>UlcnetModelIoStateBuffers</code></td><td>borrowed <code>float*</code>；元素數（不是位元組）</td><td>NULL／0（不登錄）</td><td>init 前</td><td>浮點 host 四組全設，目標平台全空；指標有而元素數為 0、或反之，一律拒絕；須與物件同壽命</td></tr>
 <tr><td><code>model_layout_version</code></td><td><code>UlcnetPrepostConfig</code></td><td>0 或 18</td><td>0（用本 build 的 18）</td><td>init 前</td><td>非 0 時須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 並與 ONNX metadata 一致；用來在載入舊圖時早期拒絕</td></tr>
 <tr><td><code>--max-delay-frames</code>、<code>--opset</code>(17)、<code>--verify</code></td><td><code>export_onnx.py</code></td><td>D 2…64</td><td>checkpoint 的 D</td><td>匯出</td><td>D 與 PTQ calibration、C 端 descriptor 必須同一個值</td></tr>
@@ -338,11 +339,11 @@ int board_hop(UlcnetPrepost *p, uint32_t *seen, const float *e_re, const float *
 <div class="tbl"><table>
 <tr><th>名稱</th><th>值</th><th>位置</th><th>不開放的原因</th></tr>
 <tr><td><code>ULCNET_MODEL_IO_LAYOUT_VERSION</code></td><td>18（3–17 已退役）</td><td><code>ulcnet_model_io.h</code></td><td>與 <code>export_onnx.py</code> 的 <code>LAYOUT_VERSION</code> 互鎖，在匯出與 host 測試擋下相同張量名稱但邊界不同的舊圖（板端 sample 不讀版號）</td></tr>
-<tr><td>state 形狀（<code>TA_CHANNELS</code> 32、<code>SCORE_WINDOW_FRAMES</code> 5、GRU 2 subband×2 層×128、<code>ta_bins</code> = ⌈K/10⌉）</td><td>K/V <code>(1,32,D,TA)</code>、logit <code>(1,32,5,D)</code>、<code>h_gru (1,4,1,128)</code></td><td><code>export_onnx.py</code> 的 <code>state_shapes()</code></td><td>由模型拓撲決定；函式庫不持有這些形狀，descriptor 的五個 interior 欄位（<code>ta_channels</code>…<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
+<tr><td>state 形狀（<code>TA_CHANNELS</code> 32、logit window W = <code>SCORE_WINDOW_BY_GRID</code>（16 kHz／256 為 9，16 kHz／512 與 48 kHz 為 5）、GRU 2 subband×2 層×128、<code>ta_bins</code> = ⌈K/10⌉）</td><td>K/V <code>(1,32,D,TA)</code>、logit <code>(1,32,W,D)</code>、<code>h_gru (1,4,1,128)</code></td><td><code>export_onnx.py</code> 的 <code>state_shapes()</code>；板端列在 <code>stream/aiaec/graph_io_alignulcnet.h</code></td><td>由模型拓撲決定；函式庫不持有這些形狀，descriptor 的五個 interior 欄位（<code>ta_channels</code>…<code>gru_hidden</code>）恆為 0、不被讀取</td></tr>
 <tr><td><code>ULCNET_MODEL_IO_COMPRESSION_EXP</code></td><td>0.3</td><td><code>ulcnet_model_io.h</code></td><td>host 前後端與訓練 loss 共用；<code>export_onnx.py</code> 拒絕其他指數</td></tr>
 <tr><td><code>ULCNET_FAR_RAW</code>／<code>ULCNET_FAR_ALIGNED</code></td><td>0／1</td><td><code>ulcnet_model_io.h</code></td><td>production descriptor 只驗證 raw；aligned 為診斷模式</td></tr>
 <tr><td><code>ULCNET_PREPOST_CARVE_VERSION</code> = 10；<code>ULCNET_PREPOST_DESCRIPTOR_VERSION</code>／<code>ULCNET_MODEL_IO_ALIGNMENT</code></td><td>1／16</td><td><code>ulcnet_prepost.h</code>、<code>ulcnet_model_io.h</code></td><td>pool 切分與 32-byte descriptor 版本；進 <code>build_flags_hash</code></td></tr>
-<tr><td>訓練端 <code>config.ini</code> 的 <code>[model]</code>（<code>gamma</code>、<code>subband_bins</code>、<code>compression_exponent</code>）</td><td>5、2、0.3</td><td><code>Align_ULCNet/config.ini</code></td><td>權重形狀的一部分，寫進 checkpoint contract</td></tr>
+<tr><td>訓練端 <code>config_&lt;grid&gt;.ini</code> 的 <code>[model]</code>（<code>gamma</code>、<code>subband_bins</code>、<code>compression_exponent</code>）</td><td>5、2、0.3</td><td><code>Align_ULCNet/config_*.ini</code></td><td>權重形狀的一部分，寫進 checkpoint contract</td></tr>
 </table></div>
 
 <h2 id="pcm">PCM SDK 時序與狀態</h2>
@@ -482,7 +483,7 @@ calibration report（BIN 的 <code>manifest.json</code>、NPZ 的 <code>&lt;name
 <code>RETIRED_LAYOUT_VERSIONS</code> = 3–17，不得重用），其他 layout 產出的每一份
 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在
 <code>layout_version</code>；<code>ulcnet_prepost_get_mem_size()</code>／<code>_init()</code> 也拒絕非 0 又不等於本 build layout（單幀 18、封包 19）的 <code>model_layout_version</code>。
-state shape：K/V 是 <code>(1,32,D,TA)</code>、logit 是 <code>(1,32,5,D)</code>、兩顆 GRU hidden 併成單一
+state shape：K/V 是 <code>(1,32,D,TA)</code>、logit 是 <code>(1,32,W,D)</code>（W 依 grid：16 kHz／256 為 9，其餘為 5）、兩顆 GRU hidden 併成單一
 <code>h_gru (1,4,1,128)</code>；<code>output</code> 元素數是 2·K，所以 shape 不變的 layout 變更只有版本號分得出；版本號由匯出器與 host 測試釘住，板端 sample 不讀它，只依位置核對埠的數量、shape、格式與配對。
 D 不改權重；checkpoint 與 dataset 不因 layout 而需要重新訓練或重新生成，
 但 calibration 資料與量化結果要對應該份 graph，加速器程式要對應該份 descriptor。</div>
@@ -505,7 +506,7 @@ centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：<code>p
 <p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加 <code>key_history_out</code>/<code>value_history_out</code>/
 <code>logit_history_out</code>/<code>h_gru_out</code>，每個 <code>*_out</code> 與同名輸入 shape 完全相同。
 <b>位移在 graph 內、用輸入端的 Slice</b>：K/V 取輸入的 slot <code>0..D−2</code>（Slice axis 2，start 0、end D−1，step 1）
-再把新一幀 Concat 在<b>前面</b>；logit 取輸入的 frame <code>1..4</code>（start 1、end 5）再把新的一列 Concat 在<b>後面</b>。
+再把新一幀 Concat 在<b>前面</b>；logit 取輸入的 frame <code>1..W−1</code>（start 1、end W）再把新的一列 Concat 在<b>後面</b>。
 Concat 的結果同時是 attention 的候選與 <code>*_out</code>，沒有任何 state 輸出由 Slice 產生；被丟掉的那一格
 （K/V 的 slot D−1、logit 的 frame 0）只用來讓輸入與輸出 shape 相同，graph 不讀它。</p>
 <p>因此 runtime 可以把每個 <code>*_out</code> 綁到同名輸入的位址，

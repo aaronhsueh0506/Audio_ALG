@@ -1,10 +1,10 @@
 /* Host coverage for aiaec_preprocess() / aiaec_postprocess() through the real public API,
  * end to end, for the model the build binds (aiaec_product.h). The Makefile compiles this file once
  * per product (-DAIAEC_PRODUCT_MODEL_ID=...) with -DAIAEC_TEST_CATALOG, which substitutes placeholder
- * graph paths for the rows below so the gated API constructs; the production catalog (no delivered
- * graph for most rows) is covered by test_aiaec_catalog.c.
+ * graph paths for the rows below so the gated API constructs; the production catalog is covered by
+ * test_aiaec_catalog.c.
  *
- *   DeepVQE-S (N=1 and N=8 at 16k/256, N=1 at 16k/512, N=1 and N=2 at 48k/1024): the block path against the deepvqe_stream
+ *   DeepVQE-S (N=1 at 16k/256, N=1 and N=4 at 16k/512, N=1 and N=2 at 48k/1024): the block path against the deepvqe_stream
  *     packet entries driven directly, bit-exact PCM and identical accelerator-side tensors;
  *     batching against an independent N=1 stream; fail-closed; identity-accelerator delay.
  *   Align-ULCNet (N=1): normal, realignment-bypass and forced-failure hops against ulcnet_stream_*
@@ -97,7 +97,7 @@ static void fake_mask(long long ghop, float *dst, size_t n) {
 
 #if PRODUCT_DV
 /* A pure function of the input mic/far spectra, frame by frame: required wherever two drivers run
- * different frames_per_call (frame f of an N=8 batch and the N=1 hop with the same content must
+ * different frames_per_call (frame f of an N=4 batch and the N=1 hop with the same content must
  * produce the same taps). mic/far are [2][N][bins]: real plane, then imaginary plane. */
 static void content_taps(const StreamWork *w, int n, float *taps) {
     const size_t bins = w->inputs[0].w;
@@ -203,7 +203,7 @@ static int section_deepvqe_block_vs_stream(int sr, int n, int fft) {
     return bad;
 }
 
-/* N=8 batching against an independent N=1 stream fed the same per-hop PCM: the batched side carries
+/* N > 1 batching against an independent N=1 stream fed the same per-hop PCM: the batched side carries
  * the same delay (one hop of STFT/ISTFT framing), so the two PCM streams are equal sample for
  * sample. Block boundaries of the two do not line up, so one global concatenated buffer per side
  * is compared. */
@@ -307,8 +307,8 @@ static long long energy16(const int16_t *x, size_t n) {
  * the status), non-finite taps with status OK (the library must refuse them), both, and a run that never started
  * (the same silent batch, but the state generation must not move). */
 static int section_fail_closed_one(FailKind kind) {
-    enum { N = 8, HOP = 128, BS = N * HOP, BLOCKS = 6, FAILED = 2 };
-    AiaecConfig cfg = make_cfg(256, N);
+    enum { N = 4, HOP = 256, BS = N * HOP, BLOCKS = 6, FAILED = 2 };
+    AiaecConfig cfg = make_cfg(2 * HOP, N);
     void *pool = NULL;
     AiaecCtx *ctx = make_ctx(&cfg, &pool, "fail_closed");
     int16_t *mic_in, *far_zero, *pcm_out;
@@ -810,16 +810,16 @@ static int section_pool(void) {
 int main(void) {
 #if PRODUCT_DV
     g_fail |= section_deepvqe_block_vs_stream(16000, 1, 256);
-    g_fail |= section_deepvqe_block_vs_stream(16000, 8, 256);
     g_fail |= section_deepvqe_block_vs_stream(16000, 1, 512);
+    g_fail |= section_deepvqe_block_vs_stream(16000, 4, 512);
     g_fail |= section_deepvqe_block_vs_stream(48000, 1, 1024);
     g_fail |= section_deepvqe_block_vs_stream(48000, 2, 1024);
-    g_fail |= section_batching_vs_n1(16000, 256, 8);
+    g_fail |= section_batching_vs_n1(16000, 512, 4);
     g_fail |= section_batching_vs_n1(48000, 1024, 2);
     g_fail |= section_fail_closed();
     g_fail |= section_trim(16000, 1, 256);
-    g_fail |= section_trim(16000, 8, 256);
     g_fail |= section_trim(16000, 1, 512);
+    g_fail |= section_trim(16000, 4, 512);
     g_fail |= section_trim(48000, 1, 1024);
     g_fail |= section_trim(48000, 2, 1024);
 #endif

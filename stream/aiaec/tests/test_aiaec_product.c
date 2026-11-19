@@ -1,8 +1,9 @@
 /* The product binding (aiaec_product.h): aiaec.c compiled with -DAIAEC_PRODUCT_MODEL_ID=<id> resolves
  * the same customer config {sr, fft, hop_in} to that model's own catalog rows. One source, three
  * builds selected by -DAIAEC_TEST_PRODUCT=1|2|3, all with -DAIAEC_TEST_CATALOG:
- *   1  DeepVQE-S: 16k/256 resolves at N=1 and N=8, hop_in 129 is refused at init.
- *   2  Align-ULCNet: 16k/256 resolves at N=1 and N=8 (packet graph, 9 inputs, frame_reset last signal).
+ *   1  DeepVQE-S: 16k/256 resolves at N=1 and 16k/512 at N=4, hop_in 129 is refused at init.
+ *   2  Align-ULCNet: 16k/256 resolves at N=1 and 16k/512 at N=4 (packet graph, 9 inputs, frame_reset last signal).
+ *   1, 2  16k/256 N=8 (listed without a graph) is refused with AIAEC_ERR_FRAMES_PER_CALL.
  *   3  an id that names no model: every entry refuses with AIAEC_ERR_MODEL_ID, no graph path.
  * Builds 1 and 2 print the pool size of the same config; the Makefile asserts they differ
  * (a pool carved for one product is not the other's).
@@ -30,11 +31,11 @@ static int init_cfg(const AiaecConfig *cfg, AiaecInfo *info, void **pool_out, Ai
     return aiaec_init(cfg, *pool_out, (size_t)req.bytes, ctx_out, info);
 }
 
-/* One zero N=8 (hop_in 1024) block through a real pre; the views of the first signal. */
-static int pre_zero_n8(AiaecCtx *ctx, StreamWork *work) {
+/* One zero 16k/512 N=4 (hop_in 1024) block through a real pre; the views of the first signal. */
+static int pre_zero_n4(AiaecCtx *ctx, StreamWork *work) {
     static const int16_t pcm[1024];
     static const float f[1024];
-    static const AiaecAlignEvent ev[8];
+    static const AiaecAlignEvent ev[4];
     AiaecInput in;
     memset(&in, 0, sizeof(in));
     in.samples = 1024;
@@ -44,7 +45,7 @@ static int pre_zero_n8(AiaecCtx *ctx, StreamWork *work) {
 #else
     in.kind = AIAEC_INPUT_ALIGN_ULCNET;
     in.u.align_ulcnet.residual_in = f; in.u.align_ulcnet.far_in = f;
-    in.u.align_ulcnet.events = ev; in.u.align_ulcnet.event_count = 8;
+    in.u.align_ulcnet.events = ev; in.u.align_ulcnet.event_count = 4;
     (void)pcm;
 #endif
 #if AIAEC_TEST_PRODUCT == 1
@@ -55,7 +56,7 @@ static int pre_zero_n8(AiaecCtx *ctx, StreamWork *work) {
 #endif
 
 int main(void) {
-    AiaecConfig n1, n8, odd;
+    AiaecConfig n1, n4, n8, odd;
     StreamMemReq req;
     AiaecInfo info;
     StreamWork work;
@@ -65,6 +66,7 @@ int main(void) {
     unsigned char small[64];
 
     n1.sr = 16000; n1.fft = 256; n1.hop_in = 128;
+    n4 = n1; n4.fft = 512; n4.hop_in = 1024;
     n8 = n1; n8.hop_in = 1024;
     odd = n1; odd.hop_in = 129;
 
@@ -82,32 +84,36 @@ int main(void) {
     CHECK(aiaec_get_mem_size(&odd, &req) == AIAEC_ERR_IN_HOP, "hop_in 129 must be refused at init");
     ctx = (AiaecCtx *)small;
     CHECK(aiaec_init(&odd, small, sizeof(small), &ctx, &info) == AIAEC_ERR_IN_HOP && ctx == NULL, "hop_in 129: init");
+    CHECK(aiaec_get_mem_size(&n8, &req) == AIAEC_ERR_FRAMES_PER_CALL, "16k/256 hop_in 1024 (N=8) must be refused");
+    ctx = (AiaecCtx *)small;
+    CHECK(aiaec_init(&n8, small, sizeof(small), &ctx, &info) == AIAEC_ERR_FRAMES_PER_CALL && ctx == NULL,
+          "16k/256 N=8: init");
 #if AIAEC_TEST_PRODUCT == 1
-    rc = init_cfg(&n8, &info, &pool, &ctx);
+    rc = init_cfg(&n4, &info, &pool, &ctx);
     CHECK(rc == AIAEC_OK && info.graph_path != NULL &&
-          pre_zero_n8(ctx, &work) == AIAEC_OK && work.input_count == 2 && work.inputs[0].h == 8u && work.inputs[1].h == 8u &&
-          work.outputs[0].c == 8u, "deepvqe_s: hop_in 1024 is N=8 (2 signals over 8 frames)");
-    CHECK(strstr(info.graph_path, "n8") != NULL, "deepvqe_s: N=8 picks its graph");
+          pre_zero_n4(ctx, &work) == AIAEC_OK && work.input_count == 2 && work.inputs[0].h == 4u && work.inputs[1].h == 4u &&
+          work.inputs[0].w == 257u && work.outputs[0].c == 4u, "deepvqe_s: 16k/512 hop_in 1024 is N=4 (2 signals over 4 frames)");
+    CHECK(strstr(info.graph_path, "fft512_n4") != NULL, "deepvqe_s: 16k/512 N=4 picks its graph");
     free(pool);
     rc = init_cfg(&n1, &info, &pool, &ctx);
-    CHECK(rc == AIAEC_OK && strstr(info.graph_path, "n1") != NULL, "deepvqe_s: N=1 picks its graph");
+    CHECK(rc == AIAEC_OK && strstr(info.graph_path, "fft256_n1") != NULL, "deepvqe_s: N=1 picks its graph");
     free(pool);
 #else
-    rc = init_cfg(&n8, &info, &pool, &ctx);
+    rc = init_cfg(&n4, &info, &pool, &ctx);
     CHECK(rc == AIAEC_OK && info.graph_path != NULL &&
-          pre_zero_n8(ctx, &work) == AIAEC_OK && work.input_count == 5 && work.inputs[0].h == 8u &&
-          work.inputs[4].w == 8u && work.inputs[4].h == 1u,
-          "align_ulcnet: hop_in 1024 is N=8 (packet graph, 5 signals, frame_reset last)");
-    CHECK(strstr(info.graph_path, "n8") != NULL, "align_ulcnet: N=8 picks its graph");
+          pre_zero_n4(ctx, &work) == AIAEC_OK && work.input_count == 5 && work.inputs[0].h == 4u &&
+          work.inputs[0].w == 257u && work.inputs[4].w == 4u && work.inputs[4].h == 1u,
+          "align_ulcnet: 16k/512 hop_in 1024 is N=4 (packet graph, 5 signals, frame_reset last)");
+    CHECK(strstr(info.graph_path, "fft512_n4") != NULL, "align_ulcnet: 16k/512 N=4 picks its graph");
     free(pool);
     rc = init_cfg(&n1, &info, &pool, &ctx);
-    CHECK(rc == AIAEC_OK && strstr(info.graph_path, "n1") != NULL, "align_ulcnet: N=1 picks its graph");
+    CHECK(rc == AIAEC_OK && strstr(info.graph_path, "fft256_n1") != NULL, "align_ulcnet: N=1 picks its graph");
     free(pool);
 #endif
     rc = aiaec_get_mem_size(&n1, &req);
     printf("pool product=%d bytes=%llu\n", (int)AIAEC_PRODUCT_MODEL_ID, (unsigned long long)req.bytes);
 #endif
-    (void)n8; (void)small; (void)rc; (void)req; (void)info; (void)work; (void)ctx; (void)pool;
+    (void)n4; (void)n8; (void)small; (void)rc; (void)req; (void)info; (void)work; (void)ctx; (void)pool;
 
     if (g_fail) { printf("test_aiaec_product[%d]: FAIL\n", AIAEC_TEST_PRODUCT); return 1; }
     printf("test_aiaec_product[%d]: PASS (AIAEC_PRODUCT_MODEL_ID=%d)\n", AIAEC_TEST_PRODUCT, (int)AIAEC_PRODUCT_MODEL_ID);

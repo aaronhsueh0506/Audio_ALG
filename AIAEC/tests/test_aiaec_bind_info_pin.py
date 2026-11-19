@@ -8,11 +8,12 @@ signal_in + k <-> output head_out + k. The ONNX names are read on the exporter s
 input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinned below by the same exports.
 
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
-``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG so the rows without a delivered graph still
-resolve) prints the graph path of a real init and the StreamWork of the first real pre call for each family
-(PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1 and N=8, 16k/512 N=1
-and 48k/1024 N=1 and N=2, and Align-ULCNet 16k/256 N=1 and N=8 (packet graph, layout 19), 16k/512 N=1 and
-48k/1024 N=1 and N=2.
+``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG, placeholder graph paths) prints the graph path of a real init and the StreamWork of the first real pre call for each family
+(PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1, 16k/512 N=1 and N=4
+and 48k/1024 N=1 and N=2, and Align-ULCNet 16k/256 N=1, 16k/512 N=1 and N=4 (packet graph, layout 19) and
+48k/1024 N=1 and N=2. Every model is built with the [model] values of the model's config for its grid (config_16k_256.ini,
+config_16k_512.ini, config_48k.ini, read with training_common.read_model_kwargs), so each board row is checked
+against its shipped config.
 The dumped signal inputs and head output are compared with the exported graph's leading inputs and outputs
 by position and exact padded shape, for both families, and the two families must print one and the
 same views. Align-ULCNet's frame_reset values and the BYPASS block of an
@@ -25,7 +26,8 @@ The graph rows are compared with the same exports: ``make -C stream/aiaec graph-
 the two model-config headers (AIAEC_GRAPH_IO_DUMPER compares another build), and each row must equal the fresh
 export: layout version, port counts and order, every input and output shape, the state names and their order, each
 state's shape at both ends, the state output name ``<input>_out`` and frame_reset as the last signal (Align-ULCNet
-N > 1). The row set must be exactly the exported cases.
+N > 1). The row set must be exactly the exported cases, and the Align-ULCNet logit window of every row must equal the
+exporter's SCORE_WINDOW_BY_GRID entry for its grid.
 """
 
 import contextlib
@@ -46,6 +48,7 @@ from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC._streaming_export import _build, export_graph as deepvqe_export_graph
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, make_linear_aec_contract
+from aiaec_shipped_config import shipped_model_kwargs
 
 REPO = Path(__file__).resolve().parents[2]
 STREAM_AIAEC = REPO / 'stream' / 'aiaec'
@@ -53,13 +56,13 @@ STREAM_AIAEC = REPO / 'stream' / 'aiaec'
 # (model, sr, fft, N) -> hop_in is N * fft / 2
 CASES = [
     ('deepvqe_s', 16000, 256, 1),
-    ('deepvqe_s', 16000, 256, 8),
     ('deepvqe_s', 16000, 512, 1),
+    ('deepvqe_s', 16000, 512, 4),
     ('deepvqe_s', 48000, 1024, 1),
     ('deepvqe_s', 48000, 1024, 2),
     ('align_ulcnet', 16000, 256, 1),
-    ('align_ulcnet', 16000, 256, 8),
     ('align_ulcnet', 16000, 512, 1),
+    ('align_ulcnet', 16000, 512, 4),
     ('align_ulcnet', 48000, 1024, 1),
     ('align_ulcnet', 48000, 1024, 2),
 ]
@@ -136,9 +139,18 @@ def _pad(shape):
 
 def delay_depth(sr, fft):
     """The C catalog's rule (AIAEC_MAX_DELAY_SECONDS = 0.5): ceil(0.5 s / hop). Align-ULCNet's own
-    default at 16 kHz / FFT 512 is 64 (the paper's value), so its export must pass this depth
-    explicitly (the exporter's --max-delay-frames), as the deployed 16 kHz / 512 graph does."""
+    default at 16 kHz / FFT 512 is 64 (the paper's value); its config_16k_512.ini sets
+    max_delay_frames = 32, the deployed depth."""
     return int(np.ceil(0.5 * sr / (fft // 2)))
+
+
+MODELS = {'deepvqe_s': ('DeepVQE_S', DeepVQES), 'align_ulcnet': ('Align_ULCNet', AlignULCNet)}
+
+
+def model_kwargs(model_name, sr, fft):
+    """The constructor kwargs a row is pinned with: the [model] of the model's config for the row's grid."""
+    folder, model_cls = MODELS[model_name]
+    return shipped_model_kwargs(folder, model_cls, (sr, fft))
 
 
 @pytest.fixture(scope='module')
@@ -154,7 +166,7 @@ def exports(tmp_path_factory):
         torch.manual_seed(7)
         with contextlib.redirect_stdout(io.StringIO()):
             if model_name == 'deepvqe_s':
-                model = DeepVQES(grid, max_delay_seconds=0.5).eval()
+                model = DeepVQES(grid, **model_kwargs(model_name, sr, fft)).eval()
                 assert model.max_delay_frames == delay_depth(sr, fft)
                 checkpoint = work / (_case_id(case) + '.pth')
                 checkpoint.write_bytes(b'random-weights')
@@ -163,7 +175,8 @@ def exports(tmp_path_factory):
                     AecGrid(sr, fft, fft, fft // 2), built, str(checkpoint), str(path),
                     model.max_delay_frames, verify=False, frames_per_call=n)
             else:
-                model = AlignULCNet(grid, max_delay_frames=delay_depth(sr, fft)).eval()
+                model = AlignULCNet(grid, **model_kwargs(model_name, sr, fft)).eval()
+                assert model.max_delay_frames == delay_depth(sr, fft)
                 linear = make_linear_aec_contract(sr, frame_size=fft)
                 checkpoint = work / (_case_id(case) + '.pth')
                 torch.save({'contract': {'linear_aec': linear.as_dict(),
@@ -220,31 +233,32 @@ def test_c_work_views_equal_the_exported_graph(case, family, dumpers, exports):
 
 
 def test_the_customer_arithmetic_is_pinned_to_the_exported_n(dumpers, exports):
-    """hop_in 128 is N=1, 1024 is N=8 and 129 is refused at 16 kHz / FFT 256; the N it derives is
-    the N the graph was exported for (the input time axis of the DeepVQE-S graph)."""
+    """hop_in 256 is N=1 and 1024 is N=4 at 16 kHz / FFT 512; hop_in 129 is refused and 1024 (N=8) has no graph
+    at 16 kHz / FFT 256. The N it derives is the N the graph was exported for (the input time axis of the graph)."""
     dv = dumpers['deepvqe_s']
-    for hop_in, n in ((128, 1), (1024, 8)):
-        dump = run_dumper(dv, 16000, 256, hop_in)
-        graph, _meta = exports[('deepvqe_s', 16000, 256, n)]
+    for hop_in, n in ((256, 1), (1024, 4)):
+        dump = run_dumper(dv, 16000, 512, hop_in)
+        graph, _meta = exports[('deepvqe_s', 16000, 512, n)]
         assert dump['rc'] == 0
-        assert dump['in'][0][0][2] == n == hop_in // (256 // 2) == _dims(graph.input[0])[2]
-    assert run_dumper(dv, 16000, 256, 129)['rc'] == -4          # AIAEC_ERR_IN_HOP
-    assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 129)['rc'] == -4
-    # Align-ULCNet: N=8 is the packet graph; its time axis is the N it was exported for
-    dump = run_dumper(dumpers['align_ulcnet'], 16000, 256, 1024)
-    graph, _meta = exports[('align_ulcnet', 16000, 256, 8)]
-    assert dump['rc'] == 0 and dump['in'][0][0][2] == 8 == _dims(graph.input[0])[2]
-    assert dump['inputs'] == 5 and dump['in'][4][0] == (1, 1, 1, 8)        # frame_reset [1, N], the last signal
+        assert dump['in'][0][0][2] == n == hop_in // (512 // 2) == _dims(graph.input[0])[2]
+    for model_name in ('deepvqe_s', 'align_ulcnet'):
+        assert run_dumper(dumpers[model_name], 16000, 256, 129)['rc'] == -4     # AIAEC_ERR_IN_HOP
+        assert run_dumper(dumpers[model_name], 16000, 256, 1024)['rc'] == -5    # AIAEC_ERR_FRAMES_PER_CALL: N=8
+    # Align-ULCNet: N=4 is the packet graph; its time axis is the N it was exported for
+    dump = run_dumper(dumpers['align_ulcnet'], 16000, 512, 1024)
+    graph, _meta = exports[('align_ulcnet', 16000, 512, 4)]
+    assert dump['rc'] == 0 and dump['in'][0][0][2] == 4 == _dims(graph.input[0])[2]
+    assert dump['inputs'] == 5 and dump['in'][4][0] == (1, 1, 1, 4)        # frame_reset [1, N], the last signal
 
 
 @pytest.mark.parametrize('family', FAMILIES, ids=('pcm', 'freq'))
-def test_align_event_hop_3_of_an_n8_packet_puts_frame_reset_00100000_in_the_fifth_signal(family, dumpers, exports):
+def test_align_event_hop_3_of_an_n4_packet_puts_frame_reset_0010_in_the_fifth_signal(family, dumpers, exports):
     """The stream, not the graph or the sample, derives the control values: model hop 2 (the third) marked
-    as an alignment change gives 0 0 1 0 0 0 0 0, still one SUBMIT with five signals (the packet graph)."""
-    dump = run_dumper(dumpers['align_ulcnet'], 16000, 256, 1024, family, event_hop=2)
-    graph, _meta = exports[('align_ulcnet', 16000, 256, 8)]
+    as an alignment change gives 0 0 1 0, still one SUBMIT with five signals (the packet graph)."""
+    dump = run_dumper(dumpers['align_ulcnet'], 16000, 512, 1024, family, event_hop=2)
+    graph, _meta = exports[('align_ulcnet', 16000, 512, 4)]
     assert dump['rc'] == 0 and dump['action'] == 1 and dump['inputs'] == 5
-    assert dump['frame_reset'] == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert dump['frame_reset'] == [0.0, 0.0, 1.0, 0.0]
     assert [p[0] for p in dump['in']] == [_dims(v) for v in graph.input][:5]
 
 
@@ -273,6 +287,8 @@ def test_a_spectrum_family_refuses_what_the_pcm_family_refuses(dumpers):
         assert run_dumper(dumpers['deepvqe_s'], 16000, 256, 129, family)['rc'] == -4
         assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 1032, family)['rc'] == -4
         assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 256, family)['rc'] == -5   # N=2: no graph in the catalog
+        for model_name in ('deepvqe_s', 'align_ulcnet'):
+            assert run_dumper(dumpers[model_name], 16000, 256, 1024, family)['rc'] == -5   # 16k/256 N=8: no graph
 
 
 # ---- the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the same exports ----
@@ -345,3 +361,21 @@ def test_sample_row_equals_a_fresh_export(case, graph_io_rows, exports):
         assert row['in'][len(signals) + k] == row['out'][1 + k], name
     if model_name == 'align_ulcnet' and n > 1:
         assert in_names[len(signals) - 1] == 'frame_reset' and row['in'][len(signals) - 1] == (1, 1, 1, n)
+
+
+def test_the_exporter_score_window_table_is_the_c_rows(graph_io_rows):
+    """align_export.SCORE_WINDOW_BY_GRID (what export_graph accepts) and the C rows' logit_history window
+    [1, 32, W, D] are one table: the same grids, every row of a grid with that grid's W at both ends."""
+    logit = ALIGN_ULCNET_STATES.index('logit_history')
+    windows = {}
+    for row_id, row in graph_io_rows.items():
+        if not row_id.startswith('align_ulcnet_'):
+            continue
+        sr, fft, n = row_id[len('align_ulcnet_'):].split('_')
+        signals = len(signal_names('align_ulcnet', int(n[1:])))
+        shape_in, shape_out = row['in'][signals + logit], row['out'][1 + logit]
+        assert shape_in == shape_out, row_id
+        windows.setdefault((int(sr), int(fft)), set()).add(shape_in[2])
+    assert set(windows) == set(align_export.SCORE_WINDOW_BY_GRID) == set(align_export.SUPPORTED_GRIDS)
+    for grid, found in windows.items():
+        assert found == {align_export.SCORE_WINDOW_BY_GRID[grid]}, grid

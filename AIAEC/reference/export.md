@@ -27,9 +27,12 @@ records the calibration frames against it. Run it from the model directory:
 
 --frames-per-call N (DeepVQE-S and Align-ULCNet, default 1) records a graph
 that runs N STFT frames per call. The graph and every recorded tensor carry N
-frames and --frames counts calls, so `--frames 1024 --frames-per-call 8`
-records 8192 frames. A file's short last block is dropped, except for
-Align-ULCNet with --events, which keeps it zero-completed.
+frames and --frames counts calls, so `--frames 2048 --frames-per-call 4`
+records 8192 frames. The board graph rows register N = 1 at 16 kHz / FFT 256,
+N = 1 and 4 at 16 kHz / FFT 512 and N = 1 and 2 at 48 kHz / FFT 1024
+(`stream/aiaec/graph_io_*.h`); another N exports but no board sample binds it.
+A file's short last block is dropped, except for Align-ULCNet with --events,
+which keeps it zero-completed.
 
 `export_onnx.py` remains available for a graph-only export:
 

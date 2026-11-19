@@ -28,13 +28,14 @@ from AIAEC.Align_ULCNet.export_onnx import (
     MAX_DELAY_DEPTH,
     MIN_DELAY_DEPTH,
     OUTPUT_NAMES,
-    SCORE_WINDOW_FRAMES,
+    SCORE_WINDOW_BY_GRID,
     STATE_LAYOUT_VERSION,
     STATE_NAMES,
     STATE_OUTPUT_NAMES,
     SUPPORTED_GRIDS,
     WINDOW_STATE_DROPS,
     WINDOW_STATE_NAMES,
+    score_window_for,
     ta_bins_for,
     TA_CHANNELS,
     _write_metadata,
@@ -58,6 +59,8 @@ GRID = SignalGrid(16000, 512, 512, 256)
 N_FREQS = GRID.n_freqs
 TA_BINS = 26
 D = 8
+# This grid's logit window, which the default model (score_kernel 5,3) has.
+SCORE_WINDOW = SCORE_WINDOW_BY_GRID[(GRID.sample_rate, GRID.n_fft)]
 
 
 def _checkpoint_contract(**extra):
@@ -98,7 +101,8 @@ def test_ta_bins_follows_the_grid():
     assert ta_bins_for(m48) == 52
     assert m16.reorient.width == 52 and m48.reorient.width == 104
     # The K/V caches carry it, so the state geometry follows the grid too.
-    assert state_shapes(D, ta_bins_for(m48))['key_history'][-1] == 52
+    assert state_shapes(D, ta_bins_for(m48),
+                        score_window_for(m48))['key_history'][-1] == 52
 
 
 _GRID_PROBE = """
@@ -212,7 +216,9 @@ def test_c_state_tables_are_one_table_and_match_the_exporter():
     for name, table in tables.items():
         assert table == reference, name
     assert reference['CHANNELS'] == TA_CHANNELS
-    assert reference['SCORE_FRAMES'] == SCORE_WINDOW_FRAMES
+    # The C tests run the 16 kHz / 512 and 48 kHz / 1024 grids.
+    assert reference['SCORE_FRAMES'] == SCORE_WINDOW_BY_GRID[(16000, 512)]
+    assert reference['SCORE_FRAMES'] == SCORE_WINDOW_BY_GRID[(48000, 1024)]
     assert reference['GRU_ROWS'] == GRU_SUBBANDS * GRU_LAYERS
     assert reference['GRU_HIDDEN'] == GRU_HIDDEN
 
@@ -244,7 +250,7 @@ def test_c_state_table_ta_bins_matches_the_python_derivation(
                                    capture_output=True, text=True).stdout)
     model = AlignULCNet(grid, max_delay_frames=D)
     assert c_ta_bins == ta_bins_for(model)
-    shapes = state_shapes(D, ta_bins_for(model))
+    shapes = state_shapes(D, ta_bins_for(model), score_window_for(model))
     table = _state_table(_STATE_TABLE_SOURCES[0])
     assert shapes['key_history'] == (1, table['CHANNELS'], D, c_ta_bins)
     assert shapes['logit_history'] == (1, table['CHANNELS'],
@@ -253,7 +259,7 @@ def test_c_state_table_ta_bins_matches_the_python_derivation(
 
 
 def test_streaming_export_shapes_are_fixed_and_full_window():
-    shapes = state_shapes(D, TA_BINS)
+    shapes = state_shapes(D, TA_BINS, SCORE_WINDOW)
     assert shapes['key_history'] == (1, 32, D, 26)
     assert shapes['value_history'] == (1, 32, D, 26)
     assert shapes['logit_history'] == (1, 32, 5, D)
@@ -278,7 +284,7 @@ def test_streaming_export_shapes_are_fixed_and_full_window():
     assert WINDOW_STATE_NAMES == ('key_history', 'value_history',
                                   'logit_history')
     assert GRU_SUBBANDS * GRU_LAYERS == shapes['h_gru'][1]
-    assert SCORE_WINDOW_FRAMES == shapes['logit_history'][2]
+    assert SCORE_WINDOW == shapes['logit_history'][2]
 
 
 def test_layout_version_is_new_and_retired_numbers_stay_retired():
@@ -419,7 +425,7 @@ def test_metadata_frontend_is_copied_from_the_contract_not_hard_coded(tmp_path):
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     checkpoint = tmp_path / 'ckpt.pt'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
-    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)
     outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
 
     contract = _checkpoint_contract()
@@ -523,7 +529,7 @@ def test_retired_behavior_hash_writes_no_graph_on_any_export_path(
     with pytest.raises(ValueError, match='retired'):
         export_graph(model, str(checkpoint), str(out / 'direct.onnx'))
 
-    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)
     outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
     with pytest.raises(ValueError, match='retired'):
         _write_metadata(str(out / 'meta.onnx'), str(checkpoint), model,
@@ -547,7 +553,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     checkpoint = tmp_path / 'ckpt.pt'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
-    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)
     outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
 
     metadata = _write_metadata(
@@ -561,7 +567,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     ]
     assert metadata['state_layout_version'] == STATE_LAYOUT_VERSION
     assert metadata['state_binding'] == 'in_place_same_address'
-    assert metadata['score_window_frames'] == SCORE_WINDOW_FRAMES
+    assert metadata['score_window_frames'] == SCORE_WINDOW == score_window_for(model)
 
     # Checkpoints without the field keep the same raw-far training/deployment
     # contract.
@@ -584,7 +590,7 @@ def test_full_window_wrapper_matches_forward_stream_frame_by_frame(
     wrapper = AlignUlcnetStreamingExport(model).eval()
     assert wrapper.ta_bins == ta_bins
     explicit = tuple(value.clone() for value in dummy_inputs(
-        D, grid.n_freqs, ta_bins)[SIGNAL_INPUTS:])
+        D, grid.n_freqs, ta_bins, wrapper.score_window)[SIGNAL_INPUTS:])
     reference = model.create_stream_state()
     generator = torch.Generator().manual_seed(73)
 
@@ -644,7 +650,7 @@ def test_window_shift_directions():
     torch.manual_seed(31)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    state = dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
+    state = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)[SIGNAL_INPUTS:]
     generator = torch.Generator().manual_seed(32)
     previous = None
     for _ in range(D + 3):
@@ -671,7 +677,7 @@ def test_dropped_window_slot_is_never_read():
     torch.manual_seed(33)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    state = dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
+    state = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)[SIGNAL_INPUTS:]
     generator = torch.Generator().manual_seed(34)
     for _ in range(D + 2):
         outputs = _run_wrapper(wrapper, model, state, generator)
@@ -712,7 +718,7 @@ def test_exported_onnx_state_contract(tmp_path):
 
     loaded = onnx.load(str(path))
     graph = loaded.graph
-    shapes = state_shapes(depth, TA_BINS)
+    shapes = state_shapes(depth, TA_BINS, SCORE_WINDOW)
 
     def dims(value):
         return tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
@@ -837,7 +843,7 @@ def test_hidden_stacks_on_the_channel_axis():
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
     reference = model.create_stream_state()
-    state = dummy_inputs(depth, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
+    state = dummy_inputs(depth, N_FREQS, TA_BINS, SCORE_WINDOW)[SIGNAL_INPUTS:]
     generator = torch.Generator().manual_seed(11)
     with torch.no_grad():
         for _ in range(2 * depth + 2):
@@ -858,7 +864,7 @@ def test_hidden_stacks_on_the_channel_axis():
 
 
 def test_reset_is_all_zero_external_state():
-    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS, SCORE_WINDOW)
     for state in inputs[SIGNAL_INPUTS:]:
         assert torch.count_nonzero(state) == 0
 
@@ -870,7 +876,7 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
     torch.manual_seed(17)
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    initial = dummy_inputs(depth, N_FREQS, TA_BINS)
+    initial = dummy_inputs(depth, N_FREQS, TA_BINS, SCORE_WINDOW)
     output_path = tmp_path / 'align_ulcnet_stream.onnx'
 
     torch.onnx.export(

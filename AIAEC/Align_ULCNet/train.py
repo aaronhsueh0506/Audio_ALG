@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Align-ULCNet training -- linear AEC -> joint RES+NR paper reference.
 
-用法:
-    python3 train.py --config config.ini --packed-dir data_aec_16k/packed/all --gpu 0 --mmap
-    python3 train.py --config config.ini --device cpu
-    python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth
-    python3 train.py --config config.ini --resume output/align_ulcnet_e5.pth --reset-optimizer
-    python3 train.py --config config.ini --seed 123
-    python3 train.py --config config.ini baseline.ini              # default recipe
-    python3 train.py --config config.ini baseline.ini ref_512.ini  # 512/256 reference
+用法 (--config 必填，每個板端 grid 一份自足的 config: config_16k_256.ini / config_16k_512.ini / config_48k.ini):
+    python3 train.py --config config_16k_512.ini --packed-dir data_aec_16k/packed/all --gpu 0 --mmap
+    python3 train.py --config config_16k_512.ini --device cpu
+    python3 train.py --config config_16k_512.ini --resume output_16k_512/align_ulcnet_e5.pth
+    python3 train.py --config config_16k_512.ini --resume output_16k_512/align_ulcnet_e5.pth --reset-optimizer
+    python3 train.py --config config_16k_512.ini --seed 123
     ([loss] stft_consistency = true refuses MPS: pass --device cpu or a CUDA device)
 
-config.ini sections (see the shipped config.ini for every knob, documented):
+config_<grid>.ini sections (see a shipped config for every knob, documented):
     [signal]     sample rate + FFT grid. Paper defaults are 16 kHz/512/512/256;
                  this project also accepts 48 kHz/1024/1024/512 (see
                  model.py/README.md) -- must equal the grid
@@ -94,7 +92,8 @@ LOSS_VERSION = 'align_ulcnet_plcpa_c03_beta07_consistent_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
-    return build_arg_parser('Train Align-ULCNet (linear AEC -> RES+NR)')
+    return build_arg_parser('Train Align-ULCNet (linear AEC -> RES+NR)',
+                            default_config=None)
 
 
 def forward_batch(model, stems_batch, aec_grid, device):

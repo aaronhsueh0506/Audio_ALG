@@ -1,23 +1,23 @@
-/* Align-ULCNet packet graph (frames_per_call N = 8 at 16k/256, layout 19) through the real public API, with a
+/* Align-ULCNet packet graph (frames_per_call N = 4 at 16k/512, layout 19) through the real public API, with a
  * deterministic host stand-in for the accelerator that implements the graph's semantics: a frame whose frame_reset
  * is 1.0 resets the model state to zero before the frame and bypasses it (identity mask, state stays zero), any
- * other frame steps the state. Align-ULCNet product only; built with -DAIAEC_TEST_CATALOG, which gives the N=8 row a
- * placeholder graph path (the production catalog refuses it).
+ * other frame steps the state. Align-ULCNet product only; built with -DAIAEC_TEST_CATALOG, which gives the N=4 row a
+ * placeholder graph path.
  *
- *   spectra   the _freq family at N=8 equals the _freq family at N=1 applying the same events, bit for bit, for
- *             event streams: none, frame 1, frame 3, frame 8, two in one packet, adjacent, one in every packet, every
+ *   spectra   the _freq family at N=4 equals the _freq family at N=1 applying the same events, bit for bit, for
+ *             event streams: none, frame 1, frame 3, the last frame, two in one packet, adjacent, one in every packet, every
  *             frame, a solid false -> true edge on frame 2 of a packet, and one on frame 1 of a packet (the previous hop's
- *             solid carried across the packet boundary). One accelerator call per packet at N=8, none for an event hop at N=1.
- *   events    frame_reset carries exactly the edge pattern; the state generation never changes for an event at N=8;
+ *             solid carried across the packet boundary). One accelerator call per packet at N=4, none for an event hop at N=1.
+ *   events    frame_reset carries exactly the edge pattern; the state generation never changes for an event at N=4;
  *             an all-event packet is still one SUBMIT job.
- *   families  the PCM family equals _freq at N=8 fed by an independent, never restarted analyser plus an external
+ *   families  the PCM family equals _freq at N=4 fed by an independent, never restarted analyser plus an external
  *             AcIstft, sample for sample, through the events: no entry restarts an analysis or a synthesis.
- *   realign   the PCM family and _freq (+ external STFT and ISTFT) at N=8 equal the N=1 stream sample for sample with the same
+ *   realign   the PCM family and _freq (+ external STFT and ISTFT) at N=4 equal the N=1 stream sample for sample with the same
  *             events (none, one hop, adjacent, first, last, across a packet boundary, solid false -> true after
  *             earlier hops, every hop, a full reset in the middle), with the accelerator's end-of-packet state and
- *             the vendor call count compared: one call per packet at N=8, one per non-event hop at N=1.
+ *             the vendor call count compared: one call per packet at N=4, one per non-event hop at N=1.
  *   pin       the PCM family returns the event hop's signal (the error spectrum through the running analysis and
- *             synthesis) and keeps the audio of the hop before it; N = 8 equals N = 1 through the event.
+ *             synthesis) and keeps the audio of the hop before it; N = 4 equals N = 1 through the event.
  *   tail      a 16000-count sample at the last real input sample comes back model_hop later, through the test's own
  *             all-zero block, and is lost without it.
  *   failure   an inference failure, a non-finite mask and a finite mask whose enhanced frame overflows pass all N error
@@ -44,12 +44,13 @@
 #error "test_aiaec_packet.c is the Align-ULCNet product's test"
 #endif
 
-#define FFT 256
-#define HOP 128
-#define BINS 129
-#define NF 8
+#define FFT 512
+#define HOP 256
+#define BINS 257
+#define NF 4
 #define HOP_IN (NF * HOP)
-#define MAX_PACKETS 7
+#define DEPTH 32   /* the catalog's D: ceil(0.5 s / hop) */
+#define MAX_PACKETS 14
 #define MAX_HOPS (MAX_PACKETS * NF)
 
 static int g_fail = 0;
@@ -137,7 +138,7 @@ static void accel_run(Accel *a, const StreamWork *w, int n) {
     if (a->mode == ACC_NAN) out[BINS / 2] = NAN;
     else if (a->mode == ACC_INF_FIRST) out[0] = INFINITY;
     else if (a->mode == ACC_NEGINF_LAST) out[w->outputs[0].elements - 1u] = -INFINITY;
-    else if (a->mode == ACC_HUGE_RE_MID) out[(size_t)(n > 5 ? 5 : n - 1) * BINS] = HUGE_MASK;   /* frame 5, real, bin 0 */
+    else if (a->mode == ACC_HUGE_RE_MID) out[(size_t)(n > 1 ? 1 : 0) * BINS] = HUGE_MASK;   /* frame 1, real, bin 0 */
     else if (a->mode == ACC_HUGE_IM_LAST) out[(size_t)(2 * n - 1) * BINS] = HUGE_MASK;   /* last frame, imaginary, bin 0 */
 }
 
@@ -193,9 +194,10 @@ typedef struct Sched {
     AiaecAlignEvent ev[MAX_HOPS];
 } Sched;
 
-static void sched_clear(Sched *s, const char *name, int packets) {
+/* hops: a multiple of NF */
+static void sched_clear(Sched *s, const char *name, int hops) {
     memset(s, 0, sizeof(*s));
-    s->name = name; s->packets = packets; s->reset_hop = -1;
+    s->name = name; s->packets = hops / NF; s->reset_hop = -1;
 }
 
 /* what the edge rule says, with the previous hop's solid carried across packets */
@@ -251,7 +253,7 @@ static void run_freq_n1(const Sched *s, Run *r) {
     ctxs_free(&c);
 }
 
-static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
+static void run_freq_packet(const Sched *s, Run *r, AccMode mode) {
     Ctxs c;
     Accel acc;
     int edge[MAX_HOPS];
@@ -268,9 +270,9 @@ static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
         int rc;
         freq_input(&fin, p * NF, NF, s->ev);
         rc = aiaec_preprocess_freq(c.freq, &fin, &w);
-        CHECK(rc == AIAEC_OK, "n8 %s: preprocess packet %d rc=%d", s->name, p, rc);
+        CHECK(rc == AIAEC_OK, "packet %s: preprocess packet %d rc=%d", s->name, p, rc);
         CHECK(w.action == STREAM_WORK_SUBMIT && w.input_count == 5 && w.output_count == 1,
-              "n8 %s: packet %d work action=%d inputs=%d", s->name, p, (int)w.action, w.input_count);
+              "packet %s: packet %d work action=%d inputs=%d", s->name, p, (int)w.action, w.input_count);
         for (k = 0; k < NF && w.input_count == 5; ++k) {
             const float want = edge[p * NF + k] ? 1.0f : 0.0f;
             if (w.inputs[4].data[k] != want) r->reset_pattern_ok = 0;
@@ -279,7 +281,7 @@ static void run_freq_n8(const Sched *s, Run *r, AccMode mode) {
         accel_run(&acc, &w, NF);
         r->last_gen = w.state_generation;
         rc = aiaec_postprocess_freq(c.freq, 0, r->re + (size_t)p * NF * BINS, r->im + (size_t)p * NF * BINS);
-        CHECK(rc == AIAEC_OK, "n8 %s: postprocess packet %d rc=%d", s->name, p, rc);
+        CHECK(rc == AIAEC_OK, "packet %s: postprocess packet %d rc=%d", s->name, p, rc);
     }
     r->calls = acc.calls; r->gen_changes = acc.gen_changes;
     ctxs_free(&c);
@@ -301,42 +303,43 @@ static int section_spectra(void) {
     Sched s[11];
     int i, h, n = 0;
 
-    sched_clear(&s[n], "none", 3); ++n;
-    sched_clear(&s[n], "frame1", 3); s[n].ev[0].changed = 1; ++n;
-    sched_clear(&s[n], "frame3", 3); s[n].ev[2].changed = 1; ++n;
-    sched_clear(&s[n], "frame8", 3); s[n].ev[7].changed = 1; ++n;
-    sched_clear(&s[n], "two_in_one_packet", 3); s[n].ev[2].changed = 1; s[n].ev[5].changed = 1; ++n;
-    sched_clear(&s[n], "adjacent", 3); s[n].ev[1].changed = 1; s[n].ev[2].changed = 1; ++n;
-    sched_clear(&s[n], "every_packet", 3);
-    s[n].ev[2].changed = 1; s[n].ev[8].changed = 1; s[n].ev[15].changed = 1; s[n].ev[19].changed = 1; ++n;
-    sched_clear(&s[n], "all_frames", 3); for (h = 0; h < NF; ++h) s[n].ev[h].changed = 1; ++n;
+    sched_clear(&s[n], "none", 24); ++n;
+    sched_clear(&s[n], "frame1", 24); s[n].ev[0].changed = 1; ++n;
+    sched_clear(&s[n], "frame3", 24); s[n].ev[2].changed = 1; ++n;
+    sched_clear(&s[n], "last_frame", 24); s[n].ev[NF - 1].changed = 1; ++n;
+    sched_clear(&s[n], "two_in_one_packet", 24); s[n].ev[1].changed = 1; s[n].ev[3].changed = 1; ++n;
+    sched_clear(&s[n], "adjacent", 24); s[n].ev[1].changed = 1; s[n].ev[2].changed = 1; ++n;
+    sched_clear(&s[n], "every_packet", 24);   /* one event in each of the six packets, at varying slots */
+    s[n].ev[2].changed = 1; s[n].ev[4].changed = 1; s[n].ev[11].changed = 1; s[n].ev[13].changed = 1;
+    s[n].ev[19].changed = 1; s[n].ev[22].changed = 1; ++n;
+    sched_clear(&s[n], "all_frames", 24); for (h = 0; h < NF; ++h) s[n].ev[h].changed = 1; ++n;
     /* solid false -> true on frame 2 of packet 1 */
-    sched_clear(&s[n], "solid_edge_frame2", 3); for (h = 9; h < 24; ++h) s[n].ev[h].solid = 1; ++n;
+    sched_clear(&s[n], "solid_edge_frame2", 24); for (h = NF + 1; h < 24; ++h) s[n].ev[h].solid = 1; ++n;
     /* the previous hop of the edge is the last hop of the previous packet */
-    sched_clear(&s[n], "solid_edge_across_packets", 3); for (h = 8; h < 24; ++h) s[n].ev[h].solid = 1; ++n;
-    /* solid true from the first hop is no edge (no previous hop), then it drops and returns inside one packet */
-    sched_clear(&s[n], "solid_drop_return", 3);
-    for (h = 0; h < 24; ++h) s[n].ev[h].solid = !(h >= 10 && h < 12); ++n;
+    sched_clear(&s[n], "solid_edge_across_packets", 24); for (h = NF; h < 24; ++h) s[n].ev[h].solid = 1; ++n;
+    /* solid true from the first hop is no edge (no previous hop), then it drops and returns inside packet 2 */
+    sched_clear(&s[n], "solid_drop_return", 24);
+    for (h = 0; h < 24; ++h) s[n].ev[h].solid = !(h >= 9 && h < 11); ++n;
 
     for (i = 0; i < n; ++i) {
-        static Run r1, r8;
+        static Run r1, rp;
         int edge[MAX_HOPS], edges = 0;
         run_freq_n1(&s[i], &r1);
-        run_freq_n8(&s[i], &r8, ACC_MODEL);
+        run_freq_packet(&s[i], &rp, ACC_MODEL);
         expected_edges(&s[i], edge);
         for (h = 0; h < s[i].packets * NF; ++h) edges += edge[h];
-        CHECK(memcmp(r1.re, r8.re, sizeof(float) * (size_t)s[i].packets * NF * BINS) == 0 &&
-              memcmp(r1.im, r8.im, sizeof(float) * (size_t)s[i].packets * NF * BINS) == 0,
-              "%s: N=8 spectra differ from the N=1 stream applying the same events", s[i].name);
-        CHECK(r8.calls == s[i].packets, "%s: %d vendor calls for %d packets", s[i].name, r8.calls, s[i].packets);
+        CHECK(memcmp(r1.re, rp.re, sizeof(float) * (size_t)s[i].packets * NF * BINS) == 0 &&
+              memcmp(r1.im, rp.im, sizeof(float) * (size_t)s[i].packets * NF * BINS) == 0,
+              "%s: N=4 spectra differ from the N=1 stream applying the same events", s[i].name);
+        CHECK(rp.calls == s[i].packets, "%s: %d vendor calls for %d packets", s[i].name, rp.calls, s[i].packets);
         CHECK(r1.calls == s[i].packets * NF - edges && r1.bypass_hops == edges, "%s: N=1 calls %d bypass %d for %d events",
               s[i].name, r1.calls, r1.bypass_hops, edges);
-        CHECK(r8.gen_changes == 0 && r8.last_gen == r8.first_gen, "%s: N=8 state generation changed (%u changes) on events", s[i].name, r8.gen_changes);
-        CHECK(r8.reset_pattern_ok && r8.resets_seen == edges, "%s: frame_reset pattern (%d ones, %d edges)", s[i].name, r8.resets_seen, edges);
-        check_event_frames(&s[i], &r8, "n8");
+        CHECK(rp.gen_changes == 0 && rp.last_gen == rp.first_gen, "%s: N=4 state generation changed (%u changes) on events", s[i].name, rp.gen_changes);
+        CHECK(rp.reset_pattern_ok && rp.resets_seen == edges, "%s: frame_reset pattern (%d ones, %d edges)", s[i].name, rp.resets_seen, edges);
+        check_event_frames(&s[i], &rp, "packet");
         check_event_frames(&s[i], &r1, "n1");
         printf("section_spectra[%s]: %d packets, %d events, %d vendor calls (N=1: %d), bit-equal to N=1\n", s[i].name,
-               s[i].packets, edges, r8.calls, r1.calls);
+               s[i].packets, edges, rp.calls, r1.calls);
     }
     return 0;
 }
@@ -353,7 +356,7 @@ static void block_input(AiaecInput *in, int block, const AiaecAlignEvent *ev) {
     in->u.align_ulcnet.event_count = NF;
 }
 
-/* _freq at N=8 fed by an analyser that is never restarted: what the PCM family must equal through an external ISTFT */
+/* _freq at N=4 fed by an analyser that is never restarted: what the PCM family must equal through an external ISTFT */
 static void run_freq_continuous_analyser(const Sched *s, Run *r) {
     static float ere[MAX_HOPS * BINS], eim[MAX_HOPS * BINS], fre[MAX_HOPS * BINS], fim[MAX_HOPS * BINS];
     int h;
@@ -396,7 +399,7 @@ static int section_families(void) {
     float hopbuf[HOP];
     int p, i, h;
 
-    sched_clear(&s, "families", 4);
+    sched_clear(&s, "families", 32);
     s.ev[2].changed = 1; s.ev[3].changed = 1; s.ev[9].changed = 1; s.ev[16].changed = 1;
     for (h = 12; h < 32; ++h) s.ev[h].solid = 1;   /* solid edge at hop 12 */
 
@@ -430,7 +433,7 @@ static int section_families(void) {
         CHECK(energy > 100000, "PCM output is (nearly) silent: energy %lld", energy);
     }
     ext_free(&syn); ctxs_free(&c);
-    printf("section_families: PCM == _freq(continuous analyser) + ISTFT, through %d events at N=8\n", 5);
+    printf("section_families: PCM == _freq(continuous analyser) + ISTFT, through %d events at N=4\n", 5);
     return 0;
 }
 
@@ -438,7 +441,7 @@ static int section_families(void) {
 
 typedef struct PcmRun {
     int16_t pcm[MAX_HOPS * HOP];
-    float spec_re[MAX_HOPS * BINS], spec_im[MAX_HOPS * BINS];   /* the _freq family's output spectra, N=1 or N=8 */
+    float spec_re[MAX_HOPS * BINS], spec_im[MAX_HOPS * BINS];   /* the _freq family's output spectra, N=1 or N=4 */
     float st_end[MAX_PACKETS][BINS];                            /* the accelerator state at each packet end */
     int calls, pre_ok, post_ok;
     unsigned gen_changes;
@@ -529,42 +532,42 @@ static int first_diff(const int16_t *a, const int16_t *b, int n, int *maxd, int 
 }
 
 static void realign_case(const Sched *s, const PcmRun *none) {
-    static PcmRun b1, b8, p8, n8;
+    static PcmRun b1, bp, pp, f1;
     int edge[MAX_HOPS], edges = 0, h, p, maxd, cnt, first;
     const int hops = s->packets * NF;
 
     expected_edges(s, edge);
     for (h = 0; h < hops; ++h) edges += edge[h];
     run_pcm(s, 1, 0, &b1);
-    run_pcm(s, NF, 0, &b8);
-    run_pcm(s, NF, 1, &p8);
-    run_pcm(s, 1, 1, &n8);
+    run_pcm(s, NF, 0, &bp);
+    run_pcm(s, NF, 1, &pp);
+    run_pcm(s, 1, 1, &f1);
 
-    first = first_diff(b1.pcm, b8.pcm, hops * HOP, &maxd, &cnt);
-    CHECK(first < 0, "%s: PCM N=8 differs from N=1 in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
-    first = first_diff(b1.pcm, p8.pcm, hops * HOP, &maxd, &cnt);
-    CHECK(first < 0, "%s: _freq N=8 + external STFT/ISTFT differs from N=1 PCM in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
-    first = first_diff(b1.pcm, n8.pcm, hops * HOP, &maxd, &cnt);
+    first = first_diff(b1.pcm, bp.pcm, hops * HOP, &maxd, &cnt);
+    CHECK(first < 0, "%s: PCM N=4 differs from N=1 in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
+    first = first_diff(b1.pcm, pp.pcm, hops * HOP, &maxd, &cnt);
+    CHECK(first < 0, "%s: _freq N=4 + external STFT/ISTFT differs from N=1 PCM in %d samples (first %d, max %d)", s->name, cnt, first, maxd);
+    first = first_diff(b1.pcm, f1.pcm, hops * HOP, &maxd, &cnt);
     CHECK(first < 0, "%s: _freq N=1 + external STFT/ISTFT differs from N=1 PCM in %d samples (first %d)", s->name, cnt, first);
-    CHECK(memcmp(n8.spec_re, p8.spec_re, sizeof(float) * (size_t)hops * BINS) == 0 &&
-          memcmp(n8.spec_im, p8.spec_im, sizeof(float) * (size_t)hops * BINS) == 0, "%s: _freq spectra N=8 differ from N=1", s->name);
+    CHECK(memcmp(f1.spec_re, pp.spec_re, sizeof(float) * (size_t)hops * BINS) == 0 &&
+          memcmp(f1.spec_im, pp.spec_im, sizeof(float) * (size_t)hops * BINS) == 0, "%s: _freq spectra N=4 differ from N=1", s->name);
     for (p = 0; p < s->packets; ++p)
-        CHECK(memcmp(b1.st_end[p], b8.st_end[p], sizeof(b1.st_end[p])) == 0, "%s: accelerator state at the end of packet %d differs (N=1 vs N=8)", s->name, p);
-    CHECK(b8.calls == s->packets && p8.calls == s->packets && b1.calls == hops - edges && n8.calls == hops - edges,
-          "%s: vendor calls N=8 %d/%d (want %d), N=1 %d/%d (want %d)", s->name, b8.calls, p8.calls, s->packets, b1.calls, n8.calls, hops - edges);
-    CHECK(b8.pre_ok == s->packets && b8.post_ok == s->packets && b1.pre_ok == hops && b1.post_ok == hops && p8.pre_ok == p8.post_ok &&
-          n8.pre_ok == n8.post_ok, "%s: pre/post pairing", s->name);
-    CHECK(b8.gen_changes == (unsigned)(s->reset_hop >= 0), "%s: N=8 accelerator saw %u state-generation changes (reset only)", s->name, b8.gen_changes);
+        CHECK(memcmp(b1.st_end[p], bp.st_end[p], sizeof(b1.st_end[p])) == 0, "%s: accelerator state at the end of packet %d differs (N=1 vs N=4)", s->name, p);
+    CHECK(bp.calls == s->packets && pp.calls == s->packets && b1.calls == hops - edges && f1.calls == hops - edges,
+          "%s: vendor calls N=4 %d/%d (want %d), N=1 %d/%d (want %d)", s->name, bp.calls, pp.calls, s->packets, b1.calls, f1.calls, hops - edges);
+    CHECK(bp.pre_ok == s->packets && bp.post_ok == s->packets && b1.pre_ok == hops && b1.post_ok == hops && pp.pre_ok == pp.post_ok &&
+          f1.pre_ok == f1.post_ok, "%s: pre/post pairing", s->name);
+    CHECK(bp.gen_changes == (unsigned)(s->reset_hop >= 0), "%s: N=4 accelerator saw %u state-generation changes (reset only)", s->name, bp.gen_changes);
     if (none) {   /* hops before the first event use the incoming state and history: identical to the event-free run */
         int fe = hops;
         for (h = hops - 1; h >= 0; --h) if (edge[h]) fe = h;
-        CHECK(memcmp(b8.pcm, none->pcm, sizeof(int16_t) * (size_t)fe * HOP) == 0, "%s: output before the first event hop (%d) differs from the event-free run", s->name, fe);
+        CHECK(memcmp(bp.pcm, none->pcm, sizeof(int16_t) * (size_t)fe * HOP) == 0, "%s: output before the first event hop (%d) differs from the event-free run", s->name, fe);
         if (fe < hops)
-            CHECK(memcmp(b8.pcm + (size_t)fe * HOP, none->pcm + (size_t)fe * HOP, sizeof(int16_t) * HOP) != 0 || fe >= hops,
+            CHECK(memcmp(bp.pcm + (size_t)fe * HOP, none->pcm + (size_t)fe * HOP, sizeof(int16_t) * HOP) != 0 || fe >= hops,
                   "%s: the event hop %d left the output unchanged (the event had no effect)", s->name, fe);
     }
-    printf("section_realign[%s]: %d hops, %d events, PCM N=8 == N=1 (%d samples), _freq+STFT/ISTFT == PCM; vendor calls N=8 %d (packets %d), N=1 %d\n",
-           s->name, hops, edges, hops * HOP, b8.calls, s->packets, b1.calls);
+    printf("section_realign[%s]: %d hops, %d events, PCM N=4 == N=1 (%d samples), _freq+STFT/ISTFT == PCM; vendor calls N=4 %d (packets %d), N=1 %d\n",
+           s->name, hops, edges, hops * HOP, bp.calls, s->packets, b1.calls);
 }
 
 static int section_realign(void) {
@@ -572,21 +575,21 @@ static int section_realign(void) {
     static PcmRun none;
     int i, h, n = 0;
 
-    sched_clear(&sc[n], "none", 3); ++n;
-    sched_clear(&sc[n], "hop3", 3); sc[n].ev[2].changed = 1; ++n;
-    sched_clear(&sc[n], "adjacent", 3); sc[n].ev[2].changed = 1; sc[n].ev[3].changed = 1; ++n;
-    sched_clear(&sc[n], "first_of_stream", 3); sc[n].ev[0].changed = 1; ++n;
-    sched_clear(&sc[n], "last_of_packet", 3); sc[n].ev[7].changed = 1; ++n;
-    sched_clear(&sc[n], "last_of_stream", 3); sc[n].ev[23].changed = 1; ++n;
-    sched_clear(&sc[n], "first_of_next_packet", 3); sc[n].ev[8].changed = 1; ++n;
-    sched_clear(&sc[n], "across_boundary", 3); sc[n].ev[7].changed = 1; sc[n].ev[8].changed = 1; ++n;
-    sched_clear(&sc[n], "event_in_next_packet", 3); sc[n].ev[12].changed = 1; ++n;
-    sched_clear(&sc[n], "solid_false_true", 3); for (h = 10; h < 24; ++h) sc[n].ev[h].solid = 1; ++n;
-    sched_clear(&sc[n], "solid_false_true_and_changed", 3);
+    sched_clear(&sc[n], "none", 24); ++n;
+    sched_clear(&sc[n], "hop3", 24); sc[n].ev[2].changed = 1; ++n;
+    sched_clear(&sc[n], "adjacent", 24); sc[n].ev[1].changed = 1; sc[n].ev[2].changed = 1; ++n;
+    sched_clear(&sc[n], "first_of_stream", 24); sc[n].ev[0].changed = 1; ++n;
+    sched_clear(&sc[n], "last_of_packet", 24); sc[n].ev[NF - 1].changed = 1; ++n;
+    sched_clear(&sc[n], "last_of_stream", 24); sc[n].ev[23].changed = 1; ++n;
+    sched_clear(&sc[n], "first_of_next_packet", 24); sc[n].ev[NF].changed = 1; ++n;
+    sched_clear(&sc[n], "across_boundary", 24); sc[n].ev[NF - 1].changed = 1; sc[n].ev[NF].changed = 1; ++n;
+    sched_clear(&sc[n], "event_in_next_packet", 24); sc[n].ev[NF + 2].changed = 1; ++n;
+    sched_clear(&sc[n], "solid_false_true", 24); for (h = 10; h < 24; ++h) sc[n].ev[h].solid = 1; ++n;
+    sched_clear(&sc[n], "solid_false_true_and_changed", 24);
     for (h = 5; h < 24; ++h) sc[n].ev[h].solid = 1;
     sc[n].ev[13].changed = 1; sc[n].ev[18].changed = 1; ++n;
-    sched_clear(&sc[n], "every_hop", 3); for (h = 0; h < 24; ++h) sc[n].ev[h].changed = 1; ++n;
-    sched_clear(&sc[n], "full_reset_after_events", 4);
+    sched_clear(&sc[n], "every_hop", 24); for (h = 0; h < 24; ++h) sc[n].ev[h].changed = 1; ++n;
+    sched_clear(&sc[n], "full_reset_after_events", 32);
     sc[n].ev[2].changed = 1; sc[n].ev[13].changed = 1; sc[n].ev[26].changed = 1; sc[n].reset_hop = 16; ++n;
 
     run_pcm(&sc[0], NF, 0, &none);
@@ -597,7 +600,7 @@ static int section_realign(void) {
         static Sched tail;
         const Sched *s = &sc[n - 1];
         int fe = s->reset_hop;
-        sched_clear(&tail, "fresh_tail", s->packets - fe / NF);
+        sched_clear(&tail, "fresh_tail", s->packets * NF - fe);
         memcpy(tail.ev, s->ev + fe, sizeof(AiaecAlignEvent) * (size_t)(s->packets * NF - fe));
         run_pcm(s, NF, 0, &full);
         /* the fresh stream sees the remaining input as its own start: shift the global signal */
@@ -612,7 +615,7 @@ static int section_realign(void) {
         CHECK(memcmp(full.pcm + (size_t)fe * HOP, fresh.pcm, sizeof(int16_t) * (size_t)(s->packets * NF - fe) * HOP) == 0,
               "after a full reset the PCM family differs from a fresh stream fed the same remaining input");
     }
-    printf("section_realign: %d scenarios, PCM and _freq at N=8 equal the N=1 stream\n", n);
+    printf("section_realign: %d scenarios, PCM and _freq at N=4 equal the N=1 stream\n", n);
     return 0;
 }
 
@@ -627,23 +630,23 @@ static long long hop_energy(const int16_t *pcm, int hop) {
 
 /* The PCM entries restart only the model at an event hop: the analysis and synthesis keep running, so the event hop returns
  * the error spectrum through them (it carries the signal, the audio of the hop before it is output); hops before the event
- * are those of the event-free stream, the hop after it is not (the model restarted). N = 8 returns the same PCM as N = 1.
+ * are those of the event-free stream, the hop after it is not (the model restarted). N = 4 returns the same PCM as N = 1.
  * Pinned so a change must be deliberate (aiaec.h "Alignment events"); section_families pins the sample values. */
 static int section_event_hop_pin(void) {
     static Sched none, ev;
-    static PcmRun r_none, r_ev1, r_ev8;
-    const int event = 11, hops = 3 * NF;
+    static PcmRun r_none, r_ev1, r_evp;
+    const int event = 2 * NF + 1, hops = 24;
 
-    sched_clear(&none, "pin_none", 3);
-    sched_clear(&ev, "pin_event", 3);
+    sched_clear(&none, "pin_none", hops);
+    sched_clear(&ev, "pin_event", hops);
     ev.ev[event].changed = 1;
     run_pcm(&none, 1, 0, &r_none);
     run_pcm(&ev, 1, 0, &r_ev1);
-    run_pcm(&ev, NF, 0, &r_ev8);
+    run_pcm(&ev, NF, 0, &r_evp);
 
     CHECK(hop_energy(r_none.pcm, event) > 1000000, "control: the event-free stream is silent at hop %d (%lld)", event, hop_energy(r_none.pcm, event));
-    CHECK(hop_energy(r_ev1.pcm, event) > 1000000 && hop_energy(r_ev8.pcm, event) > 1000000,
-          "the event hop is silent: N=1 %lld N=8 %lld", hop_energy(r_ev1.pcm, event), hop_energy(r_ev8.pcm, event));
+    CHECK(hop_energy(r_ev1.pcm, event) > 1000000 && hop_energy(r_evp.pcm, event) > 1000000,
+          "the event hop is silent: N=1 %lld N=4 %lld", hop_energy(r_ev1.pcm, event), hop_energy(r_evp.pcm, event));
     CHECK(hop_energy(r_ev1.pcm, event - 1) > 1000000 && hop_energy(r_ev1.pcm, event + 1) > 1000000,
           "the hops around the event are silent: %lld / %lld", hop_energy(r_ev1.pcm, event - 1), hop_energy(r_ev1.pcm, event + 1));
     CHECK(memcmp(r_ev1.pcm, r_none.pcm, sizeof(int16_t) * (size_t)event * HOP) == 0, "hops before the event differ from the event-free stream");
@@ -651,15 +654,15 @@ static int section_event_hop_pin(void) {
           "the event hop equals the event-free stream (the event had no effect)");
     CHECK(memcmp(r_ev1.pcm + (event + 1) * HOP, r_none.pcm + (event + 1) * HOP, sizeof(int16_t) * HOP) != 0,
           "the hop after the event equals the event-free stream (the model was not restarted)");
-    CHECK(memcmp(r_ev1.pcm, r_ev8.pcm, sizeof(int16_t) * (size_t)hops * HOP) == 0, "PCM at N=8 differs from N=1 through an event");
-    printf("section_event_hop_pin: the event hop carries signal, N=8 == N=1, neighbours carry signal\n");
+    CHECK(memcmp(r_ev1.pcm, r_evp.pcm, sizeof(int16_t) * (size_t)hops * HOP) == 0, "PCM at N=4 differs from N=1 through an event");
+    printf("section_event_hop_pin: the event hop carries signal, N=4 == N=1, neighbours carry signal\n");
     return 0;
 }
 
 /* ---- the generic binding ------------------------------------------------------------------------------------ */
 
-/* StreamWork's views against the exporter's literal shapes (16k/256: 129 bins): four feature signals [1,1,n,129], at
- * N = 8 frame_reset [1,1,1,8] as the fifth and last, one head [1,2,n,129]; at N = 1 nothing past the four. */
+/* StreamWork's views against the exporter's literal shapes (16k/512: 257 bins): four feature signals [1,1,n,257], at
+ * N = 4 frame_reset [1,1,1,4] as the fifth and last, one head [1,2,n,257]; at N = 1 nothing past the four. */
 static void check_work_views(const StreamWork *w, int n, const char *what) {
     const int want_in = n > 1 ? 5 : 4;
     int i;
@@ -667,14 +670,14 @@ static void check_work_views(const StreamWork *w, int n, const char *what) {
           "%s: work counts %d/%d", what, w->input_count, w->output_count);
     for (i = 0; i < 4; ++i)
         CHECK(w->inputs[i].data != NULL && w->inputs[i].b == 1u && w->inputs[i].c == 1u && w->inputs[i].h == (unsigned)n &&
-              w->inputs[i].w == 129u && w->inputs[i].elements == (size_t)n * 129u, "%s: work.inputs[%d] shape", what, i);
+              w->inputs[i].w == 257u && w->inputs[i].elements == (size_t)n * 257u, "%s: work.inputs[%d] shape", what, i);
     if (n > 1)
         CHECK(w->inputs[4].data != NULL && w->inputs[4].b == 1u && w->inputs[4].c == 1u && w->inputs[4].h == 1u &&
               w->inputs[4].w == (unsigned)n && w->inputs[4].elements == (size_t)n, "%s: work.inputs[4] is frame_reset [1,1,1,%d]", what, n);
     else
         CHECK(w->inputs[4].data == NULL && w->inputs[4].elements == 0u && w->inputs[4].w == 0u, "%s: nothing past the 4 signals", what);
     CHECK(w->outputs[0].data != NULL && w->outputs[0].b == 1u && w->outputs[0].c == 2u && w->outputs[0].h == (unsigned)n &&
-          w->outputs[0].w == 129u && w->outputs[0].elements == (size_t)2u * n * 129u, "%s: work.outputs[0] shape", what);
+          w->outputs[0].w == 257u && w->outputs[0].elements == (size_t)2u * n * 257u, "%s: work.outputs[0] shape", what);
 }
 
 static int section_frame_reset_inputs(void) {
@@ -685,12 +688,12 @@ static int section_frame_reset_inputs(void) {
     Accel acc[2];
     int edge[MAX_HOPS], p, k, fam, h;
 
-    sched_clear(&s, "reset_inputs", 3);
+    sched_clear(&s, "reset_inputs", 24);
     s.ev[2].changed = 1; s.ev[8].changed = 1; s.ev[15].changed = 1; s.ev[16].changed = 1;
-    for (h = 20; h < 3 * NF; ++h) s.ev[h].solid = 1;   /* a solid false -> true edge at hop 20 */
+    for (h = 20; h < 24; ++h) s.ev[h].solid = 1;   /* a solid false -> true edge at hop 20 */
     expected_edges(&s, edge);
     if (ctxs_make(&c, NF, 1, 1) != 0) return 1;
-    CHECK(c.ib.graph_path == c.if_.graph_path, "N=8: the two families report one info");
+    CHECK(c.ib.graph_path == c.if_.graph_path, "N=4: the two families report one info");
     accel_init(&acc[0], aiaec_state_generation(c.blk), ACC_MODEL);
     accel_init(&acc[1], aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s.packets; ++p) {
@@ -703,10 +706,10 @@ static int section_frame_reset_inputs(void) {
               "packet %d: preprocess", p);
         for (fam = 0; fam < 2; ++fam) {
             const float *reset = w[fam].inputs[4].data;
-            check_work_views(&w[fam], NF, "N=8");
-            if (p == 0) {   /* the event at hop 2 of packet 0 alone: frame_reset 00100000 */
-                static const float want0[NF] = { 0, 0, 1, 0, 0, 0, 0, 0 };
-                CHECK(memcmp(reset, want0, sizeof(want0)) == 0, "family %d: packet 0 frame_reset is not 00100000", fam);
+            check_work_views(&w[fam], NF, "N=4");
+            if (p == 0) {   /* the event at hop 2 of packet 0 alone: frame_reset 0010 */
+                static const float want0[NF] = { 0, 0, 1, 0 };
+                CHECK(memcmp(reset, want0, sizeof(want0)) == 0, "family %d: packet 0 frame_reset is not 0010", fam);
             }
             for (k = 0; k < NF; ++k)
                 CHECK(reset[k] == (edge[p * NF + k] ? 1.0f : 0.0f), "family %d packet %d: frame_reset[%d] is %g, event %d", fam, p, k,
@@ -738,7 +741,7 @@ static int section_frame_reset_inputs(void) {
               "N=1: postprocess");
     }
     ctxs_free(&c1);
-    printf("section_frame_reset_inputs: work views equal the exporter's shapes in both families, frame_reset is the last signal at N=8 and carries the %d edges\n",
+    printf("section_frame_reset_inputs: work views equal the exporter's shapes in both families, frame_reset is the last signal at N=4 and carries the %d edges\n",
            edge[2] + edge[8] + edge[15] + edge[16] + edge[20]);
     return 0;
 }
@@ -792,15 +795,15 @@ static int section_failure(void) {
     int p, h, m;
     unsigned gen_before, gen_after;
 
-    sched_clear(&s, "failure", 4);
+    sched_clear(&s, "failure", 32);
     s.ev[10].changed = 1;
     /* non-finite mask in every packet: all frames pass through, generation advances once per packet; NaN in the middle
      * of the real plane, +Inf first, -Inf at the last element of the imaginary plane. The same for a finite mask whose
      * enhanced frame overflows, at bin 0 where the error's imaginary part is zero, so exactly one output plane
-     * overflows: frame 5's real plane, then the last frame's imaginary plane; neither is the schedule's event frame. */
+     * overflows: frame 1's real plane, then the last frame's imaginary plane; neither is the schedule's event frame (2). */
     for (m = 0; m < 5; ++m) {
         static const AccMode bad_mode[5] = { ACC_NAN, ACC_INF_FIRST, ACC_NEGINF_LAST, ACC_HUGE_RE_MID, ACC_HUGE_IM_LAST };
-        run_freq_n8(&s, &r, bad_mode[m]);   /* the driver does not look at ai_rc; the library must catch it */
+        run_freq_packet(&s, &r, bad_mode[m]);   /* the driver does not look at ai_rc; the library must catch it */
         for (h = 0; h < s.packets * NF; ++h)
             CHECK(memcmp(r.re + (size_t)h * BINS, g_ere + (size_t)h * BINS, BINS * sizeof(float)) == 0 &&
                   memcmp(r.im + (size_t)h * BINS, g_eim + (size_t)h * BINS, BINS * sizeof(float)) == 0,
@@ -816,16 +819,16 @@ static int section_failure(void) {
     {
         enum { P = 7 };
         static const int status[P] = { 0, 7, 7, 0, STREAM_RUN_NOT_STARTED, STREAM_RUN_NOT_STARTED, 0 };
-        static const unsigned step[P] = { 0u, 1u, 1u, 0u, 1u, 0u, 0u };   /* packet 1 holds the hop-10 event, packet 4 the hop-33 one */
+        static const unsigned step[P] = { 0u, 1u, 1u, 0u, 1u, 0u, 0u };   /* packets 1 and 4 hold an event */
         static float re[NF * BINS], im[NF * BINS], fresh_re[2][NF * BINS], fresh_im[2][NF * BINS];
         unsigned gen_seen[P], want;
         AiaecFreqInput fin;
         StreamWork w;
         int f;
 
-        sched_clear(&s, "failure", P);
-        s.ev[10].changed = 1;
-        s.ev[33].changed = 1;
+        sched_clear(&s, "failure", P * NF);
+        s.ev[NF + 2].changed = 1;
+        s.ev[4 * NF + 1].changed = 1;
         for (f = 0; f < 2; ++f) {
             const int fp = f ? 6 : 3;
             if (ctxs_make(&c, NF, 0, 1) != 0) return 1;
@@ -884,20 +887,20 @@ static int section_gates(void) {
     StreamMemReq rq;
     unsigned int gen0;
 
-    sched_clear(&s, "gates", 1);
+    sched_clear(&s, "gates", NF);
     if (ctxs_make(&c, NF, 1, 0) != 0) return 1;
     gen0 = aiaec_state_generation(c.blk);
 
     block_input(&in, 0, s.ev);
     in.u.align_ulcnet.event_count = 1; in.u.align_ulcnet.events = one;
-    CHECK(aiaec_preprocess(c.blk, &in, &w) == AIAEC_ERR_INPUT_SIZE, "one event for an N=8 block must be refused");
+    CHECK(aiaec_preprocess(c.blk, &in, &w) == AIAEC_ERR_INPUT_SIZE, "one event for an N=4 block must be refused");
     block_input(&in, 0, s.ev);
     in.u.align_ulcnet.events = NULL;
     CHECK(aiaec_preprocess(c.blk, &in, &w) == AIAEC_ERR_NULL, "NULL events");
     CHECK(aiaec_state_generation(c.blk) == gen0, "state advanced after NULL events");
     block_input(&in, 0, s.ev);
     in.samples = HOP;
-    CHECK(aiaec_preprocess(c.blk, &in, &w) == AIAEC_ERR_INPUT_SIZE, "one hop of samples for an N=8 block");
+    CHECK(aiaec_preprocess(c.blk, &in, &w) == AIAEC_ERR_INPUT_SIZE, "one hop of samples for an N=4 block");
     CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_ERR_SEQUENCE, "postprocess without preprocess");
 
     block_input(&in, 0, s.ev);
@@ -915,18 +918,18 @@ static int section_gates(void) {
     CHECK(aiaec_get_mem_size(&n16, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=16 is not in the catalog");
     bad.hop_in = HOP_IN + 1;
     CHECK(aiaec_get_mem_size(&bad, &rq) == AIAEC_ERR_IN_HOP, "hop_in 1025 is refused");
-    {   /* a pool carved for N=1 is too small for N=8 */
-        StreamMemReq r1, r8;
+    {   /* a pool carved for N=1 is too small for N=4 */
+        StreamMemReq r1, rp;
         void *pool;
         AiaecCtx *ctx = NULL;
         AiaecInfo info;
         int rc;
-        CHECK(aiaec_get_mem_size(&n1, &r1) == AIAEC_OK && aiaec_get_mem_size(&bad, &r8) != AIAEC_OK, "n1/n8 sizes");
+        CHECK(aiaec_get_mem_size(&n1, &r1) == AIAEC_OK && aiaec_get_mem_size(&bad, &rp) != AIAEC_OK, "N=1 / bad hop_in sizes");
         bad.hop_in = HOP_IN;
-        CHECK(aiaec_get_mem_size(&bad, &r8) == AIAEC_OK && r8.bytes > r1.bytes, "N=8 pool must be larger than N=1's");
-        pool = alloc_aligned((size_t)r8.bytes);
+        CHECK(aiaec_get_mem_size(&bad, &rp) == AIAEC_OK && rp.bytes > r1.bytes, "N=4 pool must be larger than N=1's");
+        pool = alloc_aligned((size_t)rp.bytes);
         rc = aiaec_init(&bad, pool, (size_t)r1.bytes, &ctx, &info);
-        CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "an N=1 sized pool for N=8, rc=%d", rc);
+        CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "an N=1 sized pool for N=4, rc=%d", rc);
         free(pool);
     }
     ctxs_free(&c);
@@ -939,20 +942,20 @@ static int section_gates(void) {
 static int section_model_io_pin(void) {
     UlcnetGridSpec spec;
     UlcnetGrid grid;
-    UlcnetModelIoDescriptor d1, d8, bad;
-    UlcnetModelIoMemReq m1, m8;
+    UlcnetModelIoDescriptor d1, dp, bad;
+    UlcnetModelIoMemReq m1, mp;
     UlcnetPrepostConfig pc;
-    UlcnetPrepostMemReq q1, q8;
+    UlcnetPrepostMemReq q1, qp;
     int frames;
 
     memset(&spec, 0, sizeof(spec));
-    spec.sample_rate = 16000; spec.n_fft = FFT; spec.delay_depth = 63;
+    spec.sample_rate = 16000; spec.n_fft = FFT; spec.delay_depth = DEPTH;
     CHECK(ulcnet_grid_make(&grid, &spec) == ULCNET_GRID_OK, "grid");
     CHECK(ULCNET_MODEL_IO_LAYOUT_VERSION == 18u && ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION == 19u, "layout numbers");
     CHECK(ulcnet_model_io_descriptor_default(&grid, &d1) == 0 && ulcnet_model_io_descriptor_validate(&grid, &d1) == 0 &&
           ulcnet_model_io_descriptor_frames(&d1) == 1, "layout 18, one frame");
-    CHECK(ulcnet_model_io_descriptor_default_packet(&grid, NF, &d8) == 0 && d8.layout_version == 19u && d8.frames_per_call == NF &&
-          ulcnet_model_io_descriptor_validate(&grid, &d8) == 0 && ulcnet_model_io_descriptor_frames(&d8) == NF, "layout 19, N=8");
+    CHECK(ulcnet_model_io_descriptor_default_packet(&grid, NF, &dp) == 0 && dp.layout_version == 19u && dp.frames_per_call == NF &&
+          ulcnet_model_io_descriptor_validate(&grid, &dp) == 0 && ulcnet_model_io_descriptor_frames(&dp) == NF, "layout 19, N=4");
 
     bad = d1; bad.frames_per_call = 1;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) == 0, "layout 18 with frames_per_call 1");
@@ -960,34 +963,34 @@ static int section_model_io_pin(void) {
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "layout 19 with one frame");
     bad = d1; bad.layout_version = 19u; bad.frames_per_call = 1;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "layout 19 with frames_per_call 1");
-    bad = d8; bad.layout_version = 18u;
-    CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "layout 18 with 8 frames");
-    bad = d8; bad.layout_version = 17u;
+    bad = dp; bad.layout_version = 18u;
+    CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "layout 18 with 4 frames");
+    bad = dp; bad.layout_version = 17u;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "retired layout 17");
-    bad = d8; bad.layout_version = 20u;
+    bad = dp; bad.layout_version = 20u;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "layout 20 was never assigned");
-    bad = d8; bad.frames_per_call = ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL + 1;
+    bad = dp; bad.frames_per_call = ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL + 1;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "more frames than the exporter's maximum");
-    bad = d8; bad.frames_per_call = -8;
+    bad = dp; bad.frames_per_call = -NF;
     CHECK(ulcnet_model_io_descriptor_validate(&grid, &bad) != 0, "negative frames");
     for (frames = -1; frames <= 1; ++frames)
         CHECK(ulcnet_model_io_descriptor_default_packet(&grid, frames, &bad) != 0, "default_packet(%d) must be refused", frames);
     CHECK(ulcnet_model_io_descriptor_default_packet(&grid, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL + 1, &bad) != 0, "default_packet(65)");
     CHECK(ulcnet_model_io_descriptor_default_packet(&grid, ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL, &bad) == 0, "default_packet(64)");
 
-    CHECK(ulcnet_model_io_get_mem_requirements(&d1, &m1) == 0 && ulcnet_model_io_get_mem_requirements(&d8, &m8) == 0 &&
-          m8.bytes > m1.bytes, "the packet pool carries N frames of feature and mask planes");
+    CHECK(ulcnet_model_io_get_mem_requirements(&d1, &m1) == 0 && ulcnet_model_io_get_mem_requirements(&dp, &mp) == 0 &&
+          mp.bytes > m1.bytes, "the packet pool carries N frames of feature and mask planes");
 
     /* the prepost class: the layout follows frames_per_call, and a mismatch is refused before a pool is sized */
     CHECK(ulcnet_prepost_config_defaults(&pc, &grid) == 0 && ulcnet_prepost_get_mem_size(&pc, &q1) == 0 && q1.layout_version == 18u,
           "prepost one frame");
     pc.frames_per_call = NF;
-    CHECK(ulcnet_prepost_get_mem_size(&pc, &q8) == 0 && q8.layout_version == 19u && q8.build_flags_hash != q1.build_flags_hash &&
-          q8.bytes > q1.bytes, "prepost packet");
+    CHECK(ulcnet_prepost_get_mem_size(&pc, &qp) == 0 && qp.layout_version == 19u && qp.build_flags_hash != q1.build_flags_hash &&
+          qp.bytes > q1.bytes, "prepost packet");
     pc.model_layout_version = 18u;
-    CHECK(ulcnet_prepost_get_mem_size(&pc, &q8) != 0, "prepost N=8 with layout 18");
+    CHECK(ulcnet_prepost_get_mem_size(&pc, &qp) != 0, "prepost N=4 with layout 18");
     pc.model_layout_version = 19u;
-    CHECK(ulcnet_prepost_get_mem_size(&pc, &q8) == 0, "prepost N=8 with layout 19");
+    CHECK(ulcnet_prepost_get_mem_size(&pc, &qp) == 0, "prepost N=4 with layout 19");
     pc.frames_per_call = 1;
     CHECK(ulcnet_prepost_get_mem_size(&pc, &q1) != 0, "prepost N=1 with layout 19");
     pc.frames_per_call = -1; pc.model_layout_version = 0u;
@@ -995,28 +998,28 @@ static int section_model_io_pin(void) {
 
     /* the per-frame calls refuse a slot or an event the instance has no room for */
     {
-        UlcnetPrepostConfig c1, c8;
-        UlcnetPrepost *p1, *p8;
-        void *m1p, *m8p;
+        UlcnetPrepostConfig c1, cp;
+        UlcnetPrepost *p1, *pp;
+        void *m1p, *mpp;
         float z[NF * BINS];
         int ev[NF] = { 0 };
         UlcnetModelIoInputs in;
         UlcnetModelIoOutputs out;
         memset(z, 0, sizeof(z));
-        ulcnet_prepost_config_defaults(&c1, &grid); ulcnet_prepost_config_defaults(&c8, &grid); c8.frames_per_call = NF;
-        ulcnet_prepost_get_mem_size(&c1, &q1); ulcnet_prepost_get_mem_size(&c8, &q8);
-        m1p = alloc_aligned((size_t)q1.bytes); m8p = alloc_aligned((size_t)q8.bytes);
-        p1 = ulcnet_prepost_init(m1p, (size_t)q1.bytes, &c1); p8 = ulcnet_prepost_init(m8p, (size_t)q8.bytes, &c8);
-        CHECK(p1 && p8, "prepost init");
-        if (p1 && p8) {
+        ulcnet_prepost_config_defaults(&c1, &grid); ulcnet_prepost_config_defaults(&cp, &grid); cp.frames_per_call = NF;
+        ulcnet_prepost_get_mem_size(&c1, &q1); ulcnet_prepost_get_mem_size(&cp, &qp);
+        m1p = alloc_aligned((size_t)q1.bytes); mpp = alloc_aligned((size_t)qp.bytes);
+        p1 = ulcnet_prepost_init(m1p, (size_t)q1.bytes, &c1); pp = ulcnet_prepost_init(mpp, (size_t)qp.bytes, &cp);
+        CHECK(p1 && pp, "prepost init");
+        if (p1 && pp) {
             int k;
-            CHECK(ulcnet_prepost_pre_frame(p8, NF, z, z, z, z, 0) == -1, "slot N on a packet instance");
+            CHECK(ulcnet_prepost_pre_frame(pp, NF, z, z, z, z, 0) == -1, "slot N on a packet instance");
             CHECK(ulcnet_prepost_pre_frame(p1, 1, z, z, z, z, 0) == -1, "slot 1 on a one-frame instance");
             CHECK(ulcnet_prepost_pre_frame(p1, 0, z, z, z, z, 1) == -1, "event on a one-frame instance");
-            CHECK(ulcnet_prepost_pre_frame(p8, 0, NULL, z, z, z, 0) == -1, "packet frame without a spectrum");
+            CHECK(ulcnet_prepost_pre_frame(pp, 0, NULL, z, z, z, 0) == -1, "packet frame without a spectrum");
             for (k = 0; k < NF; ++k) ev[k] = k == 2;
-            for (k = 0; k < NF; ++k) CHECK(ulcnet_prepost_pre_frame(p8, k, z, z, z, z, ev[k]) == 0, "packet slot %d", k);
-            CHECK(ulcnet_prepost_views(p8, &in, &out) == 0 &&
+            for (k = 0; k < NF; ++k) CHECK(ulcnet_prepost_pre_frame(pp, k, z, z, z, z, ev[k]) == 0, "packet slot %d", k);
+            CHECK(ulcnet_prepost_views(pp, &in, &out) == 0 &&
                   in.frame_reset != NULL && in.frame_reset_elements == NF && in.frame_reset[2] == 1.0f &&
                   in.frame_reset[1] == 0.0f && in.spectrum_bins_elements == (size_t)NF * BINS &&
                   out.spectrum_ri_elements == (size_t)2 * NF * BINS, "packet views");
@@ -1024,7 +1027,7 @@ static int section_model_io_pin(void) {
                   in.frame_reset == NULL && in.frame_reset_elements == 0u && out.spectrum_ri_elements == (size_t)2 * BINS,
                   "one-frame views carry no frame_reset");
         }
-        free(m1p); free(m8p);
+        free(m1p); free(mpp);
     }
     printf("section_model_io_pin: layout 18 <-> one frame, layout 19 <-> 2..%d frames\n", ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL);
     return 0;
@@ -1056,14 +1059,14 @@ static int close_packet(UlcnetModelIoState *io, const int *ev, float *re, float 
  * keeps what the new check cannot see: a NaN mask bin in the event frame and a NaN in the registered state. The overflow
  * also sits alone in frame 0 and in the last bin of each frame (the NEON scan's scalar tail), at both boundaries. */
 static int section_model_io_enhanced_check(void) {
-    enum { EVENT_FRAME = 3, BAD_FRAME = 6 };
+    enum { EVENT_FRAME = 1, BAD_FRAME = 2 };
     static float re[NF * BINS], im[NF * BINS];
     float st[4][8];   /* a registered state; the library knows no shape, only the element counts */
     UlcnetModelIoStateBuffers reg = { st[0], 8u, st[1], 8u, st[2], 8u, st[3], 8u };
     UlcnetGridSpec spec;
     UlcnetGrid grid;
-    UlcnetModelIoDescriptor d8;
-    UlcnetModelIoMemReq m8;
+    UlcnetModelIoDescriptor dp;
+    UlcnetModelIoMemReq mp;
     UlcnetModelIoState *io;
     UlcnetModelIoInputs in;
     UlcnetModelIoOutputs out;
@@ -1075,11 +1078,11 @@ static int section_model_io_enhanced_check(void) {
     enum { PASSES = 5 + NF };   /* 4: frame 0, bin 0; 5 + k: frame k, last bin */
 
     memset(&spec, 0, sizeof(spec));
-    spec.sample_rate = 16000; spec.n_fft = FFT; spec.delay_depth = 63;
-    if (ulcnet_grid_make(&grid, &spec) != ULCNET_GRID_OK || ulcnet_model_io_descriptor_default_packet(&grid, NF, &d8) != 0 ||
-        ulcnet_model_io_get_mem_requirements(&d8, &m8) != 0) { FAIL("enhanced check: model-I/O sizing"); return 1; }
-    pool = alloc_aligned((size_t)m8.bytes);
-    io = ulcnet_model_io_init(pool, (size_t)m8.bytes, &d8, &reg);
+    spec.sample_rate = 16000; spec.n_fft = FFT; spec.delay_depth = DEPTH;
+    if (ulcnet_grid_make(&grid, &spec) != ULCNET_GRID_OK || ulcnet_model_io_descriptor_default_packet(&grid, NF, &dp) != 0 ||
+        ulcnet_model_io_get_mem_requirements(&dp, &mp) != 0) { FAIL("enhanced check: model-I/O sizing"); return 1; }
+    pool = alloc_aligned((size_t)mp.bytes);
+    io = ulcnet_model_io_init(pool, (size_t)mp.bytes, &dp, &reg);
     if (!io) { FAIL("enhanced check: model-I/O init"); free(pool); return 1; }
     ev[EVENT_FRAME] = 1;
     /* the overflow needs a real error part there (the imaginary part of bin 0 and of the last bin is zero) */

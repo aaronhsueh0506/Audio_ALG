@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import AIAEC.training_common as training_common
+from aiaec_shipped_config import config_path, config_paths
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
@@ -72,6 +73,7 @@ def _cfg(text: str) -> configparser.ConfigParser:
 def test_all_trainers_accept_packed_gpu_and_mmap_args(module_name):
     trainer = importlib.import_module(module_name)
     args = trainer.build_parser().parse_args([
+        '--config', 'config_16k_512.ini',
         '--packed-dir', '/datasets/aec-packed', '--gpu', '2', '--mmap',
     ])
     assert args.packed_dir == '/datasets/aec-packed'
@@ -861,9 +863,12 @@ def test_all_trainers_halt_instead_of_clipping_a_nonfinite_norm(source_path):
 
 
 AIAEC_TRAINER_CONFIGS = [
-    pathlib.Path(training_common.__file__).parent / name / 'config.ini'
-    for name in sorted(MODEL_TASKS)
+    path for name in sorted(MODEL_TASKS) for path in config_paths(name)
 ]
+SHIPPED_CONFIG_CASES = [(path.parent.name, path)
+                        for path in AIAEC_TRAINER_CONFIGS]
+SHIPPED_CONFIG_IDS = [f'{name}-{path.stem}'
+                      for name, path in SHIPPED_CONFIG_CASES]
 
 
 @pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
@@ -1037,21 +1042,31 @@ def test_a_configured_weight_decay_is_not_silently_rounded_away():
 
 
 def test_shipped_configs_declare_the_model_specific_training_recipes():
+    # Align-ULCNet: the paper's 4e-3 at 16 kHz / 512 and 48 kHz, half of it at
+    # 16 kHz / 256 (hop 128 doubles the GRU steps per chunk).
     expected = {
-        'Align_ULCNet': ('adam', 'warmup_cosine', 2e-3, 0.0,
-                         16, 50, 0),
-        'Align_CRUSE': ('adam', 'warmup_cosine', 1.5e-4, 5e-6,
-                        16, 50, 0),
-        'DeepVQE_S': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
-                      8, 50, 0),
-        'CAGCRN': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
-                   32, 50, 0),
+        ('Align_ULCNet', 'config_16k_256'): ('adam', 'warmup_cosine', 2e-3,
+                                             0.0, 16, 50, 0),
+        ('Align_ULCNet', 'config_16k_512'): ('adam', 'warmup_cosine', 4e-3,
+                                             0.0, 16, 50, 0),
+        ('Align_ULCNet', 'config_48k'): ('adam', 'warmup_cosine', 4e-3,
+                                         0.0, 16, 50, 0),
+        ('Align_CRUSE', 'config'): ('adam', 'warmup_cosine', 1.5e-4, 5e-6,
+                                    16, 50, 0),
+        ('DeepVQE_S', 'config_16k_256'): ('adamw', 'warmup_cosine', 1.2e-3,
+                                          5e-7, 8, 50, 0),
+        ('DeepVQE_S', 'config_16k_512'): ('adamw', 'warmup_cosine', 1.2e-3,
+                                          5e-7, 8, 50, 0),
+        ('DeepVQE_S', 'config_48k'): ('adamw', 'warmup_cosine', 1.2e-3,
+                                      5e-7, 8, 50, 0),
+        ('CAGCRN', 'config'): ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
+                               32, 50, 0),
     }
     declared = {}
     for path in AIAEC_TRAINER_CONFIGS:
         cfg = configparser.ConfigParser()
         assert cfg.read(path), path
-        declared[path.parent.name] = (
+        declared[(path.parent.name, path.stem)] = (
             cfg.get('training', 'optimizer'),
             cfg.get('training', 'scheduler'),
             cfg.getfloat('training', 'lr'),
@@ -1063,23 +1078,21 @@ def test_shipped_configs_declare_the_model_specific_training_recipes():
     assert declared == expected
 
 
-def test_shipped_loss_and_delay_overrides_are_explicit():
+def test_shipped_loss_settings_are_explicit():
     configs = {}
     for path in AIAEC_TRAINER_CONFIGS:
         cfg = configparser.ConfigParser()
         assert cfg.read(path), path
-        configs[path.parent.name] = cfg
+        configs[(path.parent.name, path.stem)] = cfg
 
-    ulcnet = configs['Align_ULCNet']
-    assert ulcnet.getfloat('model', 'max_delay_seconds') == pytest.approx(0.5)
-
-    for name in ('Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'):
-        cfg = configs[name]
+    for (name, _), cfg in configs.items():
+        if name not in ('Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'):
+            continue
         assert cfg.getfloat('loss', 'compression') == pytest.approx(0.3)
         assert cfg.getfloat('loss', 'complex_weight') == pytest.approx(0.7)
         assert cfg.getboolean('loss', 'stft_consistency')
 
-    cagcrn = configs['CAGCRN']
+    cagcrn = configs[('CAGCRN', 'config')]
     assert cagcrn.getfloat('loss', 'mse_weight') == pytest.approx(1.0)
     assert cagcrn.getfloat('loss', 'si_snr_weight') == pytest.approx(1.0)
     assert cagcrn.getfloat('loss', 'l1_weight') == pytest.approx(1.0)
@@ -1090,7 +1103,7 @@ def test_each_trainer_wires_the_schedule_its_recipe_declares():
     for path in AIAEC_TRAINER_SOURCES:
         source = path.read_text(encoding='utf-8')
         cfg = configparser.ConfigParser()
-        assert cfg.read(path.with_name('config.ini'))
+        assert cfg.read(config_path(path.parent.name))
         assert cfg.get('training', 'scheduler') == 'warmup_cosine'
         assert "if recipe['schedule'] == 'warmup_cosine':" in source
         assert 'make_scheduler(' in source
@@ -1136,7 +1149,7 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
         model_name, monkeypatch, tmp_path):
     """Execute setup using each shipped config; stub only the epoch body."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    config = pathlib.Path(training_common.__file__).parent / model_name / 'config.ini'
+    config = config_path(model_name)
     linear = _linear_for_training_config([config])
 
     class FakePackedDataset:
@@ -1236,9 +1249,10 @@ def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_paths,
     return capture['contract']
 
 
-@pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
+@pytest.mark.parametrize('model_name, shipped', SHIPPED_CONFIG_CASES,
+                         ids=SHIPPED_CONFIG_IDS)
 def test_the_checkpoint_contract_records_the_training_recipe(
-        model_name, monkeypatch, tmp_path):
+        model_name, shipped, monkeypatch, tmp_path):
     """Two runs of one model at different learning rates must not resume into
     each other.
 
@@ -1247,8 +1261,6 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     ``loss_version``) and a checkpoint trained at one LR silently continues
     under another.
     """
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / model_name / 'config.ini')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
 
@@ -1307,8 +1319,7 @@ def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
     ``reduce_on_plateau`` is an optional comparison schedule. PyTorch's
     default ``min_lr`` is 0, so the project floor must stay wired explicitly.
     """
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / 'Align_ULCNet' / 'config.ini')
+    shipped = config_path('Align_ULCNet')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('training', 'scheduler', 'reduce_on_plateau')
@@ -1357,8 +1368,7 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     IDENTICAL contract. Compares real contracts built by the real ``main``, not
     the source text.
     """
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / model_name / 'config.ini')
+    shipped = config_path(model_name)
 
     def contract_for(section=None, key=None, value=None):
         cfg = configparser.ConfigParser()
@@ -1395,8 +1405,7 @@ def test_align_ulcnet_step_schedule_advances_per_batch(
     advances; anything other than one per training batch fails.
     """
     trainer = importlib.import_module('AIAEC.Align_ULCNet.train')
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / 'Align_ULCNet' / 'config.ini')
+    shipped = config_path('Align_ULCNet')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('training', 'scheduler', 'warmup_cosine')
@@ -1486,8 +1495,7 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
     returned.
     """
     trainer = importlib.import_module('AIAEC.Align_ULCNet.train')
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / 'Align_ULCNet' / 'config.ini')
+    shipped = config_path('Align_ULCNet')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('loss', 'stft_consistency', 'true' if enabled else 'false')
@@ -1564,8 +1572,7 @@ def test_other_step_schedules_advance_per_batch(
     one per training batch fails.
     """
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / model_name / 'config.ini')
+    shipped = config_path(model_name)
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('training', 'scheduler', 'warmup_cosine')
@@ -1645,8 +1652,7 @@ def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
     counter, which hands a resume stale patience.
     """
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / model_name / 'config.ini')
+    shipped = config_path(model_name)
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('training', 'max_epochs', '3')

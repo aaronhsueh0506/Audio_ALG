@@ -88,11 +88,11 @@ vs 上游 4800 Hz）</td><td>執行期給定：應用端填 <code>DFN2GridSpec</
 <td>執行期給定：<code>RNNoiseGridSpec</code>→<code>rnnoise_grid_make()</code></td><td><code>lib/ainr/rnnoise_erb/process.h</code></td></tr>
 <tr><td>AIAEC Align-ULCNet</td><td>16 k / 48 k</td>
 <td>256 / 128（129）、512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>UlcnetGridSpec</code>）</td>
-<td><code>config.ini</code>；<code>export_onnx.py</code> 的
+<td><code>config_16k_256.ini</code>／<code>config_16k_512.ini</code>／<code>config_48k.ini</code>；<code>export_onnx.py</code> 的
 <code>SUPPORTED_GRIDS</code></td></tr>
-<tr><td>AIAEC DeepVQE-S</td><td>16 k</td>
-<td>512 / 256（257）、256 / 128（129）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
-<td><code>config.ini</code>；<code>deepvqe_prepost.h</code></td></tr>
+<tr><td>AIAEC DeepVQE-S</td><td>16 k / 48 k</td>
+<td>256 / 128（129）、512 / 256（257）或 1024 / 512（513）</td><td>訓練端 config 固定；C 端執行期給定（<code>DeepVqeGridSpec</code>→<code>deepvqe_grid_make()</code>）</td>
+<td><code>config_16k_256.ini</code>／<code>config_16k_512.ini</code>／<code>config_48k.ini</code>；<code>deepvqe_prepost.h</code></td></tr>
 <tr><td>AIAEC 其餘兩個（CRUSE/CAGCRN）</td><td>16 k</td>
 <td>512 / 256（257）</td><td>config 固定；沒有 C 程式碼，C 端的框架由應用端用 audiolib 自行建立</td>
 <td>各模型的 <code>config.ini</code></td></tr>

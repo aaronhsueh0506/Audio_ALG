@@ -32,6 +32,7 @@ from AIAEC.Align_ULCNet import inference as al_inference
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.aiaec_streaming import StreamISTFT
 from AIAEC.dataset_gen import make_linear_aec_contract
+from aiaec_shipped_config import ctor_contract, shipped_model_kwargs
 
 SR, N_FFT, HOP = 16000, 256, 128
 GRID = SignalGrid(SR, N_FFT, N_FFT, HOP)
@@ -83,7 +84,7 @@ STREAMS = {
 @pytest.fixture(scope='module')
 def model():
     torch.manual_seed(1)
-    return AlignULCNet(GRID, max_delay_seconds=0.5).eval()
+    return AlignULCNet(GRID, **shipped_model_kwargs('Align_ULCNet', AlignULCNet)).eval()
 
 
 @pytest.fixture(scope='module')
@@ -95,7 +96,7 @@ def checkpoint(model, tmp_path_factory):
         'n_fft': N_FFT, 'win_len': N_FFT, 'hop_len': HOP,
         'loss_version': 'test', 'linear_aec': linear.as_dict(),
         'linear_aec_contract_hash': linear.fingerprint(),
-        'ctor_max_delay_seconds': 0.5,
+        **ctor_contract('Align_ULCNet', AlignULCNet),
     }
     path = work / 'al256.pth'
     torch.save({'contract': contract, 'state_dict': model.state_dict()}, path)

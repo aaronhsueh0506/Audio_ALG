@@ -8,7 +8,13 @@ After a failed job the current spectral contribution is zero. Output PCM can sti
 
 The supplied config uses AdamW, peak LR `1.2e-3`, weight decay `5e-7`, batch 8 and 50 epochs. It uses the STFT-consistent PLCPA objective. The three-epoch warm-up and per-step cosine schedule end at `1e-6`. [Training and dataset](../reference/training.md)
 
-`config.ini` ships the hop-128 values and `baseline.ini` / `ref_512.ini` overlay the default recipe and the 512/256 reference ([config overlays and grid options](../reference/training.md)).
+The model ships one self-contained config per board grid: `config_16k_256.ini`, `config_16k_512.ini` and `config_48k.ini`. `--config` is required, so a grid is always chosen; each file carries its own `[signal]`, `packed_dir` and `output_dir` ([per-grid configs and grid options](../reference/training.md)):
+
+```bash
+python3 train.py --config config_16k_512.ini --packed-dir /path/to/packed/all --gpu 0 --mmap
+```
+
+The 16 kHz / FFT 256 board row (`stream/aiaec/graph_io_deepvqes.h`, N = 1 only) takes the `config_16k_256.ini` model (`similarity_channels` 8, `score_kernel` 9,5, `gru_hidden` 256: `align_key_ring` `[1,8,63,33]`, `align_score_history` `[1,8,9,63]`, `h_gru` `[1,1,1,256]`); the 16 kHz / FFT 512 and 48 kHz rows take the constructor defaults of `config_16k_512.ini` and `config_48k.ini` (D = 32 and 47). A FFT 256 graph trained with the constructor defaults does not match its row and is refused by the sample's port check.
 
 ## ONNX and calibration
 
@@ -28,14 +34,15 @@ streaming invocation. The `mic`/`far` tensors it records are the host-compressed
 planar spectra the graph binds (layout version 4).
 
 For a graph that runs N frames per call, add `--frames-per-call N` (board
-blocks of 1024 samples: N = 8 at 16 kHz / FFT 256, N = 2 at 48 kHz / FFT 1024).
-The graph and every recorded tensor then carry N frames, and `--frames` counts
-calls, so 1024 calls of 8 frames record 8192 frames, as many as above:
+blocks of 1024 samples: N = 4 at 16 kHz / FFT 512, N = 2 at 48 kHz / FFT 1024;
+16 kHz / FFT 256 is registered at N = 1 only). The graph and every recorded
+tensor then carry N frames, and `--frames` counts calls, so 2048 calls of 4
+frames record 8192 frames, as many as above:
 
 ```bash
 python3 inference.py calib --checkpoint checkpoint.pth \
   --primary-dir /path/to/microphone --far-dir /path/to/far \
-  --frames 1024 --frames-per-call 8 --format bin --output calib/deepvqe_s_n8
+  --frames 2048 --frames-per-call 4 --format bin --output calib/deepvqe_s_n4
 ```
 
 ## Graph port order

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """DeepVQE-S training -- primary end-to-end AEC + RES + NR (+ dereverb).
 
-用法:
-    python3 train.py --config config.ini --packed-dir data_aec_16k/packed/all --gpu 0 --mmap
-    python3 train.py --config config.ini --device cpu
-    python3 train.py --config config.ini --resume output/deepvqe_s_e5.pth
-    python3 train.py --config config.ini --resume output/deepvqe_s_e5.pth --reset-optimizer
-    python3 train.py --config config.ini --seed 123
-    python3 train.py --config config.ini baseline.ini              # default recipe
-    python3 train.py --config config.ini baseline.ini ref_512.ini  # 512/256 reference
+用法 (--config 必填，每個板端 grid 一份自足的 config: config_16k_256.ini / config_16k_512.ini / config_48k.ini):
+    python3 train.py --config config_16k_512.ini --packed-dir data_aec_16k/packed/all --gpu 0 --mmap
+    python3 train.py --config config_16k_512.ini --device cpu
+    python3 train.py --config config_16k_512.ini --resume output_16k_512/deepvqe_s_e5.pth
+    python3 train.py --config config_16k_512.ini --resume output_16k_512/deepvqe_s_e5.pth --reset-optimizer
+    python3 train.py --config config_16k_512.ini --seed 123
 
-config.ini sections (see the shipped config.ini for every knob, documented):
+config_<grid>.ini sections (see a shipped config for every knob, documented):
     [signal]   sample rate + FFT grid. MUST equal the grid the packed corpus
                was rendered with (AIAEC/dataset_gen/config.ini's [signal]);
                AecGrid/SignalGrid do not re-derive it from the data.
@@ -103,7 +101,8 @@ LOSS_VERSION = 'deepvqe_s_plcpa_c03_beta07_consistent_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
-    return build_arg_parser('Train DeepVQE-S (end-to-end AEC+RES+NR, dereverb target)')
+    return build_arg_parser('Train DeepVQE-S (end-to-end AEC+RES+NR, dereverb target)',
+                            default_config=None)
 
 
 def forward_batch(model, stems_batch, aec_grid, device):

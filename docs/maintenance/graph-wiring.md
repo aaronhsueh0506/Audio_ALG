@@ -18,7 +18,7 @@
 
 `ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。
 
-接線表的列與 AIAEC 正式目錄（`aiaec.c`）的組態一致：兩個模型各有 16 kHz／fft 256 的 N=1 與 N=8、16 kHz／fft 512 的 N=1、48 kHz／fft 1024 的 N=1 與 N=2，每列都帶 graph 路徑（同一個模型的所有列共用一個路徑：卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑，sample 在開圖後以 `graph_io_check_ports()` 拒絕其他組態）。表外的 N（例如 16k／512 的 N=8）沒有列，正式建置在 init 就拒絕。測試目錄（`-DAIAEC_TEST_CATALOG`）與正式目錄的列集合相同，只有路徑是佔位字串，見 `stream/aiaec/tests/test_aiaec_graph_io.c`。
+接線表的列與 AIAEC 正式目錄（`aiaec.c`）的組態一致：兩個模型各有 16 kHz／fft 256 的 N=1、16 kHz／fft 512 的 N=1 與 N=4、48 kHz／fft 1024 的 N=1 與 N=2，每列都帶 graph 路徑（同一個模型的所有列共用一個路徑：卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑，sample 在開圖後以 `graph_io_check_ports()` 拒絕其他組態）。表外的 N（例如 16k／256 的 N=8、16k／512 的 N=8）沒有列，正式建置在 init 就拒絕。板端一次 1024 點的錄音在 16 kHz 用 fft 512 的 N=4（`--hop-in 1024`）；fft 256 只有 N=1。每列依各模型同 grid 的訓練設定檔：16 kHz／fft 256 依 `config_16k_256.ini`（DeepVQE-S：`align_key_ring` `[1,8,63,33]`、`align_score_history` `[1,8,9,63]`、`h_gru` `[1,1,1,256]`；Align-ULCNet：logit window 9）；16 kHz／fft 512 與 48 kHz 依 `config_16k_512.ini`／`config_48k.ini`，其 `[model]` 即建構子預設（DeepVQE-S sim 4、score window 5、GRU 192；Align-ULCNet logit window 5）。Align-ULCNet 的 window 是 `GraphIoAlignulcnetGrid.score_window`，匯出器以 `SCORE_WINDOW_BY_GRID`（`AIAEC/Align_ULCNet/export_onnx.py`）拒絕 window 不符的 checkpoint。測試目錄（`-DAIAEC_TEST_CATALOG`）接受的組態與正式目錄相同，只有路徑是佔位字串，見 `stream/aiaec/tests/test_aiaec_graph_io.c`；它另列一個沒有路徑的 16 kHz／256 N=8，讓「列出但沒有 graph」的拒絕（`AIAEC_ERR_FRAMES_PER_CALL`）也有測試。
 
 ## 規則
 
@@ -35,7 +35,7 @@
 | Align-ULCNet N=1（layout 18） | 4（`error_mag`、`far_mag`、`error_cos`、`error_sin`） | 1（`output`） | 8 ／ 5 | 4 |
 | Align-ULCNet N>1（layout 19） | 5（上列加最後一個 `frame_reset`，`[1, 1, 1, N]`） | 1 | 9 ／ 5 | 4 |
 
-Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個 `frame_reset`，由 stream 依逐 hop 事件填進 `StreamWork.inputs`，sample 把它當一般的第五個訊號輸入搬運，沒有特例。N=1 維持 layout 18，圖裡沒有 `frame_reset`，事件 hop 是 BYPASS 區塊。包內第 3 個 hop 有事件時 `frame_reset` 為 `00100000`。
+Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個 `frame_reset`，由 stream 依逐 hop 事件填進 `StreamWork.inputs`，sample 把它當一般的第五個訊號輸入搬運，沒有特例。N=1 維持 layout 18，圖裡沒有 `frame_reset`，事件 hop 是 BYPASS 區塊。16 kHz／512 的 N=4 包內第 3 個 hop 有事件時 `frame_reset` 為 `0010`。
 
 ## Float I/O 模式（FLOAT_IN／FLOAT_OUT）
 
@@ -84,8 +84,8 @@ make -C stream/ainr MASK_ONLY=1 test-ainr-graph-io
 make -C stream/aiaec test-aiaec-graph-io
 ```
 
-- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `StreamWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 與 Align-ULCNet 各 16k/256 N=1、N=8、16k/512 N=1、48k/1024 N=1、N=2）。另固定 N=8 第 3 個 hop 事件的 `frame_reset` 為 `00100000`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
-  （二）另用 `make -C stream/aiaec graph-io-dumper`（環境變數 `AIAEC_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_deepvqes.h`／`graph_io_alignulcnet.h` 的每一列，逐列比對全新匯出的圖：layout 版本、訊號／head／輸入／輸出的數量、每個輸入輸出的 shape、state 名稱與順序、輸出名稱 `<輸入>_out`、state 兩端同 shape，以及 Align-ULCNet N>1 的 `frame_reset` 為最後一個訊號；列集合必須恰為匯出的六個案例。
+- `test_aiaec_bind_info_pin.py`（一）用 `make -C stream/aiaec bind-dumpers` 建的傾印程式（真的 `aiaec_init` 與 `aiaec_preprocess*`，兩個家族各一次），把 `StreamWork` 的訊號與 head（數量、形狀、元素數）依位置比對隨機權重匯出圖的訊號輸入與 head 輸出，並檢查匯出圖的名稱順序與 state 兩端同形狀（DeepVQE-S 與 Align-ULCNet 各 16k/256 N=1、16k/512 N=1、N=4、48k/1024 N=1、N=2）。另固定 16k/512 N=4 第 3 個 hop 事件的 `frame_reset` 為 `0010`、16k/256 N=8 回 `AIAEC_ERR_FRAMES_PER_CALL`，與 N=1 事件 hop 為沒有任何 tensor 的 BYPASS。傾印程式不印 state，因為函式庫沒有 state 的資料。
+  （二）另用 `make -C stream/aiaec graph-io-dumper`（環境變數 `AIAEC_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_deepvqes.h`／`graph_io_alignulcnet.h` 的每一列，逐列比對全新匯出的圖：layout 版本、訊號／head／輸入／輸出的數量、每個輸入輸出的 shape、state 名稱與順序、輸出名稱 `<輸入>_out`、state 兩端同 shape，以及 Align-ULCNet N>1 的 `frame_reset` 為最後一個訊號；列集合必須恰為匯出的十個案例。每列的模型用同 grid 設定檔（`config_16k_256.ini`、`config_16k_512.ini`、`config_48k.ini`）的 `[model]`（`training_common.read_model_kwargs`）建立；`test_the_exporter_score_window_table_is_the_c_rows` 另核對 Align-ULCNet 每列的 logit window 等於匯出器 `SCORE_WINDOW_BY_GRID` 的同 grid 值。
 - `test_dfn2_port_order.py` 對 DFN2 full 與 lite、N=1 與 8 的匯出圖做名稱順序與 state 形狀檢查，並用 `make -C stream/ainr [MASK_ONLY=1] work-dumper` 建的傾印程式，把四個登錄列（full 16 kHz/256 的 N=1 與 8、full 與 lite 48 kHz/1024 的 N=1）的 `StreamWork` 對匯出圖的訊號輸入與 head 輸出，另驗拒絕的組態回傳碼。它也用 `make -C stream/ainr graph-io-dumper`（`AINR_GRAPH_IO_DUMPER` 可改指別的建置）傾印 `graph_io_dfn2.h` 的每一列，逐列比對全新匯出的圖（`test_sample_row_equals_a_fresh_export`，項目同上），列集合必須恰為登錄的四列。
 - `test-ainr-graph-io` 另驗每個家族的第二個 block 與第一個同形狀，以及 `ainr_get_mem_size()` 的每個拒絕碼由三個 init 家族原樣回傳（`*ctx` 為 NULL、`*info` 不動）。
 - `stream/common` 的 `test_stream_bind` 涵蓋 `stream_check_ports()` 的每條拒絕規則（含定點 state 埠兩端 `zero_point` 必須為 0）；`test_stream_mem` 涵蓋 `StreamMemReq` 與 pool 工具。

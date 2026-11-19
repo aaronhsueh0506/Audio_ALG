@@ -1,7 +1,7 @@
-"""Align-ULCNet N=8 packet graph through the C stream, ONNX Runtime as the accelerator.
+"""Align-ULCNet 16 kHz / FFT 512 N=4 packet graph through the C stream, ONNX Runtime as the accelerator.
 
 The C side (stream/aiaec/aiaec.c, the _freq family, built into a small binary driver by
-``make -C stream/aiaec packet-driver`` with the test catalog) frames a packet of 8 hops: features, the
+``make -C stream/aiaec packet-driver`` with the test catalog) frames a packet of 4 hops: features, the
 frame_reset control, one job, the host back end, the error spectrum for event hops. Between its preprocess and
 postprocess requests this test runs the exported layout-19 graph (random weights, tiny) in ONNX Runtime and hands
 the output mask back, exactly as a board sample would with its accelerator run. The packet is compared, frame by frame, with
@@ -11,10 +11,12 @@ the output mask back, exactly as a board sample would with its accelerator run. 
   (b) the C N=1 stream (ONNX Runtime running the layout-18 graph) applying the same events -- the stream
       whose event handling this packet path must equal.
 
-Event streams: none, frame 1, frame 3, frame 8, two in one packet, adjacent, one in every packet, every frame, a
-solid false -> true edge on frame 2, and a solid edge whose previous hop is the last hop of the previous packet.
-It also counts accelerator calls (exactly one per packet at N=8) and checks that the state generation, which makes
-a board sample reload its state, never changes for an event at N=8.
+Event streams: none, frame 1, frame 3, the last frame, two in one packet, adjacent, one in every packet, every frame,
+a solid false -> true edge on frame 2, and a solid edge whose previous hop is the last hop of the previous packet.
+It also counts accelerator calls (exactly one per packet at N=4) and checks that the state generation, which makes
+a board sample reload its state, never changes for an event at N=4. The model is the config_16k_512.ini model
+(D = 32), as the 16 kHz / FFT 512 graph rows are. The 16 kHz / FFT 256 grid, registered at
+N=1 only, runs its layout-18 graph (the config_16k_256.ini model) through the C N=1 stream against the same Python reference.
 """
 
 import contextlib
@@ -33,18 +35,19 @@ from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.Align_ULCNet import export_onnx as ex
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import make_linear_aec_contract
+from aiaec_shipped_config import ctor_contract, shipped_model_kwargs
 
 REPO = Path(__file__).resolve().parents[2]
 STREAM_AIAEC = REPO / 'stream' / 'aiaec'
 
-SR, N_FFT, HOP = 16000, 256, 128
+SR, N_FFT, HOP = 16000, 512, 256
 GRID = SignalGrid(SR, N_FFT, N_FFT, HOP)
 F = GRID.n_freqs
-PACKETS = 3
-NF = 8
+PACKETS = 6
+NF = 4
 
 # Measured on random weights (print lines of -s): C against the Python reference differs by about 1e-6 of the
-# largest value (float32 rounding of two independent front/back ends), C N=8 against C N=1 by 0 (the two graphs run
+# largest value (float32 rounding of two independent front/back ends), C N=4 against C N=1 by 0 (the two graphs run
 # the same arithmetic in ONNX Runtime). The bounds leave a margin for another runtime and still catch a wrong frame,
 # a wrong event or a swapped plane, which move values by O(1).
 TOL_PYTHON = 1e-4
@@ -71,8 +74,8 @@ class Driver:
     def _int(self):
         return struct.unpack('<i', self._read(4))[0]
 
-    def open(self, n):
-        self._send(struct.pack('<ii', 1, n))
+    def open(self, n, fft=N_FFT):
+        self._send(struct.pack('<iii', 1, n, fft))
         rc, generation, slot = self._int(), self._int(), self._int()
         assert rc == 0 and slot >= 0, 'open N=%d: rc=%d' % (n, rc)
         return slot, generation
@@ -91,13 +94,13 @@ class Driver:
         out_elements = self._int()
         return rc, action, work_gen, live_gen, tensors, out_elements
 
-    def post(self, slot, n, status, mask):
-        """mask: the accelerator's output [1, 2, n, F] as flat float32, or None for a bypass block."""
+    def post(self, slot, n, status, mask, bins=F):
+        """mask: the accelerator's output [1, 2, n, bins] as flat float32, or None for a bypass block."""
         flat = b'' if mask is None else np.ascontiguousarray(mask, dtype='<f4').tobytes()
         self._send(struct.pack('<iiii', 3, slot, status, 0 if mask is None else mask.size), flat)
         rc, live_gen = self._int(), self._int()
-        re = np.frombuffer(self._read(4 * n * F), dtype='<f4').copy().reshape(n, F)
-        im = np.frombuffer(self._read(4 * n * F), dtype='<f4').copy().reshape(n, F)
+        re = np.frombuffer(self._read(4 * n * bins), dtype='<f4').copy().reshape(n, bins)
+        im = np.frombuffer(self._read(4 * n * bins), dtype='<f4').copy().reshape(n, bins)
         return rc, live_gen, re + 1j * im
 
     def close(self):
@@ -134,22 +137,23 @@ def driver(driver_path):
 @pytest.fixture(scope='module')
 def model():
     torch.manual_seed(1)
-    return AlignULCNet(GRID, max_delay_seconds=0.5).eval()
+    return AlignULCNet(GRID, **shipped_model_kwargs(
+        'Align_ULCNet', AlignULCNet, (SR, N_FFT))).eval()
 
 
 @pytest.fixture(scope='module')
 def sessions(model, tmp_path_factory):
     ort = pytest.importorskip('onnxruntime')
-    work = tmp_path_factory.mktemp('al256_ort')
+    work = tmp_path_factory.mktemp('al512_ort')
     linear = make_linear_aec_contract(SR, frame_size=N_FFT)
     contract = {
         'model_name': 'Align_ULCNet', 'task': AlignULCNet.task, 'sr': SR,
         'n_fft': N_FFT, 'win_len': N_FFT, 'hop_len': HOP,
         'loss_version': 'test', 'linear_aec': linear.as_dict(),
         'linear_aec_contract_hash': linear.fingerprint(),
-        'ctor_max_delay_seconds': 0.5,
+        **ctor_contract('Align_ULCNet', AlignULCNet, (SR, N_FFT)),
     }
-    checkpoint = work / 'al256.pth'
+    checkpoint = work / 'al512.pth'
     torch.save({'contract': contract, 'state_dict': model.state_dict()}, checkpoint)
     result = {}
     for n in (1, NF):
@@ -178,13 +182,13 @@ EVENT_STREAMS = {
     'none': _changed(),
     'frame1': _changed(0),
     'frame3': _changed(2),
-    'frame8': _changed(7),
-    'two_in_one_packet': _changed(2, 5),
+    'last_frame': _changed(NF - 1),
+    'two_in_one_packet': _changed(1, 3),
     'adjacent': _changed(1, 2),
-    'every_packet': _changed(2, 8, 15, 19),
+    'every_packet': _changed(2, 4, 11, 13, 19, 22),   # one in each of the six packets
     'all_frames': _changed(*range(NF)),
-    'solid_edge_frame2': _solid_from(9),
-    'solid_edge_across_packets': _solid_from(8),   # hop 7 (last of packet 0) not solid, hop 8 (first of packet 1) is
+    'solid_edge_frame2': _solid_from(NF + 1),          # frame 2 of packet 1
+    'solid_edge_across_packets': _solid_from(NF),      # hop 3 (last of packet 0) not solid, hop 4 (first of packet 1) is
 }
 
 
@@ -197,8 +201,8 @@ def edge_rule(changed, solid):
     return edges
 
 
-def _complex(generator, frames):
-    shape = (frames, F)
+def _complex(generator, frames, bins=F):
+    shape = (frames, bins)
     return torch.complex(0.5 * torch.randn(shape, generator=generator),
                          0.5 * torch.randn(shape, generator=generator))
 
@@ -206,38 +210,41 @@ def _complex(generator, frames):
 def _zero_state(model):
     wrapper = ex.AlignUlcnetStreamingExport(model)
     return tuple(t.numpy().copy() for t in
-                 ex.dummy_inputs(wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)[ex.SIGNAL_INPUTS:])
+                 ex.dummy_inputs(wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins,
+                                 wrapper.score_window)[ex.SIGNAL_INPUTS:])
 
 
 def python_sequential(model, error_c, far_c, edges, state):
     """The Python N=1 stream applying reset + bypass at the edge hops (state: numpy tuple)."""
     wrapper = ex.AlignUlcnetStreamingExport(model).eval()
     state = tuple(torch.from_numpy(s) for s in state)
+    bins = error_c.shape[-1]
     enhanced = []
     for index in range(error_c.shape[0]):
         *signals, compressed = ex.stream_features(
-            model, torch.view_as_real(error_c[index].reshape(1, 1, F)),
-            torch.view_as_real(far_c[index].reshape(1, 1, F)))
+            model, torch.view_as_real(error_c[index].reshape(1, 1, bins)),
+            torch.view_as_real(far_c[index].reshape(1, 1, bins)))
         if edges[index]:
             state = tuple(torch.zeros_like(v) for v in state)
-            enhanced.append(error_c[index].reshape(1, F))
+            enhanced.append(error_c[index].reshape(1, bins))
         else:
             with torch.no_grad():
                 outputs = wrapper(*signals, *state)
             mask, state = outputs[0], ex.next_state(outputs)
             enhanced.append(torch.view_as_complex(
-                ex.host_back_end(model, compressed, mask).contiguous()).reshape(1, F))
+                ex.host_back_end(model, compressed, mask).contiguous()).reshape(1, bins))
     return torch.cat(enhanced, dim=0).numpy(), tuple(v.numpy() for v in state)
 
 
 # ---- the C streams around ONNX Runtime --------------------------------------------------------------------------
 
 class CStream:
-    """One C _freq context (N = 1 or 8) with its ONNX Runtime accelerator and the accelerator's own state."""
+    """One C _freq context (N = 1 or 4) with its ONNX Runtime accelerator and the accelerator's own state."""
 
-    def __init__(self, driver, session, model, n):
+    def __init__(self, driver, session, model, n, fft=N_FFT):
         self.driver, self.session, self.n = driver, session, n
-        self.slot, self.live_gen = driver.open(n)
+        self.bins = fft // 2 + 1
+        self.slot, self.live_gen = driver.open(n, fft)
         self.state = _zero_state(model)
         self.model = model
         self.calls = 0
@@ -256,19 +263,19 @@ class CStream:
         mask = None
         if action == 1:
             n_signal = len(tensors)
-            assert n_signal == (5 if self.n > 1 else 4) and out_elements == 2 * self.n * F
+            assert n_signal == (5 if self.n > 1 else 4) and out_elements == 2 * self.n * self.bins
             feed = {}
             for name, tensor in zip(self.names[:n_signal], tensors):
-                feed[name] = tensor.reshape(1, self.n, F) if name != 'frame_reset' else tensor.reshape(1, self.n)
+                feed[name] = tensor.reshape(1, self.n, self.bins) if name != 'frame_reset' else tensor.reshape(1, self.n)
             if self.n == 1:
-                feed = {k: v.reshape(1, 1, F) for k, v in feed.items()}
+                feed = {k: v.reshape(1, 1, self.bins) for k, v in feed.items()}
             for name, value in zip(self.names[n_signal:], self.state):
                 feed[name] = value
             outputs = self.session.run(None, feed)
             self.calls += 1
             mask = outputs[0].reshape(-1)
             self.state = tuple(outputs[1:])
-        rc, live_gen, enhanced = self.driver.post(self.slot, self.n, 0, mask)
+        rc, live_gen, enhanced = self.driver.post(self.slot, self.n, 0, mask, self.bins)
         assert rc == 0, 'postprocess rc=%d' % rc
         assert live_gen == self.live_gen or self.n == 1, 'generation moved in postprocess'
         return enhanced
@@ -280,49 +287,100 @@ def _run_scenario(driver, model, sessions, name):
     generator = torch.Generator().manual_seed(21)
     packets = [(_complex(generator, NF), _complex(generator, NF)) for _ in range(PACKETS)]
 
-    c8 = CStream(driver, sessions[NF], model, NF)
+    cp = CStream(driver, sessions[NF], model, NF)
     c1 = CStream(driver, sessions[1], model, 1)
     py_state = _zero_state(model)
     worst = {'py': 0.0, 'n1': 0.0, 'state_py': 0.0, 'state_n1': 0.0, 'event': 0.0}
     for p, (err, far) in enumerate(packets):
         sl = slice(p * NF, (p + 1) * NF)
-        got8 = c8.run(err, far, changed[sl], solid[sl])
+        gotp = cp.run(err, far, changed[sl], solid[sl])
         got1 = np.concatenate([c1.run(err[k:k + 1], far[k:k + 1], changed[p * NF + k:p * NF + k + 1],
                                       solid[p * NF + k:p * NF + k + 1]) for k in range(NF)], axis=0)
         want, py_state = python_sequential(model, err, far, edges[sl], py_state)
         scale = max(np.abs(want).max(), 1e-6)
-        worst['py'] = max(worst['py'], np.abs(got8 - want).max() / scale)
-        worst['n1'] = max(worst['n1'], np.abs(got8 - got1).max() / scale)
+        worst['py'] = max(worst['py'], np.abs(gotp - want).max() / scale)
+        worst['n1'] = max(worst['n1'], np.abs(gotp - got1).max() / scale)
         worst['state_py'] = max(worst['state_py'], max(
-            np.abs(a - b).max() for a, b in zip(c8.state, py_state)))
+            np.abs(a - b).max() for a, b in zip(cp.state, py_state)))
         worst['state_n1'] = max(worst['state_n1'], max(
-            np.abs(a - b).max() for a, b in zip(c8.state, c1.state)))
+            np.abs(a - b).max() for a, b in zip(cp.state, c1.state)))
         for k in range(NF):                                 # event hops are the error spectrum, bit for bit
             if edges[p * NF + k]:
-                assert np.array_equal(got8[k], err[k].numpy()), 'N=8 event hop %d.%d is not the error spectrum' % (p, k)
+                assert np.array_equal(gotp[k], err[k].numpy()), 'N=4 event hop %d.%d is not the error spectrum' % (p, k)
                 assert np.array_equal(got1[k], err[k].numpy()), 'N=1 event hop %d.%d is not the error spectrum' % (p, k)
             else:
-                assert not np.array_equal(got8[k], err[k].numpy()), 'N=8 hop %d.%d was not enhanced' % (p, k)
-    return c8, c1, edges, worst
+                assert not np.array_equal(gotp[k], err[k].numpy()), 'N=4 hop %d.%d was not enhanced' % (p, k)
+    return cp, c1, edges, worst
 
 
 @pytest.mark.parametrize('name', sorted(EVENT_STREAMS))
 def test_packet_stream_equals_python_sequential_and_the_c_n1_stream(driver, model, sessions, name):
-    c8, c1, edges, worst = _run_scenario(driver, model, sessions, name)
-    print('%s: events %d, N=8 calls %d (N=1 calls %d); max rel |C N=8 - python| %.3g, |C N=8 - C N=1| %.3g, '
+    cp, c1, edges, worst = _run_scenario(driver, model, sessions, name)
+    print('%s: events %d, N=4 calls %d (N=1 calls %d); max rel |C N=4 - python| %.3g, |C N=4 - C N=1| %.3g, '
           'state vs python %.3g, vs N=1 %.3g'
-          % (name, sum(edges), c8.calls, c1.calls, worst['py'], worst['n1'], worst['state_py'], worst['state_n1']))
-    assert c8.calls == PACKETS, 'exactly one accelerator call per packet'
+          % (name, sum(edges), cp.calls, c1.calls, worst['py'], worst['n1'], worst['state_py'], worst['state_n1']))
+    assert cp.calls == PACKETS, 'exactly one accelerator call per packet'
     assert c1.calls == PACKETS * NF - sum(edges)
-    assert len(c8.generations) == 1, \
-        'an event at N=8 must not change the state generation (a board sample would reload its state): %s' % c8.generations
+    assert len(cp.generations) == 1, \
+        'an event at N=4 must not change the state generation (a board sample would reload its state): %s' % cp.generations
     assert worst['py'] < TOL_PYTHON and worst['n1'] < TOL_N1_GRAPH
     assert worst['state_py'] < TOL_STATE and worst['state_n1'] < TOL_STATE
 
 
+SHIPPED_SR, SHIPPED_FFT = 16000, 256
+
+
+@pytest.fixture(scope='module')
+def shipped_one_frame(tmp_path_factory):
+    """The config_16k_256.ini model at 16 kHz / FFT 256 and its layout-18 graph in ONNX Runtime."""
+    ort = pytest.importorskip('onnxruntime')
+    work = tmp_path_factory.mktemp('al256_ort')
+    grid = SignalGrid(SHIPPED_SR, SHIPPED_FFT, SHIPPED_FFT, SHIPPED_FFT // 2)
+    torch.manual_seed(1)
+    model = AlignULCNet(grid, **shipped_model_kwargs('Align_ULCNet', AlignULCNet)).eval()
+    linear = make_linear_aec_contract(SHIPPED_SR, frame_size=SHIPPED_FFT)
+    contract = {
+        'model_name': 'Align_ULCNet', 'task': AlignULCNet.task, 'sr': SHIPPED_SR,
+        'n_fft': SHIPPED_FFT, 'win_len': SHIPPED_FFT, 'hop_len': SHIPPED_FFT // 2,
+        'loss_version': 'test', 'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+        **ctor_contract('Align_ULCNet', AlignULCNet),
+    }
+    checkpoint = work / 'al256.pth'
+    torch.save({'contract': contract, 'state_dict': model.state_dict()}, checkpoint)
+    path = work / 'al256_n1.onnx'
+    with contextlib.redirect_stdout(io.StringIO()):
+        ex.export_graph(model, str(checkpoint), str(path), verify=False, frames_per_call=1)
+    return model, ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+
+
+@pytest.mark.parametrize('name', ['none', 'two_in_one_packet', 'solid_edge_across_packets', 'every_packet'])
+def test_the_16k_256_one_frame_stream_equals_python_sequential(driver, shipped_one_frame, name):
+    """16 kHz / FFT 256 N=1 (the config_16k_256.ini model): the C N=1 stream with the layout-18 graph in ONNX Runtime equals
+    the Python reference, event hops are the error spectrum and are not submitted."""
+    model, session = shipped_one_frame
+    changed, solid = EVENT_STREAMS[name]
+    edges = edge_rule(changed, solid)
+    bins = SHIPPED_FFT // 2 + 1
+    generator = torch.Generator().manual_seed(21)
+    err, far = _complex(generator, len(edges), bins), _complex(generator, len(edges), bins)
+    c1 = CStream(driver, session, model, 1, SHIPPED_FFT)
+    got = np.concatenate([c1.run(err[k:k + 1], far[k:k + 1], changed[k:k + 1], solid[k:k + 1])
+                          for k in range(len(edges))], axis=0)
+    want, py_state = python_sequential(model, err, far, edges, _zero_state(model))
+    scale = max(np.abs(want).max(), 1e-6)
+    print('%s at 16k/256 N=1: events %d, calls %d; max rel |C - python| %.3g'
+          % (name, sum(edges), c1.calls, np.abs(got - want).max() / scale))
+    assert np.abs(got - want).max() / scale < TOL_PYTHON
+    assert max(np.abs(a - b).max() for a, b in zip(c1.state, py_state)) < TOL_STATE
+    assert c1.calls == len(edges) - sum(edges) and len(c1.generations) == 1 + sum(edges)
+    for k, edge in enumerate(edges):
+        assert np.array_equal(got[k], err[k].numpy()) == bool(edge), 'hop %d (event %d)' % (k, edge)
+
+
 def test_the_n1_stream_does_change_the_generation_on_an_event(driver, model, sessions):
     """The contrast that makes the previous assertion meaningful: N=1 restarts the state on the host."""
-    _c8, c1, edges, _worst = _run_scenario(driver, model, sessions, 'two_in_one_packet')
+    _cp, c1, edges, _worst = _run_scenario(driver, model, sessions, 'two_in_one_packet')
     assert len(c1.generations) == 1 + sum(edges)
 
 

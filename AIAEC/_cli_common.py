@@ -390,7 +390,7 @@ def make_inference_cli(model_name, model_class, description):
 
     ``load_model`` is the single checkpoint-construction site shared by the
     streaming CLI, the exporters and the calibration recorder, so a contract
-    check added here reaches all of them. config.ini is deliberately not read:
+    check added here reaches all of them. No training config is read:
     every shape-relevant setting comes from the checkpoint's own contract.
     Returns ``(build_parser, load_model, main, cli)``.
     """

@@ -144,8 +144,9 @@ TEST_DEPS := $(DEEPVQE_CORE_HEADERS) $(ULCNET_CORE_HEADERS) $(ULCNET_STREAM_HEAD
 # The product a test binary is built for is chosen by compiling aiaec.c with
 # -DAIAEC_PRODUCT_MODEL_ID=<id> (aiaec_product.h) -- the only way a test reaches the other model;
 # no customer field selects a model. AIAEC_TEST_CATALOG (aiaec.c) substitutes placeholder graph
-# paths so a test can drive the gated API through rows the production catalog does not deliver; it
-# is passed only to the targets below that say so, never to `lib` or the catalog/link-only tests.
+# paths (and adds a 16k/256 N=8 entry without one, for the refusal) so a test can drive the gated API
+# without the board's graph files; it is passed only to the targets below that say so, never to `lib`
+# or the catalog/link-only tests.
 PRODUCTS := deepvqe_s=1 align_ulcnet=10
 
 # One test source built and run once per product. $(1) test name, $(2) extra compile flags.
@@ -158,8 +159,8 @@ define RUN_PER_PRODUCT
 	done
 endef
 
-# test_aiaec_catalog: the PRODUCTION catalog (no AIAEC_TEST_CATALOG): refusal order, the rows without
-# a delivered graph, and the delivered rows (both models: 16k/256 N=1 and N=8, 16k/512 N=1, 48k/1024 N=1 and N=2).
+# test_aiaec_catalog: the PRODUCTION catalog (no AIAEC_TEST_CATALOG): refusal order, the N values
+# with no row, and the delivered rows (both models: 16k/256 N=1, 16k/512 N=1 and N=4, 48k/1024 N=1 and N=2).
 test-aiaec-catalog: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_catalog,)
 
@@ -178,8 +179,8 @@ test-aiaec-freq: $(TEST_DEPS) | _cfg_guard
 test-aiaec-nonfinite: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_nonfinite,-DAIAEC_TEST_CATALOG)
 
-# test_aiaec_packet: Align-ULCNet's packet graph (N=8, layout 19) against a host accelerator that implements the
-# graph's frame_reset semantics; the Align-ULCNet product only (the test catalog opens its N=8 row).
+# test_aiaec_packet: Align-ULCNet's packet graph (16k/512 N=4, layout 19) against a host accelerator that implements the
+# graph's frame_reset semantics; the Align-ULCNet product only.
 test-aiaec-packet: $(TEST_DEPS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 \
 	  tests/test_aiaec_packet.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_aiaec_packet"

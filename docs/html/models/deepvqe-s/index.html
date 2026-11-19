@@ -17,14 +17,15 @@
 <thead><tr><th>sr / fft</th><th>hop_in → N</th><th>正式登錄表</th><th>測試登錄表（僅主機測試）</th></tr></thead>
 <tbody>
 <tr><th>16000 / 256</th><td>128 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
-<tr><th>16000 / 256</th><td>1024 → 8</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
+<tr><th>16000 / 256</th><td>1024 → 8</td><td>無 graph，init 拒絕</td><td>列出但無路徑，init 拒絕</td></tr>
 <tr><th>16000 / 512</th><td>256 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
+<tr><th>16000 / 512</th><td>1024 → 4</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
 <tr><th>16000 / 512</th><td>2048 → 8</td><td>無 graph，init 拒絕</td><td>無，init 拒絕</td></tr>
 <tr><th>48000 / 1024</th><td>512 → 1</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
 <tr><th>48000 / 1024</th><td>1024 → 2</td><td>有登錄的 graph，接受</td><td>可建構</td></tr>
 </tbody></table>
 <p>沒有交付 graph 的組態在 <code>aiaec_get_mem_size()</code>／<code>aiaec_init()</code> 被拒絕（<code>AIAEC_ERR_FRAMES_PER_CALL</code>），不會呼叫任何 SDK。測試登錄表只存在於主機測試用的測試建置，不在交付的 archive 裡，以佔位路徑讓主機測試走完整個 API，不代表有 graph。表外的 <code>(sr, fft)</code> 回 <code>AIAEC_ERR_GRID</code>；不是模型 hop 倍數的 <code>hop_in</code>（例如 129）回 <code>AIAEC_ERR_IN_HOP</code>。FFT 512、1024 與 256 使用同一個迴圈。48 kHz 的 AEC 前端格點是 48k／1024（AEC 產品格點）。</p>
-<p>板端 graph 路徑：16k／256（N=1、N=8）、16k／512／N=1 與 48k／1024（N=1、N=2）各列共用 <code>/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin</code>（登錄表裡只寫一次）。卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑：另一個 grid 的 graph 在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_deepvqes.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256。</p>
+<p>板端 graph 路徑：16k／256／N=1、16k／512（N=1、N=4）與 48k／1024（N=1、N=2）各列共用 <code>/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin</code>（登錄表裡只寫一次）。卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑：另一個 grid 的 graph 在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_deepvqes.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256，<code>--fft-size 512 --hop-in 1024</code> 選 16 kHz／512 的 N=4（一包 1024 點）。16 kHz／256 只有 N=1：<code>--hop-in 1024</code> 在 fft 256 是 N=8，init 拒絕。</p>
 
 <h2>建置與連結</h2>
 <p>DeepVQE-S 的單模型產品用 <code>AIAEC_MODEL=deepvqe</code> 建置，連結 <code>libaiaec.a</code>、該款 backend <code>libdeepvqe_stream.a</code> 與 audiolib 的 <code>libaudio_common.a</code>（與本庫同一目標工具鏈建置）。路徑一律用 <code>print-lib-path</code> 查，且查詢要帶與建置相同的 <code>AIAEC_MODEL</code>、<code>SIMD</code>、<code>CC</code>、<code>EXTRA_CFLAGS</code>；不帶 <code>AIAEC_MODEL</code> 會查到預設 <code>both</code> 版的路徑。</p>
@@ -45,11 +46,12 @@ cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common \
 <thead><tr><th>組態</th><th>mic、far（輸入 0、1）</th><th>CCM taps（輸出 0）</th><th>state</th></tr></thead>
 <tbody>
 <tr><th>16k／256／N=1</th><td>[1,2,1,129]</td><td>[1,1,129,18]</td><td>16 組，D = 63</td></tr>
-<tr><th>16k／256／N=8</th><td>[1,2,8,129]</td><td>[1,8,129,18]</td><td>16 組，D = 63</td></tr>
 <tr><th>16k／512／N=1</th><td>[1,2,1,257]</td><td>[1,1,257,18]</td><td>16 組，D = 32</td></tr>
+<tr><th>16k／512／N=4</th><td>[1,2,4,257]</td><td>[1,4,257,18]</td><td>16 組，D = 32</td></tr>
 <tr><th>48k／1024／N=1</th><td>[1,2,1,513]</td><td>[1,1,513,18]</td><td>16 組，D = 47</td></tr>
 <tr><th>48k／1024／N=2</th><td>[1,2,2,513]</td><td>[1,2,513,18]</td><td>16 組，D = 47</td></tr>
 </tbody></table>
+<p>16k／256 那一列的 state 依 <code>AIAEC/DeepVQE_S/config_16k_256.ini</code> 的 <code>[model]</code>（<code>similarity_channels</code> 8、<code>score_kernel</code> 9,5、<code>gru_hidden</code> 256）：<code>align_key_ring</code> [1,8,63,33]、<code>align_score_history</code> [1,8,9,63]、<code>h_gru</code> [1,1,1,256]。其餘列依建構子預設（sim 通道 4、score window 5、GRU 192）。16k／256 的 graph 要用 <code>config_16k_256.ini</code> 訓練的 checkpoint 匯出；以建構子預設訓練的 16k／256 graph 在開圖後被 <code>graph_io_check_ports()</code> 拒絕。三個 grid 各有一份自足的訓練 config（<code>config_16k_256.ini</code>、<code>config_16k_512.ini</code>、<code>config_48k.ini</code>），<code>train.py</code> 的 <code>--config</code> 必填。</p>
 <p><code>StreamWork.inputs[0..1]</code> 與 <code>outputs[0]</code> 的 shape 與元素數就是上表同一列；state 不在 <code>StreamWork</code> 裡。state 的順序是匯出器的順序（<code>align_key_ring</code>、<code>align_value_ring</code>、<code>align_score_history</code>、<code>ccm_up_history</code>、<code>far1_history</code>、<code>far2_history</code>、<code>h_gru</code>、<code>mic1_history</code> … <code>mic4_history</code>、<code>res2_history</code>、<code>res3_history</code>、<code>up1_history</code> … <code>up3_history</code>；ONNX 名稱除 <code>h_gru</code> 外都帶 <code>state_</code> 前綴），各自的 shape 見模型設定的列。</p>
 
 <h2>初始化與每包呼叫</h2>
@@ -103,8 +105,8 @@ while (read_blocks(mic, far, hop_in)) {
 <thead><tr><th>組態</th><th>PCM</th><th><code>_freq</code></th></tr></thead>
 <tbody>
 <tr><td>16k／512／N=1</td><td>117760</td><td>31504</td></tr>
+<tr><td>16k／512／N=4</td><td>197920</td><td>105488</td></tr>
 <tr><td>16k／256／N=1</td><td>60928</td><td>16144</td></tr>
-<tr><td>16k／256／N=8</td><td>154816</td><td>102800</td></tr>
 <tr><td>48k／1024／N=1</td><td>231424</td><td>62224</td></tr>
 <tr><td>48k／1024／N=2</td><td>284752</td><td>111440</td></tr>
 </tbody></table>
@@ -132,13 +134,13 @@ while (read_blocks(mic, far, hop_in)) {
 <thead><tr><th>組態</th><th>主機替身</th><th>ONNX Runtime</th><th>正式 bin</th><th>板端</th></tr></thead>
 <tbody>
 <tr><th>16k／512／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：匯出圖與 PyTorch 逐項比對（隨機權重）；未經 C 家族逐包執行</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
-<tr><th>16k／256／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：匯出圖在 ONNX Runtime 逐包串流，與 N=8 的輸出一致（隨機權重）；未經 C 家族逐包執行</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
-<tr><th>16k／256／N=8</th><td>正式登錄表與測試登錄表都已測</td><td>同上（N=8 封包圖，每包一次呼叫）</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
+<tr><th>16k／512／N=4</th><td>正式登錄表與測試登錄表都已測；<code>test_aiaec_block</code> 對 <code>deepvqe_stream</code> 逐位元一致、N=4 對 N=1 逐樣本一致</td><td>同上（N=4 封包圖，每包一次呼叫）</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
+<tr><th>16k／256／N=1</th><td>正式登錄表與測試登錄表都已測</td><td>已驗：匯出圖在 ONNX Runtime 逐包串流，與同一模型的 N=8 圖輸出一致（隨機權重；N=8 只作比對，不是登錄組態）；未經 C 家族逐包執行</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
 <tr><th>48k／1024／N=1、N=2</th><td>正式登錄表與測試登錄表都已測；<code>test_aiaec_block</code> 對 <code>deepvqe_stream</code> 逐位元一致、N=2 對 N=1 逐樣本一致</td><td>隨機權重匯出圖的 shape 已驗（<code>test_aiaec_bind_info_pin.py</code>）；未經 ONNX Runtime 串流</td><td>有登錄路徑；符合性未驗</td><td>未驗</td></tr>
-<tr><th>16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
+<tr><th>16k／256／N=8、16k／512／N=8</th><td>不存在，init 拒絕</td><td>不適用</td><td>不適用</td><td>不適用</td></tr>
 </tbody></table>
 <ul>
-<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、N=8、16k／512 N=1 與 48k／1024 N=1、N=2，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
+<li><b>work 對匯出圖</b>（不跑推論）：<code>AIAEC/tests/test_aiaec_bind_info_pin.py</code> 以隨機權重匯出 16k／256 N=1、16k／512 N=1、N=4 與 48k／1024 N=1、N=2，依位置比對兩個家族真實 <code>aiaec_preprocess*()</code> 給出的 <code>StreamWork</code>（mic、far 與 CCM taps 的 shape 與元素數）和匯出圖的訊號輸入、head 輸出，並檢查匯出器的 ONNX 名稱順序符合上述規則（訊號輸入在前、state 在後；head 在前、state 輸出 = 輸入名稱加 <code>_out</code>、state 兩端同 shape）。函式庫不保存 state 的 shape；模型設定各列（<code>graph_io_deepvqes.h</code>）同一個測試用 <code>make -C stream/aiaec graph-io-dumper</code> 傾印，逐列比對全新匯出的圖（layout 版本、埠數與順序、各輸入輸出 shape、state 名稱與順序、兩端同 shape），列集合恰為匯出的案例；C 端的列對 <code>StreamWork</code> 由 <code>test-aiaec-graph-io</code> 檢查。</li>
 <li><b>ONNX Runtime</b>：<code>AIAEC/tests/test_deepvqe_frames_per_call.py</code> 匯出 16k／512 的 N=1、2、4，驗 state 就地契約並以 ONNX Runtime 對 PyTorch 驗證；<code>test_deepvqe_inference_frames_per_call.py</code> 在 16k／256 匯出 N=1 與 N=8 兩張圖，在 ONNX Runtime 串流同一段輸入，CCM taps 最大差小於 5e-5，加速器呼叫數分別為 hop 數與 hop 數除以 8 進位。兩者都不經 C 的 <code>aiaec_*</code> 家族。</li>
 </ul>
 

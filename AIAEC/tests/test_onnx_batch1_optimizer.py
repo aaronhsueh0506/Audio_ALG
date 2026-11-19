@@ -332,7 +332,7 @@ def test_ulcnet_graph_is_exactly_preserved_and_rank_four(tmp_path):
     grid = SignalGrid(16000, 512, 512, 256)
     model_ = AlignULCNet(grid, max_delay_frames=8).eval()
     wrapper = AlignUlcnetStreamingExport(model_).eval()
-    inputs = dummy_inputs(8, grid.n_freqs, 26)
+    inputs = dummy_inputs(8, grid.n_freqs, 26, wrapper.score_window)
     _assert_exact_rank_four(
         wrapper, inputs, INPUT_NAMES, OUTPUT_NAMES, tmp_path)
 

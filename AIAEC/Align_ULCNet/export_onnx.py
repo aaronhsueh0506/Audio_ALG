@@ -60,12 +60,15 @@ and every state input has an ``*_out`` output of exactly the same shape:
 
     key_history    [1, 32, D, TA]   newest frame first (slot 0 is the newest)
     value_history  [1, 32, D, TA]   newest frame first
-    logit_history  [1, 32, 5, D]    oldest frame first (slot 4 is the newest)
+    logit_history  [1, 32, W, D]    oldest frame first (slot W-1 is the newest)
     h_gru          [1, 4, 1, 128]   subband GRU 0 layers, then subband GRU 1
+
+W is the score kernel's time size, fixed per grid by ``SCORE_WINDOW_BY_GRID``
+(9 at 16 kHz / FFT 256, 5 at 16 kHz / FFT 512 and 48 kHz / FFT 1024).
 
 Each ``*_out`` is the FULL next window. The shift runs in the graph: the
 history is cut by a Slice on the graph input (K/V keep slots ``0..D-2``, the
-logit window keeps frames ``1..4``) and the new frame is concatenated behind or
+logit window keeps frames ``1..W-1``) and the new frame is concatenated behind or
 in front of it, so the Concat result is the output and no output is produced by
 a Slice. A runtime can bind each ``*_out`` to the address of its input; it must
 finish reading every state input before it writes any state output. The graph
@@ -144,12 +147,15 @@ STATE_LAYOUT_VERSION = LAYOUT_VERSION
 # corpus is materialized on (16 kHz FFT 256 / hop 128, 16 kHz FFT 512 / hop 256,
 # 48 kHz FFT 1024 / hop 512), so anything else is refused here rather than
 # failing deep in a matmul or exporting a graph no C build can bind.
-SUPPORTED_GRIDS = ((16000, 256), (16000, 512), (48000, 1024))
+# Each grid's logit window: the score kernel time size its rows in
+# stream/aiaec/graph_io_alignulcnet.h carry (each follows its
+# config_<grid>.ini); export_graph refuses any other. test_aiaec_bind_info_pin.py pins this table to the C rows.
+SCORE_WINDOW_BY_GRID = {(16000, 256): 9, (16000, 512): 5, (48000, 1024): 5}
+SUPPORTED_GRIDS = tuple(SCORE_WINDOW_BY_GRID)
 COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
-SCORE_WINDOW_FRAMES = 5
 GRU_SUBBANDS = 2
 GRU_LAYERS = 2
 GRU_HIDDEN = 128
@@ -312,7 +318,7 @@ class AlignUlcnetStreamingExport(nn.Module):
     ``t - d``.  The logit window is chronological: its last slot is the current
     frame and slot zero is ``t - (score_window - 1)``, matching the causal score
     convolution's input order. ``score_window`` is the score kernel's time size
-    (SCORE_WINDOW_FRAMES in the board table; export_graph refuses any other).
+    (the grid's SCORE_WINDOW_BY_GRID entry; export_graph refuses any other).
     """
 
     input_names = INPUT_NAMES
@@ -545,8 +551,7 @@ def score_window_for(model) -> int:
     return int(model.align.score.kt)
 
 
-def state_shapes(delay_depth: int, ta_bins: int,
-                 score_window: int = SCORE_WINDOW_FRAMES
+def state_shapes(delay_depth: int, ta_bins: int, score_window: int
                  ) -> Dict[str, Tuple[int, ...]]:
     if not MIN_DELAY_DEPTH <= delay_depth <= MAX_DELAY_DEPTH:
         raise ValueError(
@@ -619,11 +624,10 @@ def graph_signals(model, error_ri: Tensor, far_ri: Tensor) -> Tuple[Tensor, ...]
 
 
 def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
-                 score_window: int = SCORE_WINDOW_FRAMES
-                 ) -> Tuple[Tensor, ...]:
-    """Trace inputs for one frame. n_freqs and ta_bins have no defaults on
-    purpose: a default would let a caller that forgot them trace one grid's
-    graph while believing it had another."""
+                 score_window: int) -> Tuple[Tensor, ...]:
+    """Trace inputs for one frame. n_freqs, ta_bins and score_window have no
+    defaults on purpose: a default would let a caller that forgot them trace
+    one grid's graph while believing it had another."""
     shapes = state_shapes(delay_depth, ta_bins, score_window)
     signals = (
         torch.randn(1, 1, n_freqs).abs(),          # error_mag
@@ -635,8 +639,7 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
 
 
 def dummy_packet_inputs(frames_per_call: int, delay_depth: int, n_freqs: int,
-                        ta_bins: int, score_window: int = SCORE_WINDOW_FRAMES
-                        ) -> Tuple[Tensor, ...]:
+                        ta_bins: int, score_window: int) -> Tuple[Tensor, ...]:
     """Trace inputs for a packet graph: signals [1, N, F], frame_reset [1, N]."""
     shapes = state_shapes(delay_depth, ta_bins, score_window)
     n = frames_per_call
@@ -898,12 +901,15 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
             'exponent would deploy silently wrong'
             % (float(model.compression_exponent), COMPRESSION_EXPONENT)
         )
+    # An unsupported grid has no entry; the wrapper below refuses it.
+    sample_rate, n_fft = model.grid.sample_rate, model.grid.n_fft
     score_window = score_window_for(model)
-    if score_window != SCORE_WINDOW_FRAMES:
+    grid_window = SCORE_WINDOW_BY_GRID.get((sample_rate, n_fft))
+    if grid_window is not None and score_window != grid_window:
         raise ValueError(
             f'checkpoint score_kernel time size {score_window} != '
-            f'{SCORE_WINDOW_FRAMES}, the logit window fixed by '
-            'GRAPH_IO_ALIGNULCNET_SCORE_WINDOW (stream/aiaec/'
+            f'{grid_window}, the logit window of the {sample_rate} Hz / FFT '
+            f'{n_fft} rows (SCORE_WINDOW_BY_GRID; stream/aiaec/'
             'graph_io_alignulcnet.h); only the delay size may differ')
     checkpoint_data = torch.load(
         checkpoint_path, map_location='cpu', weights_only=False
@@ -916,11 +922,12 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         wrapper = AlignUlcnetPacketExport(model, frames_per_call).eval()
         inputs = dummy_packet_inputs(
             frames_per_call, wrapper.delay_depth, wrapper.n_freqs,
-            wrapper.ta_bins)
+            wrapper.ta_bins, wrapper.score_window)
     else:
         wrapper = AlignUlcnetStreamingExport(model).eval()
         inputs = dummy_inputs(
-            wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)
+            wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins,
+            wrapper.score_window)
     input_names = PACKET_INPUT_NAMES if packet else INPUT_NAMES
     with torch.no_grad():
         outputs = wrapper(*inputs)

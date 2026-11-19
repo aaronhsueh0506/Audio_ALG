@@ -84,7 +84,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _DEEPVQE_DIR = os.path.join(_AIAEC_DIR, '..', 'lib', 'aiaec', 'deepvqe_s')
 # deepvqe_*.c/.h moved to lib/aiaec/deepvqe_s/ in the single-model-release restructuring;
-# config.ini (the Python training side) stayed at AIAEC/DeepVQE_S/.
+# the training configs (the Python training side) stayed at AIAEC/DeepVQE_S/.
 _DEEPVQE_PY_DIR = os.path.join(_AIAEC_DIR, 'DeepVQE_S')
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audiolib', 'common'))
@@ -2599,8 +2599,8 @@ def test_layout_version_matches_c_header():
 
 
 def test_shipped_delay_depth_agrees_across_driver_config_and_grid():
-    """The half-second search range is stated in the trainer config's
-    max_delay_seconds, in the grid's frame conversion and in the shipped depth
+    """The half-second search range is stated in the 16 kHz / FFT 512
+    trainer config's max_delay_seconds, in the grid's frame conversion and in the shipped depth
     the C tests run at (SHIPPED_D here, the second chain depth there). They
     must name the same D."""
     import configparser
@@ -2611,7 +2611,8 @@ def test_shipped_delay_depth_agrees_across_driver_config_and_grid():
                        re.MULTILINE)
     assert len(found) == 1, found
     config = configparser.ConfigParser()
-    assert config.read(os.path.join(_DEEPVQE_PY_DIR, 'config.ini'))
+    assert config.read(os.path.join(_DEEPVQE_PY_DIR, 'config_16k_512.ini'))
+    assert (config.getint('signal', 'sr'), config.getint('signal', 'n_fft')) == (16000, 512)
     seconds = config.getfloat('model', 'max_delay_seconds')
     assert seconds == pytest.approx(0.5)
     grid = SignalGrid(16000, 512, 512, 256)

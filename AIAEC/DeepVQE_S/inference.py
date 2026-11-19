@@ -7,7 +7,7 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
     # 每次呼叫 N 個 frame (與板端 N > 1 的 graph 同排程)
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
-        --frames-per-call 8
+        --frames-per-call 4
 
 目錄批次 (--mic-dir 取代三個位置參數):
     # 沒帶 --ref-dir: reference 為數位靜音, 等同純降噪
@@ -22,13 +22,13 @@ graph path is <output>.onnx, override with --onnx):
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/mic --far-dir /path/to/far \\
         --frames 8192 --format bin --output calib/deepvqe_s
-    # N frames per call (板端 1024 點錄音: 16k/256 用 N=8, 48k/1024 用 N=2).
-    # The graph and every tensor carry N frames; --frames counts calls,
-    # so 1024 calls x 8 = 8192 frames, as many as the example above.
+    # N frames per call (板端 1024 點錄音: 16k/512 用 N=4, 48k/1024 用 N=2;
+    # 16k/256 只有 N=1). The graph and every tensor carry N frames; --frames
+    # counts calls, so 2048 calls x 4 = 8192 frames, as many as the example above.
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/mic --far-dir /path/to/far \\
-        --frames 1024 --frames-per-call 8 --format bin \\
-        --output calib/deepvqe_s_n8
+        --frames 2048 --frames-per-call 4 --format bin \\
+        --output calib/deepvqe_s_n4
 
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before inference when needed; output stays at that model rate.
@@ -36,7 +36,7 @@ rate before inference when needed; output stays at that model rate.
 Output is the common denoised, echo-free, EARLY/DEREVERBERATED near-speech
 estimate (DeepVQE's published task already includes dereverberation).
 
-config.ini is not read here: every shape-relevant setting (grid, model
+The training configs are not read here: every shape-relevant setting (grid, model
 kwargs) is recovered from the checkpoint's own contract (see train.py /
 AIAEC/training_common.py's make_checkpoint_contract), so inference cannot
 silently drift from what the weights were trained with.

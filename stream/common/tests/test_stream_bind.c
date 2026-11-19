@@ -383,11 +383,11 @@ int main(void) {
     build_dfn2(&w, 0, 1, 96);  run_profile(&w, "dfn2 lite N=1");
     build_dfn2(&w, 0, 8, 96);  run_profile(&w, "dfn2 lite N=8");
     build_deepvqe(&w, 1, 129); run_profile(&w, "deepvqe_s N=1 16k/256");
-    build_deepvqe(&w, 8, 129); run_profile(&w, "deepvqe_s N=8 16k/256");
     build_deepvqe(&w, 1, 257); run_profile(&w, "deepvqe_s N=1 16k/512");
+    build_deepvqe(&w, 4, 257); run_profile(&w, "deepvqe_s N=4 16k/512");
     build_align(&w, 1, 129);   run_profile(&w, "align_ulcnet N=1 16k/256");
-    build_align(&w, 8, 129);   run_profile(&w, "align_ulcnet N=8 16k/256");
     build_align(&w, 1, 257);   run_profile(&w, "align_ulcnet N=1 16k/512");
+    build_align(&w, 4, 257);   run_profile(&w, "align_ulcnet N=4 16k/512");
     run_overflow();
     run_negative_signal_count();
     run_empty();
@@ -401,7 +401,7 @@ int main(void) {
     CHECK(w.signal_in_count == 2 && w.head_out_count == 1 && w.input_count == 18 && w.output_count == 17, "deepvqe_s counts");
     build_align(&w, 1, 129);
     CHECK(w.signal_in_count == 4 && w.head_out_count == 1 && w.input_count == 8 && w.output_count == 5, "align N=1 counts");
-    build_align(&w, 8, 129);
+    build_align(&w, 4, 257);
     CHECK(w.signal_in_count == 5 && w.head_out_count == 1 && w.input_count == 9 && w.output_count == 5, "align N>1 counts");
 
     CHECK(STREAM_PORT_OK == 0, "OK is 0");

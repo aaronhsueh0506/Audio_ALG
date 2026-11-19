@@ -3,7 +3,7 @@
  * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration, and with
  * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
  * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
- * an empty work, N = 8 at hop 2 puts frame_reset 00100000 in the last signal. A SUBMIT work has pairwise disjoint
+ * an empty work, N = 4 at hop 2 puts frame_reset 0010 in the last signal. A SUBMIT work has pairwise disjoint
  * buffers and empty slots beyond its signals, and the two families report one and the same AiaecInfo. The rows
  * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
 
@@ -126,7 +126,7 @@ static int run_pre(const AiaecConfig *cfg, int family, int event_hop, StreamWork
         int k;
         for (k = 0; k < n; ++k) pattern[k] = work->inputs[4].data[k] == 1.0f ? '1' : work->inputs[4].data[k] == 0.0f ? '0' : '?';
         pattern[n] = '\0';
-        CHECK(n != 8 || event_hop != 2 || strcmp(pattern, "00100000") == 0, "frame_reset %s, want 00100000", pattern);
+        CHECK(n != 4 || event_hop != 2 || strcmp(pattern, "0010") == 0, "frame_reset %s, want 0010", pattern);
         CHECK(pattern[event_hop] == '1' && strchr(pattern, '1') == strrchr(pattern, '1'), "frame_reset %s: one event at %d",
               pattern, event_hop);
         ++g_patterns;

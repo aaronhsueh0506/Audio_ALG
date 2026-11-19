@@ -16,28 +16,28 @@ extern "C" {
 #define GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET    19
 
 #define GRAPH_IO_ALIGNULCNET_TA_CHANNELS   32
-#define GRAPH_IO_ALIGNULCNET_SCORE_WINDOW  5
 #define GRAPH_IO_ALIGNULCNET_GRU_ROWS      4
 #define GRAPH_IO_ALIGNULCNET_GRU_HIDDEN    128
 
-/* One registered graph. */
+/* One registered graph; score_window is the logit window W (SCORE_WINDOW_BY_GRID in export_onnx.py). */
 typedef struct GraphIoAlignulcnetGrid {
-    int sample_rate, fft, n;
+    int sample_rate, fft, n, score_window;
 } GraphIoAlignulcnetGrid;
 
+/* Each row follows the grid's AIAEC/Align_ULCNet/config_<grid>.ini. */
 static const GraphIoAlignulcnetGrid GRAPH_IO_ALIGNULCNET_GRIDS[] = {
-    { 16000, 256, 1 },
-    { 16000, 256, 8 },
-    { 16000, 512, 1 },
-    { 48000, 1024, 1 },
-    { 48000, 1024, 2 },
+    { 16000, 256, 1, 9 },
+    { 16000, 512, 1, 5 },
+    { 16000, 512, 4, 5 },
+    { 48000, 1024, 1, 5 },
+    { 48000, 1024, 2, 5 },
 };
 
 #define GRAPH_IO_ALIGNULCNET_ROW_COUNT \
     ((int)(sizeof(GRAPH_IO_ALIGNULCNET_GRIDS) / sizeof(GRAPH_IO_ALIGNULCNET_GRIDS[0])))
 
 /* The row of one grid. Inputs: error_mag, far_mag, error_cos, error_sin [1, 1, N, bins], frame_reset [1, 1, 1, N] last
- * at N > 1, then key_history, value_history [1, 32, D, ta_bins], logit_history [1, 32, 5, D], h_gru [1, 4, 1, 128];
+ * at N > 1, then key_history, value_history [1, 32, D, ta_bins], logit_history [1, 32, W, D], h_gru [1, 4, 1, 128];
  * outputs: output [1, 2, N, bins], then the states as <name>_out. */
 static inline void graph_io_alignulcnet_describe(const GraphIoAlignulcnetGrid *g, GraphIoRow *row)
 {
@@ -65,7 +65,7 @@ static inline void graph_io_alignulcnet_describe(const GraphIoAlignulcnetGrid *g
         row->state[i][2] = d; row->state[i][3] = ta;
     }
     row->state[2][0] = 1u; row->state[2][1] = GRAPH_IO_ALIGNULCNET_TA_CHANNELS;
-    row->state[2][2] = GRAPH_IO_ALIGNULCNET_SCORE_WINDOW; row->state[2][3] = d;   /* logit_history */
+    row->state[2][2] = (unsigned int)g->score_window; row->state[2][3] = d;   /* logit_history */
     row->state[3][0] = 1u; row->state[3][1] = GRAPH_IO_ALIGNULCNET_GRU_ROWS;
     row->state[3][2] = 1u; row->state[3][3] = GRAPH_IO_ALIGNULCNET_GRU_HIDDEN;   /* h_gru */
     row->state_count = 4;

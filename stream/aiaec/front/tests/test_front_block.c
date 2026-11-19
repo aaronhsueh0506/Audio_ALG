@@ -4,7 +4,7 @@
  * hop after the CHANGED hop is an ordinary hop. The accelerator is an identity mask, so the PCM the
  * block returns is the front's float residual, one hop late, the event hops included (an event
  * restarts only the model; the analysis and synthesis keep running); N = PN returns the same PCM as
- * N = 1, sample for sample. The grid is 16 kHz / 256 with PN = 8 (test_front_block) or, built through
+ * N = 1, sample for sample. The grid is 16 kHz / 512 with PN = 4 (test_front_block) or, built through
  * test_front_block_48k.c, 48 kHz / 1024 with PN = 2. */
 
 #include <math.h>
@@ -21,9 +21,9 @@ static int g_fail;
 
 #ifndef BLK_SR
 #define BLK_SR 16000
-#define BLK_FFT 256
-#define BLK_PN 8       /* the packet size */
-#define BLK_BLOCKS 504   /* hops; a multiple of BLK_PN */
+#define BLK_FFT 512
+#define BLK_PN 4       /* the packet size */
+#define BLK_BLOCKS 252   /* hops; a multiple of BLK_PN */
 #define BLK_DELAY 480    /* samples */
 #endif
 #define HOP (BLK_FFT / 2)
@@ -124,24 +124,24 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
 }
 
 int main(void) {
-    static Pass p1, p8;
+    static Pass p1, pp;
     Scene sc = scene_make(BLOCKS * HOP, BLK_DELAY);
-    int b, i, compared = 0, discriminating = 0, edges1 = 0, edges8 = 0;
+    int b, i, compared = 0, discriminating = 0, edges1 = 0, edgesp = 0;
 
     run_pass(&sc, 1, &p1);
-    run_pass(&sc, BLK_PN, &p8);
+    run_pass(&sc, BLK_PN, &pp);
     if (g_fail) return 1;
 
-    for (b = 0; b < BLOCKS; ++b) { edges1 += p1.edge[b]; edges8 += p8.edge[b]; }
-    CHECK(p1.changed >= 1 && p1.changed == p8.changed && edges1 == edges8, "N=1 changed %d edges %d, N=%d changed %d edges %d",
-          p1.changed, edges1, BLK_PN, p8.changed, edges8);
-    for (b = 0; b < BLOCKS; ++b) CHECK(p1.edge[b] == p8.edge[b], "hop %d: edge N=1 %d N=%d %d", b, p1.edge[b], BLK_PN, p8.edge[b]);
+    for (b = 0; b < BLOCKS; ++b) { edges1 += p1.edge[b]; edgesp += pp.edge[b]; }
+    CHECK(p1.changed >= 1 && p1.changed == pp.changed && edges1 == edgesp, "N=1 changed %d edges %d, N=%d changed %d edges %d",
+          p1.changed, edges1, BLK_PN, pp.changed, edgesp);
+    for (b = 0; b < BLOCKS; ++b) CHECK(p1.edge[b] == pp.edge[b], "hop %d: edge N=1 %d N=%d %d", b, p1.edge[b], BLK_PN, pp.edge[b]);
 
     /* One delay change is one event: the CHANGED hop and nothing else. */
     CHECK(p1.bypass_blocks == p1.changed && edges1 == p1.changed, "N=1: %d BYPASS blocks, %d edges for %d CHANGED hops",
           p1.bypass_blocks, edges1, p1.changed);
-    CHECK(p8.reset_ones == p8.changed && p8.bypass_blocks == 0, "N=%d: %d frame_reset ones, %d BYPASS blocks for %d CHANGED hops",
-          BLK_PN, p8.reset_ones, p8.bypass_blocks, p8.changed);
+    CHECK(pp.reset_ones == pp.changed && pp.bypass_blocks == 0, "N=%d: %d frame_reset ones, %d BYPASS blocks for %d CHANGED hops",
+          BLK_PN, pp.reset_ones, pp.bypass_blocks, pp.changed);
     for (b = 1; b < BLOCKS; ++b) CHECK(!(p1.edge[b] && p1.edge[b - 1]), "hops %d and %d are both events", b - 1, b);
     CHECK(p1.submit_blocks == BLOCKS - p1.bypass_blocks, "N=1 submit blocks %d", p1.submit_blocks);
 
@@ -159,10 +159,10 @@ int main(void) {
     }
     CHECK(compared > 100, "only %d hops compared", compared);
     CHECK(discriminating > 1000, "residual never differs from the mic (%d samples): the test cannot tell them apart", discriminating);
-    CHECK(memcmp(p1.pcm, p8.pcm, sizeof(p1.pcm)) == 0, "PCM at N=%d differs from N=1", BLK_PN);
-    CHECK(memcmp(p1.resid, p8.resid, sizeof(p1.resid)) == 0, "front residual at N=%d differs from N=1", BLK_PN);
+    CHECK(memcmp(p1.pcm, pp.pcm, sizeof(p1.pcm)) == 0, "PCM at N=%d differs from N=1", BLK_PN);
+    CHECK(memcmp(p1.resid, pp.resid, sizeof(p1.resid)) == 0, "front residual at N=%d differs from N=1", BLK_PN);
     for (i = 0; i < BLOCKS * HOP; ++i) {
-        if (!isfinite(p1.resid[i]) || !isfinite(p8.resid[i])) { CHECK(0, "residual sample %d is not finite", i); break; }
+        if (!isfinite(p1.resid[i]) || !isfinite(pp.resid[i])) { CHECK(0, "residual sample %d is not finite", i); break; }
     }
 
     {
@@ -181,6 +181,6 @@ int main(void) {
     scene_free(&sc);
     if (g_fail) { fprintf(stderr, "test_front_block: %d failure(s)\n", g_fail); return 1; }
     printf("test_front_block[%d Hz / %d]: PASS (CHANGED hops %d: N=1 bypass=%d, N=%d frame_reset=%d; %d hops compared, %d discriminating samples)\n",
-           BLK_SR, BLK_FFT, p1.changed, p1.bypass_blocks, BLK_PN, p8.reset_ones, compared, discriminating);
+           BLK_SR, BLK_FFT, p1.changed, p1.bypass_blocks, BLK_PN, pp.reset_ones, compared, discriminating);
     return 0;
 }

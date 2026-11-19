@@ -30,7 +30,9 @@ resume rules.
 Every retained model directory owns these user-facing files:
 
 - train.py
-- config.ini
+- config.ini (Align-CRUSE, CAGCRN) or config_16k_256.ini / config_16k_512.ini /
+  config_48k.ini (DeepVQE-S, Align-ULCNet: one self-contained config per board
+  grid)
 - inference.py
 - export_onnx.py
 
@@ -41,7 +43,7 @@ command-line entry points.
 Example:
 
     cd AIAEC/Align_ULCNet
-    python3 train.py --config config.ini \
+    python3 train.py --config config_16k_512.ini \
       --packed-dir /path/to/packed/all --gpu 0 --mmap
     python3 inference.py checkpoint.pth mic.wav far.wav enhanced.wav
 
@@ -69,7 +71,7 @@ deliberately common: three epochs of linear warmup followed by per-step cosine d
 
 | model | optimizer / LR | schedule | objective | shipped batch / epochs |
 |---|---|---|---|---|
-| Align-ULCNet | Adam / 2e-3 (`baseline.ini`: the paper's 4e-3) | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term (the papers state no formula) | 16 / 50 |
+| Align-ULCNet | Adam / 2e-3 at 16 kHz / 256, the paper's 4e-3 at 16 kHz / 512 and 48 kHz | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term (the papers state no formula) | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | 3-epoch warmup + cosine to 1e-6 | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1.2e-3, decay 5e-7 | 3-epoch warmup + cosine to 1e-6 | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
@@ -112,7 +114,7 @@ The checkpoint contract records the resolved training recipe -- optimizer
 name, learning rate, weight decay, amsgrad, schedule and its scalars, batch
 size, epoch budget, warmup and LR floor -- read once and used both to build the
 optimizer and to write the contract, so `require_checkpoint_contract` rejects a
-changed trajectory instead of silently resuming it. All four shipped configs use
+changed trajectory instead of silently resuming it. Every shipped config uses
 `warmup_cosine`, rebuilt from the global optimizer-step count on resume instead
 of restoring a stale scheduler horizon.
 
@@ -120,23 +122,33 @@ The stored project examples are 10-second chunks and one epoch is one complete
 DataLoader pass. Align-ULCNet's paper used random 3-second examples and 20,000
 steps per epoch.
 
-### Config overlays and grid options (DeepVQE-S, Align-ULCNet)
+### Per-grid configs and grid options (DeepVQE-S, Align-ULCNet)
 
-`--config` takes several files, read in order; a later file overrides only the
-keys it sets, and a missing file is an error. Each of the two model
-directories ships `config.ini` with the hop-128 values below set, `baseline.ini`
-(the constructor defaults and the original loss and lr: the control arm) and
-`ref_512.ini`, the 16 kHz 512/256 reference (its `[signal]`, a 512/256
-`packed_dir`, its own `output_dir`; for Align-ULCNet also
-`max_delay_frames = 32`):
+Each of the two model directories ships one self-contained config per board
+grid; `--config` is required for these two trainers (Align-CRUSE and CAGCRN
+default to their `config.ini`):
 
-    python3 train.py --config config.ini                            # hop-128 values
-    python3 train.py --config config.ini baseline.ini               # default recipe
-    python3 train.py --config config.ini baseline.ini ref_512.ini   # 512/256 reference
+| file | `[signal]` | D (`max_delay_frames`) | `packed_dir` | `output_dir` |
+|---|---|---|---|---|
+| `config_16k_256.ini` | 16 kHz, FFT 256, hop 128 | 63 (`max_delay_seconds = 0.5`) | `data_aec_16k_256/packed/all` | `output_16k_256` |
+| `config_16k_512.ini` | 16 kHz, FFT 512, hop 256 | 32 (DeepVQE-S `max_delay_seconds = 0.5`; Align-ULCNet `max_delay_frames = 32`) | `data_aec_16k/packed/all` | `output_16k_512` |
+| `config_48k.ini` | 48 kHz, FFT 1024, hop 512 | 47 (`max_delay_seconds = 0.5`) | `data_aec_48k/packed/all` | `output_48k` |
 
-Shipped `config.ini` values at hop 128: DeepVQE-S `gru_hidden = 256`,
-`similarity_channels = 8`, `score_kernel = 9,5`, `[loss] aux_stft_weight = 0.5`;
-Align-ULCNet `joint2_stride = 1`, `score_kernel = 9,5`, `[training] lr = 2e-3`.
+    python3 train.py --config config_16k_256.ini
+    python3 train.py --config config_16k_512.ini
+    python3 train.py --config config_48k.ini
+
+Every grid has its own corpus directory: `PackedAecDataset` refuses a corpus
+whose linear-AEC grid differs from `[signal]`, for every model. `--config`
+still takes several files, read in order (a later file overrides only the keys
+it sets, and a missing file is an error); the three grid files are
+alternatives, not overlays.
+
+The 16 kHz / FFT 256 file carries the hop-128 values: DeepVQE-S
+`gru_hidden = 256`, `similarity_channels = 8`, `score_kernel = 9,5`,
+`[loss] aux_stft_weight = 0.5`; Align-ULCNet `joint2_stride = 1`,
+`score_kernel = 9,5`, `[training] lr = 2e-3`. The other two files take the
+constructor defaults (Align-ULCNet `lr = 4e-3`, the paper's value).
 
 Constructor options (defaults as listed):
 
@@ -147,12 +159,22 @@ Constructor options (defaults as listed):
 
 A checkpoint contract records `ctor_score_kernel` / `ctor_joint2_stride` only
 when they differ from the default, so a default run writes the same contract as
-before and an older checkpoint loads with the defaults. The Align-ULCNet
-exporter (and `inference.py calib`) refuses a score kernel whose time size is
-not 5 (the board table's logit window); such a model still trains and runs in
-Python inference, and `5,5` and `joint2_stride = 1` export with unchanged
-state shapes. A DeepVQE-S graph with other `similarity_channels`, `gru_hidden` or
-`score_kernel` exports, but has no row in `stream/aiaec/graph_io_deepvqes.h`.
+before and an older checkpoint loads with the defaults.
+
+The board rows follow the shipped configs: the 16 kHz / FFT 256 rows of
+`stream/aiaec/graph_io_deepvqes.h` and `graph_io_alignulcnet.h` take the
+`config_16k_256.ini` values above, the 16 kHz / FFT 512 and 48 kHz rows the
+constructor defaults of their own configs. The Align-ULCNet exporter (and `inference.py calib`) refuses a score
+kernel whose time size is not the grid's logit window (`SCORE_WINDOW_BY_GRID`
+in `export_onnx.py`: 9 at FFT 256, 5 at 16 kHz / 512 and 48 kHz); such a model
+still trains and runs in Python inference. The delay size of the kernel and
+`joint2_stride` change no graph port. A DeepVQE-S graph exports with any
+`similarity_channels`, `gru_hidden` or `score_kernel`, but only the values its
+grid's rows were built from bind on the board (`graph_io_check_ports()` refuses
+the others after opening the graph). A FFT 256
+model trained with the constructor defaults is therefore not a board graph: its
+DeepVQE-S graph does not match the 16 kHz / FFT 256 row and its Align-ULCNet
+export is refused.
 
 `[loss] aux_stft_weight` (default 0, off) adds `weight x` PLCPA of the
 synthesized output at an `aux_n_fft`-point STFT (default 512, hop

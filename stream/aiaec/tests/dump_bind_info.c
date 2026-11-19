@@ -1,7 +1,7 @@
 /* Prints, for one {sr, fft, hop_in} of the product this binary is built for, the init result and the StreamWork
  * views of the first real pre call, one line per fact, for AIAEC/tests/test_aiaec_bind_info_pin.py to compare
- * with the ONNX export. Built by `make bind-dumpers` with -DAIAEC_TEST_CATALOG (placeholder graph paths, so the
- * rows without a delivered graph still resolve) and -DAIAEC_PRODUCT_MODEL_ID=<id>.
+ * with the ONNX export. Built by `make bind-dumpers` with -DAIAEC_TEST_CATALOG (placeholder graph paths) and
+ * -DAIAEC_PRODUCT_MODEL_ID=<id>.
  *
  *   dump_bind_info <sr> <fft> <hop_in> [family [event_hop]]
  *       family 0 PCM (default), 1 _freq; event_hop >= 0 (Align-ULCNet) marks that model hop of the block

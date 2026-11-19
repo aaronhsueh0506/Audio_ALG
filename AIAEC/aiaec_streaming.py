@@ -243,9 +243,9 @@ class FrameDelayAttentionCell:
     """Streaming twin of :class:`aiaec_common.FrameDelayAttention`.
 
     State: key ring, value ring (``max_delay_frames`` frames each, newest
-    first) and the score conv's five-frame logit window (oldest first).  The
-    per-frame arithmetic keeps the offline multiply-then-sum order, so
-    outputs match ``forward`` exactly. ``step`` takes one frame (``mic``/
+    first) and the score conv's logit window (its kernel's time size, oldest
+    first).  The per-frame arithmetic keeps the offline multiply-then-sum
+    order, so outputs match ``forward`` exactly. ``step`` takes one frame (``mic``/
     ``far`` time axis == 1, the original contract) or ``T_new > 1`` frames at
     once; every op below is already batched over that axis (the rings via
     :class:`DelayRingCell`, the score conv via :class:`StreamConv2dCell`,

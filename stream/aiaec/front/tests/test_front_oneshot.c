@@ -3,8 +3,8 @@
  * aiaec_front_process_i16 + aiaec_front_fill_align_input + aiaec_preprocess. Every block the two
  * work structs must carry the same action, state generation and, tensor by tensor, the same
  * shapes and bit-identical float contents; after a deterministic non-identity accelerator the
- * postprocess PCM must be byte-equal. Run at N = 1 and N = 8 on the int16 path. The scene's delay change
- * makes one block an event (BYPASS at N = 1, a frame_reset bit at N = 8), so the events are in play. The
+ * postprocess PCM must be byte-equal. Run at 16k/256 N = 1 and 16k/512 N = 4 on the int16 path. The scene's delay
+ * change makes one block an event (BYPASS at N = 1, a frame_reset bit at N = 4), so the events are in play. The
  * failure gates (NULL arguments, a context of another grid, a second pre before the post) must leave
  * the pair usable, with no postprocess owed, and leave the AEC where it was. */
 
@@ -20,9 +20,7 @@
 static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL (line %d): ", __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); ++g_fail; } } while (0)
 
-#define BINS 129
-#define HOP 128
-#define BLOCKS 504   /* hops; a multiple of 8 */
+#define SAMPLES (504 * 128)   /* the scene: a whole number of 16k/512 N = 4 blocks */
 
 typedef struct Pair {
     AiaecConfig cfg;
@@ -31,13 +29,13 @@ typedef struct Pair {
     void *bpool, *fpool;
 } Pair;
 
-static void pair_init(Pair *p, int n) {
+static void pair_init(Pair *p, int fft, int n) {
     StreamMemReq req;
     AiaecInfo info;
     size_t fbytes;
     int err = 0;
     memset(p, 0, sizeof(*p));
-    p->cfg.sr = 16000; p->cfg.fft = 256; p->cfg.hop_in = HOP * n;
+    p->cfg.sr = 16000; p->cfg.fft = fft; p->cfg.hop_in = fft / 2 * n;
     CHECK(aiaec_get_mem_size(&p->cfg, &req) == AIAEC_OK, "N=%d block mem size", n);
     if (posix_memalign(&p->bpool, req.alignment, (size_t)req.bytes) != 0) abort();
     err = aiaec_init(&p->cfg, p->bpool, (size_t)req.bytes, &p->ctx, &info);
@@ -89,22 +87,23 @@ static int block_events(const StreamWork *w, int n) {
 /* Deterministic non-identity mask, identical for both pairs. */
 static void fill_mask(const StreamWork *w, int n, int blk) {
     float *out = w->outputs[0].data;
+    const int bins = (int)w->outputs[0].w;
     int k, b;
     for (k = 0; k < n; ++k)
-        for (b = 0; b < BINS; ++b) {
-            out[(size_t)k * BINS + b] = 0.3f + 0.7f * (float)((b + blk) % 9) / 8.0f;
-            out[((size_t)n + (size_t)k) * BINS + b] = 0.05f * (float)((b + k) % 5);
+        for (b = 0; b < bins; ++b) {
+            out[(size_t)k * bins + b] = 0.3f + 0.7f * (float)((b + blk) % 9) / 8.0f;
+            out[((size_t)n + (size_t)k) * bins + b] = 0.05f * (float)((b + k) % 5);
         }
 }
 
-static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) {
-    static int16_t pa[BLOCKS * HOP], pb[BLOCKS * HOP];
-    const int hop_in = HOP * n, packets = BLOCKS / n;
+static void run_equiv(const Scene *sc, int fft, int n, int *events, int *discriminating) {
+    static int16_t pa[SAMPLES], pb[SAMPLES];
+    const int hop = fft / 2, hop_in = hop * n, packets = SAMPLES / hop_in;
     Pair A, B;
     int b;
 
-    pair_init(&A, n);
-    pair_init(&B, n);
+    pair_init(&A, fft, n);
+    pair_init(&B, fft, n);
     if (!A.ctx || !A.front || !B.ctx || !B.front) return;
     *events = 0;
     for (b = 0; b < packets && !g_fail; ++b) {
@@ -130,14 +129,15 @@ static void run_equiv(const Scene *sc, int n, int *events, int *discriminating) 
     CHECK(memcmp(pa, pb, sizeof(pa)) == 0, "N=%d: postprocess PCM differs between the one-shot and the three calls", n);
     {
         int i;
-        for (i = 4 * HOP; i < BLOCKS * HOP; ++i)
-            if (abs((int)pa[i] - (int)sc->mic[i - HOP]) > 500) ++*discriminating;
+        for (i = 4 * hop; i < SAMPLES; ++i)
+            if (abs((int)pa[i] - (int)sc->mic[i - hop]) > 500) ++*discriminating;
     }
     pair_free(&A);
     pair_free(&B);
 }
 
 static void run_gates(const Scene *sc) {
+    enum { HOP = 128 };   /* 16k/256 N = 1 */
     static int16_t pa[HOP], pb[HOP];
     Pair A, B, C;
     StreamWork wa, wb, wz;
@@ -147,9 +147,9 @@ static void run_gates(const Scene *sc) {
     void *pool512 = NULL;
     int b, rc;
 
-    pair_init(&A, 1);
-    pair_init(&B, 1);
-    pair_init(&C, 8);   /* a context of another grid */
+    pair_init(&A, 256, 1);
+    pair_init(&B, 256, 1);
+    pair_init(&C, 512, 4);   /* a context of another grid */
     if (!A.ctx || !A.front || !B.ctx || !B.front || !C.ctx) return;
     CHECK(aiaec_get_mem_size(&cfg512, &req512) == AIAEC_OK, "16k/512 block mem size");
     if (posix_memalign(&pool512, req512.alignment, (size_t)req512.bytes) != 0) abort();
@@ -202,14 +202,14 @@ static void run_gates(const Scene *sc) {
 /* A refused call leaves the AEC and the context untouched: stream B gets a second pre at packet 20 while the
  * first is still open (AIAEC_ERR_SEQUENCE), stream A does not; every packet from 20 on, work and PCM, is
  * bit-identical between the two. */
-static void run_duplicate(const Scene *sc, int n) {
-    static int16_t pa[BLOCKS * HOP], pb[BLOCKS * HOP];
-    const int hop_in = HOP * n, packets = BLOCKS / n, dup_at = 20 < packets ? 20 : packets / 2;
+static void run_duplicate(const Scene *sc, int fft, int n) {
+    static int16_t pa[SAMPLES], pb[SAMPLES];
+    const int hop_in = fft / 2 * n, packets = SAMPLES / hop_in, dup_at = 20 < packets ? 20 : packets / 2;
     Pair A, B;
     int b;
 
-    pair_init(&A, n);
-    pair_init(&B, n);
+    pair_init(&A, fft, n);
+    pair_init(&B, fft, n);
     if (!A.ctx || !A.front || !B.ctx || !B.front) return;
     for (b = 0; b < packets && !g_fail; ++b) {
         const int16_t *mic = sc->mic + (size_t)b * hop_in, *far = sc->far + (size_t)b * hop_in;
@@ -236,18 +236,19 @@ static void run_duplicate(const Scene *sc, int n) {
 }
 
 int main(void) {
-    Scene sc = scene_make(BLOCKS * HOP, 480);
-    int ev1 = 0, ev8 = 0, d1 = 0, d8 = 0;
+    Scene sc = scene_make(SAMPLES, 480);
+    int ev1 = 0, ev4 = 0, d1 = 0, d4 = 0;
 
-    run_equiv(&sc, 1, &ev1, &d1);
-    run_equiv(&sc, 8, &ev8, &d8);
+    run_equiv(&sc, 256, 1, &ev1, &d1);
+    run_equiv(&sc, 512, 4, &ev4, &d4);
     run_gates(&sc);
-    run_duplicate(&sc, 1);
-    run_duplicate(&sc, 8);
-    CHECK(ev1 >= 1 && ev8 >= 1, "the scene made no alignment event (N=1 %d, N=8 %d): the equivalence would not cover events", ev1, ev8);
-    CHECK(d1 > 1000 && d8 > 1000, "PCM never differs from the mic (%d, %d): the comparison cannot tell the paths apart", d1, d8);
+    run_duplicate(&sc, 256, 1);
+    run_duplicate(&sc, 512, 4);
+    CHECK(ev1 >= 1 && ev4 >= 1, "the scene made no alignment event (N=1 %d, N=4 %d): the equivalence would not cover events", ev1, ev4);
+    CHECK(d1 > 1000 && d4 > 1000, "PCM never differs from the mic (%d, %d): the comparison cannot tell the paths apart", d1, d4);
     scene_free(&sc);
     if (g_fail) { fprintf(stderr, "test_front_oneshot: %d failure(s)\n", g_fail); return 1; }
-    printf("test_front_oneshot: PASS (N=1 and N=8 bit-identical to the three calls over %d hops; event blocks N=1 %d, N=8 %d)\n", BLOCKS, ev1, ev8);
+    printf("test_front_oneshot: PASS (16k/256 N=1 and 16k/512 N=4 bit-identical to the three calls over %d samples; event blocks N=1 %d, N=4 %d)\n",
+           SAMPLES, ev1, ev4);
     return 0;
 }

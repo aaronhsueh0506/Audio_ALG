@@ -17,9 +17,15 @@ should not be reported as an upstream checkpoint-equivalent setting.
 
 The historical 16 kHz dataset default uses FFT/window/hop 512/512/256; materialization, packing, training and Python inference also accept 256/256/128. Keep the two corpora/checkpoints separate and match the model grid to its materialized frontend. The streaming ONNX exporter accepts three deployed profiles: 16 kHz/256, 16 kHz/512 and 48 kHz/1024; any other grid is refused. The 48 kHz grid uses 1024/1024/512 and needs a checkpoint trained for its frequency dimensions. The checkpoint, ONNX and runtime must agree on attention history `max_delay_frames` (D). The matched-filter count in the upstream AEC is independent of D. [Delay profiles and memory](reference/delay.md)
 
-The supplied config uses Adam, peak LR `2e-3` (`baseline.ini`: the paper's `4e-3`), and STFT-consistent PLCPA with power `0.3` and complex weight `0.7`. It selects the best checkpoint by validation. [Training and dataset](../reference/training.md)
+The supplied config uses Adam, peak LR `2e-3` at 16 kHz / FFT 256 and the paper's `4e-3` at 16 kHz / FFT 512 and 48 kHz, and STFT-consistent PLCPA with power `0.3` and complex weight `0.7`. It selects the best checkpoint by validation. [Training and dataset](../reference/training.md)
 
-`config.ini` ships the hop-128 values and `baseline.ini` / `ref_512.ini` overlay the default recipe and the 512/256 reference ([config overlays and grid options](../reference/training.md)).
+The model ships one self-contained config per board grid: `config_16k_256.ini`, `config_16k_512.ini` (`max_delay_frames = 32`) and `config_48k.ini`. `--config` is required, so a grid is always chosen; each file carries its own `[signal]`, `packed_dir` and `output_dir` ([per-grid configs and grid options](../reference/training.md)):
+
+```bash
+python3 train.py --config config_16k_512.ini --packed-dir /path/to/packed/all --gpu 0 --mmap
+```
+
+The logit window of the graph is the score kernel's time size and is fixed per grid by the board rows (`stream/aiaec/graph_io_alignulcnet.h`, mirrored by `SCORE_WINDOW_BY_GRID` in `export_onnx.py`): 9 at 16 kHz / FFT 256 (`config_16k_256.ini`), 5 at 16 kHz / FFT 512 and 48 kHz (the constructor default). The exporter refuses any other, so a FFT 256 checkpoint trained with the constructor's score kernel does not export.
 
 ## Release data kept out of the customer manual
 
@@ -32,19 +38,19 @@ the four state outputs named `<input>_out`; state `k` is input `signal_in + k` a
 inputs are `error_mag`, `far_mag`, `error_cos`, `error_sin` (layout 18, `--frames-per-call 1`: 8 inputs, 5 outputs); at
 `--frames-per-call N > 1` (layout 19) `frame_reset` `[1, N]` is appended as the last signal input (9 inputs, 5 outputs). One
 description generator produces both. `stream/aiaec` keeps no port list: `StreamWork` carries the block's signals and the head, and the
-graph's wiring (including the four state shapes) is the board sample's model configuration (`stream/aiaec/graph_io_alignulcnet.h`, shared helper `stream/common/graph_io.h`), which binds by
+graph's wiring (including the four state shapes, `logit_history` `[1, 32, W, D]` with the row's window W) is the board sample's model configuration (`stream/aiaec/graph_io_alignulcnet.h`, shared helper `stream/common/graph_io.h`), which binds by
 position, never by name. The stream computes `frame_reset` from the per-hop events (hop 3 of a packet alone: `0 0 1 0 0 0 0 0`) and the
 sample moves it like any other signal input. `AIAEC/tests/test_aiaec_bind_info_pin.py` compares the `StreamWork` views of real pre calls
-with a fresh export for N = 1 and N = 8 and asserts this name order. Fixed-point state ports need `zero_point` 0 at both ends
+with a fresh export for N = 1 and N = 4 (16 kHz / FFT 512) and asserts this name order. Fixed-point state ports need `zero_point` 0 at both ends
 (the sample's `stream_check_ports()` refuses a graph that does not).
 
 ## Alignment events in Python (`--events`)
 
-The C stream restarts the model on an alignment event: the linear AEC reports `(changed, solid)` per model hop, and a hop is an event when `changed`, or when `solid` turns 0 -> 1 after an earlier hop (`prev_solid` is carried across packets). An event hop resets the model state at that hop and is a residual bypass (enhanced frame = error spectrum); at `--frames-per-call N > 1` it is the packet graph's `frame_reset[1, N]` control (1.0 on the event hop). The Python PBFDKF has no delay-state accessor, so Python cannot derive the pairs from the mic/far WAVs; it replays them from a record file. The whole rule lives once, in `alignment_events.py` (`EdgeTracker`); inference and calib both use it, so N = 1 and N = 8 see the same events.
+The C stream restarts the model on an alignment event: the linear AEC reports `(changed, solid)` per model hop, and a hop is an event when `changed`, or when `solid` turns 0 -> 1 after an earlier hop (`prev_solid` is carried across packets). An event hop resets the model state at that hop and is a residual bypass (enhanced frame = error spectrum); at `--frames-per-call N > 1` it is the packet graph's `frame_reset[1, N]` control (1.0 on the event hop). The Python PBFDKF has no delay-state accessor, so Python cannot derive the pairs from the mic/far WAVs; it replays them from a record file. The whole rule lives once, in `alignment_events.py` (`EdgeTracker`); inference and calib both use it, so N = 1 and N > 1 see the same events.
 
 ```
-python3 AIAEC/Align_ULCNet/inference.py checkpoint.pth mic.wav far.wav out.wav --frames-per-call 8 --events mic.events.json
-python3 AIAEC/Align_ULCNet/inference.py calib ... --frames-per-call 8 --events RECORD_OR_DIR
+python3 AIAEC/Align_ULCNet/inference.py checkpoint.pth mic.wav far.wav out.wav --frames-per-call 4 --events mic.events.json
+python3 AIAEC/Align_ULCNet/inference.py calib ... --frames-per-call 4 --events RECORD_OR_DIR
 ```
 
 Record file: one record per real model hop, in order (record k = STFT frame k = the k-th model hop; "hop 3" is index 2). The count must equal `ceil(samples / hop_len)` at the model rate; a padding hop never belongs in the record, and frames after the last record (the analyser's tail frame, packet padding) are never events.
@@ -57,7 +63,7 @@ Record file: one record per real model hop, in order (record k = STFT frame k = 
 
 Values are 0/1. No file carries a precomputed restart flag. Behaviour:
 
-- Inference prints `alignment events: ...` and, at N > 1, `packet K frame_reset 00100000` for the first packet and every packet holding an event. The streaming STFT/ISTFT keep running through an event, as in every C entry. Not valid with `--mic-dir`.
+- Inference prints `alignment events: ...` and, at N > 1, `packet K frame_reset 0010` (N = 4, an event on hop 3) for the first packet and every packet holding an event. The streaming STFT/ISTFT keep running through an event, as in every C entry. Not valid with `--mic-dir`.
 - Calib takes a file (one pair) or a directory with `<relative wav name without .wav>.events.json|csv|npz` per pair; a missing or wrong-length record is an error. N > 1 captures `frame_reset` as exact 0.0/1.0 (policy `binary_control_no_ptq`, no range, no quantization). N = 1 has no control input: an event hop restarts the state and is not captured (it is a bypass the accelerator never runs) and does not count in `--frames`. The report gains `alignment_events` with the number of replayed event frames. With `--events` the last real hops are kept: a short final packet is zero-completed to N and its padding slots carry `frame_reset` 0, so an event on the last real hop is captured.
 - Without `--events` nothing changes: no event ever occurs, only whole packets are captured (a short tail is dropped, as before) and the outputs are bit-identical to before.
 - Verified with random weights against the C `_freq` stream and ONNX Runtime (`tests/test_aiaec_packet_ort_events.py`); there is no formal quantized graph or board run yet.

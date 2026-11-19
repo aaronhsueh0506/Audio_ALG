@@ -53,21 +53,21 @@ self-stamping route:
         --primary-is-mic --frames 8192 --max-delay-frames 8 --format bin \\
         --output calib/align_ulcnet_d8
 
-N frames per call (packet graph, 板端 1024 點錄音: 16k/256 用 N=8, 48k/1024
-用 N=2). The graph and every tensor carry N frames; --frames counts calls, so
-1024 calls x 8 = 8192 frames, as many as above. Without --events every
-frame_reset is 0 and only whole packets are captured:
+N frames per call (packet graph, 板端 1024 點錄音: 16k/512 用 N=4, 48k/1024
+用 N=2; 16k/256 只有 N=1). The graph and every tensor carry N frames; --frames
+counts calls, so 2048 calls x 4 = 8192 frames, as many as above. Without
+--events every frame_reset is 0 and only whole packets are captured:
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/raw_mic --far-dir /path/to/raw_far \\
-        --primary-is-mic --frames 1024 --frames-per-call 8 \\
-        --max-delay-frames 8 --format bin --output calib/align_ulcnet_d8_n8
+        --primary-is-mic --frames 2048 --frames-per-call 4 \\
+        --max-delay-frames 8 --format bin --output calib/align_ulcnet_d8_n4
 
 Alignment events: the Python linear AEC reports no delay state, so the C
 stage's per-hop restarts are replayed from a record file instead:
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
-        --frames-per-call 8 --events mic.events.json
+        --frames-per-call 4 --events mic.events.json
 An event hop resets the model state at that hop and bypasses it (enhanced
-frame = error spectrum); N = 1 and N = 8 take the same records and the same
+frame = error spectrum); N = 1 and N > 1 take the same records and the same
 edge rule (changed, or solid false -> true after an earlier hop). See
 Align_ULCNet/README.md for the record format.
 
@@ -82,7 +82,7 @@ process starts with cold AEC/model state, which then persists for the whole
 file as in deployment. Output is the common denoised, echo-free,
 early/dereverberated near-end speech estimate.
 
-config.ini is not read for model shape: every shape-relevant setting, including
+The training configs are not read for model shape: every shape-relevant setting, including
 the exact materialized Python-PBFDKF frontend, is recovered from the
 checkpoint's own contract, and inference refuses a missing or drifted AEC
 contract. ``--input-is-linear-error`` is an evaluation-only bypass for
