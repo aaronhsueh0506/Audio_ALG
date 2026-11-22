@@ -661,7 +661,7 @@ static void test_model_hooks(void) {
     plan_for(&plan, model_of(counting_identity_infer, NULL));
     plan.stream_cfg.erb_inv = NULL;
     CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, 0) == -1, "plan: a missing ERB matrix");
-    plan.stream_cfg.erb_fwd = NULL;   /* neither: the stream's file mode is not a plan */
+    plan.stream_cfg.erb_fwd = NULL;   /* no table at all is refused too */
     CHECK(dfn_hop_pool_plan(&plan, DFN2_SR, 0) == -1, "plan: no ERB matrix at all");
     {   /* an inverse matrix that is not a partition of unity (one bin off by a relative 1e-4): the plan
          * sizes it, the build refuses it; the same pool builds with the matrix restored */

@@ -1,5 +1,5 @@
-/* Host test fixture of the ainr suites: the ERB table writer and the aligned pool allocator. Header-only; not part of
- * the library. link_only_ainr.c keeps its own copy (it is a link probe). */
+/* Host test fixture of the ainr suites: in-memory ERB tables and the aligned
+ * pool allocator. Header-only; not part of the library. link_only_ainr.c keeps its own copy (it is a link probe). */
 
 #ifndef AINR_TEST_FIXTURE_H
 #define AINR_TEST_FIXTURE_H
@@ -8,56 +8,92 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_scratch_path() */
+#include "../ainr.h"
+#include "../dfn2/tests/erb_fixture.h"   /* erb_fixture_split_inv_band_major() */
 
 /* ERB_PATTERN: fwd[i] = (i % 17) * 0.01 and an inverse that splits bin k 0.75 / 0.25 over bands k % n_erb and
- * (k + 1) % n_erb (bin-major both; ainr_init refuses an inverse that is not a partition of unity). ERB_IDENTITY: every bin in
+ * (k + 1) % n_erb (ainr_init refuses an inverse that is not a partition of unity). ERB_IDENTITY: every bin in
  * one contiguous band, forward = band mean, inverse = 1, so a unit mask is a unit gain.
- * ERB_NOT_PARTITION: inv[i] = ((i + 3) % 11) * 0.02, an inverse whose bins do not sum to 1 (refused by init).
+ * ERB_NOT_PARTITION: inv at bin-major index i = ((i + 3) % 11) * 0.02, an inverse whose bins do not sum to 1 (refused by init).
  * ERB_BAND0: zero forward table, band 0 owns every bin (a partition of unity). */
 typedef enum AinrFixtureErb { ERB_PATTERN = 0, ERB_IDENTITY = 1, ERB_NOT_PARTITION = 2, ERB_BAND0 = 3 } AinrFixtureErb;
 
-/* Writes the ERB file ainr_init_from_erb_file() reads: int32 n_bins, n_erb, then both tables; exits on failure. */
-static inline void write_erb_file(const char *path, int n_bins, int n_erb, AinrFixtureErb mode)
+/* In-memory ERB tables as AinrConfig takes them: fwd bin-major [n_bins][n_erb], inv band-major [n_erb][n_bins]; n_erb is
+ * the band count AinrConfig.n_erb gets (a test may overwrite it to present tables of another count). */
+typedef struct ErbTables { float *fwd, *inv; int n_erb; } ErbTables;
+
+static inline ErbTables erb_tables(int n_bins, int n_erb, AinrFixtureErb mode)
 {
     size_t elems = (size_t)n_bins * (size_t)n_erb, i;
-    float *fwd = (float *)calloc(elems, sizeof(float));
-    float *inv = (float *)calloc(elems, sizeof(float));
-    int *size = (int *)calloc((size_t)n_erb, sizeof(int));
-    int32_t hdr[2];
-    FILE *fp;
     int k, e;
+    ErbTables t;
 
-    if (!fwd || !inv || !size) { fprintf(stderr, "calloc fail\n"); exit(1); }
+    t.n_erb = n_erb;
+    t.fwd = (float *)calloc(elems, sizeof(float));
+    t.inv = (float *)calloc(elems, sizeof(float));
+    if (!t.fwd || !t.inv) { fprintf(stderr, "calloc fail\n"); exit(1); }
     if (mode == ERB_IDENTITY) {
-        for (k = 0; k < n_bins; ++k) { e = (int)((long long)k * n_erb / n_bins); size[e]++; }
+        int *size = (int *)calloc((size_t)n_erb, sizeof(int));
+        if (!size) { fprintf(stderr, "calloc fail\n"); exit(1); }
+        for (k = 0; k < n_bins; ++k) size[(int)((long long)k * n_erb / n_bins)]++;
         for (k = 0; k < n_bins; ++k) {
             e = (int)((long long)k * n_erb / n_bins);
-            fwd[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f / (float)size[e];
-            inv[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f;
+            t.fwd[(size_t)k * (size_t)n_erb + (size_t)e] = 1.0f / (float)size[e];
+            t.inv[(size_t)e * (size_t)n_bins + (size_t)k] = 1.0f;
         }
+        free(size);
     } else if (mode == ERB_BAND0) {
-        for (k = 0; k < n_bins; ++k) inv[(size_t)k * (size_t)n_erb] = 1.0f;
+        for (k = 0; k < n_bins; ++k) t.inv[k] = 1.0f;
     } else if (mode == ERB_NOT_PARTITION) {
-        for (i = 0; i < elems; ++i) {
-            fwd[i] = (float)(i % 17) * 0.01f;
-            inv[i] = (float)((i + 3) % 11) * 0.02f;
-        }
+        for (k = 0; k < n_bins; ++k)
+            for (e = 0; e < n_erb; ++e) {
+                i = (size_t)k * (size_t)n_erb + (size_t)e;
+                t.fwd[i] = (float)(i % 17) * 0.01f;
+                t.inv[(size_t)e * (size_t)n_bins + (size_t)k] = (float)((i + 3) % 11) * 0.02f;
+            }
     } else {
-        for (i = 0; i < elems; ++i) fwd[i] = (float)(i % 17) * 0.01f;
-        for (k = 0; k < n_bins; ++k) {   /* a partition of unity: bin k splits 0.75 / 0.25 over two bands */
-            inv[(size_t)k * (size_t)n_erb + (size_t)(k % n_erb)] = 0.75f;
-            inv[(size_t)k * (size_t)n_erb + (size_t)((k + 1) % n_erb)] = 0.25f;
-        }
+        for (i = 0; i < elems; ++i) t.fwd[i] = (float)(i % 17) * 0.01f;
+        erb_fixture_split_inv_band_major(t.inv, n_bins, n_erb);
     }
-    fp = fopen(path, "wb");
-    if (!fp) { fprintf(stderr, "fopen write fail (%s)\n", path); exit(1); }
-    hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), elems, fp);
-    fwrite(inv, sizeof(float), elems, fp);
-    fclose(fp);
-    free(fwd); free(inv); free(size);
+    return t;
+}
+
+static inline ErbTables erb_tables_synthetic(int n_bins, int n_erb) { return erb_tables(n_bins, n_erb, ERB_PATTERN); }
+static inline ErbTables erb_tables_identity(int n_bins, int n_erb) { return erb_tables(n_bins, n_erb, ERB_IDENTITY); }
+static inline ErbTables erb_tables_non_partition(int n_bins, int n_erb) { return erb_tables(n_bins, n_erb, ERB_NOT_PARTITION); }
+
+static inline void erb_tables_free(ErbTables *t)
+{
+    free(t->fwd); free(t->inv);
+    t->fwd = NULL; t->inv = NULL; t->n_erb = 0;
+}
+
+/* cfg with t's tables and band count set (cfg is not modified). */
+static inline AinrConfig ainr_cfg_with(const AinrConfig *cfg, const ErbTables *t)
+{
+    AinrConfig c = *cfg;
+    c.erb_fwd = t ? t->fwd : NULL;
+    c.erb_inv = t ? t->inv : NULL;
+    c.n_erb = t ? t->n_erb : cfg->n_erb;
+    return c;
+}
+
+static inline int ainr_init_t(const AinrConfig *cfg, const ErbTables *t, void *pool, size_t bytes, AinrCtx **ctx,
+                              AinrInfo *info)
+{
+    AinrConfig c;
+    if (!cfg) return ainr_init(NULL, pool, bytes, ctx, info);
+    c = ainr_cfg_with(cfg, t);
+    return ainr_init(&c, pool, bytes, ctx, info);
+}
+
+static inline int ainr_init_freq_t(const AinrConfig *cfg, const ErbTables *t, void *pool, size_t bytes,
+                                   AinrFreqCtx **ctx, AinrInfo *info)
+{
+    AinrConfig c;
+    if (!cfg) return ainr_init_freq(NULL, pool, bytes, ctx, info);
+    c = ainr_cfg_with(cfg, t);
+    return ainr_init_freq(&c, pool, bytes, ctx, info);
 }
 
 /* A deterministic non-silent hop of int16 samples; `seed` moves the pattern. */
@@ -65,21 +101,6 @@ static inline void fill_pcm(int16_t *pcm, int n, int seed)
 {
     int i;
     for (i = 0; i < n; ++i) pcm[i] = (int16_t)((i * 13 + seed * 7) % 211 - 100);
-}
-
-static inline void write_synthetic_erb(const char *path, int n_bins, int n_erb)
-{
-    write_erb_file(path, n_bins, n_erb, ERB_PATTERN);
-}
-
-static inline void write_non_partition_erb(const char *path, int n_bins, int n_erb)
-{
-    write_erb_file(path, n_bins, n_erb, ERB_NOT_PARTITION);
-}
-
-static inline void write_identity_erb(const char *path, int n_bins, int n_erb)
-{
-    write_erb_file(path, n_bins, n_erb, ERB_IDENTITY);
 }
 
 static inline void *alloc_aligned(size_t bytes, unsigned int alignment)

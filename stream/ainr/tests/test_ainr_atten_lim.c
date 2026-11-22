@@ -1,16 +1,14 @@
 /* ainr_set_atten_lim*(): the limit reaches the enhance stage (a fully suppressing mask leaves more
  * energy under a 20 dB limit than with the limit disabled), the value survives ainr_reset(), and the
- * two families refuse NULL, NaN/Inf and a call with a block open. Not built under NO_STDIO. */
+ * two families refuse NULL, NaN/Inf and a call with a block open. */
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
 
 #define FAIL(...) do { fprintf(stderr, "%s: ", label); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); return 1; } while (0)
@@ -35,37 +33,35 @@ static double run_energy(AinrCtx *ctx, int hop_in, int blocks) {
     return e;
 }
 
-static AinrCtx *make_pcm(const AinrConfig *cfg, const char *erb) {
+static AinrCtx *make_pcm(const AinrConfig *cfg, const ErbTables *erb) {
     StreamMemReq req;
     if (ainr_get_mem_size(cfg, &req) != AINR_OK) return NULL;
     AinrCtx *ctx = NULL;
     AinrInfo info;
-    if (ainr_init_from_erb_file(cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &ctx, &info) != AINR_OK)
+    if (ainr_init_t(cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &ctx, &info) != AINR_OK)
         return NULL;
     return ctx;
 }
 
 static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req;
     AinrCtx *ctx;
     AinrFreqCtx *fq;
     StreamWork io;
     AinrInfo info;
     int16_t *buf;
-    char erb[160];
     double e_off, e_lim, e_lim2;
     int n_bins = fft / 2 + 1;
     float *z;
     const int blocks = 24;
 
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_attenlim_erb");
-    write_synthetic_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
     memset(&cfg, 0, sizeof(cfg));
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * (fft / 2);
 
     /* Behaviour: default (catalog, disabled) vs 20 dB, same input; the value survives a reset. */
-    ctx = make_pcm(&cfg, erb);
+    ctx = make_pcm(&cfg, &erb);
     if (!ctx) FAIL("init failed");
     e_off = run_energy(ctx, cfg.hop_in, blocks);
     ainr_reset(ctx);
@@ -93,7 +89,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     /* Same refusals on the _freq family. */
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) FAIL("freq size");
     fq = NULL;
-    if (ainr_init_freq_from_erb_file(&cfg, erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &fq, &info) != AINR_OK) fq = NULL;
+    if (ainr_init_freq_t(&cfg, &erb, alloc_aligned((size_t)req.bytes, req.alignment), (size_t)req.bytes, &fq, &info) != AINR_OK) fq = NULL;
     if (!fq) FAIL("freq init failed");
     z = (float *)calloc((size_t)n * (size_t)n_bins * 4u, sizeof(float));
     buf = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));
@@ -104,7 +100,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     if (ainr_set_atten_lim_freq(fq, 6.0f) != AINR_ERR_SEQUENCE) FAIL("freq open block not refused");
     if (ainr_postprocess_freq(fq, -1, z + (size_t)n * (size_t)n_bins * 2u, z + (size_t)n * (size_t)n_bins * 3u) != AINR_OK) FAIL("freq post failed");
     free(z); free(buf);
-    unlink(erb);
+    erb_tables_free(&erb);
     printf("%s: atten-lim setter OK (limit energy %.3g vs %.3g disabled)\n", label, e_lim, e_off);
     return 0;
 }

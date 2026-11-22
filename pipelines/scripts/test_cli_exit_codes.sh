@@ -55,9 +55,9 @@ mono_aec_dfn_res)
     expect 2 --delay-mode fixed --fixed-delay 12x
     expect 2 --atten-lim 12dB
     # An option followed by another option has no value (exit 2); "-x" is a value, here a file that is missing (exit 1).
-    expect_each 2 "--erb-fwd --cng --erb-inv x" "--erb-inv --cng --erb-fwd x" "--erb-fwd" "--atten-lim --cng" \
+    expect_each 2 "--erb --cng" "--erb" "--atten-lim --cng" \
         "--sample-rate --cng" "--delay-num-filters --cng" "--delay-mode --" "--fixed-delay --"
-    expect 1 --erb-fwd -x --erb-inv -y
+    expect 1 --erb -x
     ;;
 mono_alignulcnet|4ch_alignulcnet)
     expect 2 --sample-rate 44100

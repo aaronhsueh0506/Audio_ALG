@@ -67,6 +67,7 @@ DFN2_DIR ?= $(ALG_DIR)/lib/ainr/dfn2
 # The sample-rate bridge (stream/ainr/bridge) that ../dfn/dfn_hop.h uses, and the
 # model stream (stream/ainr/dfn2) that ../dfn/dfn_hop.h drives.
 BRIDGE_DIR ?= $(ALG_DIR)/stream/ainr/bridge
+STREAM_AINR_DIR ?= $(ALG_DIR)/stream/ainr
 STREAM_DFN2_DIR ?= $(ALG_DIR)/stream/ainr/dfn2
 STREAM_COMMON_DIR ?= $(ALG_DIR)/stream/common
 # The model stream (stream/aiaec/ulcnet) that alignulcnet/main.c drives on its spectrum entries.
@@ -74,12 +75,9 @@ STREAM_ULCNET_DIR ?= $(ALG_DIR)/stream/aiaec/ulcnet
 # Include paths of every TU that includes ulcnet_stream.h.
 ULCNET_STREAM_INC = -I$(STREAM_ULCNET_DIR) -I$(ULCNET_DIR) -I$(STREAM_COMMON_DIR)
 # Include paths of every TU that includes ../dfn/dfn_hop.h or ../dfn/dfn_hop_pool.h.
-DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
-# dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
-DFN2_STREAM_NO_STDIO_FLAG :=
-ifeq ($(NO_STDIO),1)
-DFN2_STREAM_NO_STDIO_FLAG := -DDFN2_STREAM_NO_STDIO
-endif
+DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -I$(STREAM_AINR_DIR)
+# The headers ../dfn/dfn_example_args.h includes from stream/ainr.
+DFN_EXAMPLE_AINR_HDRS = $(STREAM_AINR_DIR)/dfn2_grids.h $(STREAM_AINR_DIR)/dfn2_erb_file.h $(STREAM_AINR_DIR)/ainr_product.h
 
 # DeepFilterNet2 lookahead pair, same knobs and rules as pipelines/Makefile. The DFN2 hop glue, the
 # bridge and the example main take their grid and pair at run time (the config carries a DFN2Grid),
@@ -340,7 +338,7 @@ $(OBJ_DIR)/ainr_bridge.o: $(BRIDGE_DIR)/ainr_bridge.c $(BRIDGE_DIR)/ainr_bridge.
 	$(CC) $(LIB_CFLAGS) -I$(BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(STREAM_COMMON_DIR)/stream_range.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_process.o: $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
@@ -353,10 +351,10 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 
 # aec_bf_dfn_res/main.c and its tests/test_4ch_dfn.c compose the unit with
 # ../dfn/dfn_hop.h.
-$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
+$(OBJ_DIR)/test_4ch_dfn.o: aec_bf_dfn_res/tests/test_4ch_dfn.c aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h tests/conv_chain_4ch.h tests/array_test_rig.h ../dfn/dfn_hop.h ../dfn/dfn_hop_pool.h ../dfn/dfn_example_args.h $(DFN_EXAMPLE_AINR_HDRS) ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/tests/dfn_test_fixture.h ../dfn/tests/dfn_test_grid.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
+$(OBJ_DIR)/4ch_aec_bf_dfn_res_main.o: aec_bf_dfn_res/main.c array_sample_driver.h array_sample_beam.h array_sample_post.h ../dfn/dfn_hop.h ../dfn/dfn_example_args.h $(DFN_EXAMPLE_AINR_HDRS) ../dfn/dfn_unit_partition.h ../example_cli.h ../dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # alignulcnet/main.c and its tests/test_4ch_ulcnet.c compose the unit with the
@@ -486,7 +484,7 @@ audit-no-stdio: $(DFN_PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(COMMON_LIB) \
 	  if [ -n "$$hits" ]; then echo "FAIL: stdio symbols in $$archive" >&2; echo "$$hits" >&2; exit 1; fi; \
 	 done; \
 	 hits=$$(nm -A "$(DFN_PIPELINE_LIB)" | awk '{ n=$$NF; if (n ~ /^_?(fopen|fread|fclose)$$/) print }'); \
-	 if [ -n "$$hits" ]; then echo "FAIL: file-loader symbols in $(DFN_PIPELINE_LIB) (dfn2_stream.o)" >&2; echo "$$hits" >&2; exit 1; fi; \
+	 if [ -n "$$hits" ]; then echo "FAIL: fopen/fread/fclose symbols in $(DFN_PIPELINE_LIB)" >&2; echo "$$hits" >&2; exit 1; fi; \
 	 echo "4ch pipeline stack: NO_STDIO audit PASS"
 
 FORCE:

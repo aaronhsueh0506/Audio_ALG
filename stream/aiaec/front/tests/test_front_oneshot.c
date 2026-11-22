@@ -31,14 +31,13 @@ typedef struct Pair {
 
 static void pair_init(Pair *p, int fft, int n) {
     StreamMemReq req;
-    AiaecInfo info;
     size_t fbytes;
     int err = 0;
     memset(p, 0, sizeof(*p));
     p->cfg.sr = 16000; p->cfg.fft = fft; p->cfg.hop_in = fft / 2 * n;
     CHECK(aiaec_get_mem_size(&p->cfg, &req) == AIAEC_OK, "N=%d block mem size", n);
     if (posix_memalign(&p->bpool, req.alignment, (size_t)req.bytes) != 0) abort();
-    err = aiaec_init(&p->cfg, p->bpool, (size_t)req.bytes, &p->ctx, &info);
+    err = aiaec_init(&p->cfg, p->bpool, (size_t)req.bytes, &p->ctx);
     CHECK(err == AIAEC_OK && p->ctx != NULL, "N=%d block init err=%d", n, err);
     fbytes = aiaec_front_get_mem_size(&p->cfg);
     CHECK(fbytes > 0, "N=%d front size", n);
@@ -153,10 +152,7 @@ static void run_gates(const Scene *sc) {
     if (!A.ctx || !A.front || !B.ctx || !B.front || !C.ctx) return;
     CHECK(aiaec_get_mem_size(&cfg512, &req512) == AIAEC_OK, "16k/512 block mem size");
     if (posix_memalign(&pool512, req512.alignment, (size_t)req512.bytes) != 0) abort();
-    {
-        AiaecInfo info512;
-        CHECK(aiaec_init(&cfg512, pool512, (size_t)req512.bytes, &ctx512, &info512) == AIAEC_OK && ctx512 != NULL, "16k/512 block init");
-    }
+    CHECK(aiaec_init(&cfg512, pool512, (size_t)req512.bytes, &ctx512) == AIAEC_OK && ctx512 != NULL, "16k/512 block init");
 
     memset(&wz, 0, sizeof(wz));
     for (b = 0; b < 40 && !g_fail; ++b) {

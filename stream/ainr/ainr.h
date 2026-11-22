@@ -1,11 +1,12 @@
-/* AINR customer interface (DeepFilterNet2 full / lite). The customer sets {sr, fft, hop_in}; the product
- * build binds the model; ainr.c's catalog resolves the grid, N = hop_in / (fft / 2), the graph path and
- * the ERB file. The accelerator (open graph, move tensors, run, read back) stays the sample's:
+/* AINR customer interface (DeepFilterNet2 full / lite). The customer sets {sr, fft, hop_in} and the grid's ERB tables;
+ * the product build binds the model, whose grid (dfn2_grids.h) and N = hop_in / (fft / 2) init resolves. Files (graph,
+ * ERB matrices) and the accelerator (open graph, move tensors, run, read back) stay the sample's:
  *
- *     AinrConfig cfg = { sr, fft, hop_in };
+ *     ...load fb_<sr>_<n_erb>.bin (graph_io_dfn2_erb_file(), dfn2_erb_file.h) into erb_fwd / erb_inv...
+ *     AinrConfig cfg = { sr, fft, hop_in, erb_fwd, erb_inv, n_erb };
  *     ainr_get_mem_size(&cfg, &req);  ...allocate req.bytes at req.alignment...
- *     ainr_init(&cfg, pool, req.bytes, &ctx, &info);   // host only: ERB, pool, no SDK
- *     ...open info.graph_path, check its ports against the sample's model config for the same graph,
+ *     ainr_init(&cfg, pool, req.bytes, &ctx, &info);   // host only: pool, no SDK, no file
+ *     ...open the file of the graph_io_dfn2.h row (sr, fft, N, info.mask_lookahead), check its ports against that row,
  *        seed the state sync from ainr_state_generation()...
  *     for each block of hop_in samples:
  *         ainr_preprocess(ctx, pcm_in, &work);          // work.action: SUBMIT or BYPASS
@@ -17,8 +18,8 @@
  * Run status and state generation: STREAM_RUN_* in stream_run.h. The accelerator's state is zero when the generation
  * is seeded after init. The status of a BYPASS block is not read.
  *
- * A block whose run did not succeed still calls ainr_postprocess() with its run status. An unregistered
- * config is refused before any SDK call. Every successful preprocess pairs with one postprocess, a SUBMIT block
+ * A block whose run did not succeed still calls ainr_postprocess() with its run status. A config without a graph_io row
+ * is refused by the sample before any SDK call. Every successful preprocess pairs with one postprocess, a SUBMIT block
  * also with one run. A BYPASS block is N == 1 with mask_lookahead > 0 and only one of the first mask_lookahead
  * blocks after init or reset: no job, its work is all zero (state_generation included), its output is silence.
  * N > 1 is one packet at any mask_lookahead: the N hops of a block are one SUBMIT job (never a BYPASS block) whose graph reads
@@ -26,9 +27,7 @@
  * has the latency of N == 1; with mask_lookahead > 0 the first block's first mask_lookahead heads are before the stream start
  * (silence), so the accelerator's state has seen that many more frames than at N == 1.
  * StreamWork (stream_run.h) has the same size in the full and the lite archive: a client linked to
- * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time.
- * File mode only: the pool size assumes the ERB tables load from a file. Under -DDFN2_STREAM_NO_STDIO
- * no init function is compiled in; use dfn2_stream_init() (dfn2/dfn2_stream.h) directly. */
+ * the wrong variant sees another input_count/output_count, not an overrun. A context is used from one thread at a time. */
 
 #ifndef AINR_H
 #define AINR_H
@@ -49,17 +48,23 @@ typedef struct AinrConfig {
     int sr;        /* Hz */
     int fft;       /* FFT size; model_hop = fft / 2 */
     int hop_in;    /* new PCM samples per call: a positive multiple of model_hop, N = hop_in / model_hop */
+    /* The grid's ERB tables, borrowed for the context's life (get_mem_size does not read them): erb_fwd bin-major
+     * [n_bins][n_erb], erb_inv band-major [n_erb][n_bins], n_bins = fft / 2 + 1, as dfn2_erb_file.h loads them.
+     * n_erb is the tables' band count; init refuses one other than the grid's. */
+    const float *erb_fwd;
+    const float *erb_inv;
+    int          n_erb;
 } AinrConfig;
 
 enum {
     AINR_OK = 0,
     AINR_ERR_NULL = -1,
     AINR_ERR_MODEL_ID = -2,                     /* the bound model is not of this archive variant */
-    AINR_ERR_GRID = -3,                         /* no catalog entry for (sr, fft) */
+    AINR_ERR_GRID = -3,                         /* the bound model has no grid for (sr, fft) */
     AINR_ERR_IN_HOP = -4,                       /* hop_in is not a positive multiple of model_hop */
-    AINR_ERR_FRAMES_PER_CALL = -6,              /* N has no delivered graph */
+    AINR_ERR_FRAMES_PER_CALL = -6,              /* N beyond DFN2_MODEL_MAX_FRAMES_PER_CALL (64) */
     AINR_ERR_POOL = -7,                         /* pool too small or misaligned */
-    AINR_ERR_ERB_FILE = -8,                     /* ERB file missing, short or longer, of another size, a non-finite forward value, or an inverse that is not a partition of unity */
+    AINR_ERR_ERB_TABLES = -8,                   /* erb_fwd / erb_inv NULL, n_erb not the grid's, a non-finite or negative forward value, or an inverse that is not a partition of unity */
     AINR_ERR_SEQUENCE = -9,                     /* preprocess/postprocess not called in pairs */
     AINR_ERR_NONFINITE_INPUT = -10              /* _freq bin NaN/Inf or beyond 2^63 * sqrt(fft); NaN/Inf atten_lim */
 };
@@ -69,9 +74,9 @@ const char *ainr_status_text(int code);
 
 /* Result of one init, the same for both families of a config. */
 typedef struct AinrInfo {
-    const char  *graph_path;           /* model.bin of this configuration; a static string */
     int          queue_frames;         /* mask_lookahead + df_lookahead, for every N: the final PCM trails the input by queue_frames + 1
                                               model hops (_freq: after the caller's own ISTFT) */
+    int          mask_lookahead;       /* of the bound model at this grid: the graph_io_dfn2.h key of its graph */
 } AinrInfo;
 
 /* ---- PCM family ----
@@ -80,12 +85,12 @@ typedef struct AinrInfo {
 typedef struct AinrCtx AinrCtx;
 
 /* Pool size and alignment for cfg: AINR_OK (req filled) or an AINR_ERR_* (req untouched). Checked in order:
- * model vs variant, grid, hop_in divisibility, shipped graph for N. */
+ * model vs variant, grid, hop_in divisibility, N range. */
 int ainr_get_mem_size(const AinrConfig *cfg, StreamMemReq *req);
 
-/* Constructs in the pool (AINR_ALIGNMENT-aligned, >= ainr_get_mem_size() bytes) and loads the grid's ERB
- * tables. AINR_OK sets *ctx and *info; an AINR_ERR_* leaves *ctx NULL and *info untouched, and a small or
- * misaligned pool is not written. */
+/* Constructs in the pool (AINR_ALIGNMENT-aligned, >= ainr_get_mem_size() bytes) over cfg's ERB tables. AINR_OK sets
+ * *ctx and *info; an AINR_ERR_* leaves *ctx NULL and *info untouched, and a small or misaligned pool or missing tables
+ * leave the pool unwritten. */
 int ainr_init(const AinrConfig *cfg, void *pool, size_t pool_bytes, AinrCtx **ctx, AinrInfo *info);
 
 /* Back to the start: state zeroed, generation advanced, an open call dropped; ERB tables kept. */

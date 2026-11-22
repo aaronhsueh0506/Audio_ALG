@@ -1,10 +1,10 @@
 /* The board samples' AIAEC graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the StreamWork of
  * real pre calls (PCM, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
- * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration, and with
- * the test catalog (-DAIAEC_TEST_CATALOG) the library accepts a (sr, fft, N) exactly when the row exists; with the
- * production catalog every accepted configuration has a row. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
+ * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration. Every row is a
+ * configuration the library accepts; a configuration it accepts without a row (N in the model's range) is
+ * GRAPH_IO_ERR_NO_ROW. Every row names its graph file <model>_<sr / 1000>k_fft<fft>_n<N>.bin. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
  * an empty work, N = 4 at hop 2 puts frame_reset 0010 in the last signal. A SUBMIT work has pairwise disjoint
- * buffers and empty slots beyond its signals, and the two families report one and the same AiaecInfo. The rows
+ * buffers and empty slots beyond its signals. The rows
  * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
 
 #include <stdio.h>
@@ -22,10 +22,14 @@
 #define FIND(sr, fft, n, mc) graph_io_alignulcnet_find(sr, fft, n, mc)
 #define ROW_COUNT GRAPH_IO_ALIGNULCNET_ROW_COUNT
 #define IS_ALIGN 1
+#define MODEL_FILE_NAME "alignulcnet"
+#define ROW_AT(i, mc) graph_io_alignulcnet_row(i, mc)
 #else
 #define FIND(sr, fft, n, mc) graph_io_deepvqes_find(sr, fft, n, mc)
 #define ROW_COUNT GRAPH_IO_DEEPVQES_ROW_COUNT
 #define IS_ALIGN 0
+#define MODEL_FILE_NAME "deepvqes"
+#define ROW_AT(i, mc) graph_io_deepvqes_row(i, mc)
 #endif
 
 static int g_fail, g_patterns;
@@ -35,11 +39,6 @@ static int disjoint(const void *a, size_t na, const void *b, size_t nb)
 {
     const unsigned char *pa = (const unsigned char *)a, *pb = (const unsigned char *)b;
     return pa + na * sizeof(float) <= pb || pb + nb * sizeof(float) <= pa;
-}
-
-static int same_info(const AiaecInfo *a, const AiaecInfo *b)
-{
-    return a->graph_path == b->graph_path;
 }
 
 static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamWork *work)
@@ -85,7 +84,7 @@ static void compare_work(const char *tag, const GraphIoConfig *mc, const StreamW
 }
 
 /* One pre call of `family` on a fresh init; event_hop < 0: no event. Returns the pre status. */
-static int run_pre(const AiaecConfig *cfg, int family, int event_hop, StreamWork *work, AiaecInfo *info)
+static int run_pre(const AiaecConfig *cfg, int family, int event_hop, StreamWork *work)
 {
     StreamMemReq req;
     AiaecCtx *pcm = NULL; AiaecFreqCtx *freq = NULL;
@@ -98,8 +97,8 @@ static int run_pre(const AiaecConfig *cfg, int family, int event_hop, StreamWork
     rc = family == 0 ? aiaec_get_mem_size(cfg, &req) : aiaec_get_mem_size_freq(cfg, &req);
     if (rc != AIAEC_OK) return rc;
     if (posix_memalign(&pool, req.alignment, (size_t)req.bytes) != 0) exit(2);
-    rc = family == 0 ? aiaec_init(cfg, pool, (size_t)req.bytes, &pcm, info)
-                     : aiaec_init_freq(cfg, pool, (size_t)req.bytes, &freq, info);
+    rc = family == 0 ? aiaec_init(cfg, pool, (size_t)req.bytes, &pcm)
+                     : aiaec_init_freq(cfg, pool, (size_t)req.bytes, &freq);
     if (rc != AIAEC_OK) { free(pool); return rc; }
     events = (AiaecAlignEvent *)calloc((size_t)n, sizeof *events);
     s16 = (int16_t *)calloc((size_t)cfg->hop_in, sizeof *s16);
@@ -139,8 +138,7 @@ int main(void)
 {
     static const int ffts[] = { 128, 256, 512, 1024 };
     static const int srs[] = { 16000, 48000 };
-    int si, fi, n, accepted = 0, rows_hit = 0, compared = 0, family;
-    AiaecInfo infos[2];
+    int si, fi, n, ri, no_row = 0, accepted = 0, rows_hit = 0, compared = 0, family;
 
     /* The wiring tables and the libraries name the same graph layouts. */
     CHECK(GRAPH_IO_DEEPVQES_LAYOUT == DEEPVQE_PREPOST_LAYOUT_VERSION,
@@ -152,9 +150,22 @@ int main(void)
     CHECK(GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
           "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET,
           (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
-    /* AiaecInfo is the init's slim result (the graph path): no port list can sit inside it. */
-    CHECK(sizeof(AiaecInfo) == sizeof(const char *), "AiaecInfo grew to %zu bytes (graph path = %zu)", sizeof(AiaecInfo),
-          sizeof(const char *));
+    /* Every row names its graph file by the rule, and a row is a configuration the library accepts. */
+    for (ri = 0; ri < ROW_COUNT; ++ri) {
+        GraphIoConfig rc_cfg;
+        char want[64];
+        AiaecConfig rcfg;
+        StreamMemReq rreq;
+        int grc = ROW_AT(ri, &rc_cfg);
+
+        CHECK(grc == GRAPH_IO_OK, "row %d: expand rc %d", ri, grc);
+        if (grc != GRAPH_IO_OK) continue;
+        snprintf(want, sizeof want, MODEL_FILE_NAME "_%dk_fft%d_n%d.bin", rc_cfg.sample_rate / 1000, rc_cfg.fft, rc_cfg.n);
+        CHECK(rc_cfg.file != NULL && strcmp(rc_cfg.file, want) == 0, "row %d (sr %d fft %d N %d): file %s, want %s", ri,
+              rc_cfg.sample_rate, rc_cfg.fft, rc_cfg.n, rc_cfg.file ? rc_cfg.file : "(null)", want);
+        rcfg.sr = rc_cfg.sample_rate; rcfg.fft = rc_cfg.fft; rcfg.hop_in = rc_cfg.n * (rc_cfg.fft / 2);
+        CHECK(aiaec_get_mem_size(&rcfg, &rreq) == AIAEC_OK, "row %d: the library refuses its configuration", ri);
+    }
 
     for (si = 0; si < 2; ++si) for (fi = 0; fi < 4; ++fi) for (n = 1; n <= 8; ++n) {
         AiaecConfig cfg;
@@ -166,26 +177,24 @@ int main(void)
         lib_ok = aiaec_get_mem_size(&cfg, &req) == AIAEC_OK;
         row_ok = FIND(cfg.sr, cfg.fft, graph_io_frames(cfg.fft, cfg.hop_in), &mc) == GRAPH_IO_OK;
         accepted += lib_ok; rows_hit += row_ok;
-#ifdef AIAEC_TEST_CATALOG
-        CHECK(lib_ok == row_ok, "sr %d fft %d N %d: library %s, model config %s", cfg.sr, cfg.fft, n,
-              lib_ok ? "accepts" : "refuses", row_ok ? "has a row" : "has no row");
-#else
-        CHECK(!lib_ok || row_ok, "sr %d fft %d N %d: production catalog accepts, model config has no row", cfg.sr,
-              cfg.fft, n);
-#endif
+        CHECK(!row_ok || lib_ok, "sr %d fft %d N %d: model config has a row, the library refuses it", cfg.sr, cfg.fft, n);
+        if (lib_ok && !row_ok) {
+            /* accepted by the library, no graph: the sample refuses it before any accelerator call */
+            CHECK(FIND(cfg.sr, cfg.fft, n, &mc) == GRAPH_IO_ERR_NO_ROW, "sr %d fft %d N %d: want GRAPH_IO_ERR_NO_ROW", cfg.sr,
+                  cfg.fft, n);
+            ++no_row;
+        }
         if (!lib_ok || !row_ok) continue;
-        memset(infos, 0, sizeof infos);
         for (family = 0; family < 2; ++family) {
-            StreamWork work; AiaecInfo info;
+            StreamWork work;
             char tag[96];
             int rc, e, ev, n_events = IS_ALIGN ? 2 : 1;   /* no event, then (Align-ULCNet) an event at hop 2 or the last */
             for (e = 0; e < n_events; ++e) {
                 ev = e == 0 ? -1 : (n > 2 ? 2 : n - 1);
                 snprintf(tag, sizeof tag, "sr %d fft %d N %d family %d event_hop %d", cfg.sr, cfg.fft, n, family, ev);
-                rc = run_pre(&cfg, family, ev, &work, &info);
+                rc = run_pre(&cfg, family, ev, &work);
                 CHECK(rc == AIAEC_OK, "%s pre rc %d", tag, rc);
                 if (rc != AIAEC_OK) continue;
-                if (e == 0) infos[family] = info;
                 if (IS_ALIGN && n == 1 && ev == 0) {
                     /* an N = 1 event hop is BYPASS: no tensors, so no boundary check (and none would pass) */
                     CHECK(work.action == STREAM_WORK_BYPASS && work.input_count == 0 && work.output_count == 0,
@@ -199,20 +208,11 @@ int main(void)
                 ++compared;
             }
         }
-        CHECK(infos[0].graph_path != NULL && same_info(&infos[0], &infos[1]),
-              "sr %d fft %d N %d: the two families report one and the same info", cfg.sr, cfg.fft, n);
     }
-#ifdef AIAEC_TEST_CATALOG
-    CHECK(rows_hit == ROW_COUNT && accepted == ROW_COUNT, "%d rows, %d hit, %d configs accepted", ROW_COUNT, rows_hit, accepted);
-#endif
+    CHECK(rows_hit == ROW_COUNT, "%d rows, %d hit by the sweep", ROW_COUNT, rows_hit);
+    CHECK(no_row > 0, "the sweep found no library-accepted configuration without a row");
     if (g_fail) return 1;
-    printf("test_aiaec_graph_io[%s, %s catalog]: PASS (library-accepted configs %d, rows hit %d of %d, pre calls compared %d, frame_reset patterns %d)\n",
-           IS_ALIGN ? "align_ulcnet" : "deepvqe_s",
-#ifdef AIAEC_TEST_CATALOG
-           "test",
-#else
-           "production",
-#endif
-           accepted, rows_hit, ROW_COUNT, compared, g_patterns);
+    printf("test_aiaec_graph_io[%s]: PASS (library-accepted configs %d, rows hit %d of %d, accepted without a row %d, pre calls compared %d, frame_reset patterns %d)\n",
+           IS_ALIGN ? "align_ulcnet" : "deepvqe_s", accepted, rows_hit, ROW_COUNT, no_row, compared, g_patterns);
     return 0;
 }

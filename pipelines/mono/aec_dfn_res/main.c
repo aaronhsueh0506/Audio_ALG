@@ -25,7 +25,7 @@
  * the resamplers and the FIFOs keep running), with no delay line.
  *
  * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives the model stream
- * (stream/ainr/dfn2, memory mode) and synthesises through an AcIstft; any other host rate runs the
+ * (stream/ainr/dfn2) and synthesises through an AcIstft; any other host rate runs the
  * same stream on its 48 kHz grid inside stream/ainr/bridge's AinrBridge, which needs the 48 kHz /
  * 1024 model. The model grid is built from the --ai-sample-rate / --ai-fft-size pair
  * (dfn_example_args.h) with dfn2_grid_make() and handed to every object; nothing here is fixed at

@@ -136,10 +136,9 @@ skeleton (default, `--delay-num-filters 1 --cng --atten-lim 12`, `--sample-rate 
 `libaudio_pipeline_dfn.a` holds the DFN2 model stream (`dfn2_stream.o`), the sample-rate bridge
 (`ainr_bridge.o`), the DFN2 host pre/post objects. The example links it with `libaec` and
 `libaudio_common` (no denoiser, so no `libanr`); the board supplies the stateless model callback
-(`DFN2Model`) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
-from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../../dfn/README.md`](../../dfn/README.md)). `main.c` is the board
-skeleton: delay-profile flags in the `aec_wav` spelling, `--erb-fwd` /
-`--erb-inv`, `--sample-rate` (default 16000), `--ai-sample-rate` / `--ai-fft-size` (the model grid, default 48000 / 1024), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
+(`DFN2Model`) and the ERB matrices (one `fb_<sr>_<n_erb>.bin`
+from `AINR/DeepFilterNet2/export_erb_matrix.py --format bin`; layout in [`../../dfn/README.md`](../../dfn/README.md)). `main.c` is the board
+skeleton: delay-profile flags in the `aec_wav` spelling, `--erb`, `--sample-rate` (default 16000), `--ai-sample-rate` / `--ai-fft-size` (the model grid, default 48000 / 1024), `--atten-lim`, `--cng`, and a fail-open `run_accelerator()`
 stub to replace with the runtime call (the recurrent state is the accelerator's: it reloads quantized zeros when
 `job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, a
 refused commit or a run that started and failed; a callback that ran nothing returns `STREAM_RUN_NOT_STARTED` and moves
@@ -155,7 +154,7 @@ detectable.
 
 ```
 App                 Aec           DfnHop + DFN2Stream (+ AinrBridge)        AcIstft (DFN2 grid rate; 48 kHz as shipped)
- |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
+ |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load the ERB file (--erb)
  |-- aec_resolve_signal_grid; aec_config_from_level; aec_get_mem_size / aec_init -->|
  |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_bytes / dfn_hop_pool_build:
  |     dfn2_stream_get_mem_size / dfn2_stream_init_ex (memory mode, freq_only), the six conversion buffers, then
@@ -171,7 +170,7 @@ App                 Aec           DfnHop + DFN2Stream (+ AinrBridge)        AcIs
 
 External parameters (board-skeleton command line, `dfn/dfn_example_args.h`): `--sample-rate` (8000 / 16000 default
 / 48000), `--ai-sample-rate` / `--ai-fft-size` (the DFN2 model grid, default 48000 / 1024), the delay profile `--delay-mode matched|fixed|external` with `--delay-num-filters` (1..5) and
-`--fixed-delay`, `--erb-fwd` / `--erb-inv` (the exported ERB matrices of the model grid, both or neither; without them the skeleton runs a
+`--fixed-delay`, `--erb` (the exported ERB file of the model grid; without it the skeleton runs a
 fail-open smoke only), `--atten-lim` (dB, 0 = unlimited; `dfn_hop_set_atten_lim()` between hops),
 `--cng` (comfort noise, off by default). An option followed by another `--` option, or by the end of the line, has no value and the
 program exits with code 2; a file named `--x` is written `./--x`. Strength of the RES gain: `aec_set_level()`. Internal: the

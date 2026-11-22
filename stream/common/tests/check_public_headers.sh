@@ -20,6 +20,7 @@ cat > "$HDR" <<'EOF'
 #include "stream_bind.h"
 #include "graph_io.h"
 #include "graph_io_dfn2.h"
+#include "dfn2_erb_file.h"
 #include "graph_io_deepvqes.h"
 #include "graph_io_alignulcnet.h"
 EOF

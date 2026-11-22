@@ -236,6 +236,7 @@ The product path of DFN2, DeepVQE-S and Align-ULCNet (`ainr.h` / `aiaec.h`) uses
 |---|---|
 | `stream/ainr/ainr.h` | DFN2 product (PCM, PCM -> spectrum, spectrum -> spectrum) |
 | `stream/ainr/bridge/ainr_bridge.h` | DFN2 on an 8 / 16 kHz host (the 48 kHz model behind a rate bridge) |
+| `stream/ainr/dfn2_erb_file.h` | sample-side loader of the DFN2 ERB matrix file `fb_<sr>_<n_erb>.bin` (`dfn2_erb_file_load()`, header-only; the library reads no file) |
 | `stream/aiaec/aiaec.h` | DeepVQE-S and Align-ULCNet product |
 | `stream/aiaec/front/aiaec_front.h` | Align-ULCNet standalone sample (links `libaiaec_front.a` and the AEC library) |
 | `stream/common/graph_io.h` with `stream/ainr/graph_io_dfn2.h`, `stream/aiaec/graph_io_deepvqes.h`, `stream/aiaec/graph_io_alignulcnet.h` | graph wiring tables and port checks (header-only) |
@@ -246,8 +247,8 @@ The product path of DFN2, DeepVQE-S and Align-ULCNet (`ainr.h` / `aiaec.h`) uses
 Include roots: the directory of each header used, `stream/common`, audiolib `common/`
 (`stream_mem.h` includes `utility/mem_align.h`) and, with `ainr_bridge.h`, audiolib
 `common/include` (`fft_wrapper.h`). An application on a frequency-domain core also includes the
-`lib/ainr/**` / `lib/aiaec/**` headers its model page names; a `-DDFN2_STREAM_NO_STDIO` build calls
-`stream/ainr/dfn2/dfn2_stream.h` directly (`ainr.h`).
+`lib/ainr/**` / `lib/aiaec/**` headers its model page names. No library reads a file: the sample opens the graph
+file (`SAMPLE_MODEL_DIR "/" cfg.file`, the name from the `graph_io_<model>.h` row) and the ERB file, and passes the ERB tables and their `n_erb` to `AinrConfig`.
 The DFN2, DeepVQE-S and Align-ULCNet library sources include no stream header; `stream/common` is on the include path of the stream `.c` files (which include `stream_run.h` and `stream_range.h`).
 
 - [ ] Every header of the set compiles in one C99 translation unit with `-Wpedantic -Werror`

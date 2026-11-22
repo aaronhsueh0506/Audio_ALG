@@ -12,18 +12,15 @@
  * Every window handed out and every delivered spectrum must also be finite. N = 1 and N = 8 (full
  * 16 kHz/256), 48 kHz/1024 N = 1 (full or lite by the archive variant). A second part drives the
  * DFN2Stream freq entry directly: its own guard returns DFN2_STREAM_ERR_RANGE with the stream untouched. A third part
- * pins the limit: a bin at exactly 2^63 (model scale) is accepted, the next float up refused. Not built
- * under NO_STDIO. */
+ * pins the limit: a bin at exactly 2^63 (model scale) is accepted, the next float up refused. */
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
 #include "dfn2_grid.h"
 #include "dfn2_stream.h"
@@ -87,7 +84,7 @@ static const char *inj_name(Injection j) {
     }
 }
 
-static int run_stream(const AinrConfig *cfg, const char *erb, int n, int n_bins, Mode mode,
+static int run_stream(const AinrConfig *cfg, const ErbTables *erb, int n, int n_bins, Mode mode,
                       Injection inj, Trace *t, const char *label) {
     StreamMemReq req;
     AinrInfo info;
@@ -107,7 +104,7 @@ static int run_stream(const AinrConfig *cfg, const char *erb, int n, int n_bins,
     if (ainr_get_mem_size_freq(cfg, &req) != AINR_OK) { fprintf(stderr, "%s: mem size fail\n", label); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
     ctx = NULL;
-    if (ainr_init_freq_from_erb_file(cfg, erb, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "%s: init fail\n", label); return 1; }
+    if (ainr_init_freq_t(cfg, erb, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "%s: init fail\n", label); return 1; }
     t->len = 0;
     t->blocks = 0;
 
@@ -195,15 +192,13 @@ static int traces_equal(const Trace *x, const Trace *y) {
 }
 
 static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     int n_bins = fft / 2 + 1, hop = fft / 2, bad = 0, j;
-    char erb[160];
     Trace clean, omit, got;
     size_t cap = (size_t)BLOCKS * (size_t)n * (size_t)n_bins * 8u;
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = n * hop;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_erb");
-    write_synthetic_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
     clean.buf = (float *)malloc(cap * sizeof(float)); clean.cap = cap;
     omit.buf = (float *)malloc(cap * sizeof(float));  omit.cap = cap;
     got.buf = (float *)malloc(cap * sizeof(float));   got.cap = cap;
@@ -213,16 +208,16 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
     }
     for (j = INJ_EST_NAN_FIRST; j <= INJ_SINGLE_HUGE; ++j) {
         Injection inj = (Injection)j;
-        if (run_stream(&cfg, erb, n, n_bins, MODE_CLEAN, inj, &clean, label) ||
-            run_stream(&cfg, erb, n, n_bins, MODE_OMIT, inj, &omit, label) ||
-            run_stream(&cfg, erb, n, n_bins, MODE_SKIP, inj, &got, label)) return 1;
+        if (run_stream(&cfg, &erb, n, n_bins, MODE_CLEAN, inj, &clean, label) ||
+            run_stream(&cfg, &erb, n, n_bins, MODE_OMIT, inj, &omit, label) ||
+            run_stream(&cfg, &erb, n, n_bins, MODE_SKIP, inj, &got, label)) return 1;
         if (!traces_equal(&got, &omit)) {
             fprintf(stderr, "%s [%s]: skip run differs from a run that never saw the block\n", label, inj_name(inj));
             bad = 1;
         } else {
             printf("%s [%s]: refused, state untouched (skip == never offered)\n", label, inj_name(inj));
         }
-        if (run_stream(&cfg, erb, n, n_bins, MODE_RETRY, inj, &got, label)) return 1;
+        if (run_stream(&cfg, &erb, n, n_bins, MODE_RETRY, inj, &got, label)) return 1;
         if (!traces_equal(&got, &clean)) {
             fprintf(stderr, "%s [%s]: retry run differs from the clean run\n", label, inj_name(inj));
             bad = 1;
@@ -230,7 +225,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
             printf("%s [%s]: refused, retried clean == clean run\n", label, inj_name(inj));
         }
     }
-    unlink(erb);
+    erb_tables_free(&erb);
     free(clean.buf); free(omit.buf); free(got.buf);
     return bad;
 }
@@ -238,7 +233,7 @@ static int run_case(int sr, int fft, int n_erb, int n, const char *label) {
 /* The limit itself, through ainr_preprocess_freq(): fft 256 and 1024 scale by an exact power of two
  * (1/16, 1/32), so a bin of 2^63 * sqrt(fft) lands on exactly 2^63 at model scale. */
 static int run_boundary(int sr, int fft, int n_erb, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req;
     AinrInfo info;
     AinrFreqCtx *ctx = NULL;
@@ -248,17 +243,15 @@ static int run_boundary(int sr, int fft, int n_erb, const char *label) {
     float scale = dfn2_stft_scale(fft), edge = ldexpf(1.0f, 63) / scale, over = nextafterf(edge, INFINITY);
     float *x[4], *out_re = (float *)malloc((size_t)n_bins * sizeof(float)),
           *out_im = (float *)malloc((size_t)n_bins * sizeof(float));
-    char erb[160];
     void *pool;
     unsigned int gen;
 
     if (edge * scale != ldexpf(1.0f, 63)) { fprintf(stderr, "%s: scale is not a power of two\n", label); return 1; }
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = fft / 2;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_edge");
-    write_synthetic_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "%s: mem size fail\n", label); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    if (ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) {
+    if (ainr_init_freq_t(&cfg, &erb, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) {
         fprintf(stderr, "%s: init fail\n", label); return 1;
     }
     for (a = 0; a < 4; ++a) { x[a] = (float *)malloc((size_t)n_bins * sizeof(float)); gen_block(x[a], (size_t)n_bins, 0, a); }
@@ -292,7 +285,7 @@ static int run_boundary(int sr, int fft, int n_erb, const char *label) {
     }
     for (i = 0; i < 4; ++i) free(x[i]);
     free(out_re); free(out_im); free(pool);
-    unlink(erb);
+    erb_tables_free(&erb);
     if (!bad) printf("%s: 2^63 accepted, next float refused, state untouched\n", label);
     return bad;
 }
@@ -306,7 +299,6 @@ static int run_stream_guard(const char *label) {
     DFN2Stream *s[2];
     float *x[4], *out_re, *out_im, *tr[2];
     size_t nb, tl[2] = {0, 0};
-    char erb[160];
     int blk, w, bad = 0;
 
     memset(&spec, 0, sizeof(spec));
@@ -320,14 +312,15 @@ static int run_stream_guard(const char *label) {
     spec.frames_per_call = 1;
     if (dfn2_grid_make(&grid, &spec) != DFN2_GRID_OK) { fprintf(stderr, "%s: grid fail\n", label); return 1; }
     nb = (size_t)grid.n_bins;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_nonfinite_stream_erb");
-    write_synthetic_erb(erb, grid.n_bins, grid.n_erb);
+    ErbTables erb = erb_tables_synthetic(grid.n_bins, grid.n_erb);
     memset(&scfg, 0, sizeof(scfg));
     scfg.grid = grid;
+    scfg.erb_fwd = erb.fwd;
+    scfg.erb_inv = erb.inv;
     if (dfn2_stream_get_mem_size(&scfg, &req) != 0) { fprintf(stderr, "%s: mem size fail\n", label); return 1; }
     for (w = 0; w < 2; ++w) {
         void *pool = alloc_aligned((size_t)req.bytes, req.alignment);
-        s[w] = dfn2_stream_init_from_erb_file(&scfg, erb, pool, (size_t)req.bytes);
+        s[w] = dfn2_stream_init(&scfg, pool, (size_t)req.bytes);
         if (!s[w]) { fprintf(stderr, "%s: init fail\n", label); return 1; }
         tr[w] = (float *)malloc((size_t)BLOCKS * nb * 8u * sizeof(float));
     }
@@ -390,7 +383,7 @@ static int run_stream_guard(const char *label) {
     }
     {   /* the limit: one float above 2^63 refused, 2^63 accepted, on a fresh stream */
         void *pool = alloc_aligned((size_t)req.bytes, req.alignment);
-        DFN2Stream *f = dfn2_stream_init_from_erb_file(&scfg, erb, pool, (size_t)req.bytes);
+        DFN2Stream *f = dfn2_stream_init(&scfg, pool, (size_t)req.bytes);
         float lim = ldexpf(1.0f, 63), over = nextafterf(lim, INFINITY), *z = (float *)calloc(nb, sizeof(float));
         DFN2HopIO io;
         memset(&io, 0, sizeof(io));
@@ -407,7 +400,7 @@ static int run_stream_guard(const char *label) {
         }
         free(z); free(pool);
     }
-    unlink(erb);
+    erb_tables_free(&erb);
     return bad;
 }
 

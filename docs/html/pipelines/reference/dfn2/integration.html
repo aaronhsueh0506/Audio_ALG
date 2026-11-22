@@ -77,7 +77,7 @@ int mono_dfn_run(void) {
     DFN2ModelIoDescriptor desc;
     dfn2_model_io_descriptor_default(&amp;mg, &amp;desc);   /* 板端應改從匯出的模型 metadata 填 */
     DfnHopPoolPlan dfn;
-    dfn_hop_pool_plan_init(&amp;dfn, &amp;mg);             /* 模型串流(記憶體模式)跑 mg;bridge 只收 48000／1024 的 mg */
+    dfn_hop_pool_plan_init(&amp;dfn, &amp;mg);             /* 模型串流跑 mg;bridge 只收 48000／1024 的 mg */
     dfn.stream_cfg.erb_fwd = erb_fwd;  dfn.stream_cfg.erb_inv = erb_inv;   /* 借用:區塊要活得比 pool 久 */
     dfn.stream_cfg.atten_lim_db = 0.0f;            /* 0 = 不限制 */
     dfn.model.infer = board_run_dfn2_graph;        /* user、reset 可省略;state 的重載看 state generation */
@@ -261,7 +261,7 @@ int four_dfn_run(void) {
   |                           |                           |                           |
   | aec_resolve_signal_grid(sr, aec_default_fft_size(sr), &amp;grid) -&gt; AEC_OK | AEC_ERR_ARG;aec_config_from_level + 欄位(derive_lane())|
   | dfn2_grid_make(&amp;mg, &amp;spec)   模型的 grid(spec 是應用端表的一列;範例 main:--ai-sample-rate / --ai-fft-size 選列) |
-  | ERB 矩陣:erb_fwd(bin-major)與 erb_inv(band-major)兩個 raw float32 檔讀進應用端的緩衝區(範例 main:--erb-fwd / --erb-inv) |
+  | ERB 矩陣:erb_fwd(bin-major)與 erb_inv(band-major)由一個 fb_&lt;sr&gt;_&lt;n_erb&gt;.bin 讀進應用端的緩衝區(範例 main:--erb) |
   | dfn2_model_io_descriptor_default(&amp;mg, &amp;desc)   板端應改填匯出的 metadata |
   | dfn_hop_pool_plan_init(&amp;plan, &amp;mg);填 plan.stream_cfg.erb_fwd / erb_inv / atten_lim_db 與 plan.model
   | aec_get_mem_size(&amp;aec_cfg)|                           |                           |
@@ -278,7 +278,7 @@ int four_dfn_run(void) {
   |&lt;- Aec* | NULL ------------|                           |                           |
   | dfn_hop_pool_build(&amp;plan, cur, n_freqs, hop_size, &amp;hop)
   |------------------------------------------------------&gt;|                           |
-  |   dfn2_stream_init_ex(&amp;plan.stream_cfg, mem, bytes, &amp;plan.stream_req)(記憶體模式;erb_inv 不是 partition of unity 在這裡被拒)
+  |   dfn2_stream_init_ex(&amp;plan.stream_cfg, mem, bytes, &amp;plan.stream_req)(erb_inv 不是 partition of unity 在這裡被拒)
   |   ainr_bridge_init_ex(mem, bytes, &amp;plan.bridge_cfg, &amp;plan.bridge_req) + dfn_hop_init_bridge()      8 / 16 kHz host
   |   ac_istft_init(mem, ib, &amp;scfg) + dfn_hop_init_direct()                  僅 48 kHz host ---------&gt;|
   | 0 | -1(對齊、大小、stale descriptor、格點不符皆會被拒);出來即 reset 狀態           |

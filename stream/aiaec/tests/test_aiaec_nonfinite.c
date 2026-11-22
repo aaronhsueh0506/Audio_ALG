@@ -1,5 +1,5 @@
 /* Non-finite input to the AIAEC product entries, for the model the build binds (aiaec_product.h); compiled once per
- * product with -DAIAEC_TEST_CATALOG.
+ * product.
  *
  *   limit    +-FLT_MAX in every plane of the _freq family (both models), and +-2^112 (AIAEC_PCM_LIMIT_BITS) in the
  *            Align-ULCNet residual and far of the PCM family, with each sign, an alternating sign, sign patterns that
@@ -64,7 +64,6 @@ static size_t this_plane_len(const Inst *x, int p) { return x->freq ? plane_len(
 static int inst_open(Inst *x, int sr, int fft, int n, int freq) {
     AiaecConfig cfg;
     StreamMemReq req;
-    AiaecInfo info;
     int rc;
     memset(x, 0, sizeof(*x));
     x->freq = freq; x->sr = sr; x->fft = fft; x->n = n; x->hop = fft / 2; x->nb = fft / 2 + 1; x->hop_in = x->hop * n;
@@ -72,7 +71,7 @@ static int inst_open(Inst *x, int sr, int fft, int n, int freq) {
     rc = freq ? aiaec_get_mem_size_freq(&cfg, &req) : aiaec_get_mem_size(&cfg, &req);
     if (rc != AIAEC_OK) { FAIL("get_mem_size fft=%d n=%d rc=%d", fft, n, rc); return -1; }
     x->pool = alloc_aligned((size_t)req.bytes);
-    rc = freq ? aiaec_init_freq(&cfg, x->pool, (size_t)req.bytes, &x->fc, &info) : aiaec_init(&cfg, x->pool, (size_t)req.bytes, &x->pcm, &info);
+    rc = freq ? aiaec_init_freq(&cfg, x->pool, (size_t)req.bytes, &x->fc) : aiaec_init(&cfg, x->pool, (size_t)req.bytes, &x->pcm);
     if (rc != AIAEC_OK) { FAIL("init fft=%d n=%d rc=%d", fft, n, rc); return -1; }
     return 0;
 }

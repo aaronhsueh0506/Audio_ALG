@@ -96,13 +96,12 @@ STREAM_DFN2_DIR = ../stream/ainr/dfn2
 STREAM_COMMON_DIR = ../stream/common
 # The sample-rate bridge (stream/ainr/bridge) that dfn/dfn_hop.h uses.
 STREAM_BRIDGE_DIR = ../stream/ainr/bridge
+# dfn2_grids.h, ainr_product.h and dfn2_erb_file.h, which dfn/dfn_example_args.h includes.
+STREAM_AINR_DIR = ../stream/ainr
 # Include paths of every TU that includes dfn/dfn_hop.h or dfn/dfn_hop_pool.h.
-DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR)
-# dfn2_stream.c compiles its file-loader entry points out under NO_STDIO=1 (audit-no-stdio).
-DFN2_STREAM_NO_STDIO_FLAG :=
-ifeq ($(NO_STDIO),1)
-DFN2_STREAM_NO_STDIO_FLAG := -DDFN2_STREAM_NO_STDIO
-endif
+DFN_HOP_INC = -I$(STREAM_DFN2_DIR) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -I$(STREAM_AINR_DIR)
+# The headers dfn/dfn_example_args.h includes from stream/ainr.
+DFN_EXAMPLE_AINR_HDRS = $(STREAM_AINR_DIR)/dfn2_grids.h $(STREAM_AINR_DIR)/dfn2_erb_file.h $(STREAM_AINR_DIR)/ainr_product.h
 
 # DeepFilterNet2 lookahead pair the test programs run: mask 0..2, deep filter 0..4 (the shipped
 # deep filter has 5 taps), plain decimals. The hop glue, the bridge and the example mains hold
@@ -602,12 +601,12 @@ $(OBJ_DIR)/ainr_bridge.o: $(STREAM_BRIDGE_DIR)/ainr_bridge.c $(STREAM_BRIDGE_DIR
 	$(CC) $(CFLAGS) -I$(STREAM_BRIDGE_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/dfn2_stream.o: $(STREAM_DFN2_DIR)/dfn2_stream.c $(STREAM_DFN2_DIR)/dfn2_stream.h $(STREAM_COMMON_DIR)/stream_mem.h $(STREAM_COMMON_DIR)/stream_run.h $(STREAM_COMMON_DIR)/stream_range.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
-	$(CC) $(CFLAGS) $(DFN2_STREAM_NO_STDIO_FLAG) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(DFN2_DIR) -I$(STREAM_DFN2_DIR) -I$(STREAM_COMMON_DIR) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_mono_dfn.o: mono/aec_dfn_res/tests/test_mono_dfn.c mono/aec_nr_res/tests/conv_chain_mono.h dfn/dfn_hop.h dfn/dfn_hop_pool.h dfn/tests/dfn_test_fixture.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_TEST_CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_example_args.h dfn/dfn_unit_partition.h example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
+$(OBJ_DIR)/mono_aec_dfn_res_main.o: mono/aec_dfn_res/main.c dfn/dfn_hop.h dfn/dfn_example_args.h $(DFN_EXAMPLE_AINR_HDRS) dfn/dfn_unit_partition.h example_cli.h dfn/dfn_hop_pool.h | _cfg_guard
 	$(CC) $(CFLAGS) $(DFN_HOP_INC) -MD -MP -c -o $@ $<
 
 # test_dfn_hop: the DfnHop paths against a twin built from the stream layer.
@@ -866,8 +865,7 @@ audit-dead-defines:
 	@scripts/audit_dead_defines.sh $(DEAD_DEFINES_ARGS)
 
 # audit-no-stdio: builds libaudio_pipeline_dfn.a with NO_STDIO=1 and asserts, with `nm` over the delivered
-# keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp (and, for dfn2_stream.o's
-# file loader, fopen/fread/fclose) is in it, and that its
+# keyed archive itself, that none of fprintf/printf/puts/fputs/stderr/__stderrp/fopen/fread/fclose is in it, and that its
 # resolved path differs from the default (NO_STDIO=0) config's path so the two cannot alias. `ar -t`
 # confirms the members (ainr_bridge.o, dfn2_stream.o, dfn2_prepost.o, dfn2_model_io.o, dfn2_process.o). The regex tolerates a
 # leading underscore and matches the last field of nm's NAME column, as

@@ -8,7 +8,7 @@ signal_in + k <-> output head_out + k. The ONNX names are read on the exporter s
 input). The graph rows (stream/aiaec/graph_io_{deepvqes,alignulcnet}.h) are pinned below by the same exports.
 
 A tiny C dumper (stream/aiaec/tests/dump_bind_info.c, built once per product by
-``make -C stream/aiaec bind-dumpers`` with -DAIAEC_TEST_CATALOG, placeholder graph paths) prints the graph path of a real init and the StreamWork of the first real pre call for each family
+``make -C stream/aiaec bind-dumpers``) prints the init status and the StreamWork of the first real pre call for each family
 (PCM, spectrum -> spectrum). Random-weight graphs are exported at DeepVQE-S 16k/256 N=1, 16k/512 N=1 and N=4
 and 48k/1024 N=1 and N=2, and Align-ULCNet 16k/256 N=1, 16k/512 N=1 and N=4 (packet graph, layout 19) and
 48k/1024 N=1 and N=2. Every model is built with the [model] values of the model's config for its grid (config_16k_256.ini,
@@ -26,8 +26,9 @@ The graph rows are compared with the same exports: ``make -C stream/aiaec graph-
 the two model-config headers (AIAEC_GRAPH_IO_DUMPER compares another build), and each row must equal the fresh
 export: layout version, port counts and order, every input and output shape, the state names and their order, each
 state's shape at both ends, the state output name ``<input>_out`` and frame_reset as the last signal (Align-ULCNet
-N > 1). The row set must be exactly the exported cases, and the Align-ULCNet logit window of every row must equal the
-exporter's SCORE_WINDOW_BY_GRID entry for its grid.
+N > 1) and the graph file name ``<model>_<sr/1000>k_fft<fft>_n<N>.bin`` (model deepvqes or alignulcnet). The row set
+must be exactly the exported cases, and the Align-ULCNet logit window of every row must equal the exporter's
+SCORE_WINDOW_BY_GRID entry for its grid.
 """
 
 import contextlib
@@ -101,7 +102,7 @@ FAMILIES = (0, 1)   # AiaecFamily: PCM, spectrum -> spectrum
 
 
 def run_dumper(path, sr, fft, hop_in, family=0, event_hop=None):
-    """The dumper's init result and the first block's StreamWork as a dict; views as (b, c, h, w) shapes with
+    """The dumper's init status and the first block's StreamWork as a dict; views as (b, c, h, w) shapes with
     their element counts. N is not printed: it is hop_in / (fft / 2)."""
     argv = [path, str(sr), str(fft), str(hop_in), str(family)]
     if event_hop is not None:
@@ -112,8 +113,6 @@ def run_dumper(path, sr, fft, hop_in, family=0, event_hop=None):
         fields = line.split()
         if fields[0] == 'rc':
             dump['rc'] = int(fields[1])
-        elif fields[0] == 'graph':
-            dump['graph'] = fields[1]
         elif fields[0] == 'work':
             dump.update(action=int(fields[2]), inputs=int(fields[4]), outputs=int(fields[6]))
         elif fields[0] in ('in', 'out'):
@@ -233,8 +232,8 @@ def test_c_work_views_equal_the_exported_graph(case, family, dumpers, exports):
 
 
 def test_the_customer_arithmetic_is_pinned_to_the_exported_n(dumpers, exports):
-    """hop_in 256 is N=1 and 1024 is N=4 at 16 kHz / FFT 512; hop_in 129 is refused and 1024 (N=8) has no graph
-    at 16 kHz / FFT 256. The N it derives is the N the graph was exported for (the input time axis of the graph)."""
+    """hop_in 256 is N=1 and 1024 is N=4 at 16 kHz / FFT 512; hop_in 129 is refused. The library accepts every N in the
+    model stream's range (N=8 at 16 kHz / FFT 256 included, which has no row); N=65 is refused. The N it derives is the N the graph was exported for (the input time axis of the graph)."""
     dv = dumpers['deepvqe_s']
     for hop_in, n in ((256, 1), (1024, 4)):
         dump = run_dumper(dv, 16000, 512, hop_in)
@@ -243,7 +242,8 @@ def test_the_customer_arithmetic_is_pinned_to_the_exported_n(dumpers, exports):
         assert dump['in'][0][0][2] == n == hop_in // (512 // 2) == _dims(graph.input[0])[2]
     for model_name in ('deepvqe_s', 'align_ulcnet'):
         assert run_dumper(dumpers[model_name], 16000, 256, 129)['rc'] == -4     # AIAEC_ERR_IN_HOP
-        assert run_dumper(dumpers[model_name], 16000, 256, 1024)['rc'] == -5    # AIAEC_ERR_FRAMES_PER_CALL: N=8
+        assert run_dumper(dumpers[model_name], 16000, 256, 1024)['rc'] == 0      # N=8: in range, no graph_io row (below)
+        assert run_dumper(dumpers[model_name], 16000, 256, 65 * 128)['rc'] == -5  # AIAEC_ERR_FRAMES_PER_CALL: N=65
     # Align-ULCNet: N=4 is the packet graph; its time axis is the N it was exported for
     dump = run_dumper(dumpers['align_ulcnet'], 16000, 512, 1024)
     graph, _meta = exports[('align_ulcnet', 16000, 512, 4)]
@@ -286,9 +286,9 @@ def test_a_spectrum_family_refuses_what_the_pcm_family_refuses(dumpers):
     for family in FAMILIES:
         assert run_dumper(dumpers['deepvqe_s'], 16000, 256, 129, family)['rc'] == -4
         assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 1032, family)['rc'] == -4
-        assert run_dumper(dumpers['align_ulcnet'], 16000, 256, 256, family)['rc'] == -5   # N=2: no graph in the catalog
         for model_name in ('deepvqe_s', 'align_ulcnet'):
-            assert run_dumper(dumpers[model_name], 16000, 256, 1024, family)['rc'] == -5   # 16k/256 N=8: no graph
+            assert run_dumper(dumpers[model_name], 16000, 256, 65 * 128, family)['rc'] == -5   # N=65: out of range
+            assert run_dumper(dumpers[model_name], 16000, 256, 1024, family)['rc'] == 0       # N=8: accepted
 
 
 # ---- the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the same exports ----
@@ -320,6 +320,8 @@ def graph_io_rows():
             current = {'layout': int(fields[3]), 'counts': tuple(int(v) for v in fields[5:9]), 'in': [], 'out': []}
             assert fields[1] not in rows, 'duplicate row ' + fields[1]
             rows[fields[1]] = current
+        elif fields[0] == 'file':
+            current['file'] = fields[1]
         else:
             kind, index, b, c, h, w, elements = fields
             assert int(index) == len(current[kind])
@@ -379,3 +381,19 @@ def test_the_exporter_score_window_table_is_the_c_rows(graph_io_rows):
     assert set(windows) == set(align_export.SCORE_WINDOW_BY_GRID) == set(align_export.SUPPORTED_GRIDS)
     for grid, found in windows.items():
         assert found == {align_export.SCORE_WINDOW_BY_GRID[grid]}, grid
+
+
+GRAPH_FILE_MODEL = {'deepvqe_s': 'deepvqes', 'align_ulcnet': 'alignulcnet'}
+
+
+@pytest.mark.parametrize('case', CASES, ids=_case_id)
+def test_sample_row_names_its_graph_file_by_the_rule(case, graph_io_rows):
+    """The file name carries the model, the grid and N: <model>_<sr/1000>k_fft<fft>_n<N>.bin, no directory."""
+    model_name, sr, fft, n = case
+    want = '%s_%dk_fft%d_n%d.bin' % (GRAPH_FILE_MODEL[model_name], sr // 1000, fft, n)
+    assert graph_io_rows[_row_id(case)]['file'] == want
+
+
+def test_every_sample_row_has_a_distinct_graph_file(graph_io_rows):
+    files = [row['file'] for row in graph_io_rows.values()]
+    assert len(set(files)) == len(files)

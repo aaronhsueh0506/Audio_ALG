@@ -1,9 +1,6 @@
-/* DeepFilterNet2 model stream (dfn2_stream.h). -DDFN2_STREAM_NO_STDIO drops the file-loader entry
- * points (dfn2_stream_init_from_erb_file[_ex]) and every stdio call with them, for a NO_STDIO
- * build; see audit-no-stdio in the Makefile. */
+/* DeepFilterNet2 model stream (dfn2_stream.h). Reads no file: the ERB tables are the caller's. */
 
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "dfn2_stream.h"
@@ -58,21 +55,13 @@ typedef struct DFN2StreamLayout {
     void       *spec_re_mem;  /* [N][n_bins] each */
     void       *spec_im_mem;
     void       *scratch_mem;  /* the hop_in/hop_out/enh_re/enh_im slab */
-    /* File mode only (both NULL in memory mode): */
-    float      *erb_fwd_storage;   /* [n_bins][n_erb], bin-major, kept */
-    float      *erb_inv_storage;   /* [n_erb][n_bins], band-major, kept */
     uint32_t    prepost_build_hash; /* dfn2_prepost's own DFN2PrepostMemReq.build_flags_hash, folded
                                       * into this stream's own hash by dfn2_stream_get_mem_size() */
 } DFN2StreamLayout;
 
-/* cfg->erb_fwd and cfg->erb_inv both NULL (file-init mode intended); cfg itself may be NULL (0). */
-static int dfn2_stream_is_file_mode(const DFN2StreamConfig *cfg) {
-    return cfg && cfg->erb_fwd == NULL && cfg->erb_inv == NULL;
-}
-
 /* Never dereferenced: dfn2_prepost_get_mem_size()'s byte count and build_flags_hash depend only
- * on cfg->grid and on whether erb_fwd/erb_inv are NULL, never on the pointer values, so this
- * gives byte-identical sizing in file mode where the real tables aren't loaded yet. */
+ * on cfg->grid and on whether erb_fwd/erb_inv are NULL, never on the pointer values, so sizing
+ * does not need the caller's tables. */
 static const float SIZING_ERB_DUMMY = 0.0f;
 
 /* STFT and ISTFT borrow the stream's one FftHandle (carved once, handed to both as cfg.fft by
@@ -97,9 +86,6 @@ static int cfg_valid(const DFN2StreamConfig *cfg) {
         (!isfinite(cfg->hpf_cutoff_hz) || cfg->hpf_cutoff_hz <= 0.0f ||
          cfg->hpf_cutoff_hz >= 0.45f * (float)cfg->grid.sample_rate))
         return 0;
-    /* Exactly one of erb_fwd/erb_inv set is never valid: memory mode needs both, file mode needs
-     * neither (dfn2_stream_is_file_mode() reads both NULL). */
-    if ((cfg->erb_fwd == NULL) != (cfg->erb_inv == NULL)) return 0;
     /* The HPF runs before the analysis, which a freq_only caller owns. */
     if (cfg->freq_only && cfg->hpf_enable) return 0;
     return 1;
@@ -109,25 +95,21 @@ static int cfg_valid(const DFN2StreamConfig *cfg) {
  * NULL, *out holds real addresses into `base`); get_mem_size()/init() agreement is `*total`
  * matching across both calls with the same cfg. -1 on a bad config or an overflowing carve.
  * Carve order (part of DFN2_STREAM_LAYOUT_VERSION/build_flags_hash -- bump both if this changes):
- * self, hpf (if enabled), fft, stft, istft, prepost, spec_re, spec_im, scratch slab, then (file mode only)
- * erb_fwd_storage, erb_inv_storage. freq_only: self, prepost, spec_re, spec_im, then (file mode only)
- * erb_fwd_storage, erb_inv_storage. */
+ * self, hpf (if enabled), fft, stft, istft, prepost, spec_re, spec_im, scratch slab. freq_only: self, prepost,
+ * spec_re, spec_im. */
 static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
                               DFN2StreamLayout *out, size_t *total) {
     size_t cursor = 0;
     void *ptr;
-    int file_mode;
     AcStftConfig scfg;
     DFN2PrepostConfig pcfg;
     DFN2PrepostMemReq pp_req;
-    size_t fft_bytes, stft_bytes, istft_bytes, scratch_bytes, spec_bytes, erb_bytes;
-    size_t n_bins, n_erb, erb_elems;
+    size_t fft_bytes, stft_bytes, istft_bytes, scratch_bytes, spec_bytes;
+    size_t n_bins;
 
     if (!cfg || !out || !total || !cfg_valid(cfg)) return -1;
     memset(out, 0, sizeof(*out));
-    file_mode = dfn2_stream_is_file_mode(cfg);
     n_bins = (size_t)cfg->grid.n_bins;
-    n_erb = (size_t)cfg->grid.n_erb;
 
     if (stream_carve(base, &cursor, sizeof(DFN2Stream), &ptr) != 0) return -1;
     out->self = (DFN2Stream *)ptr;
@@ -163,13 +145,8 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
 
     if (dfn2_prepost_config_defaults(&pcfg, &cfg->grid) != 0) return -1;
     pcfg.atten_lim_db = cfg->atten_lim_db;
-    if (file_mode) {
-        pcfg.erb_fwd = &SIZING_ERB_DUMMY;
-        pcfg.erb_inv = &SIZING_ERB_DUMMY;
-    } else {
-        pcfg.erb_fwd = cfg->erb_fwd;
-        pcfg.erb_inv = cfg->erb_inv;
-    }
+    pcfg.erb_fwd = &SIZING_ERB_DUMMY;
+    pcfg.erb_inv = &SIZING_ERB_DUMMY;
     if (dfn2_prepost_get_mem_size(&pcfg, &pp_req) != 0) return -1;
     if (stream_carve(base, &cursor, (size_t)pp_req.bytes, &ptr) != 0) return -1;
     out->prepost_mem = ptr;
@@ -190,17 +167,6 @@ static int dfn2_stream_layout(const DFN2StreamConfig *cfg, unsigned char *base,
         if (MEM_SIZE_INVALID(scratch_bytes) || stream_carve(base, &cursor, scratch_bytes, &ptr) != 0)
             return -1;
         out->scratch_mem = ptr;
-    }
-
-    if (file_mode) {
-        erb_elems = ck_mul_size(n_bins, n_erb);
-        erb_bytes = ck_mul_size(erb_elems, sizeof(float));
-        if (MEM_SIZE_INVALID(erb_bytes)) return -1;
-
-        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
-        out->erb_fwd_storage = (float *)ptr;
-        if (stream_carve(base, &cursor, erb_bytes, &ptr) != 0) return -1;
-        out->erb_inv_storage = (float *)ptr;
     }
 
     *total = ck_align16_size(cursor);
@@ -226,7 +192,6 @@ static uint32_t build_hash(const DFN2StreamConfig *cfg, uint32_t prepost_hash) {
 #else
     h = stream_fnv1a_u32(h, 0u);
 #endif
-    h = stream_fnv1a_u32(h, dfn2_stream_is_file_mode(cfg) ? 1u : 0u);
     h = stream_fnv1a_u32(h, (uint32_t)(cfg->hpf_enable ? 1 : 0));
     h = stream_fnv1a_u32(h, (uint32_t)(cfg->freq_only ? 1 : 0));
     h = stream_fnv1a_u32(h, prepost_hash);
@@ -251,8 +216,7 @@ int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req)
     return 0;
 }
 
-/* Field-by-field DFN2StreamMemReq comparison, shared by dfn2_stream_init_ex() and
- * dfn2_stream_init_from_erb_file_ex() so a future descriptor field only needs updating once. */
+/* Field-by-field DFN2StreamMemReq comparison for dfn2_stream_init_ex(). */
 static int dfn2_stream_descriptor_matches(const DFN2StreamMemReq *expected, const DFN2StreamMemReq *req) {
     return expected->descriptor_version == req->descriptor_version &&
            expected->layout_version == req->layout_version &&
@@ -263,12 +227,8 @@ static int dfn2_stream_descriptor_matches(const DFN2StreamMemReq *expected, cons
            expected->bytes == req->bytes;
 }
 
-/* Constructs every carved object except the ERB tables, which must already hold valid data by the
- * time this runs (the caller's own borrowed pointers in memory mode; `layout`'s pool-owned,
- * already-loaded storage in file mode) -- `erb_fwd`/`erb_inv` are exactly those two pointers.
- * Returns the live DFN2Stream*, or NULL leaving nothing that looks like a valid instance; only
- * called after dfn2_stream_layout() and the caller's own size/alignment/stale-pool checks already
- * passed. */
+/* Constructs every carved object over the caller's borrowed ERB tables. Returns the live DFN2Stream*, or NULL
+ * leaving nothing that looks like a valid instance; only called after dfn2_stream_prepare_pool() passed. */
 static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned char *base,
                                            const DFN2StreamLayout *layout,
                                            const float *erb_fwd, const float *erb_inv) {
@@ -335,13 +295,8 @@ static DFN2Stream *dfn2_stream_finish_init(const DFN2StreamConfig *cfg, unsigned
     return s;
 }
 
-/* The size/alignment/stale-pool-descriptor/carve-agreement validation shared by
- * dfn2_stream_init_ex() and dfn2_stream_init_from_erb_file_ex() -- everything before each one's
- * own mode-specific tail (finish_init directly, or load-the-ERB-file-then-finish_init). On success
- * (0), `pool` is zeroed and `*layout` is a carved (non-sizing) layout over it, ready for
- * finish_init() or the file loader. -1 on any check failure; `*layout` then undefined. Does not
- * check dfn2_stream_is_file_mode(cfg) -- callers check that themselves first, since the two
- * callers want opposite answers. */
+/* The size/alignment/stale-pool-descriptor/carve-agreement validation of dfn2_stream_init_ex(). On success (0),
+ * `pool` is zeroed and `*layout` is a carved layout over it; -1 on any check failure, `*layout` then undefined. */
 static int dfn2_stream_prepare_pool(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
                                     const DFN2StreamMemReq *expected, DFN2StreamLayout *layout) {
     DFN2StreamMemReq req;
@@ -363,7 +318,7 @@ DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t 
                                 const DFN2StreamMemReq *expected) {
     DFN2StreamLayout layout;
 
-    if (dfn2_stream_is_file_mode(cfg)) return NULL;
+    if (!cfg || !cfg->erb_fwd || !cfg->erb_inv) return NULL;
     if (dfn2_stream_prepare_pool(cfg, pool, pool_bytes, expected, &layout) != 0) return NULL;
 
     return dfn2_stream_finish_init(cfg, (unsigned char *)pool, &layout, cfg->erb_fwd, cfg->erb_inv);
@@ -563,87 +518,3 @@ int dfn2_stream_post_process_packet_freq(DFN2Stream *s, int ai_rc, float *re, fl
     if (valid_frames) *valid_frames = v;
     return 0;
 }
-
-#ifndef DFN2_STREAM_NO_STDIO
-
-/* The file-loader entry points: dfn2_stream_init_from_erb_file[_ex]. File format: int32 n_bins,
- * int32 n_erb header, then n_bins*n_erb float32 forward (bin-major, kept as read) and
- * n_bins*n_erb float32 inverse (bin-major as the file stores it, transposed to band-major here,
- * as the library's erb_inv argument requires). */
-
-/* The file's inverse table (bin-major) read straight into its band-major place, a stack chunk at a time, so the
- * pool holds no table-sized load scratch. 0, or -1 on a short read. */
-static int read_inv_band_major(FILE *fp, const DFN2Grid *grid, float *band_major) {
-    float chunk[64];
-    const size_t n_bins = (size_t)grid->n_bins, n_erb = (size_t)grid->n_erb;
-    const size_t want = n_bins * n_erb;
-    size_t done = 0, k;
-
-    while (done < want) {
-        size_t n = want - done < 64u ? want - done : 64u;
-        if (fread(chunk, sizeof(float), n, fp) != n) return -1;
-        for (k = 0; k < n; ++k) {
-            size_t e = done + k;
-            band_major[(e % n_erb) * n_bins + e / n_erb] = chunk[k];
-        }
-        done += n;
-    }
-    return 0;
-}
-
-/* Reads n_bins*n_erb floats into fwd_out (kept bin-major) and the inverse table into inv_out, band-major.
- * 0, or -1 after closing the file on an open/header/short-read/dimension-mismatch failure, a byte after the
- * two tables or a forward value that is not finite. */
-static int load_erb_file(const char *path, const DFN2Grid *grid, float *fwd_out, float *inv_out) {
-    FILE *fp;
-    int32_t hdr[2];
-    size_t want = (size_t)grid->n_bins * (size_t)grid->n_erb, k;
-    int rc;
-
-    fp = fopen(path, "rb");
-    if (!fp) return -1;
-
-    if (fread(hdr, sizeof(int32_t), 2, fp) != 2) {
-        fclose(fp);
-        return -1;
-    }
-    if (hdr[0] != (int32_t)grid->n_bins || hdr[1] != (int32_t)grid->n_erb) {
-        fclose(fp);
-        return -1;
-    }
-    if (fread(fwd_out, sizeof(float), want, fp) != want) {
-        fclose(fp);
-        return -1;
-    }
-    rc = read_inv_band_major(fp, grid, inv_out);
-    if (rc == 0 && (fgetc(fp) != EOF || ferror(fp))) rc = -1;   /* the file ends after the two tables */
-    fclose(fp);
-    for (k = 0; rc == 0 && k < want; ++k)
-        if (!isfinite(fwd_out[k])) rc = -1;
-    return rc;
-}
-
-DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const char *erb_path,
-                                              void *pool, size_t pool_bytes,
-                                              const DFN2StreamMemReq *expected) {
-    DFN2StreamLayout layout;
-
-    if (!erb_path || !dfn2_stream_is_file_mode(cfg)) return NULL;
-    if (dfn2_stream_prepare_pool(cfg, pool, pool_bytes, expected, &layout) != 0) return NULL;
-
-    /* Loaded straight into pool-owned storage; a short read or mismatch returns NULL with no
-     * DFN2Stream constructed -- a partial read left in the pool is harmless since no live
-     * object is returned. */
-    if (load_erb_file(erb_path, &cfg->grid, layout.erb_fwd_storage, layout.erb_inv_storage) != 0)
-        return NULL;
-
-    return dfn2_stream_finish_init(cfg, (unsigned char *)pool, &layout,
-                                   layout.erb_fwd_storage, layout.erb_inv_storage);
-}
-
-DFN2Stream *dfn2_stream_init_from_erb_file(const DFN2StreamConfig *cfg, const char *erb_path,
-                                           void *pool, size_t pool_bytes) {
-    return dfn2_stream_init_from_erb_file_ex(cfg, erb_path, pool, pool_bytes, NULL);
-}
-
-#endif /* !DFN2_STREAM_NO_STDIO */

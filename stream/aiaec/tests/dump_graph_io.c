@@ -1,6 +1,7 @@
 /* Prints every row of graph_io_deepvqes.h and graph_io_alignulcnet.h, expanded, for
  * AIAEC/tests/test_aiaec_bind_info_pin.py to compare with a fresh export. Built by `make graph-io-dumper`.
  *   row <id> layout <v> counts <signals> <heads> <inputs> <outputs>
+ *   file <name>                            the row's graph file (GraphIoConfig.file)
  *   in <i> <b> <c> <h> <w> <elements>      inputs in order: signals, then states
  *   out <i> <b> <c> <h> <w> <elements>     outputs in order: heads, then states
  * <id> is deepvqe_s_<sample_rate>_<fft>_n<N> or align_ulcnet_<sample_rate>_<fft>_n<N>. */
@@ -20,6 +21,7 @@ static void dump(const char *name, const GraphIoConfig *c)
 
     printf("row %s_%d_%d_n%d layout %d counts %d %d %d %d\n", name, c->sample_rate, c->fft, c->n, c->layout_version,
            w->signal_in_count, w->head_out_count, w->input_count, w->output_count);
+    printf("file %s\n", c->file ? c->file : "(null)");
     for (i = 0; i < w->input_count; ++i)
         printf("in %d %u %u %u %u %zu\n", i, w->inputs[i].b, w->inputs[i].c, w->inputs[i].h, w->inputs[i].w,
                w->inputs[i].elements);

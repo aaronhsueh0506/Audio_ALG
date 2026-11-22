@@ -1,8 +1,7 @@
 /* Align-ULCNet packet graph (frames_per_call N = 4 at 16k/512, layout 19) through the real public API, with a
  * deterministic host stand-in for the accelerator that implements the graph's semantics: a frame whose frame_reset
  * is 1.0 resets the model state to zero before the frame and bypasses it (identity mask, state stays zero), any
- * other frame steps the state. Align-ULCNet product only; built with -DAIAEC_TEST_CATALOG, which gives the N=4 row a
- * placeholder graph path.
+ * other frame steps the state. Align-ULCNet product only.
  *
  *   spectra   the _freq family at N=4 equals the _freq family at N=1 applying the same events, bit for bit, for
  *             event streams: none, frame 1, frame 3, the last frame, two in one packet, adjacent, one in every packet, every
@@ -36,6 +35,8 @@
 #include "aiaec_test_fixture.h"
 #include "aiaec_product.h"
 #include "audio_stft.h"
+#include "graph_io.h"
+#include "graph_io_alignulcnet.h"
 #include "stream_mem.h"
 #include "stream_run.h"
 #include "ulcnet_prepost.h"
@@ -67,7 +68,6 @@ typedef struct Ctxs {
     AiaecCtx *blk;
     AiaecFreqCtx *freq;
     void *pb, *pf;
-    AiaecInfo ib, if_;
 } Ctxs;
 
 static int ctxs_make(Ctxs *c, int n, int want_blk, int want_freq) {
@@ -78,13 +78,13 @@ static int ctxs_make(Ctxs *c, int n, int want_blk, int want_freq) {
     if (want_blk) {
         if (aiaec_get_mem_size(&cfg, &rq) != AIAEC_OK) { FAIL("block mem size n=%d", n); return -1; }
         c->pb = alloc_aligned((size_t)rq.bytes);
-        e = aiaec_init(&cfg, c->pb, (size_t)rq.bytes, &c->blk, &c->ib);
+        e = aiaec_init(&cfg, c->pb, (size_t)rq.bytes, &c->blk);
         CHECK(e == AIAEC_OK && c->blk != NULL, "init n=%d err=%d", n, e);
     }
     if (want_freq) {
         if (aiaec_get_mem_size_freq(&cfg, &rq) != AIAEC_OK) { FAIL("freq mem size n=%d", n); return -1; }
         c->pf = alloc_aligned((size_t)rq.bytes);
-        e = aiaec_init_freq(&cfg, c->pf, (size_t)rq.bytes, &c->freq, &c->if_);
+        e = aiaec_init_freq(&cfg, c->pf, (size_t)rq.bytes, &c->freq);
         CHECK(e == AIAEC_OK && c->freq != NULL, "init_freq n=%d err=%d", n, e);
     }
     return 0;
@@ -693,7 +693,6 @@ static int section_frame_reset_inputs(void) {
     for (h = 20; h < 24; ++h) s.ev[h].solid = 1;   /* a solid false -> true edge at hop 20 */
     expected_edges(&s, edge);
     if (ctxs_make(&c, NF, 1, 1) != 0) return 1;
-    CHECK(c.ib.graph_path == c.if_.graph_path, "N=4: the two families report one info");
     accel_init(&acc[0], aiaec_state_generation(c.blk), ACC_MODEL);
     accel_init(&acc[1], aiaec_state_generation_freq(c.freq), ACC_MODEL);
     for (p = 0; p < s.packets; ++p) {
@@ -883,7 +882,8 @@ static int section_gates(void) {
     AiaecInput in;
     StreamWork w;
     AiaecAlignEvent one[1] = { { 0, 0 } };
-    AiaecConfig n1 = cfg_n(1), n2 = cfg_n(2), n16 = cfg_n(16), bad = cfg_n(NF);
+    AiaecConfig n1 = cfg_n(1), n2 = cfg_n(2), n16 = cfg_n(16), n65 = cfg_n(65), bad = cfg_n(NF);
+    GraphIoConfig gmc;
     StreamMemReq rq;
     unsigned int gen0;
 
@@ -914,21 +914,24 @@ static int section_gates(void) {
     CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_OK, "postprocess");
     CHECK(aiaec_postprocess(c.blk, 0, pcm) == AIAEC_ERR_SEQUENCE, "second postprocess");
 
-    CHECK(aiaec_get_mem_size(&n2, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=2 is not in the catalog");
-    CHECK(aiaec_get_mem_size(&n16, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=16 is not in the catalog");
+    /* N in the model's range is the library's to accept; a graph for it is the sample's graph_io lookup */
+    CHECK(aiaec_get_mem_size(&n2, &rq) == AIAEC_OK && graph_io_alignulcnet_find(16000, 512, 2, &gmc) == GRAPH_IO_ERR_NO_ROW,
+          "N=2: accepted, no graph_io row");
+    CHECK(aiaec_get_mem_size(&n16, &rq) == AIAEC_OK && graph_io_alignulcnet_find(16000, 512, 16, &gmc) == GRAPH_IO_ERR_NO_ROW,
+          "N=16: accepted, no graph_io row");
+    CHECK(aiaec_get_mem_size(&n65, &rq) == AIAEC_ERR_FRAMES_PER_CALL, "N=65 is beyond the model stream's range");
     bad.hop_in = HOP_IN + 1;
     CHECK(aiaec_get_mem_size(&bad, &rq) == AIAEC_ERR_IN_HOP, "hop_in 1025 is refused");
     {   /* a pool carved for N=1 is too small for N=4 */
         StreamMemReq r1, rp;
         void *pool;
         AiaecCtx *ctx = NULL;
-        AiaecInfo info;
         int rc;
         CHECK(aiaec_get_mem_size(&n1, &r1) == AIAEC_OK && aiaec_get_mem_size(&bad, &rp) != AIAEC_OK, "N=1 / bad hop_in sizes");
         bad.hop_in = HOP_IN;
         CHECK(aiaec_get_mem_size(&bad, &rp) == AIAEC_OK && rp.bytes > r1.bytes, "N=4 pool must be larger than N=1's");
         pool = alloc_aligned((size_t)rp.bytes);
-        rc = aiaec_init(&bad, pool, (size_t)r1.bytes, &ctx, &info);
+        rc = aiaec_init(&bad, pool, (size_t)r1.bytes, &ctx);
         CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "an N=1 sized pool for N=4, rc=%d", rc);
         free(pool);
     }

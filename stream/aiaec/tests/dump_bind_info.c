@@ -1,6 +1,6 @@
 /* Prints, for one {sr, fft, hop_in} of the product this binary is built for, the init result and the StreamWork
  * views of the first real pre call, one line per fact, for AIAEC/tests/test_aiaec_bind_info_pin.py to compare
- * with the ONNX export. Built by `make bind-dumpers` with -DAIAEC_TEST_CATALOG (placeholder graph paths) and
+ * with the ONNX export. Built by `make bind-dumpers` with
  * -DAIAEC_PRODUCT_MODEL_ID=<id>.
  *
  *   dump_bind_info <sr> <fft> <hop_in> [family [event_hop]]
@@ -8,7 +8,6 @@
  *       as an alignment change; all-zero input otherwise.
  *     rc <int>                          first refusal of aiaec_get_mem_size*() / aiaec_init*() / aiaec_preprocess*(),
  *                                       0 when all succeed (a refused config prints this line only)
- *     graph <path>                      AiaecInfo.graph_path
  *     work action <int> inputs <int> outputs <int>   StreamWork.action (0 BYPASS, 1 SUBMIT), input_count, output_count
  *     in <i> <b> <c> <h> <w> <elements>   StreamWork.inputs[i], the signals in graph order (none on a BYPASS block)
  *     out <i> <b> <c> <h> <w> <elements>  StreamWork.outputs[i], the heads (none on a BYPASS block)
@@ -26,7 +25,6 @@
 
 int main(int argc, char **argv) {
     AiaecConfig cfg;
-    AiaecInfo info;
     StreamWork work;
     StreamMemReq req;
     AiaecCtx *pcm = NULL;
@@ -48,8 +46,8 @@ int main(int argc, char **argv) {
     rc = family == 0 ? aiaec_get_mem_size(&cfg, &req) : aiaec_get_mem_size_freq(&cfg, &req);
     if (rc == AIAEC_OK) {
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;
-        rc = family == 0 ? aiaec_init(&cfg, pool, (size_t)req.bytes, &pcm, &info)
-                         : aiaec_init_freq(&cfg, pool, (size_t)req.bytes, &freq, &info);
+        rc = family == 0 ? aiaec_init(&cfg, pool, (size_t)req.bytes, &pcm)
+                         : aiaec_init_freq(&cfg, pool, (size_t)req.bytes, &freq);
     }
     if (rc != AIAEC_OK) { printf("rc %d\n", rc); free(pool); return 0; }
 
@@ -79,7 +77,6 @@ int main(int argc, char **argv) {
     rc = family == 0 ? aiaec_preprocess(pcm, &in, &work) : aiaec_preprocess_freq(freq, &fin, &work);
     printf("rc %d\n", rc);
     if (rc != AIAEC_OK) goto done;
-    printf("graph %s\n", info.graph_path);
     printf("work action %d inputs %d outputs %d\n", (int)work.action, work.input_count, work.output_count);
     for (i = 0; i < work.input_count; ++i)
         printf("in %d %u %u %u %u %zu\n", i, work.inputs[i].b, work.inputs[i].c, work.inputs[i].h, work.inputs[i].w,

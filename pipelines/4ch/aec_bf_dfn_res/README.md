@@ -98,10 +98,10 @@ the program, not archived. The board supplies the stateless model
 callback (`DFN2Model`; its recurrent state is the accelerator's, reloaded with quantized zeros when
 `job.state_generation` (`dfn_hop_state_generation()`) changes: a reset, a
 refused commit or a run that started and failed; a callback that ran nothing returns `STREAM_RUN_NOT_STARTED` and moves
-nothing) and the ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
-from `AINR/DeepFilterNet2/export_erb_matrix.py`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
+nothing) and the ERB matrices (one `fb_<sr>_<n_erb>.bin`
+from `AINR/DeepFilterNet2/export_erb_matrix.py --format bin`; layout in [`../README.md`](../README.md), "Build and test"). `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (16000 default or 48000), `--ai-sample-rate` / `--ai-fft-size`,
-`--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
+`--erb`, `--atten-lim`, `--cng`; the helper's default array geometry stands in for
 the product's measured one; numbers are parsed strictly by `example_cli.h`, so values such as
 `16000Hz` exit with 2; it
 publishes the model I/O descriptor of the model grid, which a product replaces with
@@ -115,7 +115,7 @@ spectrum.
 
 ```
 App          Aec (array)                   ArraySampleBeam   DfnHop + DFN2Stream (+ AinrBridge)   AcIstft (DFN2 grid rate; 48 kHz as shipped)
- |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load erb_fwd.bin / erb_inv.bin (--erb-fwd / --erb-inv)
+ |-- dfn2_grid_make (row of --ai-sample-rate / --ai-fft-size); load the ERB file (--erb)
  |-- array_sample_default_config; aec_get_mem_requirements; aec_init_ex -->|
  |-- array_sample_beam_default_params; array_sample_beam_get_mem_size / _init(aec) -->|
  |-- dfn_hop_pool_plan_init / dfn_hop_pool_plan / dfn_hop_pool_build: dfn2_stream_* (memory mode, freq_only) and the conversion buffers,
@@ -142,7 +142,7 @@ running and the hop is not reset. In this flow the serial moves only with an arr
 refused-call path pairs with a hop reset and a cleared shift register (`dfn_reset_follow_clear()`).
 
 External parameters: the same board-skeleton flags as the mono variant (`--sample-rate` 16000 default or
-48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb-fwd` / `--erb-inv`, `--atten-lim`, `--cng`), plus the array's `AecConfig`
+48000, `--ai-sample-rate` / `--ai-fft-size`, delay profile, `--erb`, `--atten-lim`, `--cng`), plus the array's `AecConfig`
 (delay profile, `capture_proxy_channel`, `residual`) and the helper's `ArraySampleBeamParams`
 (array geometry, `num_angles`; the skeleton uses the default 35 mm UCA, which a
 product replaces with the measured one) and `aec_set_level(aec, ...)` on the array.

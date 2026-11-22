@@ -1,5 +1,4 @@
-/* The spectrum-only context of dfn2_stream (cfg.freq_only). Per grid row, in memory mode and (unless
- * -DDFN2_STREAM_NO_STDIO) in file mode:
+/* The spectrum-only context of dfn2_stream (cfg.freq_only). Per grid row:
  *   - a pool of exactly get_mem_size() bytes between two canary zones initialises, 16 bytes less is refused;
  *   - a run through the _freq entries (model failure, non-finite heads, refused bins, attenuation limit, resets
  *     between hops and inside one) returns, hop for hop, the codes, job tensors, generation, validity flag and
@@ -7,10 +6,7 @@
  *   - the canary zones are intact afterwards: nothing was written outside the pool;
  *   - the PCM entries (per-hop and packet) return -1 and write nothing, hpf_enable is refused, and a descriptor of the
  *     other kind of context is refused in both directions.
- * A row with N > 1 runs the packet entries (N frames per call, mask_lookahead 0).
- * File mode also refuses a short file (the last row has more bands than one read chunk, and the missing float is a
- * zero of a table that is a partition without it, so only the read itself can refuse it), another grid's header and
- * an inverse that is not a partition of unity. */
+ * A row with N > 1 runs the packet entries (N frames per call, mask_lookahead 0). */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -206,20 +202,6 @@ static void check_pcm_refused(DFN2Stream *slim, const DFN2Grid *g, const char *l
     free(z);
 }
 
-#ifndef DFN2_STREAM_NO_STDIO
-/* fwd then inv (both bin-major); `inv_elems` < n_bins * n_erb writes a short file. */
-static void write_erb(const char *path, int n_bins, int n_erb, const float *fwd, const float *inv_bin, size_t inv_elems) {
-    FILE *fp = fopen(path, "wb");
-    int32_t hdr[2];
-    if (!fp) { fprintf(stderr, "fopen %s\n", path); exit(2); }
-    hdr[0] = (int32_t)n_bins; hdr[1] = (int32_t)n_erb;
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), (size_t)n_bins * (size_t)n_erb, fp);
-    fwrite(inv_bin, sizeof(float), inv_elems, fp);
-    fclose(fp);
-}
-#endif
-
 static void run_row(const Row *r) {
     DFN2Grid g = make_grid(r);
     const size_t elems = (size_t)g.n_bins * (size_t)g.n_erb;
@@ -266,64 +248,12 @@ static void run_row(const Row *r) {
     full = dfn2_stream_init_ex(&cfull, fpool, (size_t)rfull.bytes, &rfull);
     CHECK(slim != NULL && full != NULL, "%s: init on the exact pool size", label);
     if (slim && full) {
-        CHECK(run_pair(slim, full, &g, label) == 0, "%s: memory mode differs from the full context", label);
+        CHECK(run_pair(slim, full, &g, label) == 0, "%s: the freq_only context differs from the full context", label);
         check_pcm_refused(slim, &g, label);
-        CHECK(guards_intact(raw, (size_t)rslim.bytes), "%s: memory mode wrote outside the pool", label);
+        CHECK(guards_intact(raw, (size_t)rslim.bytes), "%s: the freq_only context wrote outside the pool", label);
     }
     free(raw);
 
-#ifndef DFN2_STREAM_NO_STDIO
-    {
-        float *inv_bin = (float *)malloc(elems * sizeof(float));
-        DFN2StreamConfig cfile;
-        DFN2StreamMemReq rfile, rfile_full;
-        char path[96];
-
-        if (!inv_bin) exit(2);
-        erb_fixture_split_inv_bin_major(inv_bin, g.n_bins, g.n_erb);
-        erb_fixture_scratch_path(path, sizeof(path), "dfn2_stream_freq_only_erb");
-        memset(&cfile, 0, sizeof(cfile));
-        cfile.grid = g;
-        CHECK(dfn2_stream_get_mem_size(&cfile, &rfile_full) == 0, "%s: file sizing", label);
-        cfile.freq_only = 1;
-        CHECK(dfn2_stream_get_mem_size(&cfile, &rfile) == 0 && rfile.bytes == rslim.bytes + 2u * elems * sizeof(float),
-              "%s: file mode is not the memory mode plus two tables", label);
-        pool = guarded_pool((size_t)rfile.bytes, &raw);
-
-        {   /* one float short, of a table in which band 0 owns every bin */
-            float *unit_bin = (float *)calloc(elems, sizeof(float));
-            int k;
-            if (!unit_bin) exit(2);
-            for (k = 0; k < g.n_bins; ++k) unit_bin[(size_t)k * (size_t)g.n_erb] = 1.0f;
-            write_erb(path, g.n_bins, g.n_erb, fwd, unit_bin, elems - 1u);
-            CHECK(dfn2_stream_init_from_erb_file(&cfile, path, pool, (size_t)rfile.bytes) == NULL, "%s: short file accepted", label);
-            write_erb(path, g.n_bins, g.n_erb, fwd, unit_bin, elems);
-            CHECK(dfn2_stream_init_from_erb_file(&cfile, path, pool, (size_t)rfile.bytes) != NULL, "%s: the same table, complete, refused", label);
-            free(unit_bin);
-        }
-        write_erb(path, g.n_bins, g.n_erb + 4, fwd, inv_bin, elems);    /* another grid's header */
-        CHECK(dfn2_stream_init_from_erb_file(&cfile, path, pool, (size_t)rfile.bytes) == NULL, "%s: foreign header accepted", label);
-        inv_bin[elems / 2] += 0.5f;                                     /* not a partition of unity */
-        write_erb(path, g.n_bins, g.n_erb, fwd, inv_bin, elems);
-        CHECK(dfn2_stream_init_from_erb_file(&cfile, path, pool, (size_t)rfile.bytes) == NULL, "%s: non-partition file accepted", label);
-        inv_bin[elems / 2] -= 0.5f;
-
-        write_erb(path, g.n_bins, g.n_erb, fwd, inv_bin, elems);
-        CHECK(dfn2_stream_init_from_erb_file_ex(&cfile, path, pool, (size_t)rfile.bytes, &rfile_full) == NULL,
-              "%s: freq_only file init took a full descriptor", label);
-        slim = dfn2_stream_init_from_erb_file_ex(&cfile, path, pool, (size_t)rfile.bytes, &rfile);
-        remove(path);
-        full = dfn2_stream_init_ex(&cfull, fpool, (size_t)rfull.bytes, &rfull);
-        CHECK(slim != NULL && full != NULL, "%s: file init on the exact pool size", label);
-        if (slim && full) {
-            CHECK(run_pair(slim, full, &g, label) == 0, "%s: file mode differs from the full context", label);
-            check_pcm_refused(slim, &g, label);
-        }
-        CHECK(guards_intact(raw, (size_t)rfile.bytes), "%s: file mode wrote outside the pool", label);
-        free(raw);
-        free(inv_bin);
-    }
-#endif
     free(fpool);
     free(fwd);
     free(inv);
@@ -333,10 +263,6 @@ int main(void) {
     size_t i;
     for (i = 0; i < sizeof(ROWS) / sizeof(ROWS[0]); ++i) run_row(&ROWS[i]);
     if (g_fail) { printf("freq_only: %d check(s) FAILED\n", g_fail); return 1; }
-#ifdef DFN2_STREAM_NO_STDIO
-    printf("freq_only: %d grid(s), memory mode -- PASS\n", (int)(sizeof(ROWS) / sizeof(ROWS[0])));
-#else
-    printf("freq_only: %d grid(s), memory and file mode -- PASS\n", (int)(sizeof(ROWS) / sizeof(ROWS[0])));
-#endif
+    printf("freq_only: %d grid(s) -- PASS\n", (int)(sizeof(ROWS) / sizeof(ROWS[0])));
     return 0;
 }

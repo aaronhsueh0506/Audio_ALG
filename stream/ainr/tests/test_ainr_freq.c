@@ -13,8 +13,7 @@
  *   3. Queue labeling: AinrInfo.queue_frames of both families against the lookahead hops of the grid, spelled
  *      out per row (the output trails the input by queue_frames + 1 model hops).
  *
- * Not built under NO_STDIO (ainr.c's only entry points, including the new families', are
- * file-mode only). MASK_ONLY-only concepts (coefs/alpha outputs) are already guarded by ainr.h's
+ * MASK_ONLY-only concepts (coefs/alpha outputs) are already guarded by ainr.h's
  * own StreamWork contract (output_count differs), so this file needs no #ifdef DFN2_MASK_ONLY of
  * its own beyond what fill_accel() uses, matching test_ainr_dfn2.c's own convention. */
 
@@ -22,10 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
 #include "audio_stft.h"
 #include "stream_mem.h"
@@ -101,12 +98,11 @@ static void audio_synthesise(Audio *a, int n, const float *re, const float *im, 
 
 static int run_family_consistency(int sr, int fft, int n_erb, int hops,
                                    int bypass_hop, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req_pcm, req_freq;
     void *pool_pcm, *pool_freq;
     AinrCtx *ctx_pcm;
     AinrFreqCtx *ctx_freq;
-    char erb_path[160];
     int hop = fft / 2, n_bins = fft / 2 + 1;
     int16_t *pcm_in, *pcm_ref, *pcm_from_freq;
     float *freq_re, *freq_im, *af_re, *af_im;
@@ -120,13 +116,12 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
     if (ainr_get_mem_size_freq(&cfg, &req_freq) != AINR_OK) { fprintf(stderr, "%s: get_mem_size_freq fail\n", label); return 1; }
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_erb");
-    write_synthetic_erb(erb_path, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
 
     pool_pcm = alloc_aligned((size_t)req_pcm.bytes, req_pcm.alignment);
-    ainr_init_from_erb_file(&cfg, erb_path, pool_pcm, (size_t)req_pcm.bytes, &ctx_pcm, &g_info);
+    ainr_init_t(&cfg, &erb, pool_pcm, (size_t)req_pcm.bytes, &ctx_pcm, &g_info);
     pool_freq = alloc_aligned((size_t)req_freq.bytes, req_freq.alignment);
-    ainr_init_freq_from_erb_file(&cfg, erb_path, pool_freq, (size_t)req_freq.bytes, &ctx_freq, &g_info);
+    ainr_init_freq_t(&cfg, &erb, pool_freq, (size_t)req_freq.bytes, &ctx_freq, &g_info);
     if (!ctx_pcm || !ctx_freq) { fprintf(stderr, "%s: init fail\n", label); return 1; }
     if (audio_open(&audio, fft)) { fprintf(stderr, "%s: test stft/istft init fail\n", label); return 1; }
 
@@ -186,7 +181,7 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
     free(freq_re); free(freq_im); free(af_re); free(af_im);
     audio_close(&audio);
     free(pool_pcm); free(pool_freq);
-    unlink(erb_path);
+    erb_tables_free(&erb);
     return bad;
 }
 
@@ -203,12 +198,11 @@ static int run_family_consistency(int sr, int fft, int n_erb, int hops,
  * delivers a full N-frame output of real (non-silent) spectra, not an error or a short block. */
 static int test_core_ordering_and_bypass(void) {
     const int n = T2_N, hop = T2_FFT / 2, n_bins = T2_FFT / 2 + 1;
-    AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2) };
+    AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2), NULL, NULL, 0 };
     StreamMemReq req;
     AinrFreqCtx *ctx;
     StreamWork io;
     Audio audio;
-    char erb_path[160];
     void *pool;
     int16_t *pcm_in = (int16_t *)malloc((size_t)n * (size_t)hop * sizeof(int16_t));
     float *in_re = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
@@ -219,11 +213,10 @@ static int test_core_ordering_and_bypass(void) {
     float *im2 = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int rc, k, f, same;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_n8_erb");
-    write_synthetic_erb(erb_path, n_bins, T2_ERB);
+    ErbTables erb = erb_tables_synthetic(n_bins, T2_ERB);
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "test_core_ordering: get_mem_size fail\n"); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    ainr_init_freq_from_erb_file(&cfg, erb_path, pool, (size_t)req.bytes, &ctx, &g_info);
+    ainr_init_freq_t(&cfg, &erb, pool, (size_t)req.bytes, &ctx, &g_info);
     if (!ctx || audio_open(&audio, T2_FFT)) { fprintf(stderr, "test_core_ordering: init fail\n"); return 1; }
 
     /* Block 1: real job, committed. */
@@ -267,7 +260,7 @@ static int test_core_ordering_and_bypass(void) {
            n, n);
     free(pcm_in); free(in_re); free(in_im); free(re1); free(im1); free(re2); free(im2); free(pool);
     audio_close(&audio);
-    unlink(erb_path);
+    erb_tables_free(&erb);
     return 0;
 }
 
@@ -276,12 +269,11 @@ static int test_core_ordering_and_bypass(void) {
  * (the N-frame scaling scratch and the block staging that the N=1 coverage never reaches). */
 static int test_freq_core_matches_pcm_core(void) {
     const int n = T2_N, hop = T2_FFT / 2, n_bins = T2_FFT / 2 + 1;
-    AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2) };
+    AinrConfig cfg = { T2_SR, T2_FFT, T2_N * (T2_FFT / 2), NULL, NULL, 0 };
     StreamMemReq req_p, req_f;
     AinrCtx *ctx_p;
     AinrFreqCtx *ctx_f;
     Audio audio;
-    char erb_path[160];
     void *pool_p, *pool_f;
     int16_t *pcm_in = (int16_t *)malloc((size_t)n * (size_t)hop * sizeof(int16_t));
     int16_t *pcm_ref = (int16_t *)malloc((size_t)n * (size_t)hop * sizeof(int16_t));
@@ -292,15 +284,14 @@ static int test_freq_core_matches_pcm_core(void) {
     float *out_im_freq = (float *)malloc((size_t)n * (size_t)n_bins * sizeof(float));
     int block, rc;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_n8f_erb");
-    write_synthetic_erb(erb_path, n_bins, T2_ERB);
+    ErbTables erb = erb_tables_synthetic(n_bins, T2_ERB);
     if (ainr_get_mem_size(&cfg, &req_p) != AINR_OK || ainr_get_mem_size_freq(&cfg, &req_f) != AINR_OK) {
         fprintf(stderr, "test_freq_core_matches_pcm_core: get_mem_size fail\n"); return 1;
     }
     pool_p = alloc_aligned((size_t)req_p.bytes, req_p.alignment);
     pool_f = alloc_aligned((size_t)req_f.bytes, req_f.alignment);
-    ainr_init_from_erb_file(&cfg, erb_path, pool_p, (size_t)req_p.bytes, &ctx_p, &g_info);
-    ainr_init_freq_from_erb_file(&cfg, erb_path, pool_f, (size_t)req_f.bytes, &ctx_f, &g_info);
+    ainr_init_t(&cfg, &erb, pool_p, (size_t)req_p.bytes, &ctx_p, &g_info);
+    ainr_init_freq_t(&cfg, &erb, pool_f, (size_t)req_f.bytes, &ctx_f, &g_info);
     if (!ctx_p || !ctx_f || audio_open(&audio, T2_FFT)) { fprintf(stderr, "test_freq_core_matches_pcm_core: init fail\n"); return 1; }
 
     for (block = 0; block < 2; ++block) {
@@ -336,7 +327,7 @@ static int test_freq_core_matches_pcm_core(void) {
     free(out_re_freq); free(out_im_freq);
     free(pool_p); free(pool_f);
     audio_close(&audio);
-    unlink(erb_path);
+    erb_tables_free(&erb);
     return 0;
 }
 
@@ -346,12 +337,11 @@ static int test_freq_core_matches_pcm_core(void) {
  * out here (queue_frames = L + D, whatever N is), not read from the library, and must be identical for both
  * families' init info. */
 static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req_pcm, req_freq;
     void *pool_pcm, *pool_freq;
     AinrCtx *ctx_pcm;
     AinrFreqCtx *ctx_freq;
-    char erb_path[160];
     AinrInfo bi[2];
     int hop = fft / 2, n_bins = fft / 2 + 1, i;
     int want_queue = L + D;
@@ -360,22 +350,22 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
     cfg.fft = fft;
     cfg.hop_in = n * hop;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_freq_delay_erb");
-    write_synthetic_erb(erb_path, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
 
     if (ainr_get_mem_size(&cfg, &req_pcm) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
     pool_pcm = alloc_aligned((size_t)req_pcm.bytes, req_pcm.alignment);
-    ainr_init_from_erb_file(&cfg, erb_path, pool_pcm, (size_t)req_pcm.bytes, &ctx_pcm, &bi[0]);
+    ainr_init_t(&cfg, &erb, pool_pcm, (size_t)req_pcm.bytes, &ctx_pcm, &bi[0]);
 
     if (ainr_get_mem_size_freq(&cfg, &req_freq) != AINR_OK) { fprintf(stderr, "%s: get_mem_size_freq fail\n", label); return 1; }
     pool_freq = alloc_aligned((size_t)req_freq.bytes, req_freq.alignment);
-    ainr_init_freq_from_erb_file(&cfg, erb_path, pool_freq, (size_t)req_freq.bytes, &ctx_freq, &bi[1]);
+    ainr_init_freq_t(&cfg, &erb, pool_freq, (size_t)req_freq.bytes, &ctx_freq, &bi[1]);
 
     if (!ctx_pcm || !ctx_freq) { fprintf(stderr, "%s: init fail\n", label); return 1; }
 
     for (i = 0; i < 2; ++i) {
-        if (bi[i].graph_path != bi[0].graph_path) {
-            fprintf(stderr, "%s: [%d] graph differs from the PCM family's\n", label, i);
+        if (bi[i].mask_lookahead != bi[0].mask_lookahead || bi[i].mask_lookahead != L) {
+            fprintf(stderr, "%s: [%d] mask_lookahead %d (PCM family %d), want %d\n", label, i, bi[i].mask_lookahead,
+                    bi[0].mask_lookahead, L);
             return 1;
         }
         if (bi[i].queue_frames != want_queue) {
@@ -386,7 +376,7 @@ static int run_delay_labeling(int sr, int fft, int n_erb, int n, int L, int D, c
 
     printf("%s: PASS (queue_frames=%d, hop=%d)\n", label, want_queue, hop);
     free(pool_pcm); free(pool_freq);
-    unlink(erb_path);
+    erb_tables_free(&erb);
     return 0;
 }
 

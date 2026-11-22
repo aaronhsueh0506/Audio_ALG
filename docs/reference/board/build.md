@@ -197,10 +197,10 @@ samples apply their input gain with a small `InputGain` helper over `sk_scale_f3
 The DeepFilterNet2, Align-ULCNet and DeepVQE-S libraries are frequency domain only: the sample builds its own `AcStft` / `AcIstft`
 (audiolib's framing, so the board build list must include `audio_stft.c` and `audio_window.c`) and hands spectra to the library. No
 grid or lookahead pair is a build setting, so no model-grid `-D` flag belongs on a compile line. The grid is a run-time value: a sample
-passes `{sr, fft, hop_in}` (`AinrConfig` / `AiaecConfig`) to its model stream, which resolves the grid, `N = hop_in / (fft / 2)`, the graph path
-and (DFN2) ERB matrices from its catalog and reports the graph and the stream timing in the `AinrInfo` / `AiaecInfo` that `*_init()` fills
-(`AinrInfo`: `graph_path`, `queue_frames`; `AiaecInfo`: `graph_path` only; no port list). The graph's wiring (signal, head and state shapes, one row per
-registered `(model, sr, fft, N)`) is the sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`,
+passes `{sr, fft, hop_in}` (`AinrConfig` / `AiaecConfig`; DFN2 adds its grid's ERB tables and their band count `n_erb`, below) to its model stream, which resolves the grid and
+`N = hop_in / (fft / 2)` and reports the stream timing in the `AinrInfo` that `ainr_init()` fills (`queue_frames`, `mask_lookahead`; `aiaec_init()` reports nothing;
+no graph path, no port list). The graph file and its wiring (signal, head and state shapes, one row per registered
+`(model, sr, fft, N)`, DFN2 also per `mask_lookahead`) are the sample's model configuration: the per-graph tables `graph_io_<model>.h` next to each library (`stream/ainr/graph_io_dfn2.h`,
 `stream/aiaec/graph_io_{deepvqes,alignulcnet}.h`; header-only, not included by `ainr.h` / `aiaec.h`) and the shared helper
 `stream/common/graph_io.h` (row expansion, state pairing, the `stream_check_ports()` call, buffer sizing, the check of every block's work
 against the row; tested by `make -C stream/common test-graph-io`). `stream/common/stream_run.h` (the block's `StreamWork` and the run status values) is included by `ainr.h` and `aiaec.h`: it adds a header, no source and no link input. A sample adds `-I stream/common -I stream/ainr` (or `stream/aiaec`) and compiles
@@ -212,9 +212,12 @@ synthesis scales and the overlap-add mode are part of each library's framing con
 and return audio-scale spectra (the default `AcStft` / `AcIstft` scales of 1) and convert to the model scale internally, and the
 DFN2, Align-ULCNet and DeepVQE-S samples synthesize with `AC_OLA_ACCUMULATE`.
 
-A sample supplies only `sr`, `fft` and `hop_in`; the stream selects everything else. For DFN2 that is the grid row (the model's
-`df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`), the graph and the ERB matrices. A
-configuration without a delivered graph is refused by `*_get_mem_size()` / `*_init()` with its own return code.
+A sample supplies `sr`, `fft` and `hop_in` (and DFN2's ERB tables); the stream selects the rest. For DFN2 that is the grid row (the model's
+`df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`). The stream accepts any N of 1..64 (`*_ERR_FRAMES_PER_CALL`
+beyond that); a configuration without a `graph_io_<model>.h` row has no graph and is refused by the sample (`GRAPH_IO_ERR_NO_ROW`) before any SDK call.
+Each row carries the graph's file name, `<model>_<sr/1000>k_fft<fft>_n<N>.bin` (for example `deepvqes_16k_fft256_n1.bin`, `dfn2_48k_fft1024_n2.bin`;
+the `mask_lookahead` 0 DFN2 model has its own `dfn2_l0_*` files, the lite model `dfn2_lite_*`): the sample opens `SAMPLE_MODEL_DIR "/" cfg.file`
+(sample macro, default `/mnt/sd/audio_model/16x16`; the quantization folder is the sample's choice), and the files on the SD card use these names.
 
 The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_history` pairs and the Align-ULCNet and DeepVQE-S state views
 stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run
@@ -223,11 +226,15 @@ saw, reloads quantized zeros into the accelerator's state input buffers (the fir
 accelerator's state is quantized zero when the generation is first read). The start value differs per library (1 for DFN2,
 0 for Align-ULCNet and DeepVQE-S), so compare, never assume.
 
-The DFN2 stream loads the ERB matrices of the resolved grid from the board's release-asset directory during `ainr_init()`; a sample
-neither names nor opens that file, and a missing file, a header or size mismatch, bytes after the two matrices, a forward value that is not finite or is negative, or an inverse matrix that is not a partition of unity (every entry in [0, 1] and every bin's band weights sum to exactly 1.0f, as `export_erb_matrix.py` checks before it writes) returns `AINR_ERR_ERB_FILE`. The file has the layout
-of the DFN2 exporter's `erb_matrix.bin`: int32 `n_bins`, int32 `n_bands`, the forward matrix, the inverse matrix (float32; both
-`[n_bins][n_erb]`, bin-major). The stream transposes the inverse to band-major `[n_erb][n_bins]` once at init into pool-owned storage.
-The checkpoint, the ERB file and the `model.bin` must be the ones trained for the chosen grid and pair.
+No DFN2 library reads a file. The sample loads the ERB matrices of the grid and passes them in `AinrConfig.erb_fwd` / `erb_inv` and their band count in `AinrConfig.n_erb` (the `n_erb` out-parameter below; the tables are borrowed for the
+context's life; `get_mem_size` does not read them): `graph_io_dfn2_erb_file(model, sr, fft, &n_erb)` gives the name `fb_<sr>_<n_erb>.bin`,
+`stream/ainr/dfn2_erb_file.h` (`dfn2_erb_file_load(path, n_bins, n_erb, erb_fwd, erb_inv)`, directory `SAMPLE_ERB_DIR`, default `/mnt/sd/dfn2_blobs`)
+reads it. The file has the layout of the DFN2 exporter's `erb_matrix.bin` (`export_erb_matrix.py --format bin`): int32 `n_bins`, int32 `n_bands`, the
+forward matrix, the inverse matrix (float32; both `[n_bins][n_erb]`, bin-major); the loader refuses another header or size and bytes after the two
+matrices, and transposes the inverse to band-major `[n_erb][n_bins]` while reading. `ainr_init()` returns `AINR_ERR_ERB_TABLES` (the pool unwritten) for NULL tables, an `n_erb` other than the grid's, a
+forward value that is not finite or is negative, or an inverse that is not a partition of unity (every entry in [0, 1] and every bin's band weights
+sum to exactly 1.0f, as `export_erb_matrix.py` checks after it writes). The checkpoint, the ERB file and the graph file must be the ones trained
+for the chosen grid and pair.
 
 ## Compile flags (`EXTRA_CFLAGS`)
 

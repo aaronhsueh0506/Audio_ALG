@@ -4,8 +4,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'stream/ainr/dfn2/tests/erb_fixture.h'
 
@@ -18,11 +16,10 @@ def _c_sources():
 
 def test_no_c_source_writes_to_a_fixed_tmp_name():
     """A "/tmp/<name>" format string in a test is a predictable name that fopen("wb") follows through a symlink. The only
-    "/tmp/" literals are the two erb_fixture_scratch_path() definitions, which create their file with O_EXCL."""
-    helper_files = {HELPER, ROOT / 'stream/ainr/tests/link_only_ainr.c'}
+    "/tmp/" literal is the erb_fixture_scratch_path() definition, which creates its file with O_EXCL."""
     bad = []
     for path in _c_sources():
-        if path in helper_files:
+        if path == HELPER:
             continue
         for number, line in enumerate(path.read_text(errors='replace').splitlines(), 1):
             if re.search(r'"/tmp/', line):
@@ -30,9 +27,8 @@ def test_no_c_source_writes_to_a_fixed_tmp_name():
     assert not bad, 'fixed /tmp names in C sources:\n' + '\n'.join(bad)
 
 
-@pytest.mark.parametrize('source', [HELPER, ROOT / 'stream/ainr/tests/link_only_ainr.c'])
-def test_the_scratch_helpers_use_o_excl(source):
-    text = source.read_text()
+def test_the_scratch_helper_uses_o_excl():
+    text = HELPER.read_text()
     assert 'erb_fixture_scratch_path' in text and 'O_CREAT | O_EXCL' in text
 
 

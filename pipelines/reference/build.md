@@ -48,8 +48,7 @@ make -C 4ch 4ch_static
 make example-adapter
 
 # Build the DFN2 archive (model stream, rate bridge, pre/post) with no stdio linked in
-# at all (board images that forbid the stdio symbol set; dfn2_stream.o is built with -DDFN2_STREAM_NO_STDIO,
-# so its ERB file loader is out too), and audit that it holds:
+# at all (board images that forbid the stdio symbol set; no DFN2 library reads a file), and audit that it holds:
 make NO_STDIO=1 libaudio_pipeline_dfn.a
 make audit-no-stdio
 
@@ -108,7 +107,7 @@ reached a test build is red. The other pairs are not exercised by it. `make test
 test grids (with the test header's pair 1/1, not the 0/0 of those rows in the example table: it runs the same code at another
 grid, it does not test a table row).
 
-`make` builds the mono executables and the DFN2 archive (`libaudio_pipeline_dfn.a`: `dfn2_stream.o`, `ainr_bridge.o`, the DFN2 pre/post objects). A unit that includes `dfn/dfn_hop.h` or `dfn/dfn_hop_pool.h` compiles with `-I ../stream/ainr/dfn2 -I ../stream/ainr/bridge -I ../stream/common` (`DFN_HOP_INC`). There is no mono
+`make` builds the mono executables and the DFN2 archive (`libaudio_pipeline_dfn.a`: `dfn2_stream.o`, `ainr_bridge.o`, the DFN2 pre/post objects). A unit that includes `dfn/dfn_hop.h` or `dfn/dfn_hop_pool.h` compiles with `-I ../stream/ainr/dfn2 -I ../stream/ainr/bridge -I ../stream/common -I ../stream/ainr` (`DFN_HOP_INC`; `-I ../stream/ainr` is for `dfn2_grids.h`, `ainr_product.h`, `dfn2_erb_file.h`). There is no mono
 library archive: the mono examples link the producer libraries (`libaec.a`, `libanr.a`,
 `libaudio_common.a`) directly and carry their grid derivation and per-hop chain in their own
 sources. The 4-channel array is not a pipeline archive: it is an instance of the AEC library (`libaec.a`,
@@ -223,7 +222,7 @@ allocation ever, end to end, not just on the per-hop audio path.
 四條 lane、共用 `DelayAec` 與增益級都在內）以及 DFN2 的模型串流與取樣率橋接器（`DFN2Stream`、`AinrBridge`），其餘函式庫
 （`AnrDenoiser`、`AcIstft`）各有自己的 `*_mem_size` 與 `init`，整合者自己加總（DFN2 範例的尾段由 `dfn_hop_pool_plan()`／`dfn_hop_pool_bytes()`／`dfn_hop_pool_build()` 一次算完切好）。神經網路的遞迴 state 不在任何一個
 pool 裡：float 主機登錄自己的 buffer，板端由加速器持有並依 state generation 重載量化零（`mono_aec_dfn_res`、`mono_alignulcnet` 的 `run_accelerator()` 註解寫明）；
-DFN2 的 ERB 矩陣由應用讀入並持有（範例 `--erb-fwd` / `--erb-inv` 各讀一個 raw float32 檔），函式庫只借兩個指標，矩陣也不在任何 pool 裡。
+DFN2 的 ERB 矩陣由應用讀入並持有（範例 `--erb` 讀一個 `fb_<sr>_<n_erb>.bin`），函式庫只借兩個指標，矩陣也不在任何 pool 裡。
 
 [`example_board_adapter.c`](../mono/aec_nr_res/example_board_adapter.c) 是這個順序的可編譯、
 可執行的 HOST 模擬（`make example-adapter`，也接進 `make test`）：pool 計畫（AEC、

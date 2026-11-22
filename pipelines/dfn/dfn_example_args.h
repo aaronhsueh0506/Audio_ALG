@@ -1,7 +1,7 @@
 /* Command-line handling shared by the DFN2 board skeletons
  * (mono/aec_dfn_res/main.c, 4ch/aec_bf_dfn_res/main.c): the host grid, the DFN2 model
- * grid (--ai-sample-rate / --ai-fft-size, a row of the table below built into a DFN2Grid with
- * dfn2_grid_make()), delay profile (example_cli.h), the exported ERB matrices, DFN2
+ * grid (--ai-sample-rate / --ai-fft-size, a row of stream/ainr/dfn2_grids.h built into a DFN2Grid with
+ * dfn2_grid_make()), delay profile (example_cli.h), the exported ERB file (--erb), DFN2
  * attenuation limit and the comfort-noise switch (off by default). Header-only; not linked into
  * the delivered archives. */
 #ifndef DFN_EXAMPLE_ARGS_H
@@ -14,23 +14,15 @@
 
 #include "aec.h"
 #include "example_cli.h"
+#include "dfn2_erb_file.h"
 #include "dfn2_grid.h"
+#include "dfn2_grids.h"
 #include "dfn_unit_partition.h"
 
-/* The model grids the skeletons offer. Which (sample rate, fft size) pair maps to which n_erb,
- * df_bins, df_order and lookahead pair is a property of the trained model
- * (AINR/DeepFilterNet2/config.ini [signal], [model]), so it is this program's table; hop, bins,
- * the scales and the feature normaliser are all fixed by dfn2_grid.h / dfn2_grid_make(). There is
- * no 32 kHz row: the AEC in front of the model has no 32 kHz grid, so no host could run that
- * model. */
-static const DFN2GridSpec DFN_EXAMPLE_MODEL_ROWS[] = {
-    { .sample_rate = 16000, .n_fft = 256, .n_erb = 24, .df_bins = 96, .df_order = 5,
-      .mask_lookahead = 0, .df_lookahead = 0, .frames_per_call = 1 },
-    { .sample_rate = 48000, .n_fft = 1024, .n_erb = 32, .df_bins = 96, .df_order = 5,
-      .mask_lookahead = 1, .df_lookahead = 1, .frames_per_call = 1 },
-};
-#define DFN_EXAMPLE_MODEL_ROW_COUNT \
-    ((int)(sizeof(DFN_EXAMPLE_MODEL_ROWS) / sizeof(DFN_EXAMPLE_MODEL_ROWS[0])))
+/* The grids the skeletons offer are the rows of DFN2_GRIDS (stream/ainr/dfn2_grids.h) of the model
+ * AINR_MODEL_ID_DFN2_FULL: 16000/256 and 48000/1024. Hop, bins, the scales and the feature normaliser
+ * of a row are fixed by dfn2_grid.h / dfn2_grid_make(). */
+#define DFN_EXAMPLE_MODEL_ID AINR_MODEL_ID_DFN2_FULL
 #define DFN_EXAMPLE_DEFAULT_MODEL_RATE 48000
 #define DFN_EXAMPLE_DEFAULT_MODEL_FFT  1024
 
@@ -51,8 +43,7 @@ typedef struct DfnExampleArgs {
     AecDelayMode delay_mode;
     int delay_num_filters;   /* MATCHED only; 1..AEC_DELAY_NUM_FILTERS_MAX             */
     int fixed_delay_samples; /* FIXED only; -1 otherwise                    */
-    const char *erb_fwd_path;
-    const char *erb_inv_path;
+    const char *erb_path;    /* --erb: the fb_<sr>_<n_erb>.bin of the model grid, or NULL */
     float atten_lim_db;
     int enable_cng;
 } DfnExampleArgs;
@@ -77,21 +68,11 @@ static const char *dfn_example_model_rows_text(char *buf, size_t cap) {
     size_t used = 0;
     int i;
     buf[0] = '\0';
-    for (i = 0; i < DFN_EXAMPLE_MODEL_ROW_COUNT && used < cap; ++i)
-        used += (size_t)snprintf(buf + used, cap - used, "%s%d/%d", i ? ", " : "",
-                                 DFN_EXAMPLE_MODEL_ROWS[i].sample_rate,
-                                 DFN_EXAMPLE_MODEL_ROWS[i].n_fft);
+    for (i = 0; i < DFN2_GRIDS_ROWS && used < cap; ++i)
+        if (DFN2_GRIDS[i].model_id == DFN_EXAMPLE_MODEL_ID)
+            used += (size_t)snprintf(buf + used, cap - used, "%s%d/%d", used ? ", " : "",
+                                     DFN2_GRIDS[i].spec.sample_rate, DFN2_GRIDS[i].spec.n_fft);
     return buf;
-}
-
-/* The row of a (sample rate, fft size) pair, or NULL. */
-static const DFN2GridSpec *dfn_example_model_row(int sample_rate, int n_fft) {
-    int i;
-    for (i = 0; i < DFN_EXAMPLE_MODEL_ROW_COUNT; ++i)
-        if (DFN_EXAMPLE_MODEL_ROWS[i].sample_rate == sample_rate &&
-            DFN_EXAMPLE_MODEL_ROWS[i].n_fft == n_fft)
-            return &DFN_EXAMPLE_MODEL_ROWS[i];
-    return NULL;
 }
 
 static void dfn_example_usage(const char *prog, const char *rates_text) {
@@ -115,9 +96,10 @@ static void dfn_example_usage(const char *prog, const char *rates_text) {
         "                              4~413ms 5~509ms. Not a runtime knob:\n"
         "                              changing it re-queries the pool.\n"
         "  --fixed-delay <samples>     FIXED delay in native-rate samples (>=0)\n"
-        "  --erb-fwd <erb_fwd.bin>     exported DFN2 ERB matrices (both or\n"
-        "  --erb-inv <erb_inv.bin>     neither; without them a unit partition\n"
-        "                              serves the fail-open smoke run only)\n"
+        "  --erb <fb_<sr>_<n_erb>.bin> ERB matrices of the model grid (the file\n"
+        "                              export_erb_matrix.py --format bin\n"
+        "                              writes); without it a unit partition\n"
+        "                              serves the fail-open smoke run only\n"
         "  --atten-lim <dB>            DFN2 attenuation limit (default 0 = off)\n"
         "  --cng                       enable the host's comfort-noise fill\n"
         "                              (off by default for the DFN2 variants)\n"
@@ -131,7 +113,8 @@ static void dfn_example_usage(const char *prog, const char *rates_text) {
  * accepted ones. */
 static int dfn_example_resolve_model_grid(DfnExampleArgs *out, const char *name) {
     char rows_text[96];
-    const DFN2GridSpec *row = dfn_example_model_row(out->ai_sample_rate, out->ai_fft_size);
+    const DFN2GridSpec *row = dfn2_grids_find(DFN_EXAMPLE_MODEL_ID, out->ai_sample_rate,
+                                              out->ai_fft_size);
     int status;
     if (!row) {
         fprintf(stderr, "%s: no DFN2 model grid for --ai-sample-rate %d --ai-fft-size %d "
@@ -168,8 +151,7 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
     out->delay_mode = AEC_DELAY_MATCHED;
     out->delay_num_filters = DFN_EXAMPLE_DELAY_NUM_FILTERS;
     out->fixed_delay_samples = -1;
-    out->erb_fwd_path = NULL;
-    out->erb_inv_path = NULL;
+    out->erb_path = NULL;
     out->atten_lim_db = 0.0f;
     out->enable_cng = 0;
 
@@ -202,11 +184,10 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
             const char *value = example_cli_option_value(argc, argv, &i, name);
             if (!value) return 2;
             if (example_cli_delay_set_option(&delay, arg, value, name) != 0) return 2;
-        } else if (!strcmp(arg, "--erb-fwd") || !strcmp(arg, "--erb-inv")) {
+        } else if (!strcmp(arg, "--erb")) {
             const char *value = example_cli_option_value(argc, argv, &i, name);
             if (!value) return 2;
-            if (!strcmp(arg, "--erb-fwd")) out->erb_fwd_path = value;
-            else out->erb_inv_path = value;
+            out->erb_path = value;
         } else if (!strcmp(arg, "--atten-lim")) {
             const char *value = example_cli_option_value(argc, argv, &i, name);
             if (!value) return 2;
@@ -225,10 +206,6 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
     }
 
     if (dfn_example_resolve_model_grid(out, name) != 0) return 2;
-    if ((out->erb_fwd_path == NULL) != (out->erb_inv_path == NULL)) {
-        fprintf(stderr, "%s: --erb-fwd and --erb-inv go together\n", name);
-        return 2;
-    }
     if (example_cli_delay_validate(&delay, name) != 0) return 2;
     out->delay_mode = delay.mode;
     out->delay_num_filters = delay.num_filters;
@@ -250,30 +227,8 @@ static void dfn_example_erb_free(DfnExampleErb *erb) {
     memset(erb, 0, sizeof(*erb));
 }
 
-/* Exactly `count` little-endian float32 values, or failure. */
-static int dfn_example_read_matrix(const char *path, float *dst,
-                                   size_t count, const char *name) {
-    FILE *f = fopen(path, "rb");
-    size_t got;
-    int extra;
-    if (!f) {
-        fprintf(stderr, "%s: cannot open %s\n", name, path);
-        return -1;
-    }
-    got = fread(dst, sizeof(float), count, f);
-    extra = fgetc(f);
-    fclose(f);
-    if (got != count || extra != EOF) {
-        fprintf(stderr, "%s: %s holds %s than the %zu floats the model grid "
-                "expects\n", name, path, got != count ? "fewer" : "more",
-                count);
-        return -1;
-    }
-    return 0;
-}
-
-/* Fills `erb` for args->model_grid from the two exported files, or with the unit partition when
- * none were named. 0, or -1 after a message. */
+/* Fills `erb` for args->model_grid from --erb, or with the unit partition when none was named.
+ * 0, or -1 after a message. */
 static int dfn_example_load_matrices(const DfnExampleArgs *args, DfnExampleErb *erb,
                                      const char *name) {
     const DFN2Grid *grid = &args->model_grid;
@@ -289,14 +244,14 @@ static int dfn_example_load_matrices(const DfnExampleArgs *args, DfnExampleErb *
     erb->block = mem;
     erb->fwd = fwd;
     erb->inv = fwd + floats;
-    if (!args->erb_fwd_path) {
+    if (!args->erb_path) {
         dfn_unit_partition(fwd, fwd + floats, grid);
-        printf("%s: no --erb-fwd/--erb-inv: unit ERB partition, fail-open "
-               "smoke run only\n", name);
+        printf("%s: no --erb: unit ERB partition, fail-open smoke run only\n", name);
         return 0;
     }
-    if (dfn_example_read_matrix(args->erb_fwd_path, fwd, floats, name) != 0 ||
-        dfn_example_read_matrix(args->erb_inv_path, fwd + floats, floats, name) != 0) {
+    if (dfn2_erb_file_load(args->erb_path, grid->n_bins, grid->n_erb, fwd, fwd + floats) != 0) {
+        fprintf(stderr, "%s: --erb %s is not a readable ERB file of the model grid "
+                "(n_bins %d, n_erb %d)\n", name, args->erb_path, grid->n_bins, grid->n_erb);
         dfn_example_erb_free(erb);
         return -1;
     }

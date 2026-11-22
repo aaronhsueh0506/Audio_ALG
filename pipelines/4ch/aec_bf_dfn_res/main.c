@@ -23,7 +23,7 @@
  * that serial moves only with an array reset, which the refused-call path below pairs with a hop reset.
  *
  * A host on the model's own rate (--ai-sample-rate, default 48 kHz) drives the model stream
- * (stream/ainr/dfn2, memory mode) and synthesises through an AcIstft; any other host rate runs the
+ * (stream/ainr/dfn2) and synthesises through an AcIstft; any other host rate runs the
  * same stream on its 48 kHz grid inside stream/ainr/bridge's AinrBridge (which needs the 48 kHz /
  * 1024 model). The model grid is built from the --ai-sample-rate / --ai-fft-size pair
  * (dfn_example_args.h) with dfn2_grid_make() and handed to every object. The first output hops are
@@ -109,8 +109,7 @@ static int dfn_set(void *user, const char *arg, const char *value) {
                                                                        : &s->args.ai_fft_size) != 0) {
             fprintf(stderr,"%s: %s '%s' is not an integer\n",name,arg,value); return 2;
         }
-    } else if (!strcmp(arg,"--erb-fwd")) s->args.erb_fwd_path=value;
-    else if (!strcmp(arg,"--erb-inv")) s->args.erb_inv_path=value;
+    } else if (!strcmp(arg,"--erb")) s->args.erb_path=value;
     else if (!strcmp(arg,"--atten-lim")) {
         if (example_cli_parse_float(value,&s->args.atten_lim_db) != 0) {
             fprintf(stderr,"%s: --atten-lim '%s' is not a finite dB value\n",name,value);
@@ -125,8 +124,8 @@ static int dfn_parse(void *user, int argc, char **argv) {
     static const ArraySampleCliOption options[]={
         {"-h",0},{"--help",0},{"--sample-rate",1},{"--ai-sample-rate",1},{"--ai-fft-size",1},
         {"--delay-mode",1},
-        {"--delay-num-filters",1},{"--fixed-delay",1},{"--erb-fwd",1},
-        {"--erb-inv",1},{"--atten-lim",1},{"--cng",0}
+        {"--delay-num-filters",1},{"--fixed-delay",1},{"--erb",1},
+        {"--atten-lim",1},{"--cng",0}
     };
     s->program=argv[0];
     dfn_example_rates_text(HOST_RATES,s->rates_text,sizeof(s->rates_text));
@@ -139,9 +138,6 @@ static int dfn_parse(void *user, int argc, char **argv) {
                           s,dfn_set,dfn_unknown);
     if (rc != 0) return rc;
     if (dfn_example_resolve_model_grid(&s->args,name) != 0) return 2;
-    if ((s->args.erb_fwd_path==NULL)!=(s->args.erb_inv_path==NULL)) {
-        fprintf(stderr,"%s: --erb-fwd and --erb-inv go together\n",name); return 2;
-    }
     rc=example_cli_delay_validate(&s->delay,name);
     s->args.delay_mode=s->delay.mode;
     s->args.delay_num_filters=s->delay.num_filters;

@@ -1,4 +1,4 @@
-/* The spectrum entries of dfn2_stream (memory mode, freq_only context). Rows:
+/* The spectrum entries of dfn2_stream (freq_only context). Rows:
  *   latency   16 kHz / 256, 32 kHz / 512 and 48 kHz / 1024, every lookahead pair the build accepts: with the accelerator not
  *             started and with heads that are the identity on the unit ERB partition, the output of hop h is the application
  *             spectrum of hop h - (mask + df) bit for bit (zero and flagged invalid before), and hops before mask_lookahead

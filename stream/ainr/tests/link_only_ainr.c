@@ -1,31 +1,14 @@
-/* Link-only check: this file includes only ainr.h and ainr_test.h and links against the built libainr.a and
+/* Link-only check: this file includes only ainr.h and links against the built libainr.a and
  * the DFN2 archive (never compiled with ainr.c's sources, unlike the other tests): the shipped archive
  * exports ainr_*, runs a real round trip per family on its own catalog row, and StreamWork's counts and
  * shapes reflect the variant it was built as. Pass -DAINR_TEST_EXPECT_LITE for the mask-only archive. */
 
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
-
-/* A scratch file created with O_EXCL (mode 0600), so a symlink planted under a guessed name is refused, not followed. */
-static void erb_fixture_scratch_path(char *out, size_t cap, const char *tag)
-{
-    int attempt;
-    for (attempt = 0; attempt < 64; ++attempt) {
-        int fd;
-        if (snprintf(out, cap, "/tmp/%s_%d_%d.bin", tag, (int)getpid(), attempt) >= (int)cap) break;
-        fd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd >= 0) { close(fd); return; }
-    }
-    fprintf(stderr, "cannot create a scratch file for %s\n", tag);
-    exit(2);
-}
 
 #ifdef STREAM_COMMON_BIND_H
 #error "ainr.h must not pull in the sample-side graph/device wiring header"
@@ -55,34 +38,20 @@ static void *alloc_aligned(size_t bytes, unsigned int alignment) {
     return p;
 }
 
-static void write_synthetic_erb(const char *path, int n_bins, int n_erb) {
-    size_t elems = (size_t)n_bins * (size_t)n_erb;
-    float *fwd = (float *)malloc(elems * sizeof(float));
-    float *inv_bin_major = (float *)malloc(elems * sizeof(float));
-    size_t i;
-    int32_t hdr[2];
-    FILE *fp;
-
-    if (!fwd || !inv_bin_major) { fprintf(stderr, "malloc fail\n"); exit(1); }
-    for (i = 0; i < elems; ++i) {
-        fwd[i] = (float)(i % 17) * 0.01f;
-        inv_bin_major[i] = 0.0f;
+/* A partition of unity: bin i splits 0.75 / 0.25 over bands i % n_erb and (i + 1) % n_erb. fwd bin-major [n_bins][n_erb],
+ * inv band-major [n_erb][n_bins]. */
+static void make_tables(int n_bins, int n_erb, float **fwd, float **inv) {
+    size_t elems = (size_t)n_bins * (size_t)n_erb, i;
+    *fwd = (float *)malloc(elems * sizeof(float));
+    *inv = (float *)calloc(elems, sizeof(float));
+    if (!*fwd || !*inv) { fprintf(stderr, "malloc fail\n"); exit(1); }
+    for (i = 0; i < elems; ++i) (*fwd)[i] = (float)(i % 17) * 0.01f;
+    for (i = 0; i < (size_t)n_bins; ++i) {
+        (*inv)[(i % (size_t)n_erb) * (size_t)n_bins + i] = 0.75f;
+        (*inv)[((i + 1) % (size_t)n_erb) * (size_t)n_bins + i] = 0.25f;
     }
-    for (i = 0; i < (size_t)n_bins; ++i) {   /* a partition of unity: bin i splits 0.75 / 0.25 over two bands */
-        inv_bin_major[i * (size_t)n_erb + i % (size_t)n_erb] = 0.75f;
-        inv_bin_major[i * (size_t)n_erb + (i + 1) % (size_t)n_erb] = 0.25f;
-    }
-    fp = fopen(path, "wb");
-    if (!fp) { fprintf(stderr, "fopen write fail (%s)\n", path); exit(1); }
-    hdr[0] = (int32_t)n_bins;
-    hdr[1] = (int32_t)n_erb;
-    fwrite(hdr, sizeof(int32_t), 2, fp);
-    fwrite(fwd, sizeof(float), elems, fp);
-    fwrite(inv_bin_major, sizeof(float), elems, fp);
-    fclose(fp);
-    free(fwd);
-    free(inv_bin_major);
 }
+
 
 /* A block without a job: action BYPASS and an all-zero work. */
 static int check_bypass_work(const StreamWork *io) {
@@ -115,32 +84,34 @@ static int check_work_tensors(const StreamWork *io) {
 }
 
 static int run_round_trip(void) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req;
     void *pool;
     AinrCtx *ctx = NULL;
     AinrInfo info;
-    char erb_path[64];
+    float *erb_fwd, *erb_inv;
     int hop = EXPECT_FFT / 2;
     int16_t pcm_in[EXPECT_FFT / 2], pcm_out[EXPECT_FFT / 2];
     StreamWork io;
     int rc, i, b;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_link_only_erb");
-    write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
+    make_tables(EXPECT_N_BINS, EXPECT_N_ERB, &erb_fwd, &erb_inv);
 
     cfg.sr = EXPECT_SR;
     cfg.fft = EXPECT_FFT;
     cfg.hop_in = hop;
+    cfg.erb_fwd = erb_fwd;
+    cfg.erb_inv = erb_inv;
+    cfg.n_erb = EXPECT_N_ERB;
 
     if (ainr_get_mem_size(&cfg, &req) != AINR_OK) { fprintf(stderr, "ainr_get_mem_size fail\n"); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    if (ainr_init_from_erb_file(&cfg, erb_path, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) {
-        fprintf(stderr, "ainr_init_from_erb_file fail\n"); return 1;
+    if (ainr_init(&cfg, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) {
+        fprintf(stderr, "ainr_init fail\n"); return 1;
     }
 
-    if (info.graph_path == NULL) {
-        fprintf(stderr, "ainr_init: graph_path NULL\n");
+    if (info.mask_lookahead != EXPECT_BYPASS) {
+        fprintf(stderr, "ainr_init: mask_lookahead %d, expected %d\n", info.mask_lookahead, EXPECT_BYPASS);
         return 1;
     }
     for (i = 0; i < hop; ++i) pcm_in[i] = (int16_t)((i * 13) % 211 - 100);
@@ -166,8 +137,9 @@ static int run_round_trip(void) {
     rc = ainr_postprocess(ctx, 0, pcm_out);
     if (rc != AINR_OK) { fprintf(stderr, "ainr_postprocess rc=%d\n", rc); return 1; }
 
-    unlink(erb_path);
     free(pool);
+    free(erb_fwd);
+    free(erb_inv);
     printf("link_only_ainr: round trip OK (%d Hz/fft %d), input_count=%d output_count=%d\n",
           EXPECT_SR, EXPECT_FFT, io.input_count, io.output_count);
     return 0;
@@ -176,28 +148,30 @@ static int run_round_trip(void) {
 /* As run_round_trip(), for the "_freq" family (spectrum in, enhanced spectrum out) --
  * E == P (same synthetic spectrum passed as both est and app). */
 static int run_round_trip_freq(void) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req;
     void *pool;
     AinrFreqCtx *ctx = NULL;
     AinrInfo info;
-    char erb_path[64];
+    float *erb_fwd, *erb_inv;
     int hop = EXPECT_FFT / 2;
     float in_re[EXPECT_N_BINS], in_im[EXPECT_N_BINS];
     float out_re[EXPECT_N_BINS], out_im[EXPECT_N_BINS];
     StreamWork io;
     int rc, i, b;
 
-    erb_fixture_scratch_path(erb_path, sizeof(erb_path), "ainr_link_only_freq_erb");
-    write_synthetic_erb(erb_path, EXPECT_N_BINS, EXPECT_N_ERB);
+    make_tables(EXPECT_N_BINS, EXPECT_N_ERB, &erb_fwd, &erb_inv);
 
     cfg.sr = EXPECT_SR;
     cfg.fft = EXPECT_FFT;
     cfg.hop_in = hop;
+    cfg.erb_fwd = erb_fwd;
+    cfg.erb_inv = erb_inv;
+    cfg.n_erb = EXPECT_N_ERB;
 
     if (ainr_get_mem_size_freq(&cfg, &req) != AINR_OK) { fprintf(stderr, "ainr_get_mem_size_freq fail\n"); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    if (ainr_init_freq_from_erb_file(&cfg, erb_path, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "ainr_init_freq_from_erb_file fail\n"); return 1; }
+    if (ainr_init_freq(&cfg, pool, (size_t)req.bytes, &ctx, &info) != AINR_OK || !ctx) { fprintf(stderr, "ainr_init_freq fail\n"); return 1; }
 
     for (i = 0; i < EXPECT_N_BINS; ++i) { in_re[i] = 0.01f * (float)i; in_im[i] = -0.005f * (float)i; }
     for (b = 0; b < EXPECT_BYPASS; ++b) {
@@ -222,8 +196,9 @@ static int run_round_trip_freq(void) {
     rc = ainr_postprocess_freq(ctx, 0, out_re, out_im);
     if (rc != AINR_OK) { fprintf(stderr, "ainr_postprocess_freq rc=%d\n", rc); return 1; }
 
-    unlink(erb_path);
     free(pool);
+    free(erb_fwd);
+    free(erb_inv);
     printf("link_only_ainr (_freq): round trip OK (%d Hz/fft %d)\n",
           EXPECT_SR, EXPECT_FFT);
     return 0;

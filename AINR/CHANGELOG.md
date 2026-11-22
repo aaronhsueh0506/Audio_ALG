@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### 2026-11-22: DFN2 libraries read no file; the sample passes the ERB tables and opens the graph file
+
+- `AinrConfig` is `{ sr, fft, hop_in, erb_fwd, erb_inv, n_erb }`: the grid's ERB tables (`erb_fwd` bin-major `[n_bins][n_erb]`, `erb_inv` band-major `[n_erb][n_bins]`), borrowed for the context's life, with their band count `n_erb` (the `n_erb` out-parameter of `graph_io_dfn2_erb_file()`; `ainr_init[_freq]` returns `AINR_ERR_ERB_TABLES` before the pool is written when it is not the grid's, so a zero-initialised config that sets only the two pointers is refused). The sample loads `fb_<sr>_<n_erb>.bin` (format unchanged, still produced by `DeepFilterNet2/export_erb_matrix.py --format bin`) with the header-only `stream/ainr/dfn2_erb_file.h` (`dfn2_erb_file_load()`, default directory `SAMPLE_ERB_DIR` = `/mnt/sd/dfn2_blobs`).
+- `AinrInfo { queue_frames; mask_lookahead; }` (`graph_path` removed). `AINR_ERR_ERB_FILE` became `AINR_ERR_ERB_TABLES` (-8). `AINR_ERR_FRAMES_PER_CALL` is returned only for N > 64; which N has a graph is the sample's `graph_io_dfn2.h`, keyed by (model, sr, fft, N, `mask_lookahead`), and each row names its graph file `dfn2_<sr/1000>k_fft<fft>_n<N>.bin` (`dfn2_l0_*` for the `mask_lookahead` 0 model, `dfn2_lite_*` for lite). The SD-card graph files must be renamed to these names; the quantization folder is the sample's `SAMPLE_MODEL_DIR`.
+- Removed: `ainr_init_from_erb_file`, `ainr_init_freq_from_erb_file`, `ainr_test.h`, `AINR_ERB_MATRIX_DIR`, `AINR_TEST_CATALOG`, the model IDs `*_ALT1` / `*_ALT2`, `dfn2_stream_init_from_erb_file[_ex]`, the pool-owned ERB storage and `-DDFN2_STREAM_NO_STDIO`. `DFN2_STREAM_LAYOUT_VERSION` 6 -> 7.
+- `graph_io_expand()` refuses a row whose `file` is NULL or empty (`GRAPH_IO_ERR_ROW`). The stream Makefiles of AIAEC and `stream/ainr/bridge` lost their no-op `NO_STDIO` option, and every stream `audit-no-stdio` is the shared recipe of `lib/deps.mk` over the whole archive.
+- `export_erb_matrix.py --runtime-bins` and `write_runtime_bins` are retired for DFN2 (DFN3 and GTCRN keep theirs); the pipeline example mains read the `fb_*.bin` file through `--erb`.
+- Rebuild the samples: `stream/ainr/dfn2_erb_file.h` joins the customer headers, and `AiaecInfo` / `aiaec_init`'s info argument are gone on the AIAEC side.
+
 ### Board sample `uvc_ai_nr_stream.c` runs the `_freq` family
 
 - The sample no longer resamples 16 <-> 48 kHz itself or calls the PCM `ainr_*` entries: a 16 kHz / fft 256 / hop 128 host runs its own `AcStft` / `AcIstft`, and `--ai-sample-rate` / `--ai-fft-size` choose the model grid (N = 1; default 48000 / 1024 through `AinrBridge`, 16000 / 256 directly in the full build). Delays and refusal rules are in `DeepFilterNet2/reference/grid.md`. The sample now also builds `stream/ainr/bridge/ainr_bridge.c`.
@@ -27,7 +36,7 @@
 - A call is the newest N + 2 input frames and its heads are the frames T - N + 1 - M .. T - M (latency M + D as at N = 1). Every block is a job; the first block's first M heads
   are before the stream start, `post_frame` discards them while the clock is below M, and they come out as silence (only the accelerator's recurrent state has seen M more
   frames than at N = 1). `dfn2_model_io_ready_frames()` is N for N > 1 and M + 1 for N = 1; `dfn2_prepost_get_mem_size` and `ainr` no longer refuse the combination.
-- The catalog gives `AINR_MODEL_ID_DFN2_FULL` and `_ALT2` a 48 kHz / 1024 N = 2 graph (`.../dfn2/nvt_model_48k_n2.bin`); `AINR_MODEL_ID_DFN2_FULL_L0` keeps NULL paths and its own file.
+- The catalog gives `AINR_MODEL_ID_DFN2_FULL` and `_ALT2` a 48 kHz / 1024 N = 2 graph (the board graph file of that row); `AINR_MODEL_ID_DFN2_FULL_L0` keeps NULL paths and its own file.
 - `stream/ainr/dfn2/tests/lookahead_blocks.c` compares the N > 1 stream with a one-frame reference of the same stateful stand-in, for M = 1, 2, D = 0, 1, N = 2, 3, 8, PCM and spectrum.
 
 ### `DFN2Prepost` stages the application spectrum once; `DFN2HopIO.action` replaces the integer job flag

@@ -1217,31 +1217,46 @@ def test_emb_num_layers_one_fails_loudly_instead_of_building_two():
     assert len(gru_layers) == 5
 
 
-def test_runtime_erb_bins_match_the_model(tmp_path):
-    """The exported .bin matrices equal DFN2's frozen buffers.
-
-    The C host consumes caller-loaded pointers in these exact layouts, so the
-    exported pair must reproduce the model's own filterbank bit for bit.
-    """
+def _export_erb_matrix_bin(tmp_path, monkeypatch):
+    """Run ``export_erb_matrix.py --format bin`` on config.ini and parse the file: the board's
+    fb_<sr>_<n_erb>.bin, int32 n_bins and n_erb, then the forward and the inverse table, both
+    bin-major float32 with nothing after."""
+    import struct
     import sys as _sys
     for stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx',
                   'stream_model', 'export_erb_matrix'):
         _sys.modules.pop(stale, None)
     _sys.path.insert(0, ROOT)
-    from export_erb_matrix import write_runtime_bins
+    import export_erb_matrix
 
-    out = write_runtime_bins(os.path.join(ROOT, 'config.ini'),
-                             os.fspath(tmp_path))
-    fwd = np.fromfile(os.path.join(out, 'erb_fwd.bin'),
-                      '<f4').reshape(513, 32)
-    inv = np.fromfile(os.path.join(out, 'erb_inv.bin'),
-                      '<f4').reshape(32, 513)
+    monkeypatch.setattr(_sys, 'argv', [
+        'export_erb_matrix.py', '--config', os.path.join(ROOT, 'config.ini'),
+        '--output-dir', os.fspath(tmp_path), '--format', 'bin'])
+    export_erb_matrix.main()
+    with open(os.path.join(tmp_path, 'erb_matrix.bin'), 'rb') as fp:
+        raw = fp.read()
+    n_bins, n_erb = struct.unpack('<ii', raw[:8])
+    tables = np.frombuffer(raw[8:], '<f4')
+    assert tables.size == 2 * n_bins * n_erb
+    forward = tables[:n_bins * n_erb].reshape(n_bins, n_erb)
+    inverse = tables[n_bins * n_erb:].reshape(n_bins, n_erb)
+    return n_bins, n_erb, forward, inverse
+
+
+def test_erb_matrix_bin_matches_the_model(tmp_path, monkeypatch):
+    """The exported .bin tables equal DFN2's frozen buffers.
+
+    The board loader (dfn2_erb_file_load) reads this file into the caller's tables, so both must
+    reproduce the model's own filterbank bit for bit.
+    """
+    n_bins, n_erb, fwd, inv = _export_erb_matrix_bin(tmp_path, monkeypatch)
+    assert (n_bins, n_erb) == (513, 32)
     model = DeepFilterNet2(**read_model_config(load_config()))
     ref_fwd = model.erb_fb.detach().numpy().astype(np.float32)
     if ref_fwd.shape[0] < ref_fwd.shape[1]:
         ref_fwd = ref_fwd.T
     ref_inv = model.erb_inv.detach().numpy().astype(np.float32)
-    if ref_inv.shape[0] > ref_inv.shape[1]:
+    if ref_inv.shape[0] < ref_inv.shape[1]:
         ref_inv = ref_inv.T
     assert np.array_equal(fwd, ref_fwd)
     assert np.array_equal(inv, ref_inv)
@@ -1585,19 +1600,17 @@ def test_fixed_batch_bin_contains_every_lane(tmp_path):
     assert blob.size == 3 * 5 * 1 * 32
 
 
-def test_runtime_erb_bins_are_a_bitwise_partition_of_unity(tmp_path):
-    """The erb_inv.bin the C host loads must expand a unit band mask to
+def test_erb_matrix_bin_is_a_bitwise_partition_of_unity(tmp_path, monkeypatch):
+    """The inverse table of the exported .bin must expand a unit band mask to
     exactly 1.0f per bin in df_common_expand_mask's accumulation order --
     dfn2_prepost_post_frame_identity's identity, and every host identity gate built
-    on it, is exact only under that property. The runtime exporter refuses
-    to write a matrix that breaks it, and the check itself must be able to
-    fail."""
-    from export_erb_matrix import require_partition_of_unity, write_runtime_bins
+    on it, is exact only under that property. The exporter refuses to write a
+    matrix that breaks it, and the check itself must be able to fail."""
+    from export_erb_matrix import require_partition_of_unity
 
-    out_dir = write_runtime_bins(os.path.join(ROOT, 'config.ini'), str(tmp_path))
-    manifest = json.load(open(os.path.join(out_dir, 'erb_matrices.json'), encoding='utf-8'))
-    n_erb, n_bins = manifest['erb_inv.bin']['shape']
-    inverse = np.fromfile(os.path.join(out_dir, 'erb_inv.bin'), dtype='<f4').reshape(n_erb, n_bins)
+    n_bins, n_erb, _, inv_bin_major = _export_erb_matrix_bin(tmp_path, monkeypatch)
+    inverse = np.ascontiguousarray(inv_bin_major.T)
+    assert inverse.shape == (n_erb, n_bins)
     require_partition_of_unity(inverse)
     bin_gain = np.zeros(n_bins, np.float32)
     for row in inverse:

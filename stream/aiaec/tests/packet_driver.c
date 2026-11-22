@@ -1,6 +1,6 @@
 /* Binary stdin/stdout driver around the Align-ULCNet _freq family (aiaec_*_freq), for
  * AIAEC/tests/test_aiaec_packet_ort.py: the host runs the accelerator (ONNX Runtime) between a PRE and a POST
- * request. Align-ULCNet product at 16 kHz, built with -DAIAEC_TEST_CATALOG. Native-endian int32 / float32;
+ * request. Align-ULCNet product at 16 kHz. Native-endian int32 / float32;
  * bins = fft / 2 + 1 of the slot.
  *
  *   OPEN  cmd=1, n, fft                       -> rc, state_generation, slot
@@ -50,7 +50,6 @@ int main(void) {
         if (cmd == 1) {
             int n, fft, e = 0, rc;
             AiaecConfig cfg;
-            AiaecInfo info;
             StreamMemReq rq;
             if (rd(&n, sizeof(n)) != 0 || rd(&fft, sizeof(fft)) != 0) return 2;
             if (fft < 2 || fft > 4096) fft = 0;   /* refused by the catalog */
@@ -59,7 +58,7 @@ int main(void) {
             if (rc != AIAEC_OK || g_slots >= MAX_SLOTS || n < 1 || n > MAX_N) { wri(rc ? rc : -99); wri(0); wri(-1); fflush(stdout); continue; }
             if (posix_memalign(&g_slot[g_slots].pool, 16, (size_t)rq.bytes) != 0) return 2;
             g_slot[g_slots].ctx = NULL;
-            e = aiaec_init_freq(&cfg, g_slot[g_slots].pool, (size_t)rq.bytes, &g_slot[g_slots].ctx, &info);
+            e = aiaec_init_freq(&cfg, g_slot[g_slots].pool, (size_t)rq.bytes, &g_slot[g_slots].ctx);
             g_slot[g_slots].n = n;
             g_slot[g_slots].bins = fft / 2 + 1;
             wri(g_slot[g_slots].ctx ? AIAEC_OK : e);

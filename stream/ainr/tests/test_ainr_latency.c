@@ -8,17 +8,15 @@
  *   _freq        an upstream AcStft feeds E == P; an external AcIstft (ACCUMULATE, scale 1) synthesises.
  *
  * Covers full (16 kHz/256 N=1 and N=8, 48 kHz/1024 N=1) or lite (48 kHz/1024 N=1) depending on the
- * archive variant. Not built under NO_STDIO. */
+ * archive variant. */
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
 #include "audio_stft.h"
 
@@ -58,7 +56,7 @@ static int check_pulse(const float *out, size_t n, size_t idx, const char *label
  * queue_frames = L + D (whatever N is), latency = (queue_frames + 1) * hop samples -- spelled out per row,
  * not derived from the library's own formula. */
 static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_latency, const char *label) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     StreamMemReq req;
     AinrInfo bi_pcm, bi_freq;
     int hop = fft / 2, n_bins = fft / 2 + 1, hop_in = n * hop;
@@ -66,7 +64,6 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     size_t total = (size_t)BLOCKS * (size_t)hop_in, idx = (size_t)(PULSE_AT + want_latency);
     int16_t *pcm, *out16;
     float *outf, *fre, *fim, *are, *aim, *hopf;
-    char erb[160];
     void *pool;
     AinrCtx *cp;
     AinrFreqCtx *cf;
@@ -74,13 +71,12 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
     double v;
 
     cfg.sr = sr; cfg.fft = fft; cfg.hop_in = hop_in;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_latency_erb");
-    write_identity_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_identity(n_bins, n_erb);
 
     /* PCM family: init reports the queue; the internal ISTFT synthesises. */
     if (ainr_get_mem_size(&cfg, &req) != AINR_OK) { fprintf(stderr, "%s: get_mem_size fail\n", label); return 1; }
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    if (ainr_init_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &cp, &bi_pcm) != AINR_OK || !cp) {
+    if (ainr_init_t(&cfg, &erb, pool, (size_t)req.bytes, &cp, &bi_pcm) != AINR_OK || !cp) {
         fprintf(stderr, "%s: init fail\n", label); return 1;
     }
     {   /* the _freq family reports the same queue */
@@ -92,7 +88,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
             fprintf(stderr, "%s: freq size fail\n", label); return 1;
         }
         pool_f = alloc_aligned((size_t)rf.bytes, rf.alignment);
-        if (ainr_init_freq_from_erb_file(&cfg, erb, pool_f, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK) {
+        if (ainr_init_freq_t(&cfg, &erb, pool_f, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK) {
             fprintf(stderr, "%s: freq init fail\n", label); return 1;
         }
         free(pool_f);
@@ -139,7 +135,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
         st = ac_stft_init(stm, ac_stft_get_mem_size(&sc), &sc);
         if (!st || ainr_get_mem_size_freq(&cfg, &rf) != AINR_OK) { fprintf(stderr, "%s: freq setup fail\n", label); return 1; }
         pool = alloc_aligned((size_t)rf.bytes, rf.alignment);
-        if (ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK || !cf) {
+        if (ainr_init_freq_t(&cfg, &erb, pool, (size_t)rf.bytes, &cf, &bi_freq) != AINR_OK || !cf) {
             fprintf(stderr, "%s: freq init fail\n", label); return 1;
         }
         ola = ola_make(fft);
@@ -162,7 +158,7 @@ static int run_case(int sr, int fft, int n_erb, int n, int want_queue, int want_
         free(pool); free(ola.mem); free(stm);
     }
 
-    unlink(erb);
+    erb_tables_free(&erb);
     free(pcm); free(out16); free(outf); free(fre); free(fim); free(are); free(aim); free(hopf);
     return bad;
 }

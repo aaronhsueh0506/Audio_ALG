@@ -1,4 +1,4 @@
-/* The product API at N > 1 against N == 1, mask_lookahead 0 model on the test catalog (-DAINR_TEST_CATALOG, id 3), one stateful
+/* The product API at N > 1 against N == 1, mask_lookahead 0 model (id 3), one stateful
  * stand-in accelerator: PCM and _freq equal hop for hop, bit for bit, through a failed run, a non-finite head and a reset; N + 2
  * frame windows, N heads, queue_frames 0, N times fewer jobs; a wrong window slice is detected. Rows 16 kHz N 8, 32 kHz N 4, 48 kHz N 2. */
 
@@ -7,11 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
+#include "graph_io_dfn2.h"
 
 #define STATE_N 8
 #define BLOCKS 20
@@ -98,14 +97,13 @@ static void make_spec(float *re, float *im, float *ar, float *ai, int hops, int 
 
 /* `n` frames per call (the block stream, or 1: the one-frame stream running N hops per block of the other). */
 static void run(const Row *r, int n, int freq, int slice_shift, int total_n, Out *out) {
-    AinrConfig cfg = { r->sr, r->fft, n * (r->fft / 2) };
+    AinrConfig cfg = { r->sr, r->fft, n * (r->fft / 2), NULL, NULL, 0 };
     const int hop = r->fft / 2, nb = hop + 1;
     StreamMemReq req;
     AinrInfo info;
     AinrCtx *pcm = NULL;
     AinrFreqCtx *fq = NULL;
     void *pool;
-    char erb[128];
     Dev dev;
     int16_t *pin = (int16_t *)malloc((size_t)hop * (size_t)n * sizeof(int16_t));
     float *x = (float *)malloc((size_t)nb * (size_t)n * 6u * sizeof(float));
@@ -116,17 +114,15 @@ static void run(const Row *r, int n, int freq, int slice_shift, int total_n, Out
 
     memset(&dev, 0, sizeof dev);
     dev.slice_shift = n > 1 ? slice_shift : 0;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_blocks_erb");
-    write_synthetic_erb(erb, nb, r->n_erb);
+    ErbTables erb = erb_tables_synthetic(nb, r->n_erb);
     CHECK((freq ? ainr_get_mem_size_freq(&cfg, &req) : ainr_get_mem_size(&cfg, &req)) == AINR_OK, "%d Hz N %d: sizing", r->sr, n);
     pool = alloc_aligned((size_t)req.bytes, req.alignment);
-    CHECK((freq ? ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &fq, &info)
-                : ainr_init_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &pcm, &info)) == AINR_OK,
+    CHECK((freq ? ainr_init_freq_t(&cfg, &erb, pool, (size_t)req.bytes, &fq, &info)
+                : ainr_init_t(&cfg, &erb, pool, (size_t)req.bytes, &pcm, &info)) == AINR_OK,
           "%d Hz N %d: init", r->sr, n);
-    unlink(erb);
     CHECK(info.queue_frames == 0, "%d Hz N %d: queue_frames %d, want 0 (L + D)", r->sr, n, info.queue_frames);
-    CHECK(info.graph_path && (r->sr == 16000 ? strstr(info.graph_path, "16x16") != NULL : strncmp(info.graph_path, "test://", 7) == 0),
-          "%d Hz N %d: graph path %s", r->sr, n, info.graph_path ? info.graph_path : "(null)");
+    CHECK(info.mask_lookahead == 0 && graph_io_dfn2_lookup(GRAPH_IO_DFN2_FULL, r->sr, r->fft, n, info.mask_lookahead) != NULL,
+          "%d Hz N %d: mask_lookahead %d or no graph row", r->sr, n, info.mask_lookahead);
     out->queue = info.queue_frames;
     out->pcm = freq ? NULL : (int16_t *)calloc((size_t)hop * (size_t)total_n * BLOCKS, sizeof(int16_t));
     out->spec = freq ? (float *)calloc((size_t)nb * 2u * (size_t)total_n * BLOCKS, sizeof(float)) : NULL;
@@ -164,6 +160,7 @@ static void run(const Row *r, int n, int freq, int slice_shift, int total_n, Out
     }
     out->jobs = dev.jobs;
     free(pin); free(x); free(pool);
+    erb_tables_free(&erb);
 }
 
 static void run_row(const Row *r) {

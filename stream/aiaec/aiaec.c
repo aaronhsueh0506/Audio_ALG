@@ -1,8 +1,7 @@
 /* aiaec.h implementation: a block-level (hop_in samples per call) wrapper over deepvqe_stream's and
  * ulcnet_stream's packet APIs (N model hops per call). The catalog below is the only
- * place that knows which (model, sample_rate, n_fft) combinations exist and which of their
- * frames_per_call variants have an actual shipped graph. The graph's port wiring is the sample's;
- * this file keeps only the per-hop signal and head views StreamWork carries.
+ * place that knows which (model, sample_rate, n_fft) grids exist. The graph file and its port wiring are the
+ * sample's (graph_io_*.h); this file keeps only the per-hop signal and head views StreamWork carries.
  *
  * The product binds one model (aiaec_product.h). AIAEC_ENABLE_DEEPVQE_S / AIAEC_ENABLE_ALIGN_ULCNET
  * (the Makefile's AIAEC_MODEL knob) let a product link only the model it ships, so its .o never
@@ -46,105 +45,44 @@ static int aiaec_bound_model_in_build(void)
         ;
 }
 
-/* graph_path is NULL for a frames_per_call that is architecturally meaningful but has no delivered
- * graph yet -- the resolver treats it exactly like "not in this list at all", never as "pick some
- * other graph", since N changes the model's own input window length. */
-typedef struct AiaecFramesVariant {
-    int frames_per_call;
-    const char *graph_path;
-} AiaecFramesVariant;
-
 typedef struct AiaecModelEntry {
     int model_id;
     int sample_rate, n_fft;
-    float max_delay_seconds;   /* physical delay span, grid-independent; delay_depth (D) is derived at
-                                * resolve time (ceilf(max_delay_seconds * sample_rate / hop)) */
-    const AiaecFramesVariant *variants;
-    int n_variants;
 } AiaecModelEntry;
 
-/* AIAEC_TEST_CATALOG: defined only by this directory's test builds. Substitutes placeholder graph
- * paths so a test binary can drive the real gated public API end to end; the NULL-path 16k/256 N = 8
- * variant keeps the "listed but no graph" refusal covered. */
-#ifdef AIAEC_TEST_CATALOG
-static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
-    { 1, "test://aiaec/deepvqe_s/16k_fft256_n1" },
-    { 8, (const char *)0 },
-};
-static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
-    { 1, "test://aiaec/deepvqe_s/16k_fft512_n1" },
-    { 4, "test://aiaec/deepvqe_s/16k_fft512_n4" },
-};
-static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
-    { 1, "test://aiaec/deepvqe_s/48k_fft1024_n1" },
-    { 2, "test://aiaec/deepvqe_s/48k_fft1024_n2" },
-};
-static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
-    { 1, "test://aiaec/align_ulcnet/16k_fft256_n1" },
-    { 8, (const char *)0 },
-};
-static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
-    { 1, "test://aiaec/align_ulcnet/16k_fft512_n1" },
-    { 4, "test://aiaec/align_ulcnet/16k_fft512_n4" },   /* the packet graph (layout 19) */
-};
-static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
-    { 1, "test://aiaec/align_ulcnet/48k_fft1024_n1" },
-    { 2, "test://aiaec/align_ulcnet/48k_fft1024_n2" },   /* the packet graph (layout 19) */
-};
-#else
-/* Board graph path per model, shared by every row of that model: the card holds one graph, which runs only at its own
- * grid and N; the sample's graph_io_check_ports() refuses any other at init. */
-#define AIAEC_DEEPVQE_S_GRAPH "/mnt/sd/audio_model/16x16/deepvqes/nvt_model.bin"
-#define AIAEC_ULCNET_GRAPH    "/mnt/sd/audio_model/16x16/alignulcnet/nvt_model.bin"
-static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT256_VARIANTS[] = {
-    { 1, AIAEC_DEEPVQE_S_GRAPH },
-};
-static const AiaecFramesVariant AIAEC_DEEPVQE_16K_FFT512_VARIANTS[] = {
-    { 1, AIAEC_DEEPVQE_S_GRAPH },
-    { 4, AIAEC_DEEPVQE_S_GRAPH },
-};
-static const AiaecFramesVariant AIAEC_DEEPVQE_48K_FFT1024_VARIANTS[] = {
-    { 1, AIAEC_DEEPVQE_S_GRAPH },
-    { 2, AIAEC_DEEPVQE_S_GRAPH },
-};
-static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT256_VARIANTS[] = {
-    { 1, AIAEC_ULCNET_GRAPH },
-};
-static const AiaecFramesVariant AIAEC_ULCNET_16K_FFT512_VARIANTS[] = {
-    { 1, AIAEC_ULCNET_GRAPH },
-    { 4, AIAEC_ULCNET_GRAPH },
-};
-static const AiaecFramesVariant AIAEC_ULCNET_48K_FFT1024_VARIANTS[] = {
-    { 1, AIAEC_ULCNET_GRAPH },
-    { 2, AIAEC_ULCNET_GRAPH },
-};
-#endif
-
-/* 0.5 s target physical delay span for every row: D = 32 at hop 256, 63 at hop 128, 47 at hop 512 (48 kHz). */
+/* Physical delay span of every grid; D = ceil(0.5 s * sample_rate / hop): 32 at hop 256, 63 at hop 128, 47 at 48 kHz. */
 #define AIAEC_MAX_DELAY_SECONDS 0.5f
 
-#define AIAEC_VARIANTS(v) (v), ((int)(sizeof(v) / sizeof((v)[0])))
-
 static const AiaecModelEntry AIAEC_CATALOG[] = {
-    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_16K_FFT256_VARIANTS) },
-    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_16K_FFT512_VARIANTS) },
-    { AIAEC_MODEL_ID_DEEPVQE_S,    48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_DEEPVQE_48K_FFT1024_VARIANTS) },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 256, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_16K_FFT256_VARIANTS) },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 512, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_16K_FFT512_VARIANTS) },
-    { AIAEC_MODEL_ID_ALIGN_ULCNET, 48000, 1024, AIAEC_MAX_DELAY_SECONDS, AIAEC_VARIANTS(AIAEC_ULCNET_48K_FFT1024_VARIANTS) },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 256 },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    16000, 512 },
+    { AIAEC_MODEL_ID_DEEPVQE_S,    48000, 1024 },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 256 },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 16000, 512 },
+    { AIAEC_MODEL_ID_ALIGN_ULCNET, 48000, 1024 },
 };
 #define AIAEC_CATALOG_ROWS ((int)(sizeof(AIAEC_CATALOG) / sizeof(AIAEC_CATALOG[0])))
 
-/* Resolves cfg to a catalog entry, N, that variant's graph path and the derived delay depth. Order:
- * the bound model is in this build; (model, sr, fft) row match; hop_in divisibility; then the
- * shipped-variants list, where "shipped" also requires a non-NULL graph_path. graph_path_out and
+/* The bound model stream's own frames_per_call range [1, max]. */
+static int aiaec_max_frames_per_call(void)
+{
+#if AIAEC_ENABLE_DEEPVQE_S
+    if (AIAEC_BOUND_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S) return DEEPVQE_MODEL_MAX_FRAMES_PER_CALL;
+#endif
+#if AIAEC_ENABLE_ALIGN_ULCNET
+    if (AIAEC_BOUND_MODEL_ID == AIAEC_MODEL_ID_ALIGN_ULCNET) return ULCNET_MODEL_IO_MAX_FRAMES_PER_CALL;
+#endif
+    return 0;
+}
+
+/* Resolves cfg to a catalog entry, N and the derived delay depth. Order: the bound model is in this build;
+ * (model, sr, fft) row match; hop_in a positive multiple of fft / 2; N within the model stream's range.
  * delay_depth_out may be NULL. */
 static int aiaec_resolve(const AiaecConfig *cfg, const AiaecModelEntry **entry_out, int *n_out,
-                         const char **graph_path_out, int *delay_depth_out)
+                         int *delay_depth_out)
 {
-    int i, j, model_hop, n;
+    int i, model_hop, n;
     const AiaecModelEntry *entry = (const AiaecModelEntry *)0;
-    const char *graph_path = (const char *)0;
 
     if (!cfg || !entry_out || !n_out) return AIAEC_ERR_NULL;
     if (!aiaec_bound_model_in_build()) return AIAEC_ERR_MODEL_ID;
@@ -161,17 +99,12 @@ static int aiaec_resolve(const AiaecConfig *cfg, const AiaecModelEntry **entry_o
     model_hop = cfg->fft / 2;
     if (model_hop <= 0 || cfg->hop_in <= 0 || cfg->hop_in % model_hop != 0) return AIAEC_ERR_IN_HOP;
     n = cfg->hop_in / model_hop;
-
-    for (j = 0; j < entry->n_variants; ++j) {
-        if (entry->variants[j].frames_per_call == n) { graph_path = entry->variants[j].graph_path; break; }
-    }
-    if (j == entry->n_variants || !graph_path) return AIAEC_ERR_FRAMES_PER_CALL;
+    if (n > aiaec_max_frames_per_call()) return AIAEC_ERR_FRAMES_PER_CALL;
 
     *entry_out = entry;
     *n_out = n;
-    if (graph_path_out) *graph_path_out = graph_path;
     if (delay_depth_out)
-        *delay_depth_out = (int)ceilf(entry->max_delay_seconds * (float)entry->sample_rate / (float)model_hop);
+        *delay_depth_out = (int)ceilf(AIAEC_MAX_DELAY_SECONDS * (float)entry->sample_rate / (float)model_hop);
     return AIAEC_OK;
 }
 
@@ -381,7 +314,7 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
     size_t total = 0;
 
     if (!req) return AIAEC_ERR_NULL;
-    status = aiaec_resolve(cfg, &entry, &n, (const char **)0, &delay_depth);
+    status = aiaec_resolve(cfg, &entry, &n, &delay_depth);
     if (status != AIAEC_OK) return status;
 
     if (AIAEC_BOUND_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S) {
@@ -413,29 +346,21 @@ static int aiaec_core_mem_size(const AiaecConfig *cfg, AiaecFamily family, Strea
     return AIAEC_OK;
 }
 
-static void aiaec_core_info(const char *graph_path, AiaecInfo *info)
-{
-    memset(info, 0, sizeof(*info));
-    info->graph_path = graph_path;
-}
-
-/* The pool is checked against aiaec_core_mem_size() after the configuration resolves; on any error
- * info is untouched. */
+/* The pool is checked against aiaec_core_mem_size() after the configuration resolves. */
 static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *pool, size_t pool_bytes,
-                           AiaecCore **core_out, AiaecInfo *info)
+                           AiaecCore **core_out)
 {
     StreamMemReq req;
     int status, n, delay_depth;
     const AiaecModelEntry *entry;
-    const char *graph_path = (const char *)0;
     AiaecCore *core = (AiaecCore *)0;
     void *inner_pool = (void *)0;
     size_t inner_bytes = 0;
     size_t total = 0;
 
-    if (!cfg || !pool || !info) return AIAEC_ERR_NULL;
+    if (!cfg || !pool) return AIAEC_ERR_NULL;
 
-    status = aiaec_resolve(cfg, &entry, &n, &graph_path, &delay_depth);
+    status = aiaec_resolve(cfg, &entry, &n, &delay_depth);
     if (status != AIAEC_OK) return status;
     status = aiaec_core_mem_size(cfg, family, &req);
     if (status != AIAEC_OK) return status;
@@ -493,7 +418,6 @@ static int aiaec_core_init(const AiaecConfig *cfg, AiaecFamily family, void *poo
     core->model_id = AIAEC_BOUND_MODEL_ID;
     core->frames_per_call = n;
     core->block_open = 0;
-    aiaec_core_info(graph_path, info);
     *core_out = core;
     return AIAEC_OK;
 }
@@ -530,26 +454,26 @@ static unsigned int aiaec_core_generation(const AiaecCore *core)
 #endif
 }
 
-int aiaec_init(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecCtx **ctx, AiaecInfo *info)
+int aiaec_init(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecCtx **ctx)
 {
     AiaecCore *core = (AiaecCore *)0;
     int rc;
 
     if (!ctx) return AIAEC_ERR_NULL;
     *ctx = (AiaecCtx *)0;
-    rc = aiaec_core_init(cfg, AIAEC_FAMILY_PCM, pool, pool_bytes, &core, info);
+    rc = aiaec_core_init(cfg, AIAEC_FAMILY_PCM, pool, pool_bytes, &core);
     if (rc == AIAEC_OK) *ctx = (AiaecCtx *)core;
     return rc;
 }
 
-int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecFreqCtx **ctx, AiaecInfo *info)
+int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecFreqCtx **ctx)
 {
     AiaecCore *core = (AiaecCore *)0;
     int rc;
 
     if (!ctx) return AIAEC_ERR_NULL;
     *ctx = (AiaecFreqCtx *)0;
-    rc = aiaec_core_init(cfg, AIAEC_FAMILY_FREQ, pool, pool_bytes, &core, info);
+    rc = aiaec_core_init(cfg, AIAEC_FAMILY_FREQ, pool, pool_bytes, &core);
     if (rc == AIAEC_OK) *ctx = (AiaecFreqCtx *)core;
     return rc;
 }

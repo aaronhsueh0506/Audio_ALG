@@ -14,8 +14,7 @@
  * the rule above.
  *
  * A fault that hands the sample a stale or zero generation passes every functional test, so each
- * value is compared against the live counter after it has moved off zero. Not built under
- * NO_STDIO. */
+ * value is compared against the live counter after it has moved off zero. */
 
 #include <limits.h>
 #include <math.h>
@@ -23,10 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
 #include "ainr_test_fixture.h"
 
 typedef enum { FAM_PCM = 0, FAM_FREQ } Family;
@@ -43,7 +40,7 @@ typedef struct Fam {
 
 static const char *fam_name(Family f) { return f == FAM_PCM ? "pcm" : "freq"; }
 
-static int fam_init(Fam *f, const char *erb) {
+static int fam_init(Fam *f, const ErbTables *erb) {
     StreamMemReq req;
     AinrInfo info;
     void *pool;
@@ -51,11 +48,11 @@ static int fam_init(Fam *f, const char *erb) {
     case FAM_PCM:
         if (ainr_get_mem_size(&f->cfg, &req) != AINR_OK) return 1;
         pool = alloc_aligned((size_t)req.bytes, req.alignment);
-        return ainr_init_from_erb_file(&f->cfg, erb, pool, (size_t)req.bytes, &f->pcm, &info) != AINR_OK || !f->pcm;
+        return ainr_init_t(&f->cfg, erb, pool, (size_t)req.bytes, &f->pcm, &info) != AINR_OK || !f->pcm;
     default:
         if (ainr_get_mem_size_freq(&f->cfg, &req) != AINR_OK) return 1;
         pool = alloc_aligned((size_t)req.bytes, req.alignment);
-        return ainr_init_freq_from_erb_file(&f->cfg, erb, pool, (size_t)req.bytes, &f->freq, &info) != AINR_OK || !f->freq;
+        return ainr_init_freq_t(&f->cfg, erb, pool, (size_t)req.bytes, &f->freq, &info) != AINR_OK || !f->freq;
     }
 }
 
@@ -262,10 +259,8 @@ static int run_status_table(int sr, int fft, int n_erb, int n, int warm, const c
     static const int statuses[] = { STREAM_RUN_NOT_STARTED, STREAM_RUN_FAILED, 1, 5, 7, -2,
                                     STREAM_RUN_NOT_STARTED + 1, STREAM_RUN_NOT_STARTED - 1, INT_MAX, INT_MIN, 0 };
     int fi, si, rc = 0;
-    char erb[160];
     int n_bins = fft / 2 + 1;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_runstatus_erb");
-    write_synthetic_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
     for (fi = 0; fi < 2; ++fi)
         for (si = 0; si < (int)(sizeof(statuses) / sizeof(statuses[0])); ++si) {
             Fam fs[2];
@@ -280,11 +275,11 @@ static int run_status_table(int sr, int fft, int n_erb, int n, int warm, const c
                 fs[j].pcm_out = (int16_t *)calloc((size_t)fs[j].cfg.hop_in, sizeof(int16_t));
                 fs[j].re = (float *)calloc(cnt, sizeof(float)); fs[j].im = (float *)calloc(cnt, sizeof(float));
                 fs[j].out_re = (float *)calloc(cnt, sizeof(float)); fs[j].out_im = (float *)calloc(cnt, sizeof(float));
-                if (fam_init(&fs[j], erb)) { fprintf(stderr, "%s: init failed\n", label); return 1; }
+                if (fam_init(&fs[j], &erb)) { fprintf(stderr, "%s: init failed\n", label); return 1; }
             }
             if (run_status_one(&fs[0], &fs[1], warm, statuses[si], label)) rc = 1;
         }
-    unlink(erb);
+    erb_tables_free(&erb);
     if (!rc) printf("%s: run status table OK (%d statuses x 2 families)\n", label,
                     (int)(sizeof(statuses) / sizeof(statuses[0])));
     return rc;
@@ -292,10 +287,8 @@ static int run_status_table(int sr, int fft, int n_erb, int n, int warm, const c
 
 static int run_case(int sr, int fft, int n_erb, int n, int warm, const char *label) {
     int fi, rc = 0;
-    char erb[160];
     int n_bins = fft / 2 + 1;
-    erb_fixture_scratch_path(erb, sizeof(erb), "ainr_stategen_erb");
-    write_synthetic_erb(erb, n_bins, n_erb);
+    ErbTables erb = erb_tables_synthetic(n_bins, n_erb);
     for (fi = 0; fi < 2; ++fi) {
         Fam f;
         size_t cnt = (size_t)n * (size_t)n_bins;
@@ -307,11 +300,11 @@ static int run_case(int sr, int fft, int n_erb, int n, int warm, const char *lab
         f.pcm_out = (int16_t *)calloc((size_t)f.cfg.hop_in, sizeof(int16_t));
         f.re = (float *)calloc(cnt, sizeof(float)); f.im = (float *)calloc(cnt, sizeof(float));
         f.out_re = (float *)calloc(cnt, sizeof(float)); f.out_im = (float *)calloc(cnt, sizeof(float));
-        if (fam_init(&f, erb)) { fprintf(stderr, "%s/%s: init failed\n", label, fam_name(f.family)); rc = 1; continue; }
+        if (fam_init(&f, &erb)) { fprintf(stderr, "%s/%s: init failed\n", label, fam_name(f.family)); rc = 1; continue; }
         if (run_family(&f, warm, label)) rc = 1;
         else printf("%s/%s: state generation contract OK\n", label, fam_name(f.family));
     }
-    unlink(erb);
+    erb_tables_free(&erb);
     return rc;
 }
 

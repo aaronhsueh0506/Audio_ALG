@@ -21,7 +21,7 @@ static GraphIoRow row_a(void)
 {
     GraphIoRow r;
     memset(&r, 0, sizeof r);
-    r.model = M_A; r.sample_rate = 16000; r.fft = 256; r.n = 1; r.layout_version = 11;
+    r.file = "a_16k_fft256_n1.bin"; r.model = M_A; r.sample_rate = 16000; r.fft = 256; r.n = 1; r.layout_version = 11;
     r.signal_count = 2; r.head_count = 3; r.state_count = 3;
     r.signal[0][0] = 2; r.signal[0][1] = 3; r.signal[0][2] = 4; r.signal[0][3] = 5;
     r.signal[1][0] = 1; r.signal[1][1] = 1; r.signal[1][2] = 1; r.signal[1][3] = 9;
@@ -39,7 +39,7 @@ static GraphIoRow row_b(void)
 {
     GraphIoRow r;
     memset(&r, 0, sizeof r);
-    r.model = M_B; r.sample_rate = 48000; r.fft = 1024; r.n = 8; r.layout_version = 12;
+    r.file = "b_48k_fft1024_n8.bin"; r.model = M_B; r.sample_rate = 48000; r.fft = 1024; r.n = 8; r.layout_version = 12;
     r.signal_count = 3; r.head_count = 1; r.state_count = 1;
     r.signal[0][0] = 1; r.signal[0][1] = 1; r.signal[0][2] = 8; r.signal[0][3] = 33;
     r.signal[1][0] = 1; r.signal[1][1] = 2; r.signal[1][2] = 8; r.signal[1][3] = 3;
@@ -54,7 +54,7 @@ static GraphIoRow row_c(void)
 {
     GraphIoRow r;
     memset(&r, 0, sizeof r);
-    r.model = M_C; r.sample_rate = 16000; r.fft = 512; r.n = 1; r.layout_version = 13;
+    r.file = "c_16k_fft512_n1.bin"; r.model = M_C; r.sample_rate = 16000; r.fft = 512; r.n = 1; r.layout_version = 13;
     r.signal_count = 1; r.head_count = 1; r.state_count = 0;
     r.signal[0][0] = 1; r.signal[0][1] = 2; r.signal[0][2] = 3; r.signal[0][3] = 4;
     r.head[0][0] = 1; r.head[0][1] = 2; r.head[0][2] = 3; r.head[0][3] = 4;
@@ -67,7 +67,7 @@ static GraphIoRow row_d(void)
     GraphIoRow r;
     int i;
     memset(&r, 0, sizeof r);
-    r.model = M_D; r.sample_rate = 16000; r.fft = 256; r.n = 8; r.layout_version = 14;
+    r.file = "d_16k_fft256_n8.bin"; r.model = M_D; r.sample_rate = 16000; r.fft = 256; r.n = 8; r.layout_version = 14;
     r.signal_count = GRAPH_IO_MAX_SIGNALS; r.head_count = GRAPH_IO_MAX_HEADS; r.state_count = 12;
     for (i = 0; i < r.signal_count; ++i) { r.signal[i][0] = 1; r.signal[i][1] = 1; r.signal[i][2] = (unsigned)i + 1; r.signal[i][3] = 2; }
     for (i = 0; i < r.head_count; ++i) { r.head[i][0] = 1; r.head[i][1] = 1; r.head[i][2] = (unsigned)i + 1; r.head[i][3] = 3; }
@@ -203,6 +203,12 @@ static void test_expand(void)
 
     CHECK(graph_io_expand(NULL, &c) == GRAPH_IO_ERR_NULL && graph_io_expand(&ra, NULL) == GRAPH_IO_ERR_NULL,
           "expand NULL");
+    r = ra; r.file = NULL;
+    CHECK(graph_io_expand(&r, &c) == GRAPH_IO_ERR_ROW && is_zeroed(&c), "NULL file: ERR_ROW, cfg zeroed");
+    r = ra; r.file = "";
+    CHECK(graph_io_expand(&r, &c) == GRAPH_IO_ERR_ROW && is_zeroed(&c), "empty file: ERR_ROW, cfg zeroed");
+    r = ra;
+    CHECK(graph_io_expand(&r, &c) == GRAPH_IO_OK && strcmp(c.file, "a_16k_fft256_n1.bin") == 0, "a named row keeps its file");
     memset(&r, 0, sizeof r);
     CHECK(graph_io_expand(&r, &c) == GRAPH_IO_ERR_ROW, "all-zero row");
 }

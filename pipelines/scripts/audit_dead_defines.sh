@@ -12,7 +12,7 @@
 # character literals blanked first. Sources: the .c/.h files of AINR/, AIAEC/, pipelines/, stream/,
 # lib/ainr/ and lib/aiaec/, AEC's and NR's include/src (and AEC's example/) resolved through lib/deps.mk, and
 # audiolib's common/ (include, src, utility). A flag set on a line that assigns a variable whose name
-# contains TEST (DFN_TEST_CFLAGS), or whose own name has a TEST word (AIAEC_TEST_CATALOG), is a test flag and
+# contains TEST (DFN_TEST_CFLAGS), or whose own name has a TEST word (AIAEC_TEST_PRODUCT), is a test flag and
 # may be read by a test source; every other flag needs a reader outside the test and tests directories.
 #
 # Usage:  scripts/audit_dead_defines.sh [--root DIR] [--common DIR] [--py] [--verbose] [FILE...]

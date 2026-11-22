@@ -17,12 +17,6 @@ endif
 
 include ../../lib/deps.mk
 
-# aiaec.c has no file-loader TU -- nothing here needs stdio. Same build-matrix knob as every
-# other stream Makefile.
-NO_STDIO ?= 0
-override NO_STDIO := $(strip $(NO_STDIO))
-$(eval $(call CHECK_01,NO_STDIO))
-
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
@@ -60,11 +54,11 @@ endif
 
 # Forwarded to every child model directory's Makefile (deepvqe_s, ulcnet): same shape as
 # pipelines/Makefile's own FWD, scoped to what those Makefiles actually accept.
-FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) NO_STDIO=$(NO_STDIO) $(TOOLCHAIN_FWD)
+FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) $(TOOLCHAIN_FWD)
 
 BUILD_DIR := build
 override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) AIAEC_MODEL=$(AIAEC_MODEL) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) AIAEC_MODEL=$(AIAEC_MODEL) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
@@ -143,10 +137,7 @@ TEST_DEPS := $(DEEPVQE_CORE_HEADERS) $(ULCNET_CORE_HEADERS) $(ULCNET_STREAM_HEAD
 
 # The product a test binary is built for is chosen by compiling aiaec.c with
 # -DAIAEC_PRODUCT_MODEL_ID=<id> (aiaec_product.h) -- the only way a test reaches the other model;
-# no customer field selects a model. AIAEC_TEST_CATALOG (aiaec.c) substitutes placeholder graph
-# paths (and adds a 16k/256 N=8 entry without one, for the refusal) so a test can drive the gated API
-# without the board's graph files; it is passed only to the targets below that say so, never to `lib`
-# or the catalog/link-only tests.
+# no customer field selects a model.
 PRODUCTS := deepvqe_s=1 align_ulcnet=10
 
 # One test source built and run once per product. $(1) test name, $(2) extra compile flags.
@@ -159,30 +150,30 @@ define RUN_PER_PRODUCT
 	done
 endef
 
-# test_aiaec_catalog: the PRODUCTION catalog (no AIAEC_TEST_CATALOG): refusal order, the N values
-# with no row, and the delivered rows (both models: 16k/256 N=1, 16k/512 N=1 and N=4, 48k/1024 N=1 and N=2).
+# test_aiaec_catalog: refusal order, the N values with no graph_io row (accepted by the library), and the registered
+# rows (both models: 16k/256 N=1, 16k/512 N=1 and N=4, 48k/1024 N=1 and N=2).
 test-aiaec-catalog: $(TEST_DEPS) | _cfg_guard
 	$(call RUN_PER_PRODUCT,test_aiaec_catalog,)
 
 # test_aiaec_block: the block entry end to end against deepvqe_stream_*/ulcnet_stream_* driven
-# directly, with the test catalog.
+# directly.
 test-aiaec-block: $(TEST_DEPS) | _cfg_guard
-	$(call RUN_PER_PRODUCT,test_aiaec_block,-DAIAEC_TEST_CATALOG)
+	$(call RUN_PER_PRODUCT,test_aiaec_block,)
 
 # test_aiaec_freq: the _freq family against the PCM block family and an external AcStft/AcIstft, the tail
-# drain, per-family info and pool sizes, with the test catalog.
+# drain, pool sizes.
 test-aiaec-freq: $(TEST_DEPS) | _cfg_guard
-	$(call RUN_PER_PRODUCT,test_aiaec_freq,-DAIAEC_TEST_CATALOG)
+	$(call RUN_PER_PRODUCT,test_aiaec_freq,)
 
 # test_aiaec_nonfinite: +-FLT_MAX is finite input (every feature tensor stays finite), NaN/Inf in any input plane is
-# refused with AIAEC_ERR_NONFINITE_INPUT before any state change; per product, with the test catalog.
+# refused with AIAEC_ERR_NONFINITE_INPUT before any state change; per product.
 test-aiaec-nonfinite: $(TEST_DEPS) | _cfg_guard
-	$(call RUN_PER_PRODUCT,test_aiaec_nonfinite,-DAIAEC_TEST_CATALOG)
+	$(call RUN_PER_PRODUCT,test_aiaec_nonfinite,)
 
 # test_aiaec_packet: Align-ULCNet's packet graph (16k/512 N=4, layout 19) against a host accelerator that implements the
 # graph's frame_reset semantics; the Align-ULCNet product only.
 test-aiaec-packet: $(TEST_DEPS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_PRODUCT_MODEL_ID=10 \
 	  tests/test_aiaec_packet.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/test_aiaec_packet"
 	"$(OBJ_DIR)/test_aiaec_packet"
 
@@ -191,7 +182,7 @@ test-aiaec-packet: $(TEST_DEPS) | _cfg_guard
 test-aiaec-product: $(TEST_DEPS) | _cfg_guard
 	@set -e; for spec in "1 1" "2 10" "3 999"; do \
 	  set -- $$spec; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_TEST_PRODUCT=$$1 -DAIAEC_PRODUCT_MODEL_ID=$$2 \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_PRODUCT=$$1 -DAIAEC_PRODUCT_MODEL_ID=$$2 \
 	    tests/test_aiaec_product.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm \
 	    -o "$(OBJ_DIR)/test_aiaec_product_$$1"; \
 	  "$(OBJ_DIR)/test_aiaec_product_$$1" > "$(OBJ_DIR)/test_aiaec_product_$$1.out"; \
@@ -203,18 +194,15 @@ test-aiaec-product: $(TEST_DEPS) | _cfg_guard
 	echo "test-aiaec-product: PASS (pool sizes differ: $$h1 vs $$h2)"
 
 # test-aiaec-graph-io: the graph rows (graph_io_deepvqes.h, graph_io_alignulcnet.h) against the
-# StreamWork of real pre calls, per product, with the test catalog and the production one. The port check of the
+# StreamWork of real pre calls, per product. The port check of the
 # model-config header links ../common/stream_bind.c (samples only, not the archive).
 test-aiaec-graph-io: $(TEST_DEPS) tests/test_aiaec_graph_io.c graph_io_deepvqes.h graph_io_alignulcnet.h ../common/graph_io.h | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
-	  for cat in test production; do \
-	    defs=""; [ "$$cat" = test ] && defs="-DAIAEC_TEST_CATALOG"; \
-	    $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $$defs -DAIAEC_PRODUCT_MODEL_ID=$$id \
-	      tests/test_aiaec_graph_io.c $(TEST_SOURCES) ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm \
-	      -o "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
-	    "$(OBJ_DIR)/test_aiaec_graph_io_$${tag}_$$cat"; \
-	  done; \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_PRODUCT_MODEL_ID=$$id \
+	    tests/test_aiaec_graph_io.c $(TEST_SOURCES) ../common/stream_bind.c "$(COMMON_LIB)" $(LDFLAGS) -lm \
+	    -o "$(OBJ_DIR)/test_aiaec_graph_io_$$tag"; \
+	  "$(OBJ_DIR)/test_aiaec_graph_io_$$tag"; \
 	done
 
 # graph-io-dumper: tests/dump_graph_io.c prints the rows of both model-config headers and their layout constants;
@@ -225,22 +213,22 @@ $(OBJ_DIR)/dump_graph_io: tests/dump_graph_io.c graph_io_deepvqes.h graph_io_ali
 graph-io-dumper: $(OBJ_DIR)/dump_graph_io
 	@echo "$(abspath $(OBJ_DIR))/dump_graph_io"
 
-# bind-dumpers: builds tests/dump_bind_info.c once per product with the test catalog and prints the
+# bind-dumpers: builds tests/dump_bind_info.c once per product and prints the
 # two binary paths (deepvqe_s first). AIAEC/tests/test_aiaec_bind_info_pin.py runs them and compares
 # the StreamWork signal and head views of a real pre call with the ONNX export.
 bind-dumpers: $(TEST_DEPS) | _cfg_guard
 	@set -e; for spec in $(PRODUCTS); do \
 	  tag=$${spec%%=*}; id=$${spec##*=}; \
-	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=$$id \
+	  $(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_PRODUCT_MODEL_ID=$$id \
 	    tests/dump_bind_info.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/dump_bind_info_$$tag"; \
 	done
 	@echo "$(abspath $(OBJ_DIR))/dump_bind_info_deepvqe_s"
 	@echo "$(abspath $(OBJ_DIR))/dump_bind_info_align_ulcnet"
 
 # packet-driver: tests/packet_driver.c (the Align-ULCNet _freq family behind a binary stdin/stdout protocol, N chosen
-# per request) with the test catalog; prints the binary path for AIAEC/tests/test_aiaec_packet_ort.py.
+# per request); prints the binary path for AIAEC/tests/test_aiaec_packet_ort.py.
 packet-driver: $(TEST_DEPS) | _cfg_guard
-	@$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_PRODUCT_MODEL_ID=10 \
+	@$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_PRODUCT_MODEL_ID=10 \
 	  tests/packet_driver.c $(TEST_SOURCES) "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$(OBJ_DIR)/packet_driver"
 	@echo "$(abspath $(OBJ_DIR))/packet_driver"
 
@@ -301,7 +289,7 @@ endif
 # test-single-model: proves the AIAEC_MODEL=deepvqe and AIAEC_MODEL=align single-model variants
 # (see the AIAEC_MODEL knob's own comment above) each compile an aiaec.o with none of the OTHER
 # model's deepvqe_stream_*/ulcnet_stream_* symbols (nm -u, against the same object `make lib`
-# would archive -- no AIAEC_TEST_CATALOG on that compile), that the real public block API runs a
+# would archive), that the real public block API runs a
 # normal hop and a forced-bypass hop end to end for the enabled model, and that a product bound to
 # the OTHER model (-DAIAEC_PRODUCT_MODEL_ID=<its id>) is refused with AIAEC_ERR_MODEL_ID by every
 # entry (see tests/test_single_model.c). Deliberately NOT a
@@ -325,26 +313,18 @@ _test_single_model_variant: $(OBJ_DIR)/aiaec.o
 	  echo "FAIL: $(AIAEC_MODEL)-only aiaec.o references $(EXPECT_OTHER)_* symbols:" >&2; echo "$$undef_other" >&2; exit 1; \
 	fi; \
 	bin="$(OBJ_DIR)/test_single_model"; \
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) \
 	  tests/test_single_model.c $$sources aiaec.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$$bin"; \
 	"$$bin"; \
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_CATALOG -DAIAEC_TEST_OTHER_BOUND=1 -DAIAEC_PRODUCT_MODEL_ID=$(OTHER_ID) \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) -DAIAEC_TEST_OTHER_BOUND=1 -DAIAEC_PRODUCT_MODEL_ID=$(OTHER_ID) \
 	  tests/test_single_model.c $$sources aiaec.c "$(COMMON_LIB)" $(LDFLAGS) -lm -o "$$bin.other"; \
 	"$$bin.other"; \
 	echo "test-single-model ($(AIAEC_MODEL)): PASS (no $(EXPECT_OTHER)_* symbols, round trip + bound-model refusal verified)"
 
-# audit-no-stdio: aiaec.o itself has no stdio references (same convention as every other stream
-# Makefile's audit-no-stdio, scoped to just this directory's own object -- deepvqe_s/ and ulcnet/
-# each audit their own).
-audit-no-stdio:
-	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
-	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
-	obj_dir="$$(dirname "$$obj_dir")"; \
-	undef="$$(nm -u "$$obj_dir/aiaec.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
-	if [ -n "$$undef" ]; then \
-	  echo "FAIL: aiaec.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \
-	fi; \
-	echo "audit-no-stdio: PASS ($$obj_dir/aiaec.o has no stdio references)"
+# audit-no-stdio: $(LIB) has no undefined stdio reference; recipe in lib/deps.mk (MASK_ONLY does not exist here).
+audit-no-stdio: MASK_ONLY := n/a
+audit-no-stdio: $(LIB)
+	$(AUDIT_NO_STDIO_RECIPE)
 
 clean:
 	rm -rf "$(BUILD_DIR)"

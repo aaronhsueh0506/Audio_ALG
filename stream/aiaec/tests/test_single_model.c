@@ -3,13 +3,12 @@
  * forms, driven by the SAME compile-time flags aiaec.c sees:
  *
  *   default product (the enabled model): a normal SUBMIT hop and a forced-bypass hop through the real
- *     public block API, one hop through the _freq family, the info, and the
+ *     public block API, one hop through the _freq family and the
  *     work views of the first block (counts and shapes).
  *   -DAIAEC_TEST_OTHER_BOUND=1 with -DAIAEC_PRODUCT_MODEL_ID=<the model this build does NOT contain>:
  *     every entry refuses with AIAEC_ERR_MODEL_ID.
  *
- * Compiled with -DAIAEC_TEST_CATALOG so the enabled model's row has a placeholder graph path. The nm -u
- * proof that the other model's symbols are absent is the Makefile's, not this program's. */
+ * The nm -u proof that the other model's symbols are absent is the Makefile's, not this program's. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -27,15 +26,14 @@ static int g_fail = 0;
 static int check_bound_model_refused(void) {
     AiaecConfig cfg = { 16000, 256, 128 };
     StreamMemReq req;
-    AiaecInfo info;
     AiaecCtx *ctx = (AiaecCtx *)&req;
     AiaecFreqCtx *cf = (AiaecFreqCtx *)&req;
     unsigned char pool[64];
 
     CHECK(aiaec_get_mem_size(&cfg, &req) == AIAEC_ERR_MODEL_ID, "get_mem_size must be AIAEC_ERR_MODEL_ID");
-    CHECK(aiaec_init(&cfg, pool, sizeof(pool), &ctx, &info) == AIAEC_ERR_MODEL_ID && ctx == NULL, "init");
+    CHECK(aiaec_init(&cfg, pool, sizeof(pool), &ctx) == AIAEC_ERR_MODEL_ID && ctx == NULL, "init");
     CHECK(aiaec_get_mem_size_freq(&cfg, &req) == AIAEC_ERR_MODEL_ID, "get_mem_size_freq must be AIAEC_ERR_MODEL_ID");
-    CHECK(aiaec_init_freq(&cfg, pool, sizeof(pool), &cf, &info) == AIAEC_ERR_MODEL_ID && cf == NULL, "init_freq");
+    CHECK(aiaec_init_freq(&cfg, pool, sizeof(pool), &cf) == AIAEC_ERR_MODEL_ID && cf == NULL, "init_freq");
     printf("test_single_model: bound model %d absent from this build -- every entry refused -- %s\n",
            (int)AIAEC_PRODUCT_MODEL_ID, g_fail ? "FAIL" : "PASS");
     return g_fail;
@@ -44,7 +42,6 @@ static int check_bound_model_refused(void) {
 static int run_roundtrip(void) {
     AiaecConfig cfg = { 16000, 256, 128 };
     StreamMemReq req;
-    AiaecInfo info;
     AiaecCtx *ctx = NULL;
     AiaecInput input;
     StreamWork work;
@@ -55,12 +52,11 @@ static int run_roundtrip(void) {
     const int deepvqe = (AIAEC_PRODUCT_MODEL_ID == AIAEC_MODEL_ID_DEEPVQE_S);
     int k, rc;
 
-    if (aiaec_get_mem_size(&cfg, &req) != AIAEC_OK) { FAIL("aiaec_get_mem_size failed -- is AIAEC_TEST_CATALOG wired?"); return 1; }
+    if (aiaec_get_mem_size(&cfg, &req) != AIAEC_OK) { FAIL("aiaec_get_mem_size failed"); return 1; }
     if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0) { FAIL("pool alloc failed"); return 1; }
-    rc = aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, &info);
+    rc = aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx);
     if (rc != AIAEC_OK || !ctx) { FAIL("aiaec_init failed rc=%d", rc); free(pool); return 1; }
 
-    CHECK(info.graph_path != NULL, "info");
     for (k = 0; k < 128; ++k) {
         mic[k] = (int16_t)(k * 3 - 50); far16[k] = (int16_t)(k * 5 - 80);
         resid[k] = 0.001f * (float)(k * 5 - 48); farf[k] = 0.001f * (float)(k * 7 - 44);
@@ -111,7 +107,7 @@ static int run_roundtrip(void) {
         if (aiaec_get_mem_size_freq(&cfg, &rf) != AIAEC_OK || posix_memalign(&pf, 16, (size_t)rf.bytes) != 0) {
             FAIL("freq pool setup failed"); return 1;
         }
-        if (aiaec_init_freq(&cfg, pf, (size_t)rf.bytes, &cf, &info) != AIAEC_OK || !cf) {
+        if (aiaec_init_freq(&cfg, pf, (size_t)rf.bytes, &cf) != AIAEC_OK || !cf) {
             FAIL("freq init failed"); return 1;
         }
 
@@ -134,7 +130,7 @@ static int run_roundtrip(void) {
         CHECK(aiaec_postprocess_freq(cf, 0, o_re, o_im) == AIAEC_OK, "freq postprocess");
         free(pf);
     }
-    printf("test_single_model: %s round trip (block normal + bypass, freq), info, work views -- %s\n",
+    printf("test_single_model: %s round trip (block normal + bypass, freq), work views -- %s\n",
            deepvqe ? "DeepVQE-S" : "Align-ULCNet", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

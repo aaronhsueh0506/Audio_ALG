@@ -6,8 +6,8 @@
  *   dump_work <sr> <fft> <hop_in> [family]        family 0 PCM (default), 2 _freq (1 was the retired _spec)
  *     rc <int>                                    status of ainr_get_mem_size*() / ainr_init*() / the
  *                                                 preprocess calls (a refused config prints this line only)
- *     graph <path>                                AinrInfo.graph_path
  *     info queue <int>                            AinrInfo.queue_frames
+ *     info mask_lookahead <int>                   AinrInfo.mask_lookahead
  *     counts inputs <int> outputs <int>           StreamWork input_count / output_count
  *     in <i> <b> <c> <h> <w> <elements>           StreamWork.inputs[i], signal inputs only
  *     out <i> <b> <c> <h> <w> <elements>          StreamWork.outputs[i], heads only
@@ -18,14 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "ainr.h"
-#include "ainr_test.h"
-#include "ainr_test_fixture.h"   /* write_erb_file(), erb_fixture_scratch_path() */
+#include "ainr_test_fixture.h"   /* ErbTables */
 
 int main(int argc, char **argv) {
-    AinrConfig cfg;
+    AinrConfig cfg = {0};
     AinrInfo info;
     StreamWork work;
     StreamMemReq req;
@@ -34,7 +32,7 @@ int main(int argc, char **argv) {
     void *pool = NULL;
     int16_t *pcm_in = NULL, *pcm_out = NULL;
     float *zeros = NULL;
-    char erb[96];
+    ErbTables erb = { NULL, NULL };
     int rc, i, family, n_erb, hop, bins;
 
     if (argc != 4 && argc != 5) return 2;
@@ -47,12 +45,10 @@ int main(int argc, char **argv) {
         hop = cfg.fft / 2;
         bins = hop + 1;
         n_erb = cfg.sr == 16000 ? 24 : cfg.sr == 32000 ? 28 : 32;
-        erb_fixture_scratch_path(erb, sizeof(erb), "ainr_dump_work");
-        write_erb_file(erb, bins, n_erb, ERB_BAND0);
+        erb = erb_tables(bins, n_erb, ERB_BAND0);
         if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) return 2;
-        rc = family == 0 ? ainr_init_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &pcm, &info)
-                         : ainr_init_freq_from_erb_file(&cfg, erb, pool, (size_t)req.bytes, &freq, &info);
-        unlink(erb);
+        rc = family == 0 ? ainr_init_t(&cfg, &erb, pool, (size_t)req.bytes, &pcm, &info)
+                         : ainr_init_freq_t(&cfg, &erb, pool, (size_t)req.bytes, &freq, &info);
     }
     if (rc == AINR_OK) {
         pcm_in = (int16_t *)calloc((size_t)cfg.hop_in, sizeof(int16_t));
@@ -70,9 +66,9 @@ int main(int argc, char **argv) {
         }
     }
     printf("rc %d\n", rc);
-    if (rc != AINR_OK) { free(pool); free(pcm_in); free(pcm_out); free(zeros); return 0; }
-    printf("graph %s\n", info.graph_path);
+    if (rc != AINR_OK) { free(pool); free(pcm_in); free(pcm_out); free(zeros); erb_tables_free(&erb); return 0; }
     printf("info queue %d\n", info.queue_frames);
+    printf("info mask_lookahead %d\n", info.mask_lookahead);
     printf("counts inputs %d outputs %d\n", work.input_count, work.output_count);
     for (i = 0; i < work.input_count; ++i)
         printf("in %d %u %u %u %u %zu\n", i, work.inputs[i].b, work.inputs[i].c, work.inputs[i].h, work.inputs[i].w,
@@ -81,5 +77,6 @@ int main(int argc, char **argv) {
         printf("out %d %u %u %u %u %zu\n", i, work.outputs[i].b, work.outputs[i].c, work.outputs[i].h, work.outputs[i].w,
                work.outputs[i].elements);
     free(pool); free(pcm_in); free(pcm_out); free(zeros);
+    erb_tables_free(&erb);
     return 0;
 }

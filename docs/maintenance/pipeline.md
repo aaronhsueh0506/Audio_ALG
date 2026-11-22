@@ -103,14 +103,14 @@ Pass conditions:
       (`dfn_hop_state_generation()` is 1 at the end of the identity run: the first M hops carry no model frame and
       move nothing; a reset, a refused commit or a run that started and failed would add to it;
       the stub model and the identity path report `STREAM_RUN_NOT_STARTED`, which does not).
-- [ ] `erb_inv` that is not a bitwise partition of unity is refused at
-      `init` (`dfn2_stream_init*`, `ainr_init*`); the two
+- [ ] `erb_inv` that is not a bitwise partition of unity (and, for `ainr_init*`, an `AinrConfig.n_erb` other than the grid's) is refused at
+      `init` (`dfn2_stream_init*`; `ainr_init*` returns `AINR_ERR_ERB_TABLES`); the two
       example mains run the model stream, so they report it as `pipeline init failed` (exit 1),
       from `dfn_hop_pool_build()`.
-- [ ] `--erb-fwd FILE` and `--erb-inv FILE` take the two raw float32 ERB matrices of the
-      model grid (exactly `n_bins * n_erb` floats each): a missing value or only one of the
-      two exits 2, an unreadable file or a wrong float count exits 1; with neither option a
-      unit partition serves the fail-open smoke run only.
+- [ ] `--erb FILE` takes the `fb_<sr>_<n_erb>.bin` ERB file of the model grid (the board
+      samples' file, `export_erb_matrix.py --format bin`): a missing value exits 2, an
+      unreadable file or a header or size that does not match the grid exits 1; without the
+      option a unit partition serves the fail-open smoke run only.
 - [ ] Native-grid gates pass for 16 kHz/fft 256, 16 kHz/fft 512 and
       8 kHz/fft 256: the documented per-hop 48 kHz frame schedule (0,1,1,1 at
       16 kHz/hop 128; 1,2 on the other two), the cumulative frame count, the

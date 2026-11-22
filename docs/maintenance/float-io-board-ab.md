@@ -8,7 +8,7 @@
 |---|---|
 | CTRL 位元（`CTRL_BUF_FLOATIN`／`CTRL_BUF_FLOATOUT`）是否也作用在 state 埠 | 開 `FLOAT_IN=FLOAT_OUT=1` 後，啟動 log 的 `[AI3] in[i]`／`out[i]` 行裡 state 埠的 `float`／`bits`。state 回報 float 即作用在 state；回報定點即不作用（兩種結果 sample 都能接受，只要兩端一致） |
 | NPU 內建轉換與 host 呼叫是否數值相等 | 步驟 4 的 head 比對。host 對輸入傳 scale 1.0f，對輸出傳埠的 `scale_ratio`，所以差異可能來自這個不對稱，不一定是 NPU 的問題 |
-| 現有 `model.bin` 是否直接接受 float I/O | 步驟 2 的啟動結果：開圖失敗、`[AI3] in[i]`／`out[i]` 行仍回報定點，或啟動後 head 全為 NaN／全 0，都表示這個 bin 需要工具鏈的 float I/O 選項並重編；此時在 `stream/ainr/ainr.c`／`stream/aiaec/aiaec.c` 的 catalog 加第二個 `graph_path`，不改 layout 版號 |
+| 現有 `model.bin` 是否直接接受 float I/O | 步驟 2 的啟動結果：開圖失敗、`[AI3] in[i]`／`out[i]` 行仍回報定點，或啟動後 head 全為 NaN／全 0，都表示這個 bin 需要工具鏈的 float I/O 選項並重編；此時為它另放一個資料夾（`SAMPLE_MODEL_DIR`，檔名不變）或在 `graph_io_<model>.h` 加一列另一個檔名，不改 layout 版號 |
 
 ## 步驟
 

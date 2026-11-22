@@ -4,7 +4,7 @@
  * The host forms E (the estimate spectrum, the AEC's rendering base B in both example mains) and P
  * (B after the RES gain, plus comfort noise when enabled) before the hop begins. DFN2 runs on (E, P) through
  * the model-stream layer (stream/ainr/dfn2: dfn2_stream_pre_process_freq_dual /
- * dfn2_stream_post_process_freq in memory mode); this header adds what that layer leaves to its
+ * dfn2_stream_post_process_freq); this header adds what that layer leaves to its
  * caller: the audio-scale spectra in and out (dfn2_stft_scale in, dfn2_stft_unscale out), the
  * model callback, and the synthesis.
  *   host rate == the model grid's rate   DfnHop synthesises through the caller's AcIstft

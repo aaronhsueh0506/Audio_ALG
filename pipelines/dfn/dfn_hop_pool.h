@@ -1,5 +1,5 @@
 /* dfn_hop_pool.h -- example: the DeepFilterNet2 tail of an example program's pool, sized and
- * carved in one place: the model stream (stream/ainr/dfn2, memory mode, freq_only), the audio-scale
+ * carved in one place: the model stream (stream/ainr/dfn2, freq_only), the audio-scale
  * conversion buffers, and the synthesis with the output spectrum when the host runs the model's
  * grid, or the rate bridge (stream/ainr/bridge) when the host rate differs (the model is then on
  * its 48 kHz grid). Header-only, no ABI: copy and adapt.
@@ -31,7 +31,7 @@ extern "C" {
 #endif
 
 typedef struct DfnHopPoolPlan {
-    DFN2StreamConfig stream_cfg;      /* model grid, attenuation limit, ERB matrices (memory mode) */
+    DFN2StreamConfig stream_cfg;      /* model grid, attenuation limit, ERB matrices (borrowed) */
     DFN2Model model;                  /* the callback, its reset and its descriptor */
     AinrBridgeConfig bridge_cfg;
     int use_bridge;                   /* host rate differs from the model grid's (stream_cfg.grid) */

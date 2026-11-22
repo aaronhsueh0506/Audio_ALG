@@ -22,15 +22,16 @@ extern "C" {
 /* One registered graph; score_window is the logit window W (SCORE_WINDOW_BY_GRID in export_onnx.py). */
 typedef struct GraphIoAlignulcnetGrid {
     int sample_rate, fft, n, score_window;
+    const char *file;
 } GraphIoAlignulcnetGrid;
 
 /* Each row follows the grid's AIAEC/Align_ULCNet/config_<grid>.ini. */
 static const GraphIoAlignulcnetGrid GRAPH_IO_ALIGNULCNET_GRIDS[] = {
-    { 16000, 256, 1, 9 },
-    { 16000, 512, 1, 5 },
-    { 16000, 512, 4, 5 },
-    { 48000, 1024, 1, 5 },
-    { 48000, 1024, 2, 5 },
+    { 16000, 256, 1, 9, "alignulcnet_16k_fft256_n1.bin" },
+    { 16000, 512, 1, 5, "alignulcnet_16k_fft512_n1.bin" },
+    { 16000, 512, 4, 5, "alignulcnet_16k_fft512_n4.bin" },
+    { 48000, 1024, 1, 5, "alignulcnet_48k_fft1024_n1.bin" },
+    { 48000, 1024, 2, 5, "alignulcnet_48k_fft1024_n2.bin" },
 };
 
 #define GRAPH_IO_ALIGNULCNET_ROW_COUNT \
@@ -47,7 +48,7 @@ static inline void graph_io_alignulcnet_describe(const GraphIoAlignulcnetGrid *g
 
     memset(row, 0, sizeof *row);
     row->model = GRAPH_IO_ALIGNULCNET;
-    row->sample_rate = g->sample_rate; row->fft = g->fft; row->n = g->n;
+    row->sample_rate = g->sample_rate; row->fft = g->fft; row->n = g->n; row->file = g->file;
     row->layout_version = g->n > 1 ? GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET
                                    : GRAPH_IO_ALIGNULCNET_LAYOUT_ONE_FRAME;
     for (i = 0; i < 4; ++i) {

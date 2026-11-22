@@ -40,7 +40,7 @@ disas() { fp_contract_disas "$1"; }
 # kernels audited elsewhere.
 ENTRIES='
 .:libaudio_pipeline_dfn.a:ainr_bridge.o:sample-rate bridge (stream/ainr/bridge) -- host and 48 kHz WOLA, analysis windows, resamplers
-.:libaudio_pipeline_dfn.a:dfn2_stream.o:DFN2 model stream (stream/ainr/dfn2) -- the freq entries the DFN hop drives, memory mode
+.:libaudio_pipeline_dfn.a:dfn2_stream.o:DFN2 model stream (stream/ainr/dfn2) -- the freq entries the DFN hop drives
 .:mono_aec_dfn_res:mono_aec_dfn_res_main.o:DFN hop glue (dfn_hop.h in the mono example) -- boundary scaling by dfn2_stft_scale()/dfn2_stft_unscale(), spectrum conversion
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming enhance-spectrum kernels
 .:mono_alignulcnet:ulcnet_model_io.o:Align-ULCNet model I/O (mono build) -- front-end features and the complex mask product

@@ -335,7 +335,7 @@ written `./--x`). The three programs exit with code 2 and print a message or the
 usage line on stderr. A number that parses but names no grid or channel (`--sample-rate 44100`,
 `--capture-proxy 4`) is refused later, when the config is built, and exits 1 in `4ch_static` and
 `4ch_external_static`; `4ch_raw` checks the grid while parsing and exits 2. `tests/test_cli_strict.sh <bin_dir>`
-runs both static programs through every case, plus the file options of `4ch_raw` and `--erb-fwd`/`--erb-inv` of
+runs both static programs through every case, plus the file options of `4ch_raw` and `--erb` of
 `4ch_aec_bf_dfn_res`, which share their option scan (`make test` runs it), and `tests/test_array_sample_driver.c` covers the
 shared parser.
 `4ch_external_static` also refuses an AEC level (the positional argument or `--aec-level <level>`, the same setting) or `--nr-level` value that is not a whole decimal `0..3`

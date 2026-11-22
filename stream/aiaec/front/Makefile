@@ -58,12 +58,12 @@ OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 LIB := $(OBJ_DIR)/libaiaec_front.a
 FRONT_HEADERS := aiaec_front.h aiaec_front_internal.h aiaec_front_test.h ../aiaec.h ../aiaec_internal.h ../../common/stream_mem.h ../../common/stream_run.h
 
-# The Align-ULCNet build for the front integration tests: aiaec.c built for that one model with
-# placeholder graph paths (AIAEC_TEST_CATALOG), same source list as ../Makefile's single-model variant.
+# The Align-ULCNet build for the front integration tests: aiaec.c built for that one model, same source list as
+# ../Makefile's single-model variant.
 ALIGN_SOURCES := ../aiaec.c ../../../lib/aiaec/ulcnet/ulcnet_model_io.c ../../../lib/aiaec/ulcnet/ulcnet_prepost.c \
 	../ulcnet/ulcnet_stream.c
 ALIGN_CPPFLAGS := -DAIAEC_ENABLE_DEEPVQE_S=0 -DAIAEC_ENABLE_ALIGN_ULCNET=1 -DAIAEC_PRODUCT_MODEL_ID=10 \
-	-DAIAEC_TEST_CATALOG -I../deepvqe_s -I../../../lib/aiaec/deepvqe_s -I../ulcnet -I../../../lib/aiaec/ulcnet
+	-I../deepvqe_s -I../../../lib/aiaec/deepvqe_s -I../ulcnet -I../../../lib/aiaec/ulcnet
 
 .PHONY: all lib print-lib-path test test-front-events test-front-scene test-front-block test-front-block-48k test-front-oneshot test-front-refusal \
 	audit-libaiaec-no-aec clean _cfg_guard _aec_lib

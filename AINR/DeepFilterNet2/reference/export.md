@@ -17,9 +17,9 @@ python3 inference.py calib --model output/dfn2_best.pth \
 ```
 
 The library (the config's `erb_fwd` / `erb_inv`, `dfn2_set_erb_matrices`, `dfn2_prepost_set_erb_matrices`) takes pointers to the
-two matrices and reads no file: forward bin-major, inverse band-major, the layouts of `export_erb_matrix.py --runtime-bins DIR`
-(`erb_fwd.bin`, `erb_inv.bin`), which the pipeline example mains read through `--erb-fwd` and `--erb-inv`. The board samples read the
-headered `erb_matrix.bin` of `--output-dir DIR --format bin`, renamed `fb_<sr>_<n_erb>.bin` (see "The ERB matrices" under
+two matrices and reads no file: forward bin-major, inverse band-major. The producer is the headered `erb_matrix.bin` of
+`export_erb_matrix.py --output-dir DIR --format bin`, renamed `fb_<sr>_<n_erb>.bin`; the board samples (`dfn2_erb_file.h`) and the
+pipeline example mains (`--erb <fb_*.bin>`) read that one file (see "The ERB matrices" under
 [Choosing the grid](grid.md#choosing-the-grid)); the other `--output-dir` formats are for toolchain validation.
 
 The graph is stateless from the accelerator's perspective. Each invocation

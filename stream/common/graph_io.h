@@ -31,7 +31,7 @@ enum {
 enum {
     GRAPH_IO_OK = 0,
     GRAPH_IO_ERR_NULL = -301,      /* NULL argument or work tensor without data */
-    GRAPH_IO_ERR_NO_ROW = -302,    /* no row for the (model, sample rate, fft, N) of the selected graph */
+    GRAPH_IO_ERR_NO_ROW = -302,    /* no row for the configuration: the graph is not registered */
     GRAPH_IO_ERR_ROW = -303,       /* row malformed, or too large for the caller's tables */
     GRAPH_IO_ERR_COUNT = -304,     /* the work's signal or head count differs from the graph's */
     GRAPH_IO_ERR_SHAPE = -305,     /* a work tensor's shape or element count differs from the graph's */
@@ -47,6 +47,7 @@ typedef struct GraphIoRow {
     unsigned int signal[GRAPH_IO_MAX_SIGNALS][4];
     unsigned int head[GRAPH_IO_MAX_HEADS][4];
     unsigned int state[GRAPH_IO_MAX_STATES][4];
+    const char  *file;   /* graph file name without a directory, <model>[_<variant>]_<sr / 1000>k_fft<fft>_n<N>.bin */
 } GraphIoRow;
 
 /* A row expanded to the port lists stream_check_ports() takes. */
@@ -54,6 +55,7 @@ typedef struct GraphIoConfig {
     int          model, sample_rate, fft, n;
     int          layout_version;
     StreamWiring wiring;
+    const char  *file;   /* the row's graph file name; the sample adds its model directory */
 } GraphIoConfig;
 
 /* N = hop_in / (fft / 2); 0 when fft or hop_in is not positive or hop_in is not a multiple of fft / 2. */
@@ -71,14 +73,15 @@ static inline int graph_io_shape_ok(const unsigned int s[4])
 }
 
 /* Expands a row: signals then states as inputs, heads then states as outputs. OK, or ERR_NULL / ERR_ROW
- * (counts outside the tables, a zero axis); cfg is zeroed on failure. */
+ * (no file name, counts outside the tables, a zero axis); cfg is zeroed on failure. */
 static inline int graph_io_expand(const GraphIoRow *row, GraphIoConfig *cfg)
 {
     int i, k;
 
     if (!row || !cfg) return GRAPH_IO_ERR_NULL;
     memset(cfg, 0, sizeof *cfg);
-    if (row->signal_count < 1 || row->signal_count > GRAPH_IO_MAX_SIGNALS ||
+    if (!row->file || !row->file[0] ||
+        row->signal_count < 1 || row->signal_count > GRAPH_IO_MAX_SIGNALS ||
         row->head_count < 1 || row->head_count > GRAPH_IO_MAX_HEADS ||
         row->state_count < 0 || row->state_count > GRAPH_IO_MAX_STATES ||
         row->signal_count + row->state_count > STREAM_MAX_IN_PORTS ||
@@ -93,6 +96,7 @@ static inline int graph_io_expand(const GraphIoRow *row, GraphIoConfig *cfg)
 
     cfg->model = row->model; cfg->sample_rate = row->sample_rate; cfg->fft = row->fft; cfg->n = row->n;
     cfg->layout_version = row->layout_version;
+    cfg->file = row->file;
     cfg->wiring.signal_in_count = row->signal_count;
     cfg->wiring.head_out_count = row->head_count;
     cfg->wiring.input_count = row->signal_count + row->state_count;

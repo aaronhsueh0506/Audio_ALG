@@ -1,10 +1,10 @@
 /* AIAEC customer interface (DeepVQE-S / Align-ULCNet). The caller sets {sr, fft, hop_in}; the product build binds
- * one model (aiaec_product.h) and the compiled-in catalog resolves N = hop_in / (fft / 2), the delay depth and the
- * graph. The accelerator (open the graph, move tensors, run, read back) is the sample's:
+ * one model (aiaec_product.h) and the compiled-in catalog resolves N = hop_in / (fft / 2) and the delay depth. The graph
+ * file and the accelerator (open the graph, move tensors, run, read back) are the sample's:
  *
  *     AiaecConfig cfg = { sr, fft, hop_in };
- *     aiaec_get_mem_size(&cfg, &req);  ...allocate...  aiaec_init(&cfg, pool, req.bytes, &ctx, &info);   // no SDK
- *     ...open info.graph_path, check its ports against the sample's model configuration, seed the device state...
+ *     aiaec_get_mem_size(&cfg, &req);  ...allocate...  aiaec_init(&cfg, pool, req.bytes, &ctx);   // no SDK
+ *     ...graph_io_<model>_find(sr, fft, N): no row, no run; open its file, check its ports, seed the device state...
  *     per block of hop_in samples:
  *         aiaec_preprocess(ctx, &in, &work);        // work.action: SUBMIT or BYPASS
  *         ...SUBMIT: the sample's accelerator run on work; BYPASS: no accelerator call...
@@ -27,10 +27,10 @@
  *
  * Align-ULCNet takes the linear AEC's float residual, the raw far of the same hop and one AiaecAlignEvent per model
  * hop: a pipeline with its own AEC passes them directly; a standalone sample links front/ (libaiaec_front.a) and
- * calls aiaec_front_preprocess(). A configuration with no registered grid, hop_in or graph is refused by
- * aiaec_get_mem_size() and aiaec_init() before any SDK call. The PCM (no suffix) and "_freq" families
- * share configuration, catalog and AiaecInfo; both fill a StreamWork (stream_run.h). A context is used from one
- * thread at a time. */
+ * calls aiaec_front_preprocess(). A configuration with no registered grid or hop_in, or N outside the model stream's
+ * range, is refused by aiaec_get_mem_size() and aiaec_init(); a graph for N is the sample's graph_io lookup. The PCM (no
+ * suffix) and "_freq" families share configuration and catalog; both fill a StreamWork (stream_run.h). A context is used
+ * from one thread at a time. */
 
 #ifndef AIAEC_H
 #define AIAEC_H
@@ -59,7 +59,7 @@ enum {
     AIAEC_ERR_MODEL_ID = -2,          /* the product's bound model is unknown or not in this build */
     AIAEC_ERR_GRID = -3,              /* no catalog entry for (sr, fft) */
     AIAEC_ERR_IN_HOP = -4,            /* hop_in is not a positive multiple of model_hop */
-    AIAEC_ERR_FRAMES_PER_CALL = -5,   /* resolved N is not in the catalog or has no delivered graph */
+    AIAEC_ERR_FRAMES_PER_CALL = -5,   /* N = hop_in / model_hop is outside the model stream's range */
     AIAEC_ERR_POOL = -6,              /* pool too small or misaligned */
     AIAEC_ERR_SEQUENCE = -7,          /* preprocess/postprocess not called in pairs */
     AIAEC_ERR_INPUT_KIND = -8,        /* AiaecInput.kind does not match the product's model (before any state write) */
@@ -109,27 +109,18 @@ typedef struct AiaecInput {
 } AiaecInput;
 
 /* ---------------------------------------------------------------------------------------------
- * What one init selects: the graph.
- * ------------------------------------------------------------------------------------------- */
-
-/* The graph the init resolved for this configuration. */
-typedef struct AiaecInfo {
-    const char  *graph_path;           /* model.bin for this configuration; a static string, never NULL here */
-} AiaecInfo;
-
-/* ---------------------------------------------------------------------------------------------
  * PCM block family: PCM in, PCM out, both analysis STFTs and the synthesis ISTFT inside.
  * ------------------------------------------------------------------------------------------- */
 
 typedef struct AiaecCtx AiaecCtx;
 
 /* Exact pool size for cfg: AIAEC_OK (req filled) or an AIAEC_ERR_* (req untouched). Check order: the product's model,
- * the grid, hop_in divisibility, a shipped graph for the resolved N. */
+ * the grid, hop_in divisibility, N within the model stream's range. */
 int aiaec_get_mem_size(const AiaecConfig *cfg, StreamMemReq *req);
 
-/* Constructs in caller memory (aligned to req.alignment, pool_bytes >= get_mem_size()) and fills info: AIAEC_OK with
- * *ctx set, else an AIAEC_ERR_* with *ctx NULL and info untouched. Same check order, then AIAEC_ERR_POOL; no file I/O. */
-int aiaec_init(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecCtx **ctx, AiaecInfo *info);
+/* Constructs in caller memory (aligned to req.alignment, pool_bytes >= get_mem_size()): AIAEC_OK with
+ * *ctx set, else an AIAEC_ERR_* with *ctx NULL. Same check order, then AIAEC_ERR_POOL; no file I/O. */
+int aiaec_init(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecCtx **ctx);
 
 /* Back to the start: state zeroed, generation advanced, an open block discarded. */
 void aiaec_reset(AiaecCtx *ctx);
@@ -146,7 +137,7 @@ int aiaec_preprocess(AiaecCtx *ctx, const AiaecInput *input, StreamWork *work);
 int aiaec_postprocess(AiaecCtx *ctx, int run_status, int16_t *pcm_out);
 
 /* ---------------------------------------------------------------------------------------------
- * _freq family (AiaecFreqInput spectra in, no STFT / ISTFT): the same hop_in, catalog, AiaecInfo and StreamWork as the
+ * _freq family (AiaecFreqInput spectra in, no STFT / ISTFT): the same hop_in, catalog and StreamWork as the
  * PCM family; the enhanced spectrum comes out.
  * ------------------------------------------------------------------------------------------- */
 
@@ -179,7 +170,7 @@ typedef struct AiaecFreqCtx AiaecFreqCtx;
 int aiaec_get_mem_size_freq(const AiaecConfig *cfg, StreamMemReq *req);
 
 /* As aiaec_init(), for the _freq family. */
-int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecFreqCtx **ctx, AiaecInfo *info);
+int aiaec_init_freq(const AiaecConfig *cfg, void *pool, size_t pool_bytes, AiaecFreqCtx **ctx);
 
 void aiaec_reset_freq(AiaecFreqCtx *ctx);
 unsigned int aiaec_state_generation_freq(const AiaecFreqCtx *ctx);

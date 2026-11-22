@@ -5,7 +5,7 @@
  * STREAM_WORK_BYPASS). N > 1: one packet of N hops per call and one job at any L, every packet a SUBMIT
  * (dfn2_stream_{pre,post}_process_packet, below); the per-hop entries refuse it.
  *
- *     ctx = dfn2_stream_init_from_erb_file(&cfg, erb_path, pool, pool_bytes);
+ *     ctx = dfn2_stream_init(&cfg, pool, pool_bytes);   // cfg.erb_fwd / erb_inv: the grid's tables (dfn2_erb_file.h)
  *     while (have a hop of int16 pcm_in) {
  *         DFN2HopIO io;
  *         if (dfn2_stream_pre_process(ctx, pcm_in, &io) != 1) break;   // -1 is a contract error
@@ -41,7 +41,7 @@ extern "C" {
 #endif
 
 #define DFN2_STREAM_DESCRIPTOR_VERSION 1u
-#define DFN2_STREAM_LAYOUT_VERSION     6u   /* bump with build_flags_hash on any pool/carve/descriptor change */
+#define DFN2_STREAM_LAYOUT_VERSION     7u   /* bump with build_flags_hash on any pool/carve/descriptor change */
 #define DFN2_STREAM_ALIGNMENT          16u   /* the one alignment of every module (audiolib mem_align.h) */
 
 /* Largest accepted |bin| of a MODEL-scale spectrum, as IEEE bits: 2^63, so the feature power re^2 + im^2 stays
@@ -59,19 +59,18 @@ typedef struct DFN2StreamConfig {
     /* Non-zero: a spectrum-only context. Only the _freq entries run (the PCM entries return -1) and the pool holds no
      * FFT, STFT/ISTFT or PCM buffer; hpf_enable must be 0. 0: both entry families. */
     int      freq_only;
-    /* Memory-init mode (dfn2_stream_init): both required, borrowed for the stream's life; erb_fwd bin-major
-     * [n_bins][n_erb], erb_inv band-major [n_erb][n_bins] (transpose the on-disk table). Both NULL: file-init mode,
-     * storage sized from the grid. */
+    /* Required by init, borrowed for the stream's life; get_mem_size does not read them. erb_fwd bin-major
+     * [n_bins][n_erb], erb_inv band-major [n_erb][n_bins], as dfn2_erb_file.h loads them. */
     const float *erb_fwd;
     const float *erb_inv;
 } DFN2StreamConfig;
 
-/* Fixed 32-byte descriptor; a pool sized for another grid, mode (ERB source, freq_only) or build is refused by init. */
+/* Fixed 32-byte descriptor; a pool sized for another grid, freq_only setting or build is refused by init. */
 typedef struct DFN2StreamMemReq {
     uint32_t descriptor_version;  /* DFN2_STREAM_DESCRIPTOR_VERSION          */
     uint32_t layout_version;      /* DFN2_STREAM_LAYOUT_VERSION              */
     uint32_t reserved0;           /* must be 0                                */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, mode, freq_only, variant and the folded DFN2Prepost hash */
+    uint32_t build_flags_hash;    /* FNV-1a-32 over grid, HPF, freq_only, variant and the folded DFN2Prepost hash */
     uint32_t alignment;           /* DFN2_STREAM_ALIGNMENT                    */
     uint32_t reserved;            /* 0                                        */
     uint64_t bytes;
@@ -85,8 +84,6 @@ typedef struct DFN2Stream DFN2Stream;
 #define dfn2_stream_get_mem_size            dfn2_stream_get_mem_size_mask_only
 #define dfn2_stream_init                    dfn2_stream_init_mask_only
 #define dfn2_stream_init_ex                 dfn2_stream_init_ex_mask_only
-#define dfn2_stream_init_from_erb_file      dfn2_stream_init_from_erb_file_mask_only
-#define dfn2_stream_init_from_erb_file_ex   dfn2_stream_init_from_erb_file_ex_mask_only
 #define dfn2_stream_reset                   dfn2_stream_reset_mask_only
 #define dfn2_stream_state_generation        dfn2_stream_state_generation_mask_only
 #define dfn2_stream_set_atten_lim           dfn2_stream_set_atten_lim_mask_only
@@ -101,31 +98,19 @@ typedef struct DFN2Stream DFN2Stream;
 #define dfn2_stream_post_process_packet_freq dfn2_stream_post_process_packet_freq_mask_only
 #endif
 
-/* Exact pool size for the mode erb_fwd/erb_inv imply (both NULL: file mode; both set: memory mode) and for freq_only.
- * -1 (req untouched) on NULL, an invalid grid, non-finite atten_lim_db, bad hpf_cutoff_hz, exactly one table, or
- * freq_only with hpf_enable. */
+/* Exact pool size for cfg (freq_only included). -1 (req untouched) on NULL, an invalid grid, non-finite atten_lim_db,
+ * bad hpf_cutoff_hz, or freq_only with hpf_enable. */
 int dfn2_stream_get_mem_size(const DFN2StreamConfig *cfg, DFN2StreamMemReq *req);
 
 /* Constructs in the pool (16-byte aligned, >= get_mem_size()): HPF (if enabled), STFT/ISTFT and DFN2Prepost
- * (freq_only: DFN2Prepost and the spectrum staging), no heap; starts reset. NULL on a bad config, a misaligned or small pool, erb_fwd/erb_inv not both set, or tables that fail
+ * (freq_only: DFN2Prepost and the spectrum staging), no heap; starts reset. NULL on a bad config, a misaligned or small pool, a NULL erb_fwd/erb_inv, or tables that fail
  * dfn2_erb_tables_valid() (finite erb_fwd >= 0; erb_inv in [0, 1] summing to exactly 1.0f in every bin, band-ascending in float32). */
 DFN2Stream *dfn2_stream_init(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes);
 
-/* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, mode, variant or layout
+/* As dfn2_stream_init, plus the stale-pool gate: a pool carved for another grid, freq_only, variant or layout
  * is refused. `expected` NULL: as dfn2_stream_init. */
 DFN2Stream *dfn2_stream_init_ex(const DFN2StreamConfig *cfg, void *pool, size_t pool_bytes,
                                 const DFN2StreamMemReq *expected);
-
-/* As dfn2_stream_init, loading the ERB tables from `erb_path` into pool storage (cfg->erb_fwd/erb_inv NULL): int32 n_bins, n_erb,
- * then n_bins*n_erb float32 forward and inverse, both bin-major, nothing after. NULL (pool not live) on another grid's header, a short
- * or longer file, a non-finite forward value or a non-partition inverse (as dfn2_stream_init). Out under -DDFN2_STREAM_NO_STDIO. */
-DFN2Stream *dfn2_stream_init_from_erb_file(const DFN2StreamConfig *cfg, const char *erb_path,
-                                           void *pool, size_t pool_bytes);
-
-/* As dfn2_stream_init_from_erb_file, plus the same stale-pool gate as dfn2_stream_init_ex. */
-DFN2Stream *dfn2_stream_init_from_erb_file_ex(const DFN2StreamConfig *cfg, const char *erb_path,
-                                              void *pool, size_t pool_bytes,
-                                              const DFN2StreamMemReq *expected);
 
 /* Back to the start: HPF, STFT/ISTFT (when the context has them) and DFN2Prepost reset (state zeroed, generation
  * advanced); ERB tables kept. */

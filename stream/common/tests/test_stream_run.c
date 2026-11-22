@@ -89,7 +89,7 @@ static GraphIoRow row_two_three(void)
 {
     GraphIoRow r;
     memset(&r, 0, sizeof r);
-    r.model = GRAPH_IO_DFN2_FULL; r.sample_rate = 48000; r.fft = 1024; r.n = 1; r.layout_version = 1;
+    r.file = "dfn2_48k_fft1024_n1.bin"; r.model = GRAPH_IO_DFN2_FULL; r.sample_rate = 48000; r.fft = 1024; r.n = 1; r.layout_version = 1;
     r.signal_count = 2; r.head_count = 3; r.state_count = 1;
     r.signal[0][0] = 1; r.signal[0][1] = 1; r.signal[0][2] = 2; r.signal[0][3] = 5;
     r.signal[1][0] = 1; r.signal[1][1] = 3; r.signal[1][2] = 4; r.signal[1][3] = 7;
@@ -106,7 +106,7 @@ static GraphIoRow row_widest(void)
     GraphIoRow r;
     int i;
     memset(&r, 0, sizeof r);
-    r.model = GRAPH_IO_ALIGNULCNET; r.sample_rate = 16000; r.fft = 256; r.n = 8; r.layout_version = 1;
+    r.file = "alignulcnet_16k_fft256_n8.bin"; r.model = GRAPH_IO_ALIGNULCNET; r.sample_rate = 16000; r.fft = 256; r.n = 8; r.layout_version = 1;
     r.signal_count = STREAM_WORK_MAX_INPUTS; r.head_count = STREAM_WORK_MAX_OUTPUTS; r.state_count = 2;
     for (i = 0; i < r.signal_count; ++i) { r.signal[i][0] = 1; r.signal[i][1] = 1; r.signal[i][2] = (unsigned)i + 1; r.signal[i][3] = 3; }
     for (i = 0; i < r.head_count; ++i) { r.head[i][0] = 1; r.head[i][1] = 1; r.head[i][2] = (unsigned)i + 2; r.head[i][3] = 4; }

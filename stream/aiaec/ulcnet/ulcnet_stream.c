@@ -1,6 +1,5 @@
-/* Align-ULCNet PCM stream: everything (no file-loader TU for this model). No <stdio.h>, no
- * malloc/calloc/posix_memalign anywhere in this TU -- it links into a NO_STDIO target. See
- * ulcnet_stream.h for the public contract. */
+/* Align-ULCNet PCM stream: everything. No <stdio.h>, no malloc/calloc/posix_memalign anywhere
+ * in this TU -- it links into a NO_STDIO target. See ulcnet_stream.h for the public contract. */
 
 #include <stddef.h>
 #include <stdint.h>

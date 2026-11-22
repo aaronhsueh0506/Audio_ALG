@@ -1,6 +1,5 @@
-/* DeepVQE-S PCM stream: everything (no file-loader TU for this model -- there are no ERB
- * matrices to load). No <stdio.h>, no malloc/calloc/posix_memalign anywhere in this TU -- it
- * links into a NO_STDIO target. See deepvqe_stream.h for the public contract. */
+/* DeepVQE-S PCM stream: everything. No <stdio.h>, no malloc/calloc/posix_memalign anywhere in
+ * this TU -- it links into a NO_STDIO target. See deepvqe_stream.h for the public contract. */
 
 #include <stddef.h>
 #include <stdint.h>

@@ -22,13 +22,6 @@ endif
 
 include ../../../lib/deps.mk
 
-# DeepVQE-S has no file-loader TU (no ERB matrices, unlike DFN2) -- nothing here needs stdio at
-# all. NO_STDIO is kept as a build-matrix knob for consistency with the other stream Makefiles
-# (and audit-no-stdio below checks it holds), but it changes nothing in this directory's sources.
-NO_STDIO ?= 0
-override NO_STDIO := $(strip $(NO_STDIO))
-$(eval $(call CHECK_01,NO_STDIO))
-
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
@@ -52,7 +45,7 @@ endif
 
 BUILD_DIR := build
 override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) NO_STDIO=$(NO_STDIO) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-$(CFG_SIG)
 
@@ -133,20 +126,10 @@ test-lifecycle: $(LIFECYCLE_BIN)
 
 test: smoke verify-vs-sample test-freq-only test-lifecycle
 
-# audit-no-stdio: builds the archive (the one every real caller in this tree links) and asserts,
-# via `nm -u`, that deepvqe_stream.o references no stdio symbol (nothing in this model needs
-# stdio at all, unlike DFN2's file loader). TOOLCHAIN_FWD comes from lib/deps.mk (included
-# above): CC/CXX/EXTRA_CFLAGS/WERROR, shared with the COMMON_LIB resolution below instead of each
-# spelling out the same four vars again.
-audit-no-stdio:
-	@$(MAKE) --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
-	@obj_dir="$$($(MAKE) -s --no-print-directory NO_STDIO=1 SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
-	obj_dir="$$(dirname "$$obj_dir")"; \
-	undef="$$(nm -u "$$obj_dir/deepvqe_stream.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
-	if [ -n "$$undef" ]; then \
-	  echo "FAIL: deepvqe_stream.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \
-	fi; \
-	echo "audit-no-stdio: PASS ($$obj_dir/deepvqe_stream.o has no stdio references)"
+# audit-no-stdio: $(LIB) has no undefined stdio reference; recipe in lib/deps.mk (MASK_ONLY does not exist here).
+audit-no-stdio: MASK_ONLY := n/a
+audit-no-stdio: $(LIB)
+	$(AUDIT_NO_STDIO_RECIPE)
 
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) deepvqe_stream.c

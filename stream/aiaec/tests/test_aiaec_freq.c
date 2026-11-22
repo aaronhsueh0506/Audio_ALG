@@ -1,7 +1,6 @@
 /* Host coverage for the spectrum -> spectrum ("_freq") family against the PCM block family through
- * the real public API, for the model the build binds (aiaec_product.h). Compiled once per product with
- * -DAIAEC_TEST_CATALOG; the accelerator is a host stand-in (deterministic heads, an identity head, or a
- * bypass).
+ * the real public API, for the model the build binds (aiaec_product.h). Compiled once per product; the accelerator is a host
+ * stand-in (deterministic heads, an identity head, or a bypass).
  *
  *   equivalence  the PCM block family and _freq fed by an independent AcStft run in lockstep, neither of them
  *                restarted at an alignment event: the PCM output equals the externally synthesized _freq output
@@ -16,7 +15,7 @@
  *                spectrum, a fail-open frame returns its input error spectrum bit for bit.
  *   tail         a single 16000-count sample at the last real input sample comes back one model hop later
  *                after the test's own all-zero drain block, through both families.
- *   bind/pool    the info is shared by both families; pools: short / misaligned refused, larger constructs,
+ *   bind/pool    pools: short / misaligned refused, larger constructs,
  *                also when the pool is undersized; the _freq pool is the pinned size and the PCM pool is larger
  *                by the framing (FFT, two STFT, one ISTFT, PCM scratch). Every section runs each family in a pool of
  *                exactly its size with a canary zone behind it.
@@ -57,7 +56,6 @@ typedef struct Pair {
     AiaecFreqCtx *freq;
     void *p_blk, *p_freq;
     size_t b_blk, b_freq;
-    AiaecInfo info_blk, info_freq;
 } Pair;
 
 static void *pair_pool(size_t bytes) {
@@ -83,9 +81,9 @@ static int pair_make(Pair *t, const AiaecConfig *cfg) {
     }
     t->b_blk = (size_t)rb.bytes; t->b_freq = (size_t)rf.bytes;
     t->p_blk = pair_pool(t->b_blk); t->p_freq = pair_pool(t->b_freq);
-    e = aiaec_init(cfg, t->p_blk, (size_t)rb.bytes, &t->blk, &t->info_blk);
+    e = aiaec_init(cfg, t->p_blk, (size_t)rb.bytes, &t->blk);
     CHECK(e == AIAEC_OK && t->blk != NULL, "pair: init err=%d", e);
-    e = aiaec_init_freq(cfg, t->p_freq, (size_t)rf.bytes, &t->freq, &t->info_freq);
+    e = aiaec_init_freq(cfg, t->p_freq, (size_t)rf.bytes, &t->freq);
     CHECK(e == AIAEC_OK && t->freq != NULL, "pair: init_freq err=%d", e);
     return t->blk && t->freq ? 0 : -1;
 }
@@ -488,19 +486,6 @@ static void tail_input(AiaecInput *in, AiaecFreqInput *fin, const int16_t *pcm, 
 #endif
 }
 
-/* The info of one family (0 PCM, 1 _freq) of cfg, from a throw-away init. */
-static int family_info(const AiaecConfig *cfg, int family, AiaecInfo *info) {
-    StreamMemReq rq;
-    void *pool;
-    int rc = family == 0 ? aiaec_get_mem_size(cfg, &rq) : aiaec_get_mem_size_freq(cfg, &rq);
-    if (rc != AIAEC_OK) return rc;
-    pool = alloc_aligned((size_t)rq.bytes);
-    if (family == 0) { AiaecCtx *c = NULL; rc = aiaec_init(cfg, pool, (size_t)rq.bytes, &c, info); }
-    else { AiaecFreqCtx *c = NULL; rc = aiaec_init_freq(cfg, pool, (size_t)rq.bytes, &c, info); }
-    free(pool);
-    return rc;
-}
-
 /* The round trip on the final PCM, from the grid alone: one hop, both models. */
 static int expected_delay(int hop) { return hop; }
 
@@ -573,35 +558,28 @@ static int section_tail(int fft, int n) {
 }
 
 /* ---------------------------------------------------------------------------------------------
- * info, delays, pools, gates
+ * delays, pools, gates
  * ------------------------------------------------------------------------------------------- */
 static int section_bind_and_pool(int fft, int n) {
     const int hop = fft / 2;
     AiaecConfig cfg = make_cfg(fft, n);
-    AiaecInfo pb, pf;
     StreamMemReq rb, rf;
     Pair t;
     unsigned char *pool;
     int rc, bad = 0;
     unsigned int gen_f;
 
-    if (family_info(&cfg, 0, &pb) != AIAEC_OK || family_info(&cfg, 1, &pf) != AIAEC_OK) { FAIL("bind: info"); return 1; }
-    CHECK(memcmp(&pb, &pf, sizeof(pb)) == 0, "bind(fft=%d N=%d): the info differs across families", fft, n);
-    CHECK(pb.graph_path && pf.graph_path && strcmp(pb.graph_path, pf.graph_path) == 0, "bind: graph path differs across families");
     {
         AiaecConfig bad_cfg = make_cfg(fft, n);
         AiaecFreqCtx *cf = NULL;
-        AiaecInfo scratch;
         unsigned char small[64];
         bad_cfg.hop_in += 1;
-        CHECK(aiaec_init_freq(&bad_cfg, small, sizeof(small), &cf, &scratch) == AIAEC_ERR_IN_HOP && cf == NULL &&
+        CHECK(aiaec_init_freq(&bad_cfg, small, sizeof(small), &cf) == AIAEC_ERR_IN_HOP && cf == NULL &&
               aiaec_get_mem_size_freq(&bad_cfg, &rf) == AIAEC_ERR_IN_HOP,
               "bind: a bad hop_in must propagate AIAEC_ERR_IN_HOP through every family");
     }
 
     if (pair_make(&t, &cfg) != 0) return 1;
-    CHECK(memcmp(&t.info_blk, &pb, sizeof(pb)) == 0 && memcmp(&t.info_freq, &pb, sizeof(pb)) == 0,
-          "bind: the init info equals the throw-away init's");
     gen_f = aiaec_state_generation_freq(t.freq);
     CHECK(aiaec_state_generation_freq(NULL) == 0u, "bind: NULL ctx");
     aiaec_reset_freq(t.freq);
@@ -614,15 +592,14 @@ static int section_bind_and_pool(int fft, int n) {
     {
         AiaecCtx *cb = NULL;
         AiaecFreqCtx *cf = NULL;
-        AiaecInfo info;
-        rc = aiaec_init(&cfg, pool, (size_t)rb.bytes - 1u, &cb, &info);
+        rc = aiaec_init(&cfg, pool, (size_t)rb.bytes - 1u, &cb);
         CHECK(rc == AIAEC_ERR_POOL && cb == NULL, "pool: undersized block rc=%d", rc);
-        rc = aiaec_init_freq(&cfg, pool, (size_t)rf.bytes - 1u, &cf, &info);
+        rc = aiaec_init_freq(&cfg, pool, (size_t)rf.bytes - 1u, &cf);
         CHECK(rc == AIAEC_ERR_POOL && cf == NULL, "pool: undersized freq rc=%d", rc);
-        rc = aiaec_init_freq(&cfg, pool + 1, (size_t)rf.bytes, &cf, &info);
+        rc = aiaec_init_freq(&cfg, pool + 1, (size_t)rf.bytes, &cf);
         CHECK(rc == AIAEC_ERR_POOL && cf == NULL, "pool: misaligned freq rc=%d", rc);
-        CHECK(aiaec_init(&cfg, pool, (size_t)rb.bytes, &cb, &info) == AIAEC_OK && cb != NULL, "pool: the exact block size must construct");
-        CHECK(aiaec_init_freq(&cfg, pool, (size_t)rf.bytes + 64u, &cf, &info) == AIAEC_OK && cf != NULL, "pool: a larger freq pool must construct");
+        CHECK(aiaec_init(&cfg, pool, (size_t)rb.bytes, &cb) == AIAEC_OK && cb != NULL, "pool: the exact block size must construct");
+        CHECK(aiaec_init_freq(&cfg, pool, (size_t)rf.bytes + 64u, &cf) == AIAEC_OK && cf != NULL, "pool: a larger freq pool must construct");
     }
     {   /* the _freq pool carries no framing: pinned (host, both models compiled); the PCM pool adds it */
         AcStftConfig sc;
@@ -651,7 +628,7 @@ static int section_bind_and_pool(int fft, int n) {
         CHECK((size_t)rf.bytes == pinned, "pool(fft=%d N=%d): _freq pool %llu bytes, pinned %zu", fft, n,
               (unsigned long long)rf.bytes, pinned);
     }
-    printf("section_bind_and_pool(fft=%d N=%d): info shared by both families, pool sizes enforced (block/freq %llu/%llu)\n",
+    printf("section_bind_and_pool(fft=%d N=%d): pool sizes enforced (block/freq %llu/%llu)\n",
            fft, n, (unsigned long long)rb.bytes, (unsigned long long)rf.bytes);
     free(pool);
     return bad;

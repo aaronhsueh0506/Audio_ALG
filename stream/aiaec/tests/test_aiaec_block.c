@@ -1,8 +1,6 @@
 /* Host coverage for aiaec_preprocess() / aiaec_postprocess() through the real public API,
  * end to end, for the model the build binds (aiaec_product.h). The Makefile compiles this file once
- * per product (-DAIAEC_PRODUCT_MODEL_ID=...) with -DAIAEC_TEST_CATALOG, which substitutes placeholder
- * graph paths for the rows below so the gated API constructs; the production catalog is covered by
- * test_aiaec_catalog.c.
+ * per product (-DAIAEC_PRODUCT_MODEL_ID=...); the catalog's refusals are in test_aiaec_catalog.c.
  *
  *   DeepVQE-S (N=1 at 16k/256, N=1 and N=4 at 16k/512, N=1 and N=2 at 48k/1024): the block path against the deepvqe_stream
  *     packet entries driven directly, bit-exact PCM and identical accelerator-side tensors;
@@ -42,27 +40,22 @@ static AiaecConfig make_cfg(int fft, int n) {
     return make_cfg_sr(16000, fft, n);
 }
 
-static AiaecCtx *make_ctx_info(const AiaecConfig *cfg, void **pool_out, const char *who, AiaecInfo *info) {
+static AiaecCtx *make_ctx(const AiaecConfig *cfg, void **pool_out, const char *who) {
     StreamMemReq req;
     AiaecCtx *ctx = NULL;
     int rc;
     *pool_out = NULL;
     if (aiaec_get_mem_size(cfg, &req) != AIAEC_OK) {
-        FAIL("%s: aiaec_get_mem_size failed -- is AIAEC_TEST_CATALOG wired?", who);
+        FAIL("%s: aiaec_get_mem_size failed", who);
         return NULL;
     }
     if (posix_memalign(pool_out, (size_t)req.alignment, (size_t)req.bytes) != 0) {
         FAIL("%s: pool alloc failed", who);
         return NULL;
     }
-    rc = aiaec_init(cfg, *pool_out, (size_t)req.bytes, &ctx, info);
+    rc = aiaec_init(cfg, *pool_out, (size_t)req.bytes, &ctx);
     if (rc != AIAEC_OK || !ctx) FAIL("%s: aiaec_init failed rc=%d (%s)", who, rc, aiaec_status_text(rc));
     return ctx;
-}
-
-static AiaecCtx *make_ctx(const AiaecConfig *cfg, void **pool_out, const char *who) {
-    AiaecInfo info;
-    return make_ctx_info(cfg, pool_out, who, &info);
 }
 
 /* Allows 2 LSB of int16 drift: the identity-delay sections compare the pipeline's own float->int16
@@ -399,8 +392,7 @@ static int section_fail_closed(void) {
 static int section_trim(int sr, int n, int fft) {
     AiaecConfig cfg = make_cfg_sr(sr, fft, n);
     void *pool = NULL;
-    AiaecInfo bi;
-    AiaecCtx *ctx = make_ctx_info(&cfg, &pool, "delay", &bi);
+    AiaecCtx *ctx = make_ctx(&cfg, &pool, "delay");
     const int hop = fft / 2, blocks = 5, bs = hop * n;
     int16_t *mic_in, *far_zero, *pcm_out;
     int k, bidx;
@@ -596,8 +588,7 @@ static int section_bypass_ignores_run_status(void) {
 static int section_trim_align(void) {
     AiaecConfig cfg = make_cfg(256, 1);
     void *pool = NULL;
-    AiaecInfo bi;
-    AiaecCtx *ctx = make_ctx_info(&cfg, &pool, "delay_align", &bi);
+    AiaecCtx *ctx = make_ctx(&cfg, &pool, "delay_align");
     const int hop = 128, blocks = 5;
     float *residual, *far_zero;
     int16_t *pcm_out, *expect_pcm;
@@ -767,34 +758,30 @@ static int section_mismatch(void) {
 }
 
 /* The pool: init recomputes the size itself. A pool smaller than get_mem_size()'s, a misaligned one and
- * is refused (AIAEC_ERR_POOL) with ctx NULL and info untouched; the exact
+ * is refused (AIAEC_ERR_POOL) with ctx NULL; the exact
  * size and a larger pool construct, and a larger pool is zeroed only up to the size needed. */
 static int section_pool(void) {
     AiaecConfig cfg = make_cfg(256, 1);
     StreamMemReq req;
-    AiaecInfo info, ref;
     AiaecCtx *ctx = NULL;
     unsigned char *pool = NULL;
     int rc;
 
     if (aiaec_get_mem_size(&cfg, &req) != AIAEC_OK) { FAIL("pool: get_mem_size"); return 1; }
     if (posix_memalign((void **)&pool, 16, (size_t)req.bytes + 64) != 0) { FAIL("pool alloc"); return 1; }
-    memset(&ref, 0xA5, sizeof(ref));
-
-    memset(&info, 0xA5, sizeof(info));
     ctx = (AiaecCtx *)pool;
-    rc = aiaec_init(&cfg, pool, 32u, &ctx, &info);
-    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL && memcmp(&info, &ref, sizeof(info)) == 0, "pool: tiny pool rc=%d", rc);
+    rc = aiaec_init(&cfg, pool, 32u, &ctx);
+    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "pool: tiny pool rc=%d", rc);
     ctx = (AiaecCtx *)pool;
-    rc = aiaec_init(&cfg, pool, (size_t)req.bytes - 1u, &ctx, &info);
-    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL && memcmp(&info, &ref, sizeof(info)) == 0, "pool: one byte short rc=%d", rc);
+    rc = aiaec_init(&cfg, pool, (size_t)req.bytes - 1u, &ctx);
+    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "pool: one byte short rc=%d", rc);
     ctx = (AiaecCtx *)pool;
-    rc = aiaec_init(&cfg, pool + 1, (size_t)req.bytes, &ctx, &info);
-    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL && memcmp(&info, &ref, sizeof(info)) == 0, "pool: misaligned rc=%d", rc);
-    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx, &info) == AIAEC_OK && ctx != NULL, "pool: the exact size must construct");
+    rc = aiaec_init(&cfg, pool + 1, (size_t)req.bytes, &ctx);
+    CHECK(rc == AIAEC_ERR_POOL && ctx == NULL, "pool: misaligned rc=%d", rc);
+    CHECK(aiaec_init(&cfg, pool, (size_t)req.bytes, &ctx) == AIAEC_OK && ctx != NULL, "pool: the exact size must construct");
 
     memset(pool, 0x5A, (size_t)req.bytes + 64);
-    rc = aiaec_init(&cfg, pool, (size_t)req.bytes + 64, &ctx, &info);
+    rc = aiaec_init(&cfg, pool, (size_t)req.bytes + 64, &ctx);
     CHECK(rc == AIAEC_OK && ctx != NULL, "pool: a larger pool must construct, rc=%d", rc);
     {
         size_t t;

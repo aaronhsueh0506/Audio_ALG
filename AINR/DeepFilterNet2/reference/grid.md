@@ -83,9 +83,9 @@ zero from `dfn2_model_io_descriptor_default()` and never read.
   `DFN2PrepostMemReq` recorded by another grid or build is refused by `dfn2_prepost_init_ex`; query the size again.
 
 **Board samples.** The board samples (`audio_sample/`, outside this repo) hold no grid table: each hands `{sr, fft, hop_in}` to
-`stream/ainr/ainr.h`, whose catalog resolves the `DFN2GridSpec` row (the model's numbers: `df_order`, the lookahead pair,
-`frames_per_call`; the seven normaliser values are fixed constants in `dfn2_grid.h`), the graph and the ERB file, and refuses a
-configuration it has no entry for. The pipeline example mains (`pipelines/dfn/dfn_example_args.h`) keep a table of their own and
+`stream/ainr/ainr.h` together with the grid's ERB tables; the bound model's grid table (`stream/ainr/dfn2_grids.h`) resolves the `DFN2GridSpec` row (the model's numbers: `df_order`, the lookahead pair,
+`frames_per_call`; the seven normaliser values are fixed constants in `dfn2_grid.h`) and `ainr_init` refuses a grid it has no row for. The
+graph file and its ports are the sample's `graph_io_dfn2.h` row, keyed by (model, sample rate, FFT size, N, `mask_lookahead`). The pipeline example mains (`pipelines/dfn/dfn_example_args.h`) keep a table of their own and
 pass a row to `dfn2_grid_make()`. The three rows below are the defined grids; the board catalog and the example mains
 have two of them, without 32000 / 512, because the AEC in front of the model has no 32 kHz grid; the mask-only model differs in
 its df lookahead (see its row in the second table):
@@ -103,8 +103,8 @@ ones. Defaults are 48000 and 1024.
 |---|---|
 | `alg_ai3_dfn.c` | `--sample-rate <Hz>` and `--fft-size <n>`: the stream's rate is the model's rate. A token that begins `--sample` or `--fft` and is not one of these (`--sample-rate=16000`, `--samplerate`) prints the usage and exits 2 instead of running the default grid |
 | `alg_ai3_dfn_lite.c` | the same flags and the same rule, with the mask-only table: `df_order` is 0 and `df_lookahead` is 0 in every row (48000 / 1024 is 1 / 0). It is a thin wrapper: it defines `DFN2_MASK_ONLY` and includes `alg_ai3_dfn.c`. The full model and the mask-only model are two builds; the lite one builds every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own |
-| `alg_ai3_aec_dfn.c` | `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid; `--sr` stays the host rate (when absent it follows the model's rate). The configuration `{sr, fft, fft / 2}` goes to `ainr_get_mem_size_freq()` / `ainr_init_freq()`. Host rate equal to the model's: the AEC's spectra go straight into `ainr_*_freq`. Any other rate goes through `AinrBridge` (`stream/ainr/bridge`), which serves the 48000 / 1024 model and a host at 8000 or 16000, and is otherwise refused with a message before the NPU is set up (exit 1). A pair the catalog does not have (32000 / 512, for one) is refused with the accepted list (exit 2). A misspelt token that begins `--ai` exits 2. The model file is `AinrInfo.graph_path`, the per-grid file name the library resolved; the sample has no `--quant8` / `--quant16_8` (the quantization is bound by the product build) |
-| `uvc_ai_nr_stream.c` | The host is fixed at 16 kHz / fft 256 / hop 128 and the sample runs its own `AcStft` / `AcIstft`. `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid (hop = fft / 2, N = 1; defaults 48000 and 1024); the configuration goes to `ainr_get_mem_size_freq()` / `ainr_init_freq()`. 48000 / 1024 runs through `AinrBridge` (`stream/ainr/bridge`), 16000 / 256 directly on the host spectra (full build only); any other pair is refused with the accepted list before any SDK call (exit 2). Output delay through the bridge is its added delay (with L = `AinrInfo.queue_frames`) plus one host hop, directly (`queue_frames` + 1) host hops; for the catalog's default full model that is 800 samples (50.0 ms) through the bridge (629, 39.3 ms, in the lite build) and 128 samples (8.0 ms) directly. The sample prints the value it computes at start. The model file and the ERB matrix (`fb_48000_32.bin` or `fb_16000_24.bin`) must be those of the chosen grid |
+| `alg_ai3_aec_dfn.c` | `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid; `--sr` stays the host rate (when absent it follows the model's rate). The configuration `{sr, fft, fft / 2}` goes to `ainr_get_mem_size_freq()` / `ainr_init_freq()`. Host rate equal to the model's: the AEC's spectra go straight into `ainr_*_freq`. Any other rate goes through `AinrBridge` (`stream/ainr/bridge`), which serves the 48000 / 1024 model and a host at 8000 or 16000, and is otherwise refused with a message before the NPU is set up (exit 1). A pair the catalog does not have (32000 / 512, for one) is refused with the accepted list (exit 2). A misspelt token that begins `--ai` exits 2. The graph file is the `graph_io_dfn2.h` row's `file` under the sample's `SAMPLE_MODEL_DIR`; the sample has no `--quant8` / `--quant16_8` (the quantization is bound by the product build) |
+| `uvc_ai_nr_stream.c` | The host is fixed at 16 kHz / fft 256 / hop 128 and the sample runs its own `AcStft` / `AcIstft`. `--ai-sample-rate <Hz>` and `--ai-fft-size <n>` choose the model grid (hop = fft / 2, N = 1; defaults 48000 and 1024); the configuration goes to `ainr_get_mem_size_freq()` / `ainr_init_freq()`. 48000 / 1024 runs through `AinrBridge` (`stream/ainr/bridge`), 16000 / 256 directly on the host spectra (full build only); any other pair is refused with the accepted list before any SDK call (exit 2). Output delay through the bridge is its added delay (with L = `AinrInfo.queue_frames`) plus one host hop, directly (`queue_frames` + 1) host hops; for the catalog's default full model that is 800 samples (50.0 ms) through the bridge (629, 39.3 ms, in the lite build) and 128 samples (8.0 ms) directly. The sample prints the value it computes at start. The graph file (`dfn2_48k_fft1024_n1.bin` or `dfn2_16k_fft256_n1.bin`) and the ERB matrix file (`fb_48000_32.bin` or `fb_16000_24.bin`) are those of the chosen grid |
 | `uvc_audio_live2a.c` | 48 kHz only, no flags: the fixed `{48000, 1024, 512}` goes to `ainr_*_freq`; the pipeline's 16 kHz spectra reach the model through `AinrBridge` (`stream/ainr/bridge`) |
 
 The samples take the port shapes and the recurrent-state shapes from `stream/ainr/graph_io_dfn2.h` (the core library knows none):
@@ -116,23 +116,22 @@ written, `STREAM_RUN_NOT_STARTED` nothing ran, anything else a started run that 
 started run that failed. A sample refuses to start when the ports the loaded model reports differ
 from the model config.
 
-**The ERB matrices.** The core library (`lib/ainr/dfn2`) reads no file. It borrows two `const float` pointers, forward bin-major `[n_bins][n_erb]` and
-inverse band-major `[n_erb][n_bins]` (raw float32, `n_bins * n_erb * 4` bytes each: 65,664 on the 48000 / 1024 / 32 grid), which the
-application loads, owns and keeps alive while an object uses them; the inverse is a partition of unity. The producer is
-`export_erb_matrix.py`:
+**The ERB matrices.** No library reads a file. `AinrConfig` (and `DFN2StreamConfig`) take two `const float` pointers (`AinrConfig` also `n_erb`, the band count from the `n_erb` out-parameter of `graph_io_dfn2_erb_file()`), forward
+bin-major `[n_bins][n_erb]` and inverse band-major `[n_erb][n_bins]` (float32, `n_bins * n_erb * 4` bytes each: 65,664 on the
+48000 / 1024 / 32 grid), which the application loads, owns and keeps alive for the context's life; the library checks them at init
+(finite and not negative forward table, inverse a partition of unity: entries in [0, 1], every bin summing to exactly 1.0f) and refuses
+NULL or invalid tables, and an `AinrConfig.n_erb` other than the grid's, with `AINR_ERR_ERB_TABLES` (the pool unwritten). The producer is `export_erb_matrix.py --output-dir DIR --format bin` (also written by
+`--format all`): `erb_matrix.bin` holds `int32 n_bins`, `int32 n_bands`, `float32` forward `[n_bins][n_bands]`, `float32` inverse
+`[n_bins][n_bands]`, little-endian, 8 + 2 * 65,664 bytes on the 48000 / 1024 / 32 grid; both matrices are bin-major.
 
-| output | content |
-|---|---|
-| `--runtime-bins DIR` | `erb_fwd.bin` (bin-major) and `erb_inv.bin` (band-major), raw little-endian float32 without a header, plus `erb_matrices.json`: the two layouts the library takes |
-| `--output-dir DIR --format bin` (also written by `--format all`) | `erb_matrix.bin`: `int32 n_bins`, `int32 n_bands`, `float32` forward `[n_bins][n_bands]`, `float32` inverse `[n_bins][n_bands]`, little-endian, 8 + 2 * 65,664 bytes on the 48000 / 1024 / 32 grid; both matrices are bin-major, so a loader transposes the inverse to band-major |
-
-The pipeline example mains take the `--runtime-bins` pair as `--erb-fwd FILE` and `--erb-inv FILE` (both or neither; each file holds exactly
-`n_bins * n_erb` floats; without them a unit ERB partition runs, which serves the fail-open smoke run only, and the main prints a notice).
-For every DFN2 board sample `ainr_init()` / `ainr_init_freq()` reads `/mnt/sd/dfn2_blobs/fb_<sr>_<n_erb>.bin` (for example
-`fb_48000_32.bin`; `<sr>` is the model grid's rate, not the host's; the directory is `-DAINR_ERB_MATRIX_DIR` on `ainr.c`), one
-deployment set for all of them: the exporter's `erb_matrix.bin` renamed for its grid. The stream checks the header against the
-grid's `n_bins` and `n_erb`, requires the file to end after the two matrices and every forward value to be finite, transposes the
-inverse to band-major once at init and checks that it is a partition of unity (entries in [0, 1], every bin summing to exactly 1.0f) and that the forward table is finite and not negative; a mismatch is `AINR_ERR_ERB_FILE`. This repo holds no board run of these samples.
+The file is renamed `fb_<sr>_<n_erb>.bin` (for example `fb_48000_32.bin`; `<sr>` is the model grid's rate, not the host's) and is the
+one ERB format of the board samples and the pipeline example mains. The board samples take its name from
+`graph_io_dfn2_erb_file(model, sr, fft, &n_erb)` (before `ainr_init`, so it takes no N), open it under `SAMPLE_ERB_DIR` (default
+`/mnt/sd/dfn2_blobs`) and load it with `dfn2_erb_file_load(path, n_bins, n_erb, erb_fwd, erb_inv)` of the header-only
+`stream/ainr/dfn2_erb_file.h`: it checks the header against `n_bins` and `n_erb`, requires the file to end after the two matrices,
+and transposes the stored inverse to band-major while reading. The pipeline example mains take the same file as `--erb FILE`; without
+it a unit ERB partition runs, which serves the fail-open smoke run only, and the main prints a notice. This repo holds no board run of
+these samples.
 
 **Tests and pipelines.** The tests choose their grid when they are built, through a header of their own, not through the library:
 `AINR/tests/dfn2_test_grid.h` and `pipelines/dfn/tests/dfn_test_grid.h` (`-DDFN2_GRID_KHZ=16|32|48`, with `-DDFN2_MASK_LOOKAHEAD` /

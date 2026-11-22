@@ -56,7 +56,6 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
     const int hop_in = HOP * n, packets = BLOCKS / n;
     AiaecConfig cfg;
     StreamMemReq req;
-    AiaecInfo info;
     AiaecCtx *ctx = NULL;
     AiaecFront *front;
     void *bpool = NULL, *fpool = NULL;
@@ -67,7 +66,7 @@ static void run_pass(const Scene *sc, int n, Pass *p) {
     cfg.sr = BLK_SR; cfg.fft = BLK_FFT; cfg.hop_in = hop_in;
     CHECK(aiaec_get_mem_size(&cfg, &req) == AIAEC_OK, "N=%d block mem size", n);
     if (posix_memalign(&bpool, req.alignment, (size_t)req.bytes) != 0) abort();
-    err = aiaec_init(&cfg, bpool, (size_t)req.bytes, &ctx, &info);
+    err = aiaec_init(&cfg, bpool, (size_t)req.bytes, &ctx);
     CHECK(err == AIAEC_OK && ctx != NULL, "N=%d block init err=%d", n, err);
 
     fbytes = aiaec_front_get_mem_size(&cfg);

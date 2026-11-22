@@ -33,16 +33,6 @@ ifeq ($(MASK_ONLY),1)
 MASK_CPPFLAGS += -DDFN2_MASK_ONLY
 endif
 
-# NO_STDIO=1 compiles out dfn2_stream.c's file-loader entry points (the only stdio in this SDK)
-# via -DDFN2_STREAM_NO_STDIO; see audit-no-stdio.
-NO_STDIO ?= 0
-override NO_STDIO := $(strip $(NO_STDIO))
-$(eval $(call CHECK_01,NO_STDIO))
-NO_STDIO_CPPFLAGS :=
-ifeq ($(NO_STDIO),1)
-NO_STDIO_CPPFLAGS += -DDFN2_STREAM_NO_STDIO
-endif
-
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
@@ -67,7 +57,7 @@ endif
 
 BUILD_DIR := build
 override CC_TARGET_SIG := $(TARGET_ABI_SIGNATURE)
-CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) MASK_ONLY=$(MASK_ONLY) MASK_CPPFLAGS=$(MASK_CPPFLAGS) NO_STDIO=$(NO_STDIO) NO_STDIO_CPPFLAGS=$(NO_STDIO_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
+CFG_SIG_PAYLOAD := CC_TARGET_SIG=$(CC_TARGET_SIG) CC=$(CC) AR=$(AR) CFLAGS=$(CFLAGS) LDFLAGS=$(LDFLAGS) SIMD=$(SIMD) SIMD_CPPFLAGS=$(SIMD_CPPFLAGS) MASK_ONLY=$(MASK_ONLY) MASK_CPPFLAGS=$(MASK_CPPFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) COMMON_LIB=$(COMMON_LIB)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 OBJ_DIR := $(BUILD_DIR)/simd$(SIMD)-mask$(MASK_ONLY)-$(CFG_SIG)
 
@@ -96,7 +86,7 @@ VPATH := ../../../lib/ainr/dfn2
 SMOKE_BIN := $(OBJ_DIR)/smoke_dfn2_stream
 SMOKE_SOURCES := tests/smoke_dfn2_stream.c $(CORE_SOURCES) dfn2_stream.c
 
-# Needs the file-loader entry points (stdio), so never built when NO_STDIO=1.
+# The sample-side ERB file reader (../dfn2_erb_file.h) against dfn2_stream_init.
 ERB_FILE_CHECK_BIN := $(OBJ_DIR)/check_erb_file
 ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c
 
@@ -106,7 +96,7 @@ ERB_FILE_CHECK_SOURCES := tests/check_erb_file.c $(CORE_SOURCES) dfn2_stream.c
 VERIFY_VS_SAMPLE_BIN := $(OBJ_DIR)/verify_vs_sample
 VERIFY_VS_SAMPLE_SOURCES := tests/verify_vs_sample.c $(CORE_SOURCES) dfn2_stream.c
 
-# Memory-mode checks always; the file-mode ones too unless NO_STDIO (the test compiles under both).
+# The inverse ERB table check (partition of unity); with arguments, an fb_*.bin through the loader.
 ERB_PARTITION_BIN := $(OBJ_DIR)/erb_partition
 ERB_PARTITION_SOURCES := tests/erb_partition.c $(CORE_SOURCES) dfn2_stream.c
 
@@ -117,7 +107,7 @@ FAIL_TABLE_SOURCES := tests/fail_table.c $(CORE_SOURCES) dfn2_stream.c
 POOL_SIZE_BIN := $(OBJ_DIR)/pool_size
 POOL_SIZE_SOURCES := tests/pool_size.c $(CORE_SOURCES) dfn2_stream.c
 
-# The freq_only context against a full one; memory mode always, file mode too unless NO_STDIO.
+# The freq_only context against a full one.
 FREQ_ONLY_BIN := $(OBJ_DIR)/freq_only
 FREQ_ONLY_SOURCES := tests/freq_only.c $(CORE_SOURCES) dfn2_stream.c
 
@@ -147,7 +137,7 @@ print-lib-path:
 	@echo "$(abspath $(LIB))"
 
 print-cflags:
-	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS)"
+	@printf '%s\n' "$(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS)"
 
 print-sources:
 	@printf '%s\n' "$(CORE_SOURCES) $(STREAM_SOURCES)"
@@ -159,31 +149,28 @@ _cfg_guard:
 	$(CFG_GUARD_RECIPE)
 
 $(OBJ_DIR)/%.o: %.c $(CORE_HEADERS) $(STREAM_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) -MMD -MP -c -o "$@" "$<"
 
 -include $(LIB_OBJECTS:.o=.d)
 
 COMMON_HEADERS := $(wildcard $(COMMON_DIR)/include/*.h $(COMMON_DIR)/utility/*.h)
 
 $(SMOKE_BIN): $(SMOKE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(SMOKE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 smoke: $(SMOKE_BIN)
 	"$(SMOKE_BIN)"
 
-$(ERB_FILE_CHECK_BIN): $(ERB_FILE_CHECK_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-ifeq ($(NO_STDIO),1)
-	$(error check-erb-file needs the file-loader entry points; run with NO_STDIO=0)
-endif
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_FILE_CHECK_SOURCES) "$(COMMON_LIB)" \
+$(ERB_FILE_CHECK_BIN): $(ERB_FILE_CHECK_SOURCES) ../dfn2_erb_file.h $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(ERB_FILE_CHECK_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 check-erb-file: $(ERB_FILE_CHECK_BIN)
 	"$(ERB_FILE_CHECK_BIN)"
 
 $(VERIFY_VS_SAMPLE_BIN): $(VERIFY_VS_SAMPLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(VERIFY_VS_SAMPLE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
@@ -191,56 +178,56 @@ verify-vs-sample: $(VERIFY_VS_SAMPLE_BIN)
 	"$(VERIFY_VS_SAMPLE_BIN)" --inject-shift
 
 $(FAIL_TABLE_BIN): $(FAIL_TABLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(FAIL_TABLE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(FAIL_TABLE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 fail-table: $(FAIL_TABLE_BIN)
 	"$(FAIL_TABLE_BIN)"
 
 $(POOL_SIZE_BIN): $(POOL_SIZE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(POOL_SIZE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(POOL_SIZE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 pool-size: $(POOL_SIZE_BIN)
 	"$(POOL_SIZE_BIN)"
 
 $(FREQ_ONLY_BIN): $(FREQ_ONLY_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(FREQ_ONLY_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(FREQ_ONLY_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 freq-only: $(FREQ_ONLY_BIN)
 	"$(FREQ_ONLY_BIN)"
 
 $(FREQ_ROWS_BIN): $(FREQ_ROWS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(FREQ_ROWS_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(FREQ_ROWS_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 freq-rows: $(FREQ_ROWS_BIN)
 	"$(FREQ_ROWS_BIN)"
 
 $(PACKET_EQUIV_BIN): $(PACKET_EQUIV_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(PACKET_EQUIV_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(PACKET_EQUIV_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 packet-equiv: $(PACKET_EQUIV_BIN)
 	"$(PACKET_EQUIV_BIN)"
 
 $(LIFECYCLE_BIN): $(LIFECYCLE_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(LIFECYCLE_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(LIFECYCLE_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 lifecycle: $(LIFECYCLE_BIN)
 	"$(LIFECYCLE_BIN)"
 
 $(LOOKAHEAD_BLOCKS_BIN): $(LOOKAHEAD_BLOCKS_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(LOOKAHEAD_BLOCKS_SOURCES) "$(COMMON_LIB)" \
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(LOOKAHEAD_BLOCKS_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 lookahead-blocks: $(LOOKAHEAD_BLOCKS_BIN)
 	"$(LOOKAHEAD_BLOCKS_BIN)"
 
-$(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(NO_STDIO_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
+$(ERB_PARTITION_BIN): $(ERB_PARTITION_SOURCES) ../dfn2_erb_file.h $(CORE_HEADERS) $(STREAM_HEADERS) $(TEST_HEADERS) $(COMMON_LIB) $(COMMON_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(MASK_CPPFLAGS) $(ERB_PARTITION_SOURCES) "$(COMMON_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 erb-partition: $(ERB_PARTITION_BIN)
@@ -305,17 +292,9 @@ test-variant-guard:
 	echo "test-variant-guard: variant-suffixed hop entries present, no cross-variant entry exported"; \
 	echo "test-variant-guard: PASS (both matched pairings link and run)"
 
-# audit-no-stdio: builds the NO_STDIO=1 archive and asserts, via `nm -u`, that dfn2_stream.o
-# references no stdio symbol (the file-loader entry points are compiled out under that flag).
-audit-no-stdio:
-	@$(MAKE) --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) lib >/dev/null
-	@nostdio_lib="$$($(MAKE) -s --no-print-directory NO_STDIO=1 MASK_ONLY=$(MASK_ONLY) SIMD=$(SIMD) $(TOOLCHAIN_FWD) print-lib-path)"; \
-	obj_dir="$$(dirname "$$nostdio_lib")"; \
-	undef="$$(nm -u "$$obj_dir/dfn2_stream.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts' || true)"; \
-	if [ -n "$$undef" ]; then \
-	  echo "FAIL: dfn2_stream.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; \
-	fi; \
-	echo "audit-no-stdio: PASS ($$obj_dir/dfn2_stream.o has no stdio references)"
+# audit-no-stdio: $(LIB) (this MASK_ONLY variant) has no undefined stdio reference; recipe in lib/deps.mk.
+audit-no-stdio: $(LIB)
+	$(AUDIT_NO_STDIO_RECIPE)
 
 clean:
 	rm -rf "$(BUILD_DIR)"

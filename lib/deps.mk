@@ -101,6 +101,21 @@ $$(error $(1) must be exactly 0 or 1)
 endif
 endef
 
+# The recipe of an includer's `audit-no-stdio: $(LIB)` target (a tab and $(AUDIT_NO_STDIO_RECIPE)); it uses the includer's
+# CC, OBJ_DIR, LIB and MASK_ONLY. nm must read $(LIB), and it must have no undefined stdio stream, file or print symbol.
+# The positive control is a generated object that calls fopen, fread and fclose, so the scan is shown able to fail.
+STDIO_UNDEF_RE := (^|[ _])(v?[sf]?n?printf(_chk)?|f?puts|putc(har)?|fputc|f?getc|fgets|[sf]?scanf|fopen|fdopen|freopen|fread|fwrite|fclose|fflush|fseeko?|ftello?|rewind|perror|(__)?std(in|out|err)p?)(@.*)?$$
+define AUDIT_NO_STDIO_RECIPE
+@mkdir -p "$(OBJ_DIR)"
+@printf '#include <stdio.h>\nint stdio_probe(const char *p, char *b) { FILE *f = fopen(p, "rb"); size_t n = f ? fread(b, 1, 1, f) : 0; if (f) fclose(f); return (int)n; }\n' > "$(OBJ_DIR)/stdio_probe.c"
+@$(CC) -c "$(OBJ_DIR)/stdio_probe.c" -o "$(OBJ_DIR)/stdio_probe.o"
+@nm -u "$(OBJ_DIR)/stdio_probe.o" | grep -Eq '$(STDIO_UNDEF_RE)' || { echo "FAIL: positive control shows no stdio reference" >&2; exit 1; }
+@all="$$(nm -u "$(LIB)")" || { echo "FAIL: nm cannot read $(LIB)" >&2; exit 1; }; \
+undef="$$(printf '%s\n' "$$all" | grep -E '$(STDIO_UNDEF_RE)' || true)"; \
+if [ -n "$$undef" ]; then echo "FAIL: $(LIB) references stdio functions:" >&2; echo "$$undef" >&2; exit 1; fi; \
+echo "audit-no-stdio: PASS ($(LIB) has no stdio references; MASK_ONLY=$(MASK_ONLY))"
+endef
+
 # The recipe of an includer's `_cfg_guard` target (`_cfg_guard:` and, on the next line, a tab and $(CFG_GUARD_RECIPE)): the
 # compiler target must be known, and $(OBJ_DIR)/config.manifest must be absent or equal CFG_SIG_PAYLOAD, else two
 # configurations have landed in one directory.

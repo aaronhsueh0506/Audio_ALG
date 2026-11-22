@@ -6,9 +6,10 @@
 
 | 項目 | 位置 |
 |---|---|
-| 產品、grid、`N = hop_in / (fft / 2)`、graph 與 ERB 的選擇，延遲（DFN2） | `stream/ainr/ainr.c`、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` 只回 `graph_path`、`queue_frames`；`AiaecInfo` 只回 `graph_path` |
+| 產品、grid、`N = hop_in / (fft / 2)` 的範圍檢查，延遲（DFN2） | `stream/ainr/ainr.c` 與 `stream/ainr/dfn2_grids.h`（綁定模型的 grid 表）、`stream/aiaec/aiaec.c` 的內部 catalog；`AinrInfo` 只回 `queue_frames`、`mask_lookahead`；`aiaec_init()` 不回報任何東西。函式庫不知道檔名，ERB 表由呼叫端經 `AinrConfig.erb_fwd`／`erb_inv` 借給它 |
+| graph 檔名（`<model>_<sr/1000>k_fft<fft>_n<N>.bin`）、DFN2 的 ERB 檔名（`fb_<sr>_<n_erb>.bin`）與載入 | 同一份 `graph_io_<model>.h` 的列：`GraphIoRow.file`／`GraphIoConfig.file`、DFN2 另有 `GraphIoDfn2Row.erb_file`（`graph_io_dfn2_erb_file()`）；目錄是 sample 的（`SAMPLE_MODEL_DIR`、`SAMPLE_ERB_DIR`），ERB 檔由 `stream/ainr/dfn2_erb_file.h` 載入 |
 | 這一包的訊號與 head（資料指標、元素數、`[b,c,h,w]`、generation、action、`frame_reset` 控制值） | `StreamWork`（`stream/common/stream_run.h`），由真實的 pre 呼叫填 |
-| 每個登錄的組態（含尚未交付 graph 的）的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_deepvqes.h`、`stream/aiaec/graph_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列，註明所對應的匯出器 |
+| 每個登錄的組態（含尚未交付 graph 的）的完整接線（訊號、head、state 的數量與 shape） | `stream/ainr/graph_io_dfn2.h`、`stream/aiaec/graph_io_deepvqes.h`、`stream/aiaec/graph_io_alignulcnet.h`（只有標頭，`ainr.h`／`aiaec.h` 不引用）：每個登錄的 `(產品, sr, fft, N)` 一列（DFN2 另以 `mask_lookahead` 為鍵：`GraphIoDfn2Row { GraphIoRow row; int mask_lookahead; const char *erb_file; }`，因為 48 kHz 的 mask_lookahead 1 與 0 的 graph shape 相同），註明所對應的匯出器 |
 | 共用接線程式：列的展開、state 配對、`stream_check_ports()` 呼叫、buffer 大小、pre 到 AI3 的邊界核對 | `stream/common/graph_io.h`（SDK 無關、只有標頭；`make -C stream/common test-graph-io`）。sample 加 `-I stream/common -I stream/ainr`（或 `stream/aiaec`）並編譯 `stream/common/stream_bind.c` |
 | SDK 無關的 graph／裝置描述檢查器（`StreamWiring`、`StreamDeviceDesc`、`stream_check_ports()`、`STREAM_PORT_ERR_*`） | `stream/common/stream_bind.{h,c}`，只由 sample 連結；`libainr.a`、`libaiaec.a` 不含它 |
 | 記憶體需求型別 `StreamMemReq` 與 pool 工具 | `stream/common/stream_mem.h`，與接線型別無關；`ainr.h`、`aiaec.h` 只引用它 |
@@ -16,9 +17,9 @@
 
 八支 AI3 sample 的 state 同步寫法相同：只留一個計數 `g_state_gen_seen`（上一次把 NPU state 歸零時函式庫的 generation）；每次送件前，若 `work.state_generation` 不等於它，就把 state 輸入歸零並 flush，成功才更新計數，失敗則該區塊回 `STREAM_RUN_NOT_STARTED`（下一拍再試）。`work.action` 不是 `STREAM_WORK_SUBMIT` 的區塊不送件。回給 `*_postprocess*` 的狀態：`vendor_ai3_net_proc` 之前的任何失敗（核對、拷貝、歸零、`set_buf`）是 `STREAM_RUN_NOT_STARTED`；從 `vendor_ai3_net_proc` 起的失敗（執行、讀回 head）是 `STREAM_RUN_FAILED`；每個 head 都讀回才是 `STREAM_RUN_OK`。sample 不另外記「待恢復」旗標：失敗之後的歸零由函式庫推進的 generation 觸發。
 
-`ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。
+`ainr.h` 與 `aiaec.h` 不引用 `stream_bind.h`；函式庫也沒有只為 graph 接線存在的 state 尺寸常數。缺少列（`GRAPH_IO_ERR_NO_ROW`）或與所選 graph 不符的組態，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕；函式庫接受 1..64 的任何 N。
 
-接線表的列與 AIAEC 正式目錄（`aiaec.c`）的組態一致：兩個模型各有 16 kHz／fft 256 的 N=1、16 kHz／fft 512 的 N=1 與 N=4、48 kHz／fft 1024 的 N=1 與 N=2，每列都帶 graph 路徑（同一個模型的所有列共用一個路徑：卡上每個模型只放一張 graph，只能在它自己的 grid 與 N 跑，sample 在開圖後以 `graph_io_check_ports()` 拒絕其他組態）。表外的 N（例如 16k／256 的 N=8、16k／512 的 N=8）沒有列，正式建置在 init 就拒絕。板端一次 1024 點的錄音在 16 kHz 用 fft 512 的 N=4（`--hop-in 1024`）；fft 256 只有 N=1。每列依各模型同 grid 的訓練設定檔：16 kHz／fft 256 依 `config_16k_256.ini`（DeepVQE-S：`align_key_ring` `[1,8,63,33]`、`align_score_history` `[1,8,9,63]`、`h_gru` `[1,1,1,256]`；Align-ULCNet：logit window 9）；16 kHz／fft 512 與 48 kHz 依 `config_16k_512.ini`／`config_48k.ini`，其 `[model]` 即建構子預設（DeepVQE-S sim 4、score window 5、GRU 192；Align-ULCNet logit window 5）。Align-ULCNet 的 window 是 `GraphIoAlignulcnetGrid.score_window`，匯出器以 `SCORE_WINDOW_BY_GRID`（`AIAEC/Align_ULCNet/export_onnx.py`）拒絕 window 不符的 checkpoint。測試目錄（`-DAIAEC_TEST_CATALOG`）接受的組態與正式目錄相同，只有路徑是佔位字串，見 `stream/aiaec/tests/test_aiaec_graph_io.c`；它另列一個沒有路徑的 16 kHz／256 N=8，讓「列出但沒有 graph」的拒絕（`AIAEC_ERR_FRAMES_PER_CALL`）也有測試。
+接線表的列：兩個模型各有 16 kHz／fft 256 的 N=1、16 kHz／fft 512 的 N=1 與 N=4、48 kHz／fft 1024 的 N=1 與 N=2，每列都帶自己的 graph 檔名（`deepvqes_16k_fft256_n1.bin`、`alignulcnet_16k_fft512_n4.bin` 等；sample 開 `SAMPLE_MODEL_DIR "/" cfg.file`，SD 卡上的檔名要一致；一個檔只能在它自己的 grid 與 N 跑，sample 在開圖後以 `graph_io_check_ports()` 拒絕其他組態）。表外的 N（例如 16k／256 的 N=8、16k／512 的 N=8）沒有列，函式庫接受，sample 的 `graph_io_<model>_find()` 回 `GRAPH_IO_ERR_NO_ROW` 並在開圖前拒絕。板端一次 1024 點的錄音在 16 kHz 用 fft 512 的 N=4（`--hop-in 1024`）；fft 256 只有 N=1。每列依各模型同 grid 的訓練設定檔：16 kHz／fft 256 依 `config_16k_256.ini`（DeepVQE-S：`align_key_ring` `[1,8,63,33]`、`align_score_history` `[1,8,9,63]`、`h_gru` `[1,1,1,256]`；Align-ULCNet：logit window 9）；16 kHz／fft 512 與 48 kHz 依 `config_16k_512.ini`／`config_48k.ini`，其 `[model]` 即建構子預設（DeepVQE-S sim 4、score window 5、GRU 192；Align-ULCNet logit window 5）。Align-ULCNet 的 window 是 `GraphIoAlignulcnetGrid.score_window`，匯出器以 `SCORE_WINDOW_BY_GRID`（`AIAEC/Align_ULCNet/export_onnx.py`）拒絕 window 不符的 checkpoint。表與組態的對照見 `stream/aiaec/tests/test_aiaec_graph_io.c`。
 
 ## 規則
 
@@ -64,7 +65,7 @@ Align-ULCNet 只有一個描述產生器：N>1 在訊號輸入的最後多一個
 
 1. CTRL 位元（`CTRL_BUF_FLOATIN`、`CTRL_BUF_FLOATOUT`）是否也作用在 state 埠。
 2. NPU 內建轉換與 host 呼叫的數值是否相等：host 對輸入傳 scale 1.0f，對輸出傳埠的 `scale_ratio`。
-3. 現有 `model.bin` 是否直接接受 float I/O，還是工具鏈需要另一個選項並重編。若需要另一個 bin，在 `stream/ainr/ainr.c`／`stream/aiaec/aiaec.c` 的 catalog 加第二個 `graph_path`，不改 layout 版號。
+3. 現有 `model.bin` 是否直接接受 float I/O，還是工具鏈需要另一個選項並重編。若需要另一個 bin，給它另一個檔名（`graph_io_<model>.h` 的列加一列，或放在 sample 的另一個 `SAMPLE_MODEL_DIR`），不改 layout 版號。
 
 上板 A/B 的步驟與比對腳本見 `docs/maintenance/float-io-board-ab.md` 與 `docs/maintenance/float_io_compare.py`。
 

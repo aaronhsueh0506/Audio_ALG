@@ -9,15 +9,18 @@ configuration. Random-weight graphs are exported full and mask-only at N = 1 and
 ONNX names are read here, on the exporter side only), and at the registered catalog grids (16 kHz / 256, 48 kHz /
 1024) for the work-view check against ``make -C stream/ainr [MASK_ONLY=1] work-dumper``, which runs a real
 preprocess for each registered row; the rows of the mask_lookahead 0 model (32 kHz / 512 at N 1 and 4, 48 kHz / 1024
-at N 1 and 2, 16 kHz / 256 at N 1 and 8), whose 32 and 48 kHz graphs are not delivered, come from a dumper built
-on the test catalog (``EXTRA_CFLAGS=-DAINR_TEST_CATALOG -DAINR_PRODUCT_MODEL_ID=3``). Set AINR_PIN_DUMPERS to
+at N 1 and 2, 16 kHz / 256 at N 1 and 8) come from a dumper bound to that model
+(``EXTRA_CFLAGS=-DAINR_PRODUCT_MODEL_ID=3``). The library accepts any N up to 64 at a grid it knows; which N has a graph
+is the sample table, so an N without a row is accepted by the dumper (rc 0) and absent from the graph-io dumper's rows,
+and N = 65 is the library's refusal (-6). Set AINR_PIN_DUMPERS to
 ``<full dumper><pathsep><lite dumper>[<pathsep><mask_lookahead 0 dumper>]`` to compare other builds (the mutation
 check of this test).
 
 The board samples' DFN2 rows (stream/ainr/graph_io_dfn2.h) are pinned here as well: every row printed by
 ``make -C stream/ainr graph-io-dumper`` (set AINR_GRAPH_IO_DUMPER to compare another build) is compared with a fresh
 export at the production model dimensions: layout version, port counts and order, every input and output shape, the
-state shapes at both ends, the state output name ``<input>_out`` and the row set itself.
+state shapes at both ends, the state output name ``<input>_out``, the mask_lookahead, the graph file and ERB file
+names, and the row set itself (a row id is ``dfn2_<full|lite>_<sr>_<fft>_n<N>_l<mask_lookahead>``).
 """
 
 import os
@@ -87,11 +90,11 @@ def test_ports_are_signals_then_states_and_heads_then_states(export, tmp_path, m
 REPO = pathlib.Path(__file__).resolve().parents[2]
 STREAM_AINR = REPO / 'stream' / 'ainr'
 
-# (lite, sr, fft, n_erb, N): the catalog rows of ainr.c (full 16 kHz / 256 at N 1 and 8, full and lite 48 kHz / 1024
-# at N 1); df_bins is 96 in every row
+# (lite, sr, fft, n_erb, N): rows of the full model (16 kHz / 256 at N 1 and 8, 48 kHz / 1024 at N 1) and of the lite
+# model (48 kHz / 1024 at N 1); df_bins is 96 in every row
 ROWS = [(False, 16000, 256, 24, 1), (False, 16000, 256, 24, 8), (False, 48000, 1024, 32, 1),
         (True, 48000, 1024, 32, 1)]
-# The mask_lookahead 0 model's catalog rows (test catalog build): full, mask_lookahead 0, df_lookahead 0
+# The mask_lookahead 0 model's grids: full, mask_lookahead 0, df_lookahead 0
 L0_ROWS = [(False, 16000, 256, 24, 1), (False, 16000, 256, 24, 8), (False, 32000, 512, 28, 1),
            (False, 32000, 512, 28, 4), (False, 48000, 1024, 32, 1), (False, 48000, 1024, 32, 2)]
 
@@ -116,14 +119,14 @@ def work_dumpers():
                              check=True, capture_output=True, text=True)
         paths[lite] = out.stdout.strip().splitlines()[-1]
     out = subprocess.run(['make', '-s', '-C', str(STREAM_AINR), 'work-dumper',
-                          'EXTRA_CFLAGS=-DAINR_TEST_CATALOG -DAINR_PRODUCT_MODEL_ID=3'],
+                          'EXTRA_CFLAGS=-DAINR_PRODUCT_MODEL_ID=3'],
                          check=True, capture_output=True, text=True)
     paths['l0'] = out.stdout.strip().splitlines()[-1]
     return paths
 
 
 def run_work_dumper(path, sr, fft, hop_in, family=0):
-    """rc, queue, counts and the work views (b, c, h, w) with element counts of the first real preprocess."""
+    """rc, queue, mask_lookahead, counts and the work views (b, c, h, w) with element counts of the first real preprocess."""
     text = subprocess.run([path, str(sr), str(fft), str(hop_in), str(family)], check=True,
                           capture_output=True, text=True).stdout
     dump = {'in': [], 'out': []}
@@ -132,9 +135,7 @@ def run_work_dumper(path, sr, fft, hop_in, family=0):
         if fields[0] == 'rc':
             dump['rc'] = int(fields[1])
         elif fields[0] == 'info':
-            dump['queue'] = int(fields[2])
-        elif fields[0] == 'graph':
-            dump['graph'] = fields[1]
+            dump['queue' if fields[1] == 'queue' else 'mask_lookahead'] = int(fields[2])
         elif fields[0] == 'counts':
             dump['counts'] = (int(fields[2]), int(fields[4]))
         elif fields[0] in ('in', 'out'):
@@ -199,51 +200,74 @@ def test_l0_library_work_views_are_the_exported_signals_and_heads(export, tmp_pa
     for views in (dump['in'], dump['out']):
         for i, (shape, elements) in enumerate(views):
             assert elements == shape[0] * shape[1] * shape[2] * shape[3], i
-    assert dump['graph'].startswith('test://') or sr == 16000
+    assert dump['mask_lookahead'] == 0
 
 
-def test_the_l0_customer_arithmetic(work_dumpers):
-    """The mask_lookahead 0 model: N = hop_in / (fft / 2) at every grid, N > 1 allowed, an N without a graph refused."""
+def _row_key(lite, sr, fft, n, mask_lookahead):
+    return 'dfn2_%s_%d_%d_n%d_l%d' % ('lite' if lite else 'full', sr, fft, n, mask_lookahead)
+
+
+def test_the_l0_customer_arithmetic(work_dumpers, graph_io_rows):
+    """The mask_lookahead 0 model: N = hop_in / (fft / 2) at every grid, any N up to 64 accepted (an N without a graph
+    row is the sample's refusal, not the library's), N = 65 refused."""
     l0 = work_dumpers['l0']
     for sr, fft, hop_in, n in ((16000, 256, 1024, 8), (32000, 512, 1024, 4), (48000, 1024, 1024, 2), (48000, 1024, 512, 1)):
         dump = run_work_dumper(l0, sr, fft, hop_in)
         assert dump['rc'] == 0 and dump['in'][0][0][2] == n + 2 and dump['out'][0][0][2] == n
-    assert run_work_dumper(l0, 32000, 512, 768)['rc'] == -6        # N = 3: AINR_ERR_FRAMES_PER_CALL
-    assert run_work_dumper(l0, 48000, 1024, 2048)['rc'] == -6      # N = 4
+        assert dump['mask_lookahead'] == 0 and dump['queue'] == 0
+        assert _row_key(False, sr, fft, n, dump['mask_lookahead']) in graph_io_rows
+    for sr, fft, n in ((32000, 512, 3), (48000, 1024, 4), (16000, 256, 2)):   # accepted, no graph row
+        dump = run_work_dumper(l0, sr, fft, n * (fft // 2))
+        assert dump['rc'] == 0 and dump['in'][0][0][2] == n + 2 and dump['out'][0][0][2] == n
+        assert _row_key(False, sr, fft, n, dump['mask_lookahead']) not in graph_io_rows
+    assert run_work_dumper(l0, 32000, 512, 65 * 256)['rc'] == -6   # N = 65: AINR_ERR_FRAMES_PER_CALL
     assert run_work_dumper(l0, 32000, 512, 100)['rc'] == -4        # AINR_ERR_IN_HOP
     assert run_work_dumper(l0, 44100, 512, 256)['rc'] == -3        # AINR_ERR_GRID
 
 
-def test_the_customer_arithmetic_picks_the_exported_n(work_dumpers):
-    """N = hop_in / (fft / 2) at any mask_lookahead; the time axis of the signals is N + 2 and of the heads N;
-    a config with no registered graph is refused with no work."""
+def test_the_customer_arithmetic_picks_the_exported_n(work_dumpers, graph_io_rows):
+    """N = hop_in / (fft / 2) at any mask_lookahead; the time axis of the signals is N + 2 and of the heads N; a
+    config with no graph row is accepted by the library (rc 0) and absent from the sample table; N = 65 is refused."""
     full, lite = work_dumpers[False], work_dumpers[True]
     for sr, fft, hop_in, n in ((16000, 256, 128, 1), (16000, 256, 1024, 8), (48000, 1024, 512, 1), (48000, 1024, 1024, 2)):
         dump = run_work_dumper(full, sr, fft, hop_in)
         assert dump['rc'] == 0 and dump['in'][0][0][2] == n + 2 and dump['out'][0][0][2] == n
+        assert _row_key(False, sr, fft, n, dump['mask_lookahead']) in graph_io_rows
+    for sr, fft, n in ((16000, 256, 2), (48000, 1024, 4)):   # accepted, no graph row
+        dump = run_work_dumper(full, sr, fft, n * (fft // 2))
+        assert dump['rc'] == 0 and dump['in'][0][0][2] == n + 2 and dump['out'][0][0][2] == n
+        assert _row_key(False, sr, fft, n, dump['mask_lookahead']) not in graph_io_rows
+    assert run_work_dumper(full, 16000, 256, 65 * 128)['rc'] == -6   # N = 65: AINR_ERR_FRAMES_PER_CALL
     assert run_work_dumper(full, 16000, 256, 100)['rc'] == -4       # AINR_ERR_IN_HOP
-    assert run_work_dumper(full, 16000, 256, 256)['rc'] == -6       # N = 2: AINR_ERR_FRAMES_PER_CALL
-    assert run_work_dumper(full, 48000, 1024, 2048)['rc'] == -6     # N = 4
     assert run_work_dumper(full, 16000, 512, 256)['rc'] == -3       # AINR_ERR_GRID
     assert run_work_dumper(lite, 16000, 256, 128)['rc'] == -3       # lite has only 48 kHz / 1024
+    dump = run_work_dumper(lite, 48000, 1024, 3 * 512)               # lite N = 3: accepted, no row
+    assert dump['rc'] == 0 and _row_key(True, 48000, 1024, 3, dump['mask_lookahead']) not in graph_io_rows
 
 
 # ---- the graph rows (stream/ainr/graph_io_dfn2.h) against a fresh export at the production dimensions ----
 
 # (row id, mask_only, sr, fft, n_erb, mask_lookahead, df_lookahead, N): the rows of the header, spelled out here from
-# the exporter's arguments, never from the header
+# the exporter's arguments, never from the header. The 48 kHz N = 1 and N = 2 graphs exist for mask_lookahead 1 and 0;
+# the shapes do not depend on the lookahead pair, so the two rows of an N share one shape and differ in file and key.
 GRAPH_IO_CASES = [
-    ('dfn2_full_16000_256_n1', False, 16000, 256, 24, 0, 0, 1),
-    ('dfn2_full_16000_256_n8', False, 16000, 256, 24, 0, 0, 8),
-    ('dfn2_full_48000_1024_n1', False, 48000, 1024, 32, 1, 1, 1),
-    ('dfn2_full_48000_1024_n2', False, 48000, 1024, 32, 0, 0, 2),
-    ('dfn2_full_32000_512_n1', False, 32000, 512, 28, 0, 0, 1),
-    ('dfn2_full_32000_512_n4', False, 32000, 512, 28, 0, 0, 4),
-    ('dfn2_lite_48000_1024_n1', True, 48000, 1024, 32, 1, 0, 1),
+    ('dfn2_full_16000_256_n1_l0', False, 16000, 256, 24, 0, 0, 1),
+    ('dfn2_full_16000_256_n8_l0', False, 16000, 256, 24, 0, 0, 8),
+    ('dfn2_full_48000_1024_n1_l1', False, 48000, 1024, 32, 1, 1, 1),
+    ('dfn2_full_48000_1024_n2_l1', False, 48000, 1024, 32, 1, 1, 2),
+    ('dfn2_full_48000_1024_n1_l0', False, 48000, 1024, 32, 0, 0, 1),
+    ('dfn2_full_48000_1024_n2_l0', False, 48000, 1024, 32, 0, 0, 2),
+    ('dfn2_full_32000_512_n1_l0', False, 32000, 512, 28, 0, 0, 1),
+    ('dfn2_full_32000_512_n4_l0', False, 32000, 512, 28, 0, 0, 4),
+    ('dfn2_lite_48000_1024_n1_l1', True, 48000, 1024, 32, 1, 0, 1),
 ]
-# The shapes do not depend on the lookahead pair: the mask_lookahead 0 graph of the 48 kHz N = 1 row has the row of the
-# mask_lookahead 1 graph, so it is exported as well and compared with the same row
-L0_SHARED_ROWS = [('dfn2_full_48000_1024_n1', False, 48000, 1024, 32, 0, 0, 1)]
+
+
+def _graph_file(mask_only, sr, fft, mask_la, n):
+    """dfn2[_l0|_lite]_<sr/1000>k_fft<fft>_n<N>.bin: the mask_lookahead 0 model has its own files except at 16 kHz,
+    whose graphs it shares with the full model."""
+    tag = '_lite' if mask_only else '_l0' if mask_la == 0 and sr != 16000 else ''
+    return 'dfn2%s_%dk_fft%d_n%d.bin' % (tag, sr // 1000, fft, n)
 
 
 @pytest.fixture(scope='module')
@@ -260,7 +284,8 @@ def graph_io_dumper():
 
 @pytest.fixture(scope='module')
 def graph_io_rows(graph_io_dumper):
-    """row id -> {'layout', 'counts' (signals, heads, inputs, outputs), 'in', 'out'} as the header's rows expand."""
+    """row id -> {'layout', 'counts' (signals, heads, inputs, outputs), 'mask_lookahead', 'file', 'erb_file', 'in',
+    'out'} as the header's rows expand."""
     rows = {}
     current = None
     text = subprocess.run([graph_io_dumper], check=True, capture_output=True, text=True).stdout
@@ -270,6 +295,8 @@ def graph_io_rows(graph_io_dumper):
             current = {'layout': int(fields[3]), 'counts': tuple(int(v) for v in fields[5:9]), 'in': [], 'out': []}
             assert fields[1] not in rows, 'duplicate row ' + fields[1]
             rows[fields[1]] = current
+        elif fields[0] == 'file':
+            current['mask_lookahead'], current['file'], current['erb_file'] = int(fields[1]), fields[2], fields[3]
         else:
             kind, index, b, c, h, w, elements = fields
             assert int(index) == len(current[kind])
@@ -287,18 +314,17 @@ def graph_io_exports(export, tmp_path_factory):
     model_mod = dfn_pairs.import_family_module(FAMILY, 'model')
     work = tmp_path_factory.mktemp('dfn2_graph_io')
     result = {}
-    for case in GRAPH_IO_CASES + L0_SHARED_ROWS:
+    for case in GRAPH_IO_CASES:
         rid, mask_only, sr, fft, n_erb, mask_la, df_la, n = case
         torch.manual_seed(7)
         model = model_mod.DeepFilterNet2(
             n_fft=fft, sr=sr, n_erb=n_erb, df_bins=96, df_order=5, enc_ch=64, emb_size=256, df_hidden=256,
             df_num_layers=2, emb_num_layers=3, lin_groups=16, enc_lin_groups=32, mask_lookahead=mask_la,
             df_lookahead=df_la).eval()
-        stem = '%s_l%dd%d' % (rid, mask_la, df_la)
-        checkpoint = work / (stem + '.pth')
+        checkpoint = work / (rid + '.pth')
         checkpoint.write_bytes(b'only hashed')
         wrapper = export.StatelessDFN2Heads(model, frames_per_call=n, mask_only=mask_only).eval()
-        path = work / (stem + '.onnx')
+        path = work / (rid + '.onnx')
         metadata = export.export_graph(wrapper, {'SR': sr, 'N_FFT': fft, 'WIN_LEN': fft, 'HOP_LEN': fft // 2},
                                        str(checkpoint), str(path), verify=False)
         result[case] = (onnx.load(str(path)).graph, metadata)
@@ -307,12 +333,13 @@ def graph_io_exports(export, tmp_path_factory):
 
 def test_the_sample_rows_are_exactly_the_registered_rows(graph_io_rows):
     assert sorted(graph_io_rows) == sorted(case[0] for case in GRAPH_IO_CASES)
+    files = [row['file'] for row in graph_io_rows.values()]
+    assert len(set(files)) == len(files), 'two rows share a graph file'
 
 
-@pytest.mark.parametrize('case', GRAPH_IO_CASES + L0_SHARED_ROWS,
-                         ids=[case[0] + ('' if case in GRAPH_IO_CASES else '-l0') for case in GRAPH_IO_CASES + L0_SHARED_ROWS])
+@pytest.mark.parametrize('case', GRAPH_IO_CASES, ids=[case[0] for case in GRAPH_IO_CASES])
 def test_sample_row_equals_a_fresh_export(case, graph_io_rows, graph_io_exports):
-    rid, mask_only, _sr, _fft, _n_erb, _mla, _dla, n = case
+    rid, mask_only, sr, fft, n_erb, mask_la, _dla, n = case
     row = graph_io_rows[rid]
     graph, metadata = graph_io_exports[case]
     in_names = [v.name for v in graph.input]
@@ -323,6 +350,9 @@ def test_sample_row_equals_a_fresh_export(case, graph_io_rows, graph_io_exports)
     states = ['h_gru'] if mask_only else ['h_gru', 'df_convp_history']
 
     assert row['layout'] == metadata['state_layout_version']
+    assert row['mask_lookahead'] == mask_la
+    assert row['file'] == _graph_file(mask_only, sr, fft, mask_la, n)
+    assert row['erb_file'] == 'fb_%d_%d.bin' % (sr, n_erb)
     assert in_names == SIGNALS + states and out_names == heads + [name + '_out' for name in states]
     assert row['counts'] == (len(SIGNALS), len(heads), len(in_names), len(out_names))
     assert row['in'] == shapes_in, 'input shapes (signals, then states) differ from the exported graph'

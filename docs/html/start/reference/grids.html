@@ -212,7 +212,7 @@ rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1
 <tr><td><code>AEC_LAYOUT_VERSION</code> = 5</td>
 <td>AEC 函式庫 <code>aec.h</code>（sibling 檢出）</td>
 <td><code>Aec</code> pool 的版號，單支與 4ch array（<code>AecConfig.n_mics = 4</code>：共享 delay + 4 lanes + 融合與增益級，全在同一塊 pool）共用 <code>AecMemReq</code>；SRP-PHAT/BF 在 sample helper <code>array_sample_beam.h</code>，沒有 descriptor</td></tr>
-<tr><td><code>DFN2_STREAM_LAYOUT_VERSION</code> = 6</td>
+<tr><td><code>DFN2_STREAM_LAYOUT_VERSION</code> = 7</td>
 <td><code>stream/ainr/dfn2/dfn2_stream.h</code></td><td>DFN2 模型串流（兩支 pipeline 範例走它）</td></tr>
 <tr><td><code>AINR_BRIDGE_LAYOUT_VERSION</code> = 1</td>
 <td><code>stream/ainr/bridge/ainr_bridge.h</code></td><td>原生格點 ↔ 48 kHz 的取樣率橋接器（範例直接用 <code>AinrBridge</code>）</td></tr>

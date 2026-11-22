@@ -1,7 +1,7 @@
 """Align-ULCNet 16 kHz / FFT 512 N=4 packet graph through the C stream, ONNX Runtime as the accelerator.
 
 The C side (stream/aiaec/aiaec.c, the _freq family, built into a small binary driver by
-``make -C stream/aiaec packet-driver`` with the test catalog) frames a packet of 4 hops: features, the
+``make -C stream/aiaec packet-driver``) frames a packet of 4 hops: features, the
 frame_reset control, one job, the host back end, the error spectrum for event hops. Between its preprocess and
 postprocess requests this test runs the exported layout-19 graph (random weights, tiny) in ONNX Runtime and hands
 the output mask back, exactly as a board sample would with its accelerator run. The packet is compared, frame by frame, with

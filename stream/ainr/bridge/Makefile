@@ -17,14 +17,6 @@ endif
 include ../../../lib/deps.mk
 
 $(eval $(call CHECK_01,SIMD))
-# ainr_bridge.c has no stdio; NO_STDIO is accepted (and validated) so that a build that forwards it to every
-# stream directory finds this one in step with the rest, but it does not change the object and is not part of the
-# configuration signature.
-NO_STDIO ?= 0
-override NO_STDIO := $(strip $(NO_STDIO))
-ifneq ($(filter-out 0 1,$(NO_STDIO)),)
-$(error NO_STDIO must be exactly 0 or 1)
-endif
 WERROR ?= 0
 ifeq ($(WERROR),1)
 override CFLAGS += -Werror
@@ -84,11 +76,10 @@ $(TEST_BIN): tests/test_ainr_bridge.c ainr_bridge.c $(HEADERS) $(COMMON_LIB) $(C
 test: $(TEST_BIN)
 	"$(TEST_BIN)"
 
-# audit-no-stdio: ainr_bridge.o references no stdio symbol.
+# audit-no-stdio: $(LIB) has no undefined stdio reference; recipe in lib/deps.mk (MASK_ONLY does not exist here).
+audit-no-stdio: MASK_ONLY := n/a
 audit-no-stdio: $(LIB)
-	@undef="$$(nm -u "$(OBJ_DIR)/ainr_bridge.o" 2>/dev/null | grep -Ei 'fopen|fread|fclose|fwrite|fprintf|printf|puts|stderr' || true)"; \
-	if [ -n "$$undef" ]; then echo "FAIL: ainr_bridge.o references stdio symbols:" >&2; echo "$$undef" >&2; exit 1; fi; \
-	echo "audit-no-stdio: PASS ($(OBJ_DIR)/ainr_bridge.o has no stdio references)"
+	$(AUDIT_NO_STDIO_RECIPE)
 
 clean:
 	rm -rf "$(BUILD_DIR)"

@@ -51,55 +51,6 @@ def _write_matrix(fp, name, matrix):
     fp.write("};\n\n")
 
 
-def write_runtime_bins(config_path, out_dir):
-    """Emit the runtime .bin matrices the C host loads.
-
-    Raw float32 little-endian in exactly the layouts df_common consumes:
-    erb_fwd.bin bin-major [n_bins][n_erb], erb_inv.bin band-major
-    [n_erb][n_bins], plus erb_matrices.json. The library takes pointers only
-    (dfn2_set_erb_matrices), so the deployment loader owns the files and can
-    swap them at any time.
-    """
-    import configparser as _configparser
-
-    import torch
-
-    try:
-        from .model import DeepFilterNet2
-        from .train import read_model_config
-    except ImportError:
-        from model import DeepFilterNet2
-        from train import read_model_config
-
-    cfg = _configparser.ConfigParser()
-    if not cfg.read(config_path):
-        raise FileNotFoundError(config_path)
-    with torch.no_grad():
-        model = DeepFilterNet2(**read_model_config(cfg))
-        forward = model.erb_fb.detach().numpy().astype('<f4')
-        inverse = model.erb_inv.detach().numpy().astype('<f4')
-    if forward.shape[0] < forward.shape[1]:
-        forward = np.ascontiguousarray(forward.T)
-    if inverse.shape[0] > inverse.shape[1]:
-        inverse = np.ascontiguousarray(inverse.T)
-    require_partition_of_unity(inverse)
-    os.makedirs(out_dir, exist_ok=True)
-    forward.tofile(os.path.join(out_dir, 'erb_fwd.bin'))
-    inverse.tofile(os.path.join(out_dir, 'erb_inv.bin'))
-    manifest = {
-        'dtype': 'float32', 'byte_order': 'little',
-        'erb_fwd.bin': {'shape': list(forward.shape),
-                        'layout': 'bin_major [n_bins][n_erb]'},
-        'erb_inv.bin': {'shape': list(inverse.shape),
-                        'layout': 'band_major [n_erb][n_bins]'},
-    }
-    with open(os.path.join(out_dir, 'erb_matrices.json'), 'w',
-              encoding='utf-8') as fp:
-        json.dump(manifest, fp, indent=2, sort_keys=True)
-        fp.write('\n')
-    return out_dir
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',
@@ -108,15 +59,7 @@ def main():
                         help='optional checkpoint; validates that exported buffers match it')
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--format', choices=('bin', 'npy', 'c', 'all'), default='all')
-    parser.add_argument('--runtime-bins', default=None,
-                        help='write erb_fwd.bin/erb_inv.bin (+ json) in the '
-                             'exact layouts df_common consumes; no '
-                             'checkpoint needed')
     args = parser.parse_args()
-    if args.runtime_bins:
-        print(write_runtime_bins(args.config, args.runtime_bins))
-        return
-
     cfg = configparser.ConfigParser()
     if not cfg.read(args.config):
         raise FileNotFoundError(args.config)

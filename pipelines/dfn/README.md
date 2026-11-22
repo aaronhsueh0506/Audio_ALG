@@ -11,7 +11,7 @@ copy and adapt). `libaudio_pipeline_dfn.a` holds the model stream, the bridge an
 |---|---|
 | `dfn_hop.h` | Example: one DFN2 hop (`DfnHop`) over the model stream (`DFN2Stream`, `stream/ainr/dfn2`), with a caller-owned synthesis, or with the `AinrBridge` around it; the phased begin / model / end calls. It adds what the stream leaves to its caller: the audio-scale spectra in and out (`dfn2_stft_scale()` / `dfn2_stft_unscale()`), the model callback (`DFN2Model`) and the synthesis. `DfnHopJob` is the stream's `DFN2HopIO` (`inputs`, `outputs`, `state_generation`). |
 | `dfn_hop_pool.h` | Example: sizes and carves the DFN tail of an example's pool: the model stream, six `n_bins` float buffers for the scale conversion, then the synthesis and the output spectrum, or the bridge. |
-| `dfn_example_args.h` | Example: the command line shared by the two board skeletons (`--sample-rate` the host rate, `--ai-sample-rate` / `--ai-fft-size` the DFN2 model grid, `--erb-fwd` / `--erb-inv` the two ERB matrix files, `--atten-lim`, `--cng`); the delay options come from `example_cli.h`. `dfn_example_load_matrices()` reads the two files (see "Build and test") or builds the unit partition. The (sample rate, FFT size) -> (n_erb, df_bins, lookahead pair) table is the example's own, two rows (16000/256 -> 24, 96, 0/0; 48000/1024 -> 32, 96, 1/1; no 32 kHz row, the AEC in front of the model has none), default 48000/1024; an unknown pair is refused with the list (exit 2). |
+| `dfn_example_args.h` | Example: the command line shared by the two board skeletons (`--sample-rate` the host rate, `--ai-sample-rate` / `--ai-fft-size` the DFN2 model grid, `--erb` the ERB matrix file, `--atten-lim`, `--cng`); the delay options come from `example_cli.h`. `dfn_example_load_matrices()` reads the file (see "Build and test") or builds the unit partition. The (sample rate, FFT size) -> (n_erb, df_bins, lookahead pair) table is `stream/ainr/dfn2_grids.h`, the rows of `AINR_MODEL_ID_DFN2_FULL` (16000/256 -> 24, 96, 0/0; 48000/1024 -> 32, 96, 1/1; no 32 kHz row for this model id), default 48000/1024; an unknown pair is refused with the list (exit 2). The unit includes `dfn2_grids.h`, `ainr_product.h` and `dfn2_erb_file.h` from `stream/ainr`. |
 | `dfn_unit_partition.h` | The unit ERB partition used when no ERB matrices are given (fail-open smoke runs only); takes the grid. |
 | `dfn2_stage.py`, `dfn2_rate_adapter.py` | Python twins of the DFN2 library's per-frame pre/post functions (`lib/ainr/dfn2/dfn2_prepost`; the stream only sequences them) and of the rate bridge (`pipelines.dfn.dfn2_stage`, `pipelines.dfn.dfn2_rate_adapter`). The stage takes its lookahead pair from the model it is built with. |
 | `tests/` | C: `test_dfn_hop.c` (the hop against a hand-written recipe on a second `dfn2_stream` and `AinrBridge`, bit for bit, with a model that reads its windows; the plan and build refusals; the measured latency for `make test-pairs`; the model-call count per host hop; the bridge's own test is `stream/ainr/bridge/tests/test_ainr_bridge.c`, the spectrum entries' latency matrix, descriptor gate and refusals are `stream/ainr/dfn2/tests/freq_rows.c`), the shared `dfn_test_fixture.h` and `dfn_test_grid.h`, the only build-time grid selector left (`-DDFN2_GRID_KHZ=16\|32\|48`, `-DDFN2_SR` / `-DDFN2_N_FFT` / `-DDFN2_N_ERB` / `-DDFN2_DF_BINS`, `-DDFN2_MASK_LOOKAHEAD` / `-DDFN2_DF_LOOKAHEAD`): test programs size their arrays with its `DFN2_*` macros and hand `dfn_test_grid()` to the model stream and the bridge; product code never includes it. `test_dfn_test_grid_pin.py` compares its model numbers with `AINR/DeepFilterNet2/config.ini`. `check_pair_report.sh` is the `make test-pairs` gate. Python: `test_dfn2_stage.py`, `test_dfn2_rate_adapter.py` and the C-parity tests `test_dfn2_stage_c_parity.py`, `test_dfn2_rate_bridge_c_parity.py`; `dfn2_pairs.py` lists the lookahead pairs they run. |
@@ -59,15 +59,13 @@ the library accepts (`dfn2_grid_make()`). `DFN2_TEST_GRID_KHZ=16|32` (default 48
 not with the 0/0 of those rows in the example's table: it shows that the same code runs another grid (finite output, latency
 equal to the grid's lookahead, the bridge refusing it), not that a table row works.
 
-The stream config (`DFN2StreamConfig` in memory mode; `dfn_hop_pool_plan()` sets its `freq_only`, so the stream's pool holds no analysis, synthesis or PCM buffer) takes the ERB matrices as two borrowed pointers (`erb_fwd`, `erb_inv`; the inverse a partition of unity) and reads no file; the application loads and owns them and keeps them alive while the hop runs. A file whose values are not a partition of unity is refused when the pool is built (`pipeline init failed`, exit 1). The two mains
-read them from two raw little-endian float32 files, `--erb-fwd FILE` and `--erb-inv FILE` (both or neither): the
-`--runtime-bins` pair of `AINR/DeepFilterNet2/export_erb_matrix.py`, `erb_fwd.bin` bin-major `[n_bins][n_erb]` and `erb_inv.bin` band-major `[n_erb][n_bins]`, each exactly
-`n_bins * n_erb * 4` bytes (65,664 B for the 48 kHz / 1024 / 32-band model). A file that cannot be opened, or that holds fewer or more values than the
-model grid needs, is refused with a message (exit 1); a missing value, or one of the two options without the other, exits 2. Without the options a
-unit partition serves the fail-open smoke run, and the main prints a notice. The standalone board samples live outside this repo and
-read one file instead, `fb_<sr>_<n_erb>.bin` (the exporter's `erb_matrix.bin` renamed for its grid: int32 `n_bins`, int32 `n_bands`,
-forward, inverse, both bin-major); they transpose the inverse to band-major themselves at init, see
-`AINR/DeepFilterNet2/README.md`, "Choosing the grid".
+The stream config (`DFN2StreamConfig`; `dfn_hop_pool_plan()` sets its `freq_only`, so the stream's pool holds no analysis, synthesis or PCM buffer) takes the ERB matrices as two borrowed pointers (`erb_fwd`, `erb_inv`; the inverse a partition of unity) and reads no file; the application loads and owns them and keeps them alive while the hop runs. A file whose values are not a partition of unity is refused when the pool is built (`pipeline init failed`, exit 1). The two mains
+read them from one file, `--erb FILE`: the `fb_<sr>_<n_erb>.bin` the board samples read too (the exporter's `erb_matrix.bin`
+of `export_erb_matrix.py --output-dir DIR --format bin`, renamed for its grid: int32 `n_bins`, int32 `n_bands`, forward, inverse, both bin-major;
+65,664 B per matrix for the 48 kHz / 1024 / 32-band model). `dfn2_erb_file_load()` (`stream/ainr/dfn2_erb_file.h`) checks the header against the
+model grid, requires the file to end after the two matrices and transposes the inverse to band-major. A file that cannot be opened or does not
+match the grid is refused with a message (exit 1); a missing value exits 2. Without the option a unit partition serves the fail-open smoke run,
+and the main prints a notice. See `AINR/DeepFilterNet2/README.md`, "Choosing the grid".
 
 `mono/aec_dfn_res/Makefile` and `4ch/aec_bf_dfn_res/Makefile` are thin forwarders:
 `make -C pipelines/mono/aec_dfn_res test` and `make -C pipelines/4ch/aec_bf_dfn_res test` build
@@ -126,9 +124,8 @@ DFN2 board sample does not go through this folder: it picks the grid and the pai
   `lib/ainr/dfn2` (grid, pre/post class, model I/O descriptor; the ERB matrices are the application's data),
   `stream/ainr/dfn2` (`dfn2_stream`, the model stream the hop drives) and `stream/ainr/bridge` (`ainr_bridge`).
   A unit that includes `dfn_hop.h` or `dfn_hop_pool.h` compiles with
-  `-I stream/ainr/dfn2 -I stream/ainr/bridge -I stream/common` (`DFN_HOP_INC` in the two Makefiles);
-  `dfn2_stream.o` and `ainr_bridge.o` are members of `libaudio_pipeline_dfn.a` (the `pipelines/` and `pipelines/4ch/` builds)
-  (built with `-DDFN2_STREAM_NO_STDIO` under `NO_STDIO=1`, so the archive holds no file loader).
+  `-I stream/ainr/dfn2 -I stream/ainr/bridge -I stream/common -I stream/ainr` (`DFN_HOP_INC` in the two Makefiles; `-I stream/ainr` is for `dfn2_grids.h`, `ainr_product.h` and `dfn2_erb_file.h`);
+  `dfn2_stream.o` and `ainr_bridge.o` are members of `libaudio_pipeline_dfn.a` (the `pipelines/` and `pipelines/4ch/` builds).
 - The 4-channel example also needs the array instance of lib/aec (`aec.h`, `AecConfig.n_mics = 4`, in `libaec.a`) and the sample objects
   `array_sample_beam` and `array_sample_driver` in `4ch/`, which are linked into the program and are not part of
   any archive.

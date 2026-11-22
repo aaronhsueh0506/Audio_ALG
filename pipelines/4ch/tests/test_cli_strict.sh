@@ -1,6 +1,6 @@
 #!/bin/bash
 # test_cli_strict.sh <bin_dir> -- the command lines of 4ch_static and 4ch_external_static (and,
-# for the option scan they share with it, the file options of 4ch_raw and --erb-fwd/--erb-inv of
+# for the option scan they share with it, the file options of 4ch_raw and --erb of
 # 4ch_aec_bf_dfn_res).
 #
 # Every numeric option takes a whole decimal number or the program exits 2 (a command-line
@@ -98,8 +98,7 @@ for flag in "${FLAGS[@]}"; do
         expect 2 "$RAW" "$opt" "$flag" --mic-raw a --ref-raw b --output-raw /dev/null --sample-rate 16000
         expect 2 "$RAW" --print-mem-size "$opt" "$flag"
     done
-    expect 2 "$DFN4" --erb-fwd "$flag" --erb-inv x
-    expect 2 "$DFN4" --erb-inv "$flag" --erb-fwd x
+    expect 2 "$DFN4" --erb "$flag"
 done
 # The reproducer: --aec-level, --nr-level and --nr-preset must not take --no-res as their level.
 for opt in --aec-level --nr-level --nr-preset; do
@@ -111,18 +110,33 @@ done
 # when the other options are all there and the file would otherwise be opened.
 expect 2 "$RAW" --vad-u8 --print-mem-size --mic-raw a --ref-raw b --output-raw /dev/null --sample-rate 16000
 expect 2 "$RAW" --mic-raw --print-mem-size --ref-raw b --output-raw /dev/null --sample-rate 16000
-expect 2 "$DFN4" --erb-fwd --cng --erb-inv x
-# One ERB matrix file alone is a command-line error; a file that cannot be opened, or holds fewer or
-# more float32 values than the default model grid needs (513 bins x 32 bands), fails the run (exit 1).
-expect 2 "$DFN4" --erb-fwd x
-expect 2 "$DFN4" --erb-inv x
+expect 2 "$DFN4" --erb --cng
+# --erb names the board's fb_<sr>_<n_erb>.bin: int32 n_bins, int32 n_erb (513 and 32 for the default model
+# grid), then the forward and the inverse table, both bin-major float32. A file that cannot be opened, has
+# other header dimensions, fewer or more floats than the grid needs, or a byte after the tables fails the run
+# (exit 1); a well-formed file with a partition-of-unity inverse runs to completion.
 ERB_TMP=$(mktemp -d)
 trap 'rm -rf "$ERB_TMP"' EXIT
-head -c 65660 /dev/zero > "$ERB_TMP/fewer.bin"
-head -c 65668 /dev/zero > "$ERB_TMP/more.bin"
-expect_msg 1 "cannot open" "$DFN4" --erb-fwd "$ERB_TMP/absent_fwd.bin" --erb-inv "$ERB_TMP/absent_inv.bin"
-expect_msg 1 "holds fewer than" "$DFN4" --erb-fwd "$ERB_TMP/fewer.bin" --erb-inv "$ERB_TMP/fewer.bin"
-expect_msg 1 "holds more than" "$DFN4" --erb-fwd "$ERB_TMP/more.bin" --erb-inv "$ERB_TMP/more.bin"
+erb_header() { printf '\001\002\000\000\040\000\000\000'; }
+erb_table() {   # one band per bin: a one-hot row of 32 float32 values, 1.0f at the bin's band
+    local k b i
+    for ((k = 0; k < 513; k++)); do
+        b=$((k * 32 / 513))
+        for ((i = 0; i < 32; i++)); do
+            if [ "$i" -eq "$b" ]; then printf '\000\000\200\077'; else printf '\000\000\000\000'; fi
+        done
+    done
+}
+erb_table > "$ERB_TMP/table.bin"
+{ erb_header; cat "$ERB_TMP/table.bin" "$ERB_TMP/table.bin"; } > "$ERB_TMP/good.bin"
+{ erb_header; cat "$ERB_TMP/table.bin" "$ERB_TMP/table.bin"; printf '\000'; } > "$ERB_TMP/more.bin"
+head -c 131332 "$ERB_TMP/good.bin" > "$ERB_TMP/fewer.bin"
+{ printf '\000\002\000\000\040\000\000\000'; tail -c +9 "$ERB_TMP/good.bin"; } > "$ERB_TMP/header.bin"
+expect_msg 1 "not a readable ERB file" "$DFN4" --erb "$ERB_TMP/absent.bin"
+expect_msg 1 "not a readable ERB file" "$DFN4" --erb "$ERB_TMP/fewer.bin"
+expect_msg 1 "not a readable ERB file" "$DFN4" --erb "$ERB_TMP/more.bin"
+expect_msg 1 "not a readable ERB file" "$DFN4" --erb "$ERB_TMP/header.bin"
+expect 0 "$DFN4" --erb "$ERB_TMP/good.bin"
 
 expect 2 "$STATIC" --bogus
 expect 2 "$STATIC" 16000
