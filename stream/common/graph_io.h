@@ -47,7 +47,7 @@ typedef struct GraphIoRow {
     unsigned int signal[GRAPH_IO_MAX_SIGNALS][4];
     unsigned int head[GRAPH_IO_MAX_HEADS][4];
     unsigned int state[GRAPH_IO_MAX_STATES][4];
-    const char  *file;   /* graph file name without a directory, <model>[_<variant>]_<sr / 1000>k_fft<fft>_n<N>.bin */
+    const char  *file;   /* graph file path relative to the sample's model directory */
 } GraphIoRow;
 
 /* A row expanded to the port lists stream_check_ports() takes. */

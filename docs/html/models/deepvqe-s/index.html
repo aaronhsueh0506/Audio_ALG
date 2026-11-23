@@ -14,19 +14,19 @@
 
 <h2>支援的組態</h2>
 <table>
-<thead><tr><th>sr / fft</th><th>hop_in → N</th><th>graph 檔（<code>graph_io_deepvqes.h</code>）</th></tr></thead>
+<thead><tr><th>sr / fft</th><th>hop_in → N</th><th>graph（<code>graph_io_deepvqes.h</code>）</th></tr></thead>
 <tbody>
-<tr><th>16000 / 256</th><td>128 → 1</td><td><code>deepvqes_16k_fft256_n1.bin</code></td></tr>
+<tr><th>16000 / 256</th><td>128 → 1</td><td>有列</td></tr>
 <tr><th>16000 / 256</th><td>1024 → 8</td><td>沒有列；函式庫接受，sample 在開圖前拒絕</td></tr>
-<tr><th>16000 / 512</th><td>256 → 1</td><td><code>deepvqes_16k_fft512_n1.bin</code></td></tr>
-<tr><th>16000 / 512</th><td>1024 → 4</td><td><code>deepvqes_16k_fft512_n4.bin</code></td></tr>
+<tr><th>16000 / 512</th><td>256 → 1</td><td>有列</td></tr>
+<tr><th>16000 / 512</th><td>1024 → 4</td><td>有列</td></tr>
 <tr><th>16000 / 512</th><td>2048 → 8</td><td>沒有列；函式庫接受，sample 在開圖前拒絕</td></tr>
-<tr><th>48000 / 1024</th><td>512 → 1</td><td><code>deepvqes_48k_fft1024_n1.bin</code></td></tr>
-<tr><th>48000 / 1024</th><td>1024 → 2</td><td><code>deepvqes_48k_fft1024_n2.bin</code></td></tr>
+<tr><th>48000 / 1024</th><td>512 → 1</td><td>有列</td></tr>
+<tr><th>48000 / 1024</th><td>1024 → 2</td><td>有列</td></tr>
 </tbody></table>
 
 <p>函式庫接受模型 stream 收的任何 N（1..64），N 超出範圍回 <code>AIAEC_ERR_FRAMES_PER_CALL</code>；哪個 N 有 graph 是 sample 的 <code>graph_io_deepvqes.h</code> 表：沒有列的組態（<code>GRAPH_IO_ERR_NO_ROW</code>）由 sample 在任何 SDK 呼叫之前拒絕。表外的 <code>(sr, fft)</code> 回 <code>AIAEC_ERR_GRID</code>；不是模型 hop 倍數的 <code>hop_in</code>（例如 16 kHz／256 的 129）回 <code>AIAEC_ERR_IN_HOP</code>。FFT 512、1024 與 256 使用同一個迴圈。48 kHz 的 AEC 前端格點是 48k／1024（AEC 產品格點）。</p>
-<p>板端 graph 檔：每列一個檔，名稱如上表，sample 開 <code>SAMPLE_MODEL_DIR "/" cfg.file</code>（預設 <code>/mnt/sd/audio_model/16x16</code>；量化資料夾是 sample 的選擇），SD 卡上的檔名要與表一致。每個檔只能在它自己的 grid 與 N 跑：另一個 grid 的 graph 在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_deepvqes.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256，<code>--fft-size 512 --hop-in 1024</code> 選 16 kHz／512 的 N=4（一包 1024 點）。16 kHz／256 只有 N=1 的列：<code>--hop-in 1024</code> 在 fft 256 是 N=8，沒有列，sample 在開圖前拒絕。</p>
+<p>板端 graph 檔：每個模型一個檔，所有列共用 <code>deepvqes/nvt_model.bin</code>，sample 開 <code>SAMPLE_MODEL_DIR "/" cfg.file</code>（預設 <code>/mnt/sd/audio_model/16x16</code>；量化資料夾是 sample 的選擇）。卡上的檔是哪個 grid 與 N 匯出的，就只能跑那個組態：其他組態在開圖後被 sample 的 <code>graph_io_check_ports()</code> 拒絕，不會執行任何推論。sample <code>alg_ai3_deepvqes.c</code> 的預設命令列（不帶選項，等於 <code>--sample-rate 16000 --fft-size 256 --hop-in 128</code>）是 16 kHz／fft 256／<code>hop_in</code> 128（N=1，129 bins，D = 63）；<code>--fft-size 512</code> 選 16 kHz／512／256，<code>--fft-size 512 --hop-in 1024</code> 選 16 kHz／512 的 N=4（一包 1024 點）。16 kHz／256 只有 N=1 的列：<code>--hop-in 1024</code> 在 fft 256 是 N=8，沒有列，sample 在開圖前拒絕。</p>
 
 <h2>建置與連結</h2>
 <p>DeepVQE-S 的單模型產品用 <code>AIAEC_MODEL=deepvqe</code> 建置，連結 <code>libaiaec.a</code>、該款 backend <code>libdeepvqe_stream.a</code> 與 audiolib 的 <code>libaudio_common.a</code>（與本庫同一目標工具鏈建置）。路徑一律用 <code>print-lib-path</code> 查，且查詢要帶與建置相同的 <code>AIAEC_MODEL</code>、<code>SIMD</code>、<code>CC</code>、<code>EXTRA_CFLAGS</code>；不帶 <code>AIAEC_MODEL</code> 會查到預設 <code>both</code> 版的路徑。</p>
@@ -41,7 +41,7 @@ cc app.c -Istream/aiaec -Istream/common -I$AUDIOLIB/common \
 <p>漏掉 <code>libdeepvqe_stream.a</code> 會缺 <code>deepvqe_stream_*</code>。預設 <code>AIAEC_MODEL=both</code> 的 <code>libaiaec.a</code> 同時引用兩款 backend，只連 DeepVQE-S 的 backend 會缺 <code>ulcnet_stream_*</code>。</p>
 
 <h2 id="graph-wiring">Graph 接線</h2>
-<p><code>aiaec_init()</code> 不回報任何東西（沒有檔名、沒有埠表）。每個已交付 graph 的完整接線——訊號與 head 的 shape、16 組 state 的 shape——放在 <code>stream/aiaec/graph_io_deepvqes.h</code>，每個登錄的 (sr, fft, N) 一列，列旁註明所對應的匯出器，並帶中性的 graph 檔名（<code>GraphIoConfig.file</code>）；共用的接線程式 <code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）負責列的展開、state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對。兩者與 SDK 無關、只有標頭，<code>aiaec.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/aiaec</code>並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或開圖後埠與該列不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
+<p><code>aiaec_init()</code> 不回報任何東西（沒有檔名、沒有埠表）。每個已交付 graph 的完整接線——訊號與 head 的 shape、16 組 state 的 shape——放在 <code>stream/aiaec/graph_io_deepvqes.h</code>，每個登錄的 (sr, fft, N) 一列，列旁註明所對應的匯出器，並帶模型的 graph 檔路徑（<code>GraphIoConfig.file</code>）；共用的接線程式 <code>stream/common/graph_io.h</code>（由 <code>make -C stream/common test-graph-io</code> 測試）負責列的展開、state 配對、開圖後的埠檢查、input buffer 大小與送件前的核對。兩者與 SDK 無關、只有標頭，<code>aiaec.h</code> 不引用，函式庫不含接線；sample 加 <code>-I stream/common -I stream/aiaec</code>並編譯 <code>stream/common/stream_bind.c</code>。沒有對應列的組態，或開圖後埠與該列不符，由 sample 的啟動檢查在任何 SDK 呼叫之前拒絕。</p>
 <p>圖的埠順序只有一條規則：輸入 = 訊號輸入，再接 state 輸入；輸出 = head 輸出，再接 state 輸出；第 k 組 state 是輸入 <code>signal_in_count + k</code> 與輸出 <code>head_out_count + k</code>，兩端同形狀。DeepVQE-S：<code>signal_in_count</code> 2（mic、far）、<code>head_out_count</code> 1（CCM taps）、16 組 state，所以輸入 18 個、輸出 17 個，N=1 與 N&gt;1 相同。sample 依數量迴圈處理，不比對名稱。N 改變 mic／far 與 CCM head 的時間軸，不改埠順序；state 的 shape 隨 grid 與延遲深度 D = ceil(0.5 s / hop) 而變：</p>
 <table>
 <thead><tr><th>組態</th><th>mic、far（輸入 0、1）</th><th>CCM taps（輸出 0）</th><th>state</th></tr></thead>

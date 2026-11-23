@@ -205,13 +205,13 @@ static void check_row_table(void)
     for (i = 0; i < GRAPH_IO_DFN2_ROW_COUNT; ++i) {
         const GraphIoDfn2Row *r = &GRAPH_IO_DFN2_ROWS[i];
         char want[96];
-        const char *tag = r->row.model == GRAPH_IO_DFN2_LITE ? "_lite"
-                          : (r->mask_lookahead == 0 && r->row.sample_rate != 16000) ? "_l0" : "";
+        const char *dir = r->row.model == GRAPH_IO_DFN2_LITE ? "dfn2_lite"
+                          : (r->mask_lookahead == 0 && r->row.sample_rate != 16000) ? "dfn2_l0" : "dfn2";
         int n_erb = 0;
         const char *erb_file;
         GraphIoConfig c;
 
-        snprintf(want, sizeof want, "dfn2%s_%dk_fft%d_n%d.bin", tag, r->row.sample_rate / 1000, r->row.fft, r->row.n);
+        snprintf(want, sizeof want, "%s/nvt_model_%dk_n%d.bin", dir, r->row.sample_rate / 1000, r->row.n);
         CHECK(r->row.file && strcmp(r->row.file, want) == 0, "row %d: file %s, want %s", i, r->row.file ? r->row.file : "(null)", want);
         CHECK(graph_io_dfn2_row(i, &c) == GRAPH_IO_OK && c.file && strcmp(c.file, r->row.file) == 0, "row %d expands with its file", i);
         snprintf(want, sizeof want, "fb_%d_%d.bin", r->row.sample_rate, (int)r->row.signal[0][3]);

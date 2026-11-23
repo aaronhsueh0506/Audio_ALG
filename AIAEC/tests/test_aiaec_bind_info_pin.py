@@ -26,7 +26,7 @@ The graph rows are compared with the same exports: ``make -C stream/aiaec graph-
 the two model-config headers (AIAEC_GRAPH_IO_DUMPER compares another build), and each row must equal the fresh
 export: layout version, port counts and order, every input and output shape, the state names and their order, each
 state's shape at both ends, the state output name ``<input>_out`` and frame_reset as the last signal (Align-ULCNet
-N > 1) and the graph file name ``<model>_<sr/1000>k_fft<fft>_n<N>.bin`` (model deepvqes or alignulcnet). The row set
+N > 1) and the graph file ``<model>/nvt_model.bin`` (model deepvqes or alignulcnet), one per model. The row set
 must be exactly the exported cases, and the Align-ULCNet logit window of every row must equal the exporter's
 SCORE_WINDOW_BY_GRID entry for its grid.
 """
@@ -387,13 +387,8 @@ GRAPH_FILE_MODEL = {'deepvqe_s': 'deepvqes', 'align_ulcnet': 'alignulcnet'}
 
 
 @pytest.mark.parametrize('case', CASES, ids=_case_id)
-def test_sample_row_names_its_graph_file_by_the_rule(case, graph_io_rows):
-    """The file name carries the model, the grid and N: <model>_<sr/1000>k_fft<fft>_n<N>.bin, no directory."""
-    model_name, sr, fft, n = case
-    want = '%s_%dk_fft%d_n%d.bin' % (GRAPH_FILE_MODEL[model_name], sr // 1000, fft, n)
-    assert graph_io_rows[_row_id(case)]['file'] == want
-
-
-def test_every_sample_row_has_a_distinct_graph_file(graph_io_rows):
-    files = [row['file'] for row in graph_io_rows.values()]
-    assert len(set(files)) == len(files)
+def test_sample_row_names_the_model_graph_file(case, graph_io_rows):
+    """Every row of a model names its one graph file, <model>/nvt_model.bin; the port check after opening refuses a
+    graph of another grid or N."""
+    model_name = case[0]
+    assert graph_io_rows[_row_id(case)]['file'] == '%s/nvt_model.bin' % GRAPH_FILE_MODEL[model_name]

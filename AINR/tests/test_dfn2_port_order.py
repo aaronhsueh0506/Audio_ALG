@@ -263,11 +263,11 @@ GRAPH_IO_CASES = [
 ]
 
 
-def _graph_file(mask_only, sr, fft, mask_la, n):
-    """dfn2[_l0|_lite]_<sr/1000>k_fft<fft>_n<N>.bin: the mask_lookahead 0 model has its own files except at 16 kHz,
+def _graph_file(mask_only, sr, mask_la, n):
+    """dfn2[_l0|_lite]/nvt_model_<sr/1000>k_n<N>.bin: the mask_lookahead 0 model has its own directory except at 16 kHz,
     whose graphs it shares with the full model."""
     tag = '_lite' if mask_only else '_l0' if mask_la == 0 and sr != 16000 else ''
-    return 'dfn2%s_%dk_fft%d_n%d.bin' % (tag, sr // 1000, fft, n)
+    return 'dfn2%s/nvt_model_%dk_n%d.bin' % (tag, sr // 1000, n)
 
 
 @pytest.fixture(scope='module')
@@ -351,7 +351,7 @@ def test_sample_row_equals_a_fresh_export(case, graph_io_rows, graph_io_exports)
 
     assert row['layout'] == metadata['state_layout_version']
     assert row['mask_lookahead'] == mask_la
-    assert row['file'] == _graph_file(mask_only, sr, fft, mask_la, n)
+    assert row['file'] == _graph_file(mask_only, sr, mask_la, n)
     assert row['erb_file'] == 'fb_%d_%d.bin' % (sr, n_erb)
     assert in_names == SIGNALS + states and out_names == heads + [name + '_out' for name in states]
     assert row['counts'] == (len(SIGNALS), len(heads), len(in_names), len(out_names))

@@ -215,9 +215,10 @@ DFN2, Align-ULCNet and DeepVQE-S samples synthesize with `AC_OLA_ACCUMULATE`.
 A sample supplies `sr`, `fft` and `hop_in` (and DFN2's ERB tables); the stream selects the rest. For DFN2 that is the grid row (the model's
 `df_order`, lookahead pair, `frames_per_call` and the normaliser values of `config.ini`). The stream accepts any N of 1..64 (`*_ERR_FRAMES_PER_CALL`
 beyond that); a configuration without a `graph_io_<model>.h` row has no graph and is refused by the sample (`GRAPH_IO_ERR_NO_ROW`) before any SDK call.
-Each row carries the graph's file name, `<model>_<sr/1000>k_fft<fft>_n<N>.bin` (for example `deepvqes_16k_fft256_n1.bin`, `dfn2_48k_fft1024_n2.bin`;
-the `mask_lookahead` 0 DFN2 model has its own `dfn2_l0_*` files, the lite model `dfn2_lite_*`): the sample opens `SAMPLE_MODEL_DIR "/" cfg.file`
-(sample macro, default `/mnt/sd/audio_model/16x16`; the quantization folder is the sample's choice), and the files on the SD card use these names.
+Each row carries the graph file's path under the model directory: DFN2 `dfn2/nvt_model_<sr/1000>k_n<N>.bin` (the `mask_lookahead` 0 model
+under `dfn2_l0/`, the lite model under `dfn2_lite/`), DeepVQE-S and Align-ULCNet one file per model, `deepvqes/nvt_model.bin` and
+`alignulcnet/nvt_model.bin` (the port check after opening refuses a graph of another grid or N). The sample opens `SAMPLE_MODEL_DIR "/" cfg.file`
+(sample macro, default `/mnt/sd/audio_model/16x16`; the quantization folder is the sample's choice).
 
 The board registers no recurrent state (the DFN2 `gru_hidden` / `df_convp_history` pairs and the Align-ULCNet and DeepVQE-S state views
 stay NULL / 0): the accelerator keeps it. A sample therefore reads the library's state generation before every accelerator run

@@ -2,7 +2,7 @@
  * real pre calls (PCM, _freq) for the product this binary is built for (-DAIAEC_PRODUCT_MODEL_ID: 1 DeepVQE-S,
  * 10 Align-ULCNet): every SUBMIT block passes GRAPH_IO_CHECK_WORK against the row of its configuration. Every row is a
  * configuration the library accepts; a configuration it accepts without a row (N in the model's range) is
- * GRAPH_IO_ERR_NO_ROW. Every row names its graph file <model>_<sr / 1000>k_fft<fft>_n<N>.bin. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
+ * GRAPH_IO_ERR_NO_ROW. Every row names the model's one graph file <model>/nvt_model.bin. Align-ULCNet also runs an event hop: N = 1 is BYPASS with
  * an empty work, N = 4 at hop 2 puts frame_reset 0010 in the last signal. A SUBMIT work has pairwise disjoint
  * buffers and empty slots beyond its signals. The rows
  * against a fresh export are pinned by AIAEC/tests/test_aiaec_bind_info_pin.py. */
@@ -22,13 +22,13 @@
 #define FIND(sr, fft, n, mc) graph_io_alignulcnet_find(sr, fft, n, mc)
 #define ROW_COUNT GRAPH_IO_ALIGNULCNET_ROW_COUNT
 #define IS_ALIGN 1
-#define MODEL_FILE_NAME "alignulcnet"
+#define MODEL_FILE "alignulcnet/nvt_model.bin"
 #define ROW_AT(i, mc) graph_io_alignulcnet_row(i, mc)
 #else
 #define FIND(sr, fft, n, mc) graph_io_deepvqes_find(sr, fft, n, mc)
 #define ROW_COUNT GRAPH_IO_DEEPVQES_ROW_COUNT
 #define IS_ALIGN 0
-#define MODEL_FILE_NAME "deepvqes"
+#define MODEL_FILE "deepvqes/nvt_model.bin"
 #define ROW_AT(i, mc) graph_io_deepvqes_row(i, mc)
 #endif
 
@@ -150,19 +150,17 @@ int main(void)
     CHECK(GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET == ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION,
           "Align-ULCNet packet layout: table %d, ulcnet_model_io.h %d", (int)GRAPH_IO_ALIGNULCNET_LAYOUT_PACKET,
           (int)ULCNET_MODEL_IO_PACKET_LAYOUT_VERSION);
-    /* Every row names its graph file by the rule, and a row is a configuration the library accepts. */
+    /* Every row names the model's graph file, and a row is a configuration the library accepts. */
     for (ri = 0; ri < ROW_COUNT; ++ri) {
         GraphIoConfig rc_cfg;
-        char want[64];
         AiaecConfig rcfg;
         StreamMemReq rreq;
         int grc = ROW_AT(ri, &rc_cfg);
 
         CHECK(grc == GRAPH_IO_OK, "row %d: expand rc %d", ri, grc);
         if (grc != GRAPH_IO_OK) continue;
-        snprintf(want, sizeof want, MODEL_FILE_NAME "_%dk_fft%d_n%d.bin", rc_cfg.sample_rate / 1000, rc_cfg.fft, rc_cfg.n);
-        CHECK(rc_cfg.file != NULL && strcmp(rc_cfg.file, want) == 0, "row %d (sr %d fft %d N %d): file %s, want %s", ri,
-              rc_cfg.sample_rate, rc_cfg.fft, rc_cfg.n, rc_cfg.file ? rc_cfg.file : "(null)", want);
+        CHECK(rc_cfg.file != NULL && strcmp(rc_cfg.file, MODEL_FILE) == 0, "row %d (sr %d fft %d N %d): file %s, want %s", ri,
+              rc_cfg.sample_rate, rc_cfg.fft, rc_cfg.n, rc_cfg.file ? rc_cfg.file : "(null)", MODEL_FILE);
         rcfg.sr = rc_cfg.sample_rate; rcfg.fft = rc_cfg.fft; rcfg.hop_in = rc_cfg.n * (rc_cfg.fft / 2);
         CHECK(aiaec_get_mem_size(&rcfg, &rreq) == AIAEC_OK, "row %d: the library refuses its configuration", ri);
     }

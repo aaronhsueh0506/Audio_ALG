@@ -14,6 +14,9 @@ extern "C" {
 /* Layout version: DEEPVQE_PREPOST_LAYOUT_VERSION of deepvqe_prepost.h. */
 #define GRAPH_IO_DEEPVQES_LAYOUT 4
 
+/* One graph file for every row; the sample's port check after opening refuses a graph of another grid or N. */
+#define GRAPH_IO_DEEPVQES_FILE "deepvqes/nvt_model.bin"
+
 /* State order (named state_<name> except h_gru): align_key_ring, align_value_ring, align_score_history, ccm_up_history,
  * far1_history, far2_history, h_gru, mic1_history .. mic4_history, res2_history, res3_history, up1_history ..
  * up3_history. Each row follows the grid's AIAEC/DeepVQE_S/config_<grid>.ini. */
@@ -25,7 +28,7 @@ static const GraphIoRow GRAPH_IO_DEEPVQES_ROWS[] = {
       { {1, 8, 63, 33}, {1, 24, 63, 33}, {1, 8, 9, 63}, {1, 32, 4, 65}, {1, 2, 4, 129}, {1, 8, 4, 65},
         {1, 1, 1, 256}, {1, 2, 4, 129}, {1, 16, 4, 65}, {1, 64, 4, 33}, {1, 56, 4, 17}, {1, 32, 4, 33},
         {1, 40, 4, 17}, {1, 32, 4, 33}, {1, 40, 4, 17}, {1, 24, 4, 9} },
-      "deepvqes_16k_fft256_n1.bin" },
+      GRAPH_IO_DEEPVQES_FILE },
     /* 16 kHz / fft 512 (257 bins, D 32), N = 1 */
     { GRAPH_IO_DEEPVQES, 16000, 512, 1, GRAPH_IO_DEEPVQES_LAYOUT, 2, 1, 16,
       { {1, 2, 1, 257}, {1, 2, 1, 257} },
@@ -33,7 +36,7 @@ static const GraphIoRow GRAPH_IO_DEEPVQES_ROWS[] = {
       { {1, 4, 32, 65}, {1, 24, 32, 65}, {1, 4, 5, 32}, {1, 32, 4, 129}, {1, 2, 4, 257}, {1, 8, 4, 129},
         {1, 1, 1, 192}, {1, 2, 4, 257}, {1, 16, 4, 129}, {1, 64, 4, 65}, {1, 56, 4, 33}, {1, 32, 4, 65},
         {1, 40, 4, 33}, {1, 32, 4, 65}, {1, 40, 4, 33}, {1, 24, 4, 17} },
-      "deepvqes_16k_fft512_n1.bin" },
+      GRAPH_IO_DEEPVQES_FILE },
     /* 16 kHz / fft 512, N = 4 */
     { GRAPH_IO_DEEPVQES, 16000, 512, 4, GRAPH_IO_DEEPVQES_LAYOUT, 2, 1, 16,
       { {1, 2, 4, 257}, {1, 2, 4, 257} },
@@ -41,7 +44,7 @@ static const GraphIoRow GRAPH_IO_DEEPVQES_ROWS[] = {
       { {1, 4, 32, 65}, {1, 24, 32, 65}, {1, 4, 5, 32}, {1, 32, 4, 129}, {1, 2, 4, 257}, {1, 8, 4, 129},
         {1, 1, 1, 192}, {1, 2, 4, 257}, {1, 16, 4, 129}, {1, 64, 4, 65}, {1, 56, 4, 33}, {1, 32, 4, 65},
         {1, 40, 4, 33}, {1, 32, 4, 65}, {1, 40, 4, 33}, {1, 24, 4, 17} },
-      "deepvqes_16k_fft512_n4.bin" },
+      GRAPH_IO_DEEPVQES_FILE },
     /* 48 kHz / fft 1024 (513 bins, D 47), N = 1 */
     { GRAPH_IO_DEEPVQES, 48000, 1024, 1, GRAPH_IO_DEEPVQES_LAYOUT, 2, 1, 16,
       { {1, 2, 1, 513}, {1, 2, 1, 513} },
@@ -49,7 +52,7 @@ static const GraphIoRow GRAPH_IO_DEEPVQES_ROWS[] = {
       { {1, 4, 47, 129}, {1, 24, 47, 129}, {1, 4, 5, 47}, {1, 32, 4, 257}, {1, 2, 4, 513}, {1, 8, 4, 257},
         {1, 1, 1, 192}, {1, 2, 4, 513}, {1, 16, 4, 257}, {1, 64, 4, 129}, {1, 56, 4, 65}, {1, 32, 4, 129},
         {1, 40, 4, 65}, {1, 32, 4, 129}, {1, 40, 4, 65}, {1, 24, 4, 33} },
-      "deepvqes_48k_fft1024_n1.bin" },
+      GRAPH_IO_DEEPVQES_FILE },
     /* 48 kHz / fft 1024, N = 2 */
     { GRAPH_IO_DEEPVQES, 48000, 1024, 2, GRAPH_IO_DEEPVQES_LAYOUT, 2, 1, 16,
       { {1, 2, 2, 513}, {1, 2, 2, 513} },
@@ -57,7 +60,7 @@ static const GraphIoRow GRAPH_IO_DEEPVQES_ROWS[] = {
       { {1, 4, 47, 129}, {1, 24, 47, 129}, {1, 4, 5, 47}, {1, 32, 4, 257}, {1, 2, 4, 513}, {1, 8, 4, 257},
         {1, 1, 1, 192}, {1, 2, 4, 513}, {1, 16, 4, 257}, {1, 64, 4, 129}, {1, 56, 4, 65}, {1, 32, 4, 129},
         {1, 40, 4, 65}, {1, 32, 4, 129}, {1, 40, 4, 65}, {1, 24, 4, 33} },
-      "deepvqes_48k_fft1024_n2.bin" },
+      GRAPH_IO_DEEPVQES_FILE },
 };
 
 #define GRAPH_IO_DEEPVQES_ROW_COUNT \

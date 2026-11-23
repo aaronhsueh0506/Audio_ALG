@@ -35,8 +35,8 @@ N>1 在任何 mask lookahead 都可用：full 的 48 kHz／1024 有 N = 1、2 �
 
 ## Graph 與 ERB 檔
 
-- `graph_io_dfn2.h` 的每一列帶一個中性的 graph 檔名（`GraphIoConfig.file`），形如 `<model>_<sr/1000>k_fft<fft>_n<N>.bin`：`dfn2_16k_fft256_n1.bin`、`dfn2_16k_fft256_n8.bin`、`dfn2_48k_fft1024_n1.bin`、`dfn2_48k_fft1024_n2.bin`；mask_lookahead 0 的模型自己的 `dfn2_l0_48k_fft1024_n1.bin`、`dfn2_l0_48k_fft1024_n2.bin`、`dfn2_l0_32k_fft512_n1.bin`、`dfn2_l0_32k_fft512_n4.bin`（其 16 kHz 兩列與 full 同檔）；lite 的 `dfn2_lite_48k_fft1024_n1.bin`。DeepVQE-S 與 Align-ULCNet 同一規則（`deepvqes_16k_fft256_n1.bin`、`alignulcnet_16k_fft512_n4.bin` 等，見 `graph_io_deepvqes.h`、`graph_io_alignulcnet.h`）。
-- 檔案路徑與量化資料夾是 sample 的：sample 開 `SAMPLE_MODEL_DIR "/" cfg.file`（巨集，預設 `/mnt/sd/audio_model/16x16`）。SD 卡上的檔案必須使用這些檔名；不同量化放在不同資料夾，檔名相同。
+- `graph_io_dfn2.h` 的每一列帶 graph 檔在模型目錄下的相對路徑（`GraphIoConfig.file`）：`dfn2/nvt_model_16k_n1.bin`、`dfn2/nvt_model_16k_n8.bin`、`dfn2/nvt_model_48k_n1.bin`、`dfn2/nvt_model_48k_n2.bin`；mask_lookahead 0 的模型自己的 `dfn2_l0/nvt_model_48k_n1.bin`、`dfn2_l0/nvt_model_48k_n2.bin`、`dfn2_l0/nvt_model_32k_n1.bin`、`dfn2_l0/nvt_model_32k_n4.bin`（其 16 kHz 兩列與 full 同檔）；lite 的 `dfn2_lite/nvt_model_48k_n1.bin`。DeepVQE-S 與 Align-ULCNet 每個模型一個檔（`deepvqes/nvt_model.bin`、`alignulcnet/nvt_model.bin`，見 `graph_io_deepvqes.h`、`graph_io_alignulcnet.h`），開圖後的埠檢查拒絕其他 grid 或 N 的 graph。
+- 檔案路徑與量化資料夾是 sample 的：sample 開 `SAMPLE_MODEL_DIR "/" cfg.file`（巨集，預設 `/mnt/sd/audio_model/16x16`）。不同量化放在不同資料夾，檔名相同。
 - ERB 矩陣檔依 `(sr, n_erb)` 命名，與量化無關，形如 `fb_<sr>_<n_erb>.bin`（`graph_io_dfn2_erb_file(model, sr, fft, &n_erb)` 給名稱，`ainr_init()` 之前就要）。sample 以 `stream/ainr/dfn2_erb_file.h` 的 `dfn2_erb_file_load()` 從 `SAMPLE_ERB_DIR`（預設 `/mnt/sd/dfn2_blobs`）讀入，把兩個表指標放進 `AinrConfig`。格式見 `docs/html/models/dfn2/reference/grid.html` 的 ERB 一節（`export_erb_matrix.py --format bin` 的 `erb_matrix.bin` 改名）。
 - 登錄的 graph 是否已交付、量化版本是否與該列的 grid 與 N 相符，本庫沒有核對紀錄。full 16 kHz／256／N=8 與 mask_lookahead 0 模型的 32 kHz、48 kHz 各列都只有檔名；交付與是否相符待交付端確認。
 

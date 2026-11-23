@@ -83,7 +83,7 @@ mask head does not depend on the deep-filter decoder, so the same checkpoint can
 - Board sample: `alg_ai3_dfn_lite.c` (`audio_sample/`, outside this repo) is the sample for this graph: a thin wrapper that
   defines `DFN2_MASK_ONLY` and includes the full model's `alg_ai3_dfn.c`. Build it and every library unit with `-DDFN2_MASK_ONLY`, in an object directory of its own
   (objects of the other variant do not link: the link symbol is `dfn2_variant_mask_only`). It binds I/O layout 9: inputs
-  `erb, spec, h_gru` (h_gru is `(1, 3, 1, 256)`), outputs `erb_mask, h_gru_out`. The graph file is `dfn2_lite_48k_fft1024_n1.bin` (the `graph_io_dfn2.h` row) under the sample's `SAMPLE_MODEL_DIR`, and the output goes to `/mnt/sd/audio/output/DFN2_LITE/`. Its grid comes from
+  `erb, spec, h_gru` (h_gru is `(1, 3, 1, 256)`), outputs `erb_mask, h_gru_out`. The graph file is `dfn2_lite/nvt_model_48k_n1.bin` (the `graph_io_dfn2.h` row) under the sample's `SAMPLE_MODEL_DIR`, and the output goes to `/mnt/sd/audio/output/DFN2_LITE/`. Its grid comes from
   `--sample-rate` and `--fft-size` through the sample's table (see [Choosing the grid](grid.md#choosing-the-grid)); not run on a board from this repo.
 
 No retraining: the quality of stage 1 alone is whatever the jointly trained mask gives (not measured here).
