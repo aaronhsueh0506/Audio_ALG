@@ -3,6 +3,10 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-24 — AIAEC end-to-end models train on any corpus of their sample rate
+
+- **Training corpus grid (`AIAEC/training_common.py` `build_plain_loaders`).** The linear-AEC grid of the corpus must equal `[signal]` only for a model that reads `linear_error` (Align-ULCNet; `reads_linear_error()` in `dataset_gen/model_views.py`, which `_calibration_common.LINEAR_ERROR_MODELS` now derives from): DeepVQE-S, Align-CRUSE and CAGCRN train at either 16 kHz grid on a corpus of either, for example the 16 kHz / 256 corpus at FFT 512, and the checkpoint records the corpus's `linear_aec` as it was. Kept for every model: the corpus's sample rate and contract checks of `PackedAecDataset`; `[signal]` must be a grid of `SUPPORTED_FRAME_HOP_BY_SR` (before, only the corpus comparison implied it) and the corpus chunk whole hops of it (refused otherwise, since the STFT-consistent loss resynthesizes whole hops). `build_plain_loaders` takes a required `model_name` and refuses an unknown one, and an unsupported grid, before loading the corpus.
+
 ## [Unreleased] — 2026-11-24 — DeepVQE-S and Align-ULCNet: `[model] activation`
 
 - **Training option.** `activation` (default `elu`, the previous behaviour) selects `elu`, `relu`, `leaky_relu` or `prelu` for every block the paper gives ELU: DeepVQE-S the six encoder convs, the three upsample and two residual blocks (the last upsample `ccm_up` stays bare); Align-ULCNet the four encoder convs and the two joint convs (`mask_act` and `stage2_act` keep PReLU). It is an `optional_contract_kwargs` entry: a default run writes the same contract as before, `ctor_activation` is recorded otherwise and a resume across activations is refused in both directions. With the option unset, weights and forward of all four AIAEC models are bit-identical to before. Graph ports, state shapes, `graph_io` rows and layout versions do not change; the exported graph carries `Relu` / `LeakyRelu` / `PRelu` in place of `Elu`. The six per-grid configs list the key commented out.

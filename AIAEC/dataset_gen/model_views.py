@@ -37,25 +37,37 @@ class SpectralModelView:
     feature_state: Optional[Dict[str, Any]] = None
 
 
+END_TO_END_TASK = "end_to_end_aec_res_nr_dereverb"
+
 MODEL_TASKS = {
-    "Align_CRUSE": "end_to_end_aec_res_nr_dereverb",
+    "Align_CRUSE": END_TO_END_TASK,
     "Align_ULCNet": "linear_aec_postfilter_res_nr_dereverb",
-    "DeepVQE_S": "end_to_end_aec_res_nr_dereverb",
-    "CAGCRN": "end_to_end_aec_res_nr_dereverb",
+    "DeepVQE_S": END_TO_END_TASK,
+    "CAGCRN": END_TO_END_TASK,
 }
 
 
-def build_model_view(stems: AecStems, model_name: str,
-                     sample_rate: Optional[int] = None) -> ModelView:
-    """Create waveform inputs/target without duplicating task logic in trainers."""
+def _task(model_name: str) -> str:
     try:
-        task = MODEL_TASKS[model_name]
+        return MODEL_TASKS[model_name]
     except KeyError:
         raise ValueError(
             f"unknown AIAEC model {model_name!r}; expected {sorted(MODEL_TASKS)}"
         ) from None
 
-    if task == "end_to_end_aec_res_nr_dereverb":
+
+def reads_linear_error(model_name: str) -> bool:
+    """Whether the model's view reads the materialized ``linear_error`` stem
+    (the end-to-end models take the raw microphone)."""
+    return _task(model_name) != END_TO_END_TASK
+
+
+def build_model_view(stems: AecStems, model_name: str,
+                     sample_rate: Optional[int] = None) -> ModelView:
+    """Create waveform inputs/target without duplicating task logic in trainers."""
+    task = _task(model_name)
+
+    if task == END_TO_END_TASK:
         # Align-CRUSE has no AEC-only task (echo cancellation with noise left
         # untouched for a later independent NR stage): it shares this one joint
         # AEC+RES+NR+dereverberation task.

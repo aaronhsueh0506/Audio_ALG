@@ -9,9 +9,10 @@
     python3 train.py --config config.ini --seed 123
 
 config.ini sections (see the shipped config.ini for every knob, documented):
-    [signal]   sample rate + FFT grid. MUST equal the grid the packed corpus
-               was rendered with (AIAEC/dataset_gen/config.ini's [signal]);
-               AecGrid/SignalGrid do not re-derive it from the data.
+    [signal]   sample rate + FFT grid (a supported grid). The
+               packed corpus must be at its sample rate, in whole hops;
+               its linear-AEC grid may be the other one of that rate
+               (Align-CRUSE reads no linear_error).
     [data]     one packed corpus path + DataLoader batch size / workers +
                val_fraction (held out at LOAD time, see below)
     [model]    every AlignCRUSE constructor keyword (see model.py's __init__);
@@ -208,7 +209,7 @@ def main(args):
           f"grid={model_grid}")
 
     train_loader, val_loader, data_contract = build_plain_loaders(
-        cfg, aec_grid, seed=args.seed,
+        cfg, aec_grid, seed=args.seed, model_name=MODEL_NAME,
         packed_dir=args.packed_dir, mmap=args.mmap,
     )
     # The resolved numeric recipe, read ONCE and used both to record the

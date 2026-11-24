@@ -138,8 +138,13 @@ default to their `config.ini`):
     python3 train.py --config config_16k_512.ini
     python3 train.py --config config_48k.ini
 
-Every grid has its own corpus directory: `PackedAecDataset` refuses a corpus
-whose linear-AEC grid differs from `[signal]`, for every model. `--config`
+Every grid has its own corpus directory. For every model, `[signal]` must be
+a supported grid, the corpus must be at its sample rate and its chunks whole
+hops of it. A corpus whose linear-AEC grid differs from `[signal]` is refused
+only for Align-ULCNet, the one model that reads `linear_error`: DeepVQE-S (and
+Align-CRUSE, CAGCRN) train at either 16 kHz grid on a corpus of either, and
+the checkpoint records the corpus's `linear_aec` as it was. A resume needs the
+corpus it started on (`dataset_fingerprint`). `--config`
 still takes several files, read in order (a later file overrides only the keys
 it sets, and a missing file is an error); the three grid files are
 alternatives, not overlays.

@@ -15,7 +15,9 @@ import torch
 import torchaudio
 
 import AIAEC.training_common as training_common
-from AIAEC.dataset_gen import MODEL_TASKS
+from AIAEC.DeepVQE_S import train as deepvqe_train
+from AIAEC.DeepVQE_S.model import DeepVQES
+from AIAEC.dataset_gen import MODEL_TASKS, reads_linear_error
 from AIAEC.dataset_gen import pack_aec_dataset as P
 from AIAEC.dataset_gen import rematerialize_linear_aec as R
 from AIAEC.dataset_gen.aec_features import PACKED_STEM_ORDER
@@ -127,7 +129,7 @@ def test_both_grids_reach_loaders_and_checkpoint_contracts(
     aec_grid, model_grid = read_grids(artifact["cfg"])
     train, val, data = build_plain_loaders(
         artifact["cfg"], aec_grid, seed=7,
-        packed_dir=str(artifact["shards"]),
+        packed_dir=str(artifact["shards"]), model_name="Align_ULCNet",
     )
     assert data["linear_aec"] == linear.as_dict()
     assert data["linear_aec_contract_hash"] == linear.fingerprint()
@@ -236,7 +238,35 @@ def test_training_loader_refuses_other_grid(
                        match="training dataset model/PBFDKF grid mismatch"):
         build_plain_loaders(
             target["cfg"], aec_grid, packed_dir=str(source["shards"]),
+            model_name="Align_ULCNet",
         )
+
+
+@pytest.mark.parametrize("source_frame,target_frame", [(256, 512), (512, 256)])
+def test_end_to_end_models_train_on_a_corpus_of_another_grid(
+        prepared_grids, source_frame, target_frame):
+    """The end-to-end models read no linear_error: a corpus of the same
+    sample rate trains them at any grid, and its linear_aec stays recorded."""
+    assert [name for name in MODEL_TASKS if reads_linear_error(name)] == [
+        "Align_ULCNet"]
+    source = prepared_grids[source_frame]
+    target_cfg = prepared_grids[target_frame]["cfg"]
+    aec_grid, model_grid = read_grids(target_cfg)
+    train, _, data = build_plain_loaders(
+        target_cfg, aec_grid, packed_dir=str(source["shards"]),
+        model_name="DeepVQE_S",
+    )
+    assert data["linear_aec"] == source["linear"].as_dict()
+
+    torch.manual_seed(0)
+    model = DeepVQES(model_grid, max_delay_seconds=0.5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_cfg = configparser.ConfigParser()
+    loss_cfg.read_string("[loss]\ncompression = 0.3\ncomplex_weight = 0.7\n"
+                         "stft_consistency = true\n")
+    loss, steps, _ = deepvqe_train.run_epoch(model, train, aec_grid, "cpu",
+                                             loss_cfg["loss"], optimizer)
+    assert steps == 1 and loss > 0 and torch.isfinite(torch.tensor(loss))
 
 
 def test_packed_dataset_refuses_shards_from_both_grids(prepared_grids, tmp_path):

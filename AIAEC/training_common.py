@@ -98,6 +98,7 @@ from AIAEC.dataset_gen import (  # noqa: E402
     MODEL_TASKS,
     PackedAecDataset,
     aec_collate,
+    reads_linear_error,
     istft,
     stft,
 )
@@ -105,6 +106,7 @@ from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
     DATASET_DELAY_NUM_FILTERS,
     LinearAecContract,
     RETIRED_BEHAVIOR_HASHES,
+    SUPPORTED_FRAME_HOP_BY_SR,
     check_delay_num_filters,
     engine_delay_num_filters,
     make_linear_aec_config,
@@ -274,7 +276,7 @@ def read_grids(cfg, section: str = 'signal') -> Tuple[AecGrid, 'SignalGrid']:
 
 
 def _require_linear_aec_grid(linear: LinearAecContract, grid, context: str) -> None:
-    """A supported frontend grid must also be the model's selected grid."""
+    """A model that reads ``linear_error`` runs at its front end's grid."""
     sr = getattr(grid, 'sr', getattr(grid, 'sample_rate', None))
     expected = (int(sr), int(grid.n_fft), int(grid.hop_len))
     actual = (linear.sample_rate, linear.frame_size, linear.hop_size)
@@ -318,7 +320,7 @@ def split_dataset_by_sample(dataset, val_fraction: float,
 
 
 def build_plain_loaders(cfg, aec_grid, seed: int = 42,
-                        section: str = 'data', *,
+                        section: str = 'data', *, model_name: str,
                         packed_dir: Optional[str] = None,
                         mmap: bool = False) -> Tuple[
                             DataLoader, Optional[DataLoader], Dict]:
@@ -327,7 +329,17 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
     Every candidate uses this exact path. Train samples reshuffle every epoch;
     validation order stays stable. The returned JSON-serializable data
     contract records the exact corpus and split used for resume checks.
+    ``[signal]`` must be a supported grid and the corpus's chunks whole hops
+    of it; the corpus's linear-AEC grid is checked only when
+    ``reads_linear_error(model_name)``.
     """
+    reads_linear = reads_linear_error(model_name)   # before the corpus load
+    grid = (aec_grid.n_fft, aec_grid.hop_len)
+    if grid not in SUPPORTED_FRAME_HOP_BY_SR.get(aec_grid.sr, ()):
+        raise ValueError(
+            f"[signal] sr={aec_grid.sr} frame/hop={grid} is not a supported "
+            f"grid (SUPPORTED_FRAME_HOP_BY_SR: "
+            f"{SUPPORTED_FRAME_HOP_BY_SR.get(aec_grid.sr, ())})")
     resolved_packed_dir = packed_dir or cfg.get(
         section, 'packed_dir', fallback=None
     )
@@ -336,9 +348,16 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
     dataset = PackedAecDataset(
         resolved_packed_dir, expected_sr=aec_grid.sr, mmap=mmap
     )
-    _require_linear_aec_grid(
-        dataset.linear_aec_contract, aec_grid, 'training dataset'
-    )
+    if reads_linear:
+        _require_linear_aec_grid(
+            dataset.linear_aec_contract, aec_grid, 'training dataset'
+        )
+    if dataset.chunk_samples % aec_grid.hop_len:
+        # The STFT-consistent loss resynthesizes whole hops only.
+        raise ValueError(
+            f"training dataset chunks of {dataset.chunk_samples} samples are "
+            f"not whole hops of {aec_grid.hop_len}; repack with a [sequence] "
+            f"chunk_sec that is")
     val_fraction = cfg.getfloat(section, 'val_fraction', fallback=0.1)
     train_indices, val_indices = split_dataset_by_sample(
         dataset, val_fraction, seed=seed

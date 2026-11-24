@@ -526,12 +526,14 @@ any of these is opting out of the comparison** — the same failure that
 (`n_freqs = 129`, 125 fps). The allowed pairs are listed in
 `linear_aec.py`'s `SUPPORTED_FRAME_HOP_BY_SR`; `FROZEN_FRAME_HOP_BY_SR`
 retains the historical defaults for callers that omit a frame size. Each
-corpus and checkpoint still records exactly one grid, and the packer/trainer
-refuse a different grid. Adding the new pair does not change the contract
+corpus and checkpoint still records exactly one grid. The packer refuses a
+different grid, and so does the trainer of Align-ULCNet, the model that reads
+`linear_error`; DeepVQE-S, Align-CRUSE and CAGCRN train at either 16 kHz grid
+on a corpus of either. Adding the new pair does not change the contract
 version, serialization or existing fingerprints.
 
-To train on 256/128, use that same `[signal]` in the materialization/packing
-config and the model config. Keep the old corpus in its own directory:
+To train Align-ULCNet on 256/128, use that same `[signal]` in the
+materialization/packing config and the model config. Keep the old corpus in its own directory:
 `rematerialize_linear_aec.py` rewrites its input WAVs in place. The first four
 acoustic stems can be reused, but the last `linear_error` stem must be rebuilt
 for the new frontend, then repacked. A 512/256 checkpoint is not a 256/128

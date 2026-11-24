@@ -74,6 +74,7 @@ from .model_views import (
     SpectralModelView,
     build_model_view,
     build_spectral_model_view,
+    reads_linear_error,
 )
 
 __all__ = [
@@ -98,6 +99,7 @@ __all__ = [
     'DeviceModel',
     'PackedAecDataset',
     'MODEL_TASKS',
+    'reads_linear_error',
     'ModelView',
     'LinearAecContract',
     'LinearAecProcessor',

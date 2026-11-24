@@ -136,15 +136,17 @@ def test_all_train_loops_use_shared_progress_and_postfix(module_name):
     assert 'set_postfix' in names
 
 
-def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
-    observed = {}
-    linear = make_linear_aec_contract(16000, frame_size=512)
+def _fake_corpus(monkeypatch, observed, frame=512, chunk_samples=512 * 4):
+    """Replace PackedAecDataset with a 4-chunk corpus of the 16 kHz linear-AEC
+    grid ``frame``; each construction records its arguments in ``observed``."""
+    linear = make_linear_aec_contract(16000, frame_size=frame)
 
     class FakePackedDataset:
         def __init__(self, path, expected_sr=None, mmap=False):
             observed.update(path=path, expected_sr=expected_sr, mmap=mmap)
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
+            self.chunk_samples = chunk_samples
 
         def __len__(self):
             return 4
@@ -156,6 +158,11 @@ def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
             return 'fake-corpus'
 
     monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+
+
+def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
+    observed = {}
+    _fake_corpus(monkeypatch, observed)
     cfg = _cfg(
         '[data]\n'
         'packed_dir = from-config\n'
@@ -166,11 +173,32 @@ def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
     aec_grid, _ = read_grids(_cfg('[signal]\nsr=16000\nn_fft=512\n'))
     _train, _val, contract = build_plain_loaders(
         cfg, aec_grid, packed_dir='from-cli', mmap=True,
+        model_name='Align_ULCNet',
     )
     assert observed == {
         'path': 'from-cli', 'expected_sr': 16000, 'mmap': True,
     }
     assert contract['dataset_fingerprint'] == 'fake-corpus'
+
+
+@pytest.mark.parametrize('n_fft,model_name,chunk_samples,message', [
+    (1024, 'DeepVQE_S', 1024 * 4, 'not a supported grid'),
+    (512, 'DeepVQE-S', 512 * 4, 'unknown AIAEC model'),
+    (512, 'DeepVQE_S', 128 * 9, 'not whole hops of 256'),
+], ids=('grid', 'model_name', 'chunk'))
+def test_loader_refuses_a_grid_a_name_or_a_chunk_it_cannot_train(
+        monkeypatch, n_fft, model_name, chunk_samples, message):
+    """A 16 kHz / 256 corpus: the grid and the name are refused before the
+    corpus is loaded, a chunk that is not whole hops of the model right
+    after."""
+    observed = {}
+    _fake_corpus(monkeypatch, observed, frame=256, chunk_samples=chunk_samples)
+    cfg = _cfg('[data]\npacked_dir = corpus\nval_fraction = 0.25\n'
+               'batch_size = 2\nnum_workers = 0\n')
+    aec_grid, _ = read_grids(_cfg('[signal]\nsr=16000\nn_fft=%d\n' % n_fft))
+    with pytest.raises(ValueError, match=message):
+        build_plain_loaders(cfg, aec_grid, model_name=model_name)
+    assert bool(observed) == (message.startswith('not whole'))
 
 
 def test_read_grids_builds_matching_aec_and_signal_grids():
@@ -1153,6 +1181,7 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
     linear = _linear_for_training_config([config])
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
@@ -1202,6 +1231,7 @@ def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_paths,
     linear = _linear_for_training_config(config_paths)
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             capture['packed_dir'] = path
             self.linear_aec_contract = linear
@@ -1424,6 +1454,7 @@ def test_align_ulcnet_step_schedule_advances_per_batch(
     linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
@@ -1513,6 +1544,7 @@ def test_align_ulcnet_trains_on_plcpa_of_the_stft_consistent_estimate(
     linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
@@ -1587,6 +1619,7 @@ def test_other_step_schedules_advance_per_batch(
     linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
@@ -1669,6 +1702,7 @@ def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
     linear = make_linear_aec_contract(16000, frame_size=cfg.getint('signal', 'n_fft'))
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
@@ -1724,6 +1758,7 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
     linear = make_linear_aec_contract(16000, frame_size=512)
 
     class FakePackedDataset:
+        chunk_samples = 4096    # whole hops of every grid
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()

@@ -24,7 +24,7 @@ _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from AIAEC.dataset_gen import stft
+from AIAEC.dataset_gen import MODEL_TASKS, reads_linear_error, stft
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
 from AIAEC.training_common import (
     CALIBRATION_ONLY_FAR_INPUT_MODE,
@@ -32,7 +32,8 @@ from AIAEC.training_common import (
 )
 
 
-LINEAR_ERROR_MODELS = {'Align_ULCNet'}
+LINEAR_ERROR_MODELS = frozenset(
+    name for name in MODEL_TASKS if reads_linear_error(name))
 
 
 def far_mode_provenance(model_name):

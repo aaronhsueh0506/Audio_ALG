@@ -213,7 +213,7 @@ def main(args):
           f"grid={model_grid}, max_delay_frames={model.max_delay_frames}")
 
     train_loader, val_loader, data_contract = build_plain_loaders(
-        cfg, aec_grid, seed=args.seed,
+        cfg, aec_grid, seed=args.seed, model_name=MODEL_NAME,
         packed_dir=args.packed_dir, mmap=args.mmap,
     )
     # The resolved numeric recipe, read ONCE and used both to record the
