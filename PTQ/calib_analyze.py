@@ -593,11 +593,12 @@ def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
             holders.add(int(pool[np.argmin(st['frame_min'][pool])]))
             holders.add(int(pool[np.argmax(st['frame_max'][pool])]))
         must = np.array(sorted(holders), dtype=np.int64)
-        if must.size > count:
+        if must.size >= count:
             keep = must[:count]
-            notes.append('%d range-defining frames exceed --count %d; the '
-                         'range will be narrower than the budget allows'
-                         % (must.size, count))
+            if must.size > count:
+                notes.append('%d range-defining frames exceed --count %d; '
+                             'the range will be narrower than the budget '
+                             'allows' % (must.size, count))
         else:
             rest = np.setdiff1d(pool, must)
             features = frame_features(art, art.names)[rest]

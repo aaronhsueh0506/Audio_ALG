@@ -364,6 +364,7 @@ def test_conclusion_matches_whether_the_extremes_fit_the_count():
     assert any('超過 --count 4' in t and '比整池窄' in t for t in short)
     assert not any('和整池相同' in t for t in short)
     assert any('保有整池每個輸入 tensor' in t for t in texts(20))
+    assert any('保有整池每個輸入 tensor' in t for t in texts(6))  # count == must
     whole = texts(1000)
     assert any('全部 60 個 frame 都保留' in t for t in whole)
     assert not any('至少需要 0 個' in t for t in whole)
