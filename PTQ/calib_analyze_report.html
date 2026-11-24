@@ -1,13 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Calibration pattern analysis</title>
+<title>校正 pattern 挑選</title>
 <style>
-:root{--bg:#fafaf8;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#dcdcd4;--acc:#2a6f97;--bad:#c0392b;--gray:#b9b9b2;--ok:#2e8b57;--warn:#b7791f}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e8e8e3;--mut:#9a9a92;--card:#1f1f1d;--line:#34342f;--acc:#6bb3dc;--bad:#ef7a6c;--gray:#55554f;--ok:#5fc08a;--warn:#e0b050}}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,system-ui,sans-serif}
+:root{--bg:#fafaf8;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#dcdcd4;--acc:#2a6f97;--c16:#c77d1a;--bad:#c0392b;--gray:#b9b9b2;--ok:#2e8b57;--warn:#b7791f;--warnbg:#fdf6e7}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e8e8e3;--mut:#9a9a92;--card:#1f1f1d;--line:#34342f;--acc:#6bb3dc;--c16:#e0a050;--bad:#ef7a6c;--gray:#55554f;--ok:#5fc08a;--warn:#e0b050;--warnbg:#2b2619}}
+:root[data-theme=dark]{--bg:#161615;--fg:#e8e8e3;--mut:#9a9a92;--card:#1f1f1d;--line:#34342f;--acc:#6bb3dc;--c16:#e0a050;--bad:#ef7a6c;--gray:#55554f;--ok:#5fc08a;--warn:#e0b050;--warnbg:#2b2619}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,system-ui,"PingFang TC","Noto Sans TC",sans-serif}
 main{max-width:1180px;margin:0 auto;padding:16px}
 h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 8px}
 .sub{color:var(--mut);font-size:13px}
@@ -15,10 +16,11 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 8px}
 .bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
 button{font:inherit;padding:5px 11px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
 button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
-table{border-collapse:collapse;width:100%;font-size:13px}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
 th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}
+th:first-child,td:first-child,td.l,th.l{text-align:left}
 th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--card)}
+tr.grp td{border-top:2px solid var(--line)}
 .scroll{overflow-x:auto}
 canvas{width:100%;height:120px;display:block;cursor:crosshair}
 canvas.tall{height:220px;cursor:default}
@@ -26,116 +28,144 @@ canvas.tall{height:220px;cursor:default}
 .flag{color:var(--warn);font-weight:600}.good{color:var(--ok)}.badc{color:var(--bad)}
 .legend span{margin-right:14px;font-size:12px;color:var(--mut)}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-.segtable{max-height:320px;overflow:auto}
+.segtable{max-height:360px;overflow:auto}
 input[type=range]{width:220px}
+ul.concl{margin:0;padding-left:20px}ul.concl li{margin:4px 0}
+ul.concl li.warn{color:var(--fg);background:var(--warnbg);border-left:3px solid var(--warn);padding:2px 8px;list-style:none;margin-left:-20px}
+dl.gloss{margin:0}dl.gloss dt{font-weight:600;margin-top:8px}dl.gloss dd{margin:2px 0 0 0;color:var(--mut)}
 </style>
 </head>
 <body>
 <main>
-<h1>Calibration pattern analysis</h1>
+<h1>校正 pattern 挑選報告</h1>
 <div class="sub" id="meta"></div>
 
+<h2>結論</h2>
+<div class="card"><ul class="concl" id="concl"></ul>
+<div class="sub" style="margin-top:8px">這份報告只看 graph 的<b>輸入</b> tensor。挑選對 graph 內部各層是否合適，要用量化後模型的輸出來判斷。</div></div>
+
+<div id="recSection" style="display:none">
+<h2>建議挑選</h2>
+<div class="card">
+  <div class="bar"><span class="sub" id="recNote"></span><span style="flex:1"></span>
+    <button id="recBtn" class="pri">套用建議到下方互動區</button></div>
+  <div class="scroll"><table id="rtab"></table></div>
+  <div class="sub" style="margin-top:6px">「被夾的值」＝落在 range 外、上板後會被夾到邊界的值佔全部的比例；「有值被夾的 frame」＝至少有一個值被夾的 frame 比例，兩者都是精確計數。SQNR 是在每個 tensor 最多 <span id="sampleCap"></span> 個抽樣值上實際量化再反量化算出來的；「含被夾」把被夾的值算進誤差，「不含被夾」只看 range 內的值（也就是解析度）。三種格式共用同一份資料：8x8 看 8-bit 欄，16x8 和 16x16 看 16-bit 欄。range 一律包含 0（min/max 量化讓 0 可以被精確表示）。<br>「隨機」和「丟極端值」兩組對照是用整池本身評分的：整池的極值就在評分資料裡，所以會高估丟掉極值的代價；不偏的數字請用 <code>coverage</code> 子命令對另一份沒看過的錄音評估。</div>
+</div>
+</div>
+
+<h2>互動挑選</h2>
 <div class="card">
   <div class="bar">
-    <span>Click unit:</span>
-    <label><input type="radio" name="gran" value="unit" checked> <span id="unitLabel"></span></label>
-    <label id="frameOpt"><input type="radio" name="gran" value="frame"> single frame</label>
+    <span id="granBox"><span>點選單位：</span>
+      <label><input type="radio" name="gran" value="frame" checked> 單一 frame</label>
+      <label><input type="radio" name="gran" value="source"> 整個來源</label></span>
     <span style="flex:1"></span>
-    <label>drop most extreme <b id="kval">0</b> <span id="kunit"></span>
+    <label>丟掉最極端的 <b id="kval">0</b> 個 frame
       <input type="range" id="k" min="0" value="0"></label>
-    <button id="reset">Reset</button>
-    <button id="dl" class="pri">Download keep.json</button>
+    <button id="reset">重設</button>
+    <button id="dl" class="pri">下載 keep.json</button>
   </div>
   <div class="sub" id="live" style="margin-top:6px"></div>
+  <div class="scroll" style="margin-top:8px"><table id="ttab"></table></div>
+  <div class="sub" style="margin-top:6px">tail ratio＝絕對值最大值 ÷ 第 99.9 百分位的絕對值，越大代表少數值把 range 撐開。「中間 99.8% 佔 range」越小，代表大部分的值擠在 range 的一小段裡。「固定位置」表示極端值總是落在同一個 channel 或位置：那是特徵縮放的問題，刪 frame 解決不了。</div>
 </div>
 
-<div id="recSection" class="card" style="display:none">
-  <div class="bar"><b>Recommended selection</b><span class="sub" id="recNote"></span>
-    <span style="flex:1"></span><button id="recBtn" class="pri">Apply recommended</button></div>
-  <div class="scroll"><table id="rtab"></table></div>
-  <div class="sub">Dropped frames are the most extreme ones, while no tensor has more than the clip budget of all recorded values outside the kept range; the rest is thinned by k-means so it still covers the data. “typical” SQNR ignores the clipped values (resolution for the bulk of the data), “all” counts them at full error. Which of the two matters is decided by the quantised model's output, not by this page.</div>
-</div>
-
-<h2>Per-tensor statistics and live range</h2>
-<div class="card scroll"><table id="ttab"></table></div>
-<div class="sub">tail ratio = abs-max ÷ 99.9th-percentile |x|. Large values mean a few elements stretch the range. “Fixed band” flags an outlier that always lands on the same channel/feature index — fix the feature scaling rather than the pattern choice.</div>
-
-<h2>Per-frame abs-max (click to drop / restore)</h2>
-<div class="legend"><span><i class="sw" style="background:var(--acc)"></i>kept</span><span><i class="sw" style="background:var(--bad)"></i>holds the current min or max</span><span><i class="sw" style="background:var(--gray)"></i>dropped</span><label><input type="checkbox" id="log"> log y</label></div>
+<h2>每個 frame 的絕對值最大值（點擊可丟掉或放回）</h2>
+<div class="legend"><span><i class="sw" style="background:var(--acc)"></i>保留</span><span><i class="sw" style="background:var(--bad)"></i>目前決定最小值或最大值的 frame</span><span><i class="sw" style="background:var(--gray)"></i>已丟掉</span><label><input type="checkbox" id="log"> 對數 y 軸</label></div>
 <div id="charts"></div>
 
-<h2>Simulated 8-bit error vs. dropped patterns</h2>
+<h2>SQNR 與丟掉的 frame 數</h2>
 <div class="card">
   <div class="bar"><label>tensor <select id="ctensor"></select></label>
-  <span class="sub">Grid built from the kept patterns; <b>full</b> scores every recorded value (dropped ones get clipped), <b>kept</b> only what the grid was built from. Dropped = most extreme first, in the order of the sliders above.</span></div>
+  <span class="sub">依「最極端的先丟」的順序，每丟一些就用剩下的 frame 重算 range，再對整份校正檔評分（被丟的 frame 的值會被夾）。紅線是上方滑桿的位置。</span></div>
   <canvas id="curve" class="tall"></canvas>
   <div class="legend" id="curveLegend"></div>
+  <div class="tip" id="curveTip"></div>
 </div>
 
-<div id="segSection">
-<h2>Source segments</h2>
-<div class="sub" id="segnote"></div>
-<div class="card segtable"><table id="stab"></table></div>
+<h2>來源</h2>
+<div id="srcOff" class="card sub" style="display:none"></div>
+<div id="srcOn" style="display:none">
+<div class="card">
+  <b>range 收斂情形</b> <span class="sub">依隨機順序一個一個加入來源，最不穩定的 tensor 的 range 達到最終寬度的幾 %（實線：中位數；虛線：第 10 百分位）。曲線越早到 100%，代表再多錄資料越不容易出現新的極值。</span>
+  <canvas id="growth" class="tall"></canvas>
+  <div class="tip" id="growthTip"></div>
 </div>
+<div class="card segtable"><table id="stab"></table></div>
+<div class="sub">「拿掉後 range 縮小」：只拿掉這一個來源時，range 縮小最多的 tensor 縮了多少。數字大的來源獨自撐起 range，值得去聽，確認是真實會遇到的情境還是壞資料。勾選「丟掉」可整個來源一起丟。</div>
+</div>
+
+<h2>名詞說明</h2>
+<div class="card"><dl class="gloss">
+<dt>min/max 校正</dt><dd>converter 用每個 tensor 在校正資料裡的最小值和最大值決定 range。多一個極端 frame，range 就變寬、step 變粗；少一個，上板遇到那種值就會被夾。</dd>
+<dt>為什麼數量本身不重要</dt><dd>只要挑出的 frame 包含每個 tensor 的最小值和最大值，輸入的 range 就和整池相同。數量影響的是 graph 內部各層，這份報告看不到。音訊相鄰 frame 幾乎一樣，所以重點是從多少錄音、多少情境裡挑，而不是挑幾個。</dd>
+<dt>8-bit 和 16-bit 的取捨</dt><dd>16-bit 比 8-bit 多約 48 dB 的解析度，range 寬一點幾乎無感，被夾掉的代價比較大；8-bit 剛好相反。三種格式共用同一份資料時，要同時看兩欄。</dd>
+<dt>grid</dt><dd>這份報告的輸入 grid：<span id="glossScheme"></span>。非對稱＝range 包含 0、整數 zero point；對稱＝±絕對值最大；2 的冪次＝對稱、上限取到 2 的冪次（定點格式輸入的 scale）。第一個 frame 全為 0 的 tensor 視為 recurrent state：板端 state port 的 zero point 必須是 0，所以非對稱時 state 改用對稱 grid 評分。</dd>
+<dt>限制</dt><dd>只看輸入 tensor；SQNR 是抽樣估計；「丟掉的 frame」是依輸入的極端程度排序，不代表它在 graph 內部也最極端。</dd>
+</dl></div>
 </main>
 <script>
 const D = /*__DATA__*/null;
-const N = D.meta.frames, names = Object.keys(D.tensors);
-const segs = D.segments, hasSeg = segs.length > 1;
+const N = D.meta.frames, names = Object.keys(D.tensors), BITS = D.meta.bits;
+const SRC = D.sources, hasSrc = !!SRC.available;
 const dropped = new Uint8Array(N);
 const segOf = new Int32Array(N);
-segs.forEach((s,i)=>{const e=i+1<segs.length?segs[i+1].start:N;for(let f=s.start;f<e;f++)segOf[f]=i;});
-const fmt = v => (v===null||v===undefined)?'–':(Math.abs(v)>=1e4||(v!==0&&Math.abs(v)<1e-3))?v.toExponential(2):(+v.toPrecision(4)).toString();
+if(hasSrc) SRC.rows.forEach((s,i)=>{const e=i+1<SRC.rows.length?SRC.rows[i+1].start:N;for(let f=s.start;f<e;f++)segOf[f]=i;});
+const fmt = v => (v===null||v===undefined||!isFinite(v))?'–':(Math.abs(v)>=1e4||(v!==0&&Math.abs(v)<1e-3))?v.toExponential(2):(+v.toPrecision(4)).toString();
+const pct = (v,d=2) => (v===null||v===undefined)?'–':v.toFixed(d)+'%';
+const db = v => (v===null||v===undefined||!isFinite(v))?'–':v.toFixed(1);
 const $ = id => document.getElementById(id);
-const css = n => getComputedStyle(document.documentElement).getPropertyValue(n);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const BITCOL = b => b>=16?css('--c16'):css('--acc');
 
-$('meta').textContent = `${D.meta.path} · ${D.meta.format} · ${N} frames · model ${D.meta.model_family||'?'} · ${D.meta.scheme} 8-bit sim`
-  + (Object.keys(D.meta.skipped).length?` · skipped (not quantised): ${Object.keys(D.meta.skipped).join(', ')}`:'')
-  + (D.meta.contiguous?' · CONTIGUOUS-STREAM MODEL: pruning is refused by apply':'');
-$('unitLabel').textContent = hasSeg ? 'whole source segment' : 'frame';
-if(!hasSeg) $('frameOpt').style.display='none';
-$('kunit').textContent = D.meta.unit+'s';
-const nUnits = hasSeg ? segs.length : N;
-$('k').max = Math.max(1, Math.floor(nUnits/2));
-
-function unitFrames(u){ if(!hasSeg) return [u,u+1]; return [segs[u].start, u+1<segs.length?segs[u+1].start:N]; }
-function setUnit(u,val){ const [a,b]=unitFrames(u); for(let f=a;f<b;f++) dropped[f]=val; }
-function toggleAt(f){
-  const gran = document.querySelector('input[name=gran]:checked').value;
-  if(hasSeg && gran==='unit'){ const [a,b]=unitFrames(segOf[f]); setUnit(segOf[f], dropped[a]?0:1); }
-  else dropped[f]=dropped[f]?0:1;
-}
-
-// HTML-escape any string field before interpolating it into an innerHTML
-// template -- tensor names and segment source names both come from the
-// calibration artifact's manifest.json / npz member names, which this tool
-// never validates as a "safe identifier" (unlike AINR/calibration_io.py's
-// writer, which does reject path-unsafe names before ever writing a file).
-// Treat them as untrusted strings here, not as implicitly-safe labels.
+// Tensor names, source names, the path and the conclusion text all come from
+// the calibration artifact; escape every one of them before it reaches
+// innerHTML (conclusions go in through textContent).
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-// ---- tensor table
+const SCHEME_NAMES = {asym:'非對稱', sym:'對稱', pow2:'2 的冪次'};
+const schemeName = s => SCHEME_NAMES[s] || s;
+$('meta').textContent = `${D.meta.path} · ${D.meta.format} · ${N} 個 frame · 模型 ${D.meta.model_family||'?'} · 評分位數 ${BITS.join(' / ')}-bit`
+  + (Object.keys(D.meta.skipped).length?` · 不量化（略過）：${Object.keys(D.meta.skipped).join('、')}`:'')
+  + (D.meta.contiguous?' · 此模型需要連續串流，不能挑選':'');
+$('glossScheme').textContent = schemeName(D.meta.scheme);
+$('sampleCap').textContent = D.meta.sample_cap.toLocaleString('en-US');
+
+// ---- conclusions
+for(const c of D.conclusions){ const li=document.createElement('li'); li.className=c.level; li.textContent=c.text; $('concl').appendChild(li); }
+
+// ---- live range (gridRange mirrors grid_range in calib_analyze.py)
+function gridRange(lo,hi,scheme){
+  if(scheme==='asym') return [Math.min(lo,0),Math.max(hi,0)];
+  let t=Math.max(Math.abs(lo),Math.abs(hi));
+  if(scheme==='pow2') t = t>0 ? 2**Math.ceil(Math.log2(t)) : 0;
+  else if(scheme!=='sym') throw new Error('unknown scheme '+scheme);
+  return [-t,t];
+}
 function rangeOf(t){
   const s=D.tensors[t]; let lo=Infinity,hi=-Infinity,ho=-1,hh=-1;
   for(let f=0;f<N;f++){ if(dropped[f])continue;
     if(s.frame_min[f]<lo){lo=s.frame_min[f];ho=f;} if(s.frame_max[f]>hi){hi=s.frame_max[f];hh=f;} }
   return {lo,hi,ho,hh};
 }
+function framesClipped(t,lo,hi){ const s=D.tensors[t]; let c=0; for(let f=0;f<N;f++) if(s.frame_min[f]<lo||s.frame_max[f]>hi) c++; return 100*c/N; }
 function concCell(c){
   if(!c) return '–';
-  const fixed = c.ratio>8;
-  return `<span class="${fixed?'flag':''}">${c.ratio.toFixed(1)}× @${c.argmax}/${c.size}${fixed?' fixed band':''}</span>`;
+  const fixed = c.ratio>D.meta.fixed_band_ratio;
+  return `<span class="${fixed?'flag':''}">${c.ratio.toFixed(1)}× @${c.argmax}/${c.size}${fixed?' 固定位置':''}</span>`;
 }
 function renderTable(){
-  let h='<tr><th>tensor</th><th>shape</th><th>min</th><th>max</th><th>p0.1</th><th>p99.9</th><th>p99.99</th><th>KL thr (±)</th><th>MSE range</th><th>EMA min/max</th><th>scale asym</th><th>zp</th><th>levels for 99.8%</th><th>zero %</th><th>tail ratio</th><th>exc. kurt.</th><th>channel conc.</th><th>feature conc.</th><th>live min</th><th>live max</th><th>range shrink</th></tr>';
-  for(const t of names){ const s=D.tensors[t], g=s.global, r=rangeOf(t);
-    const span0=g.max-g.min, span1=r.hi-r.lo, sh=span0>0?100*(1-span1/span0):0;
-    h+=`<tr><td>${esc(t)}</td><td>${s.shape.slice(1).join('×')}</td><td>${fmt(g.min)}</td><td>${fmt(g.max)}</td><td>${fmt(g.p001)}</td><td>${fmt(g.p999)}</td><td>${fmt(g.p9999)}</td><td>${fmt(g.kl_threshold)}</td><td>${fmt(g.mse_lo)}…${fmt(g.mse_hi)} (×${g.mse_alpha.toFixed(2)})</td><td>${fmt(g.ema_min)}/${fmt(g.ema_max)}</td><td>${fmt(g.scale_asym)}</td><td>${g.zero_point_asym}</td><td class="${g.levels_p998<64?'flag':''}">${g.levels_p998.toFixed(0)}/255</td><td>${(100*g.zero_frac).toFixed(1)}</td>`
-     +`<td class="${g.tail_ratio>10?'flag':''}">${g.tail_ratio.toFixed(1)}</td><td>${g.excess_kurtosis.toFixed(1)}</td>`
+  let h='<tr><th>tensor</th><th>形狀</th><th>grid</th><th>min</th><th>max</th><th>p0.1</th><th>p99.9</th><th>tail ratio</th><th>中間 99.8% 佔 range</th><th>峰度</th><th>零值 %</th><th>channel 集中</th><th>位置集中</th><th>目前 range</th><th>range 縮小</th><th>有值被夾的 frame</th></tr>';
+  for(const t of names){ const s=D.tensors[t], g=s.global, r=rangeOf(t), sc=D.meta.schemes[t];
+    const [lo0,hi0]=gridRange(g.min,g.max,sc), [lo1,hi1]=gridRange(r.lo,r.hi,sc);
+    const sh=hi0-lo0>0?100*(1-(hi1-lo1)/(hi0-lo0)):0, fc=framesClipped(t,lo1,hi1);
+    h+=`<tr><td>${esc(t)}</td><td>${s.shape.slice(1).join('×')}</td><td>${schemeName(sc)}</td><td>${fmt(g.min)}</td><td>${fmt(g.max)}</td><td>${fmt(g.p001)}</td><td>${fmt(g.p999)}</td>`
+     +`<td class="${g.tail_ratio>10?'flag':''}">${g.tail_ratio.toFixed(1)}</td><td class="${g.core_frac<0.25?'flag':''}">${pct(100*g.core_frac,0)}</td><td>${g.excess_kurtosis.toFixed(1)}</td><td>${(100*g.zero_frac).toFixed(1)}</td>`
      +`<td>${concCell(s.concentration.channel)}</td><td>${concCell(s.concentration.last)}</td>`
-     +`<td>${fmt(r.lo)}</td><td>${fmt(r.hi)}</td><td class="${sh>0.5?'good':''}">${sh.toFixed(1)}%</td></tr>`;
+     +`<td>${fmt(lo1)} … ${fmt(hi1)}</td><td class="${sh>0.5?'good':''}">${sh.toFixed(1)}%</td><td class="${fc>0?'badc':''}">${pct(fc)}</td></tr>`;
   }
   $('ttab').innerHTML=h;
 }
@@ -147,94 +177,132 @@ for(const t of names){
   d.innerHTML=`<b>${esc(t)}</b> <span class="sub">${D.tensors[t].shape.slice(1).join('×')}</span><canvas></canvas><div class="tip"></div>`;
   $('charts').appendChild(d);
   const cv=d.querySelector('canvas'), tip=d.querySelector('.tip');
-  charts[t]={cv,tip};
+  charts[t]={cv};
   const frameAt=e=>{const r=cv.getBoundingClientRect();return Math.min(N-1,Math.max(0,Math.floor((e.clientX-r.left)/r.width*N)));};
   cv.addEventListener('click',e=>{toggleAt(frameAt(e));refresh();});
   cv.addEventListener('mousemove',e=>{const f=frameAt(e),s=D.tensors[t];
-    const sg=hasSeg?` · segment ${segOf[f]}${segs[segOf[f]].source?' ('+segs[segOf[f]].source+')':''}`:'';
-    tip.textContent=`frame ${f}${sg} · abs-max ${fmt(s.frame_absmax[f])} · min ${fmt(s.frame_min[f])} · max ${fmt(s.frame_max[f])} · LOO range shrink ${(100*s.frame_shrink[f]).toFixed(2)}%${dropped[f]?' · DROPPED':''}`;});
+    const sg=hasSrc?` · 來源 ${segOf[f]}（${SRC.rows[segOf[f]].source}）`:'';
+    tip.textContent=`frame ${f}${sg} · 絕對值最大 ${fmt(Math.max(Math.abs(s.frame_min[f]),Math.abs(s.frame_max[f])))} · min ${fmt(s.frame_min[f])} · max ${fmt(s.frame_max[f])} · 單獨拿掉後 range 縮小 ${(100*s.frame_shrink[f]).toFixed(2)}%${dropped[f]?' · 已丟掉':''}`;});
 }
 function drawChart(t){
   const {cv}=charts[t], s=D.tensors[t], dpr=window.devicePixelRatio||1;
   const w=cv.clientWidth, h=cv.clientHeight; cv.width=w*dpr; cv.height=h*dpr;
   const c=cv.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
   const log=$('log').checked, r=rangeOf(t);
-  let mx=0; for(let f=0;f<N;f++) mx=Math.max(mx,s.frame_absmax[f]); mx=mx||1;
+  const am=f=>Math.max(Math.abs(s.frame_min[f]),Math.abs(s.frame_max[f]));
+  let mx=0; for(let f=0;f<N;f++) mx=Math.max(mx,am(f)); mx=mx||1;
   const y=v=>log?h-(Math.log10(Math.max(v,mx*1e-6))-Math.log10(mx*1e-6))/(-Math.log10(1e-6))*(h-4)-2:h-2-v/mx*(h-4);
-  const col=new Array(w), val=new Float64Array(w).fill(-1), st=new Uint8Array(w);
-  for(let f=0;f<N;f++){ const x=Math.min(w-1,Math.floor(f/N*w)); const v=s.frame_absmax[f];
+  const val=new Float64Array(w).fill(-1), st=new Uint8Array(w);
+  for(let f=0;f<N;f++){ const x=Math.min(w-1,Math.floor(f/N*w)); const v=am(f);
     const k=dropped[f]?1:((f===r.ho||f===r.hh)?3:2);
     if(k>st[x]||(k===st[x]&&v>val[x])){st[x]=k;val[x]=v;} }
-  if(hasSeg){c.strokeStyle=css('--line');c.lineWidth=1;for(const sg of segs.slice(1)){const x=Math.floor(sg.start/N*w)+.5;c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();}}
+  if(hasSrc){c.strokeStyle=css('--line');c.lineWidth=1;for(const sg of SRC.rows.slice(1)){const x=Math.floor(sg.start/N*w)+.5;c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();}}
   for(let x=0;x<w;x++){ if(!st[x])continue;
     c.fillStyle=st[x]===3?css('--bad'):st[x]===1?css('--gray'):css('--acc');
     const top=y(val[x]); c.fillRect(x,top,Math.max(1,w/N),h-2-top); }
   c.fillStyle=css('--mut');c.font='11px sans-serif';c.fillText(fmt(mx),4,11);
 }
 
+// ---- unit toggling
+function srcFrames(i){ return [SRC.rows[i].start, SRC.rows[i].start+SRC.rows[i].frames]; }
+function setSrc(i,val){ const [a,b]=srcFrames(i); for(let f=a;f<b;f++) dropped[f]=val; }
+function toggleAt(f){
+  const gran=document.querySelector('input[name=gran]:checked').value;
+  if(hasSrc && gran==='source'){ const [a]=srcFrames(segOf[f]); setSrc(segOf[f], dropped[a]?0:1); }
+  else dropped[f]=dropped[f]?0:1;
+}
+if(!hasSrc) $('granBox').style.display='none';
+
 // ---- curve
 const sel=$('ctensor'); names.forEach(t=>sel.add(new Option(t,t)));
+function curveLines(){ const out=[]; for(const b of BITS){ out.push([b,'all',`${b}-bit 含被夾`,0]); out.push([b,'typ',`${b}-bit 不含被夾`,1]); } return out; }
 function drawCurve(){
   const cv=$('curve'), t=sel.value, dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
   cv.width=w*dpr;cv.height=h*dpr;const c=cv.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
-  const ks=D.curves.k, cur=D.curves.tensors[t];
-  const lines=[['minmax','sqnr_full','min/max · full','#2a6f97',0],['minmax','sqnr_kept','min/max · kept','#2a6f97',1],
-               ['pct','sqnr_full','p0.1–99.9 · full','#c77d1a',0],['pct','sqnr_kept','p0.1–99.9 · kept','#c77d1a',1],
-               ['mse','sqnr_full','MSE-clip · full','#2e8b57',0],['mse','sqnr_kept','MSE-clip · kept','#2e8b57',1]];
+  const ks=D.curves.k, cur=D.curves.tensors[t], lines=curveLines();
   let lo=Infinity,hi=-Infinity;
-  for(const [m,f] of lines) for(const p of cur[m]) if(p){lo=Math.min(lo,p[f]);hi=Math.max(hi,p[f]);}
-  if(!isFinite(lo)){return;} const pad=(hi-lo)*.1||1; lo-=pad;hi+=pad;
-  const L=44,B=22,Tp=8,R=8, X=i=>L+(i/(ks.length-1||1))*(w-L-R), Y=v=>Tp+(1-(v-lo)/(hi-lo))*(h-Tp-B);
+  for(const [b,f] of lines) for(const v of cur['b'+b][f]) if(v!==null&&isFinite(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}
+  if(!isFinite(lo)) return; const pad=(hi-lo)*.08||1; lo-=pad; hi+=pad;
+  const L=50,B=22,Tp=8,R=8, X=i=>L+(i/(ks.length-1||1))*(w-L-R), Y=v=>Tp+(1-(v-lo)/(hi-lo))*(h-Tp-B);
   c.strokeStyle=css('--line');c.fillStyle=css('--mut');c.font='11px sans-serif';c.lineWidth=1;
   for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,yy=Y(v);c.beginPath();c.moveTo(L,yy);c.lineTo(w-R,yy);c.stroke();c.fillText(v.toFixed(1)+' dB',2,yy+3);}
   ks.forEach((k,i)=>{if(i%Math.ceil(ks.length/8)===0||i===ks.length-1)c.fillText(k,X(i)-4,h-6);});
-  for(const [m,f,label,color,dash] of lines){ c.strokeStyle=color;c.setLineDash(dash?[4,3]:[]);c.lineWidth=2;c.beginPath();
-    let first=true; cur[m].forEach((p,i)=>{if(!p)return; const xx=X(i),yy=Y(p[f]); first?c.moveTo(xx,yy):c.lineTo(xx,yy);first=false;}); c.stroke(); }
+  for(const [b,f,,dash] of lines){ c.strokeStyle=BITCOL(b);c.setLineDash(dash?[4,3]:[]);c.lineWidth=2;c.beginPath();
+    let first=true; cur['b'+b][f].forEach((v,i)=>{if(v===null)return; const xx=X(i),yy=Y(v); first?c.moveTo(xx,yy):c.lineTo(xx,yy);first=false;}); c.stroke(); }
   c.setLineDash([]);
   const kcur=+$('k').value, ki=ks.findIndex(k=>k>=kcur);
   if(ki>=0){c.strokeStyle=css('--bad');c.lineWidth=1;c.beginPath();c.moveTo(X(ki),Tp);c.lineTo(X(ki),h-B);c.stroke();}
-  $('curveLegend').innerHTML=lines.map(l=>`<span><i class="sw" style="background:${l[3]};${l[4]?'opacity:.5':''}"></i>${l[2]}</span>`).join('')
-    +`<span>x = ${D.meta.unit}s dropped (most extreme first)</span>`;
+  $('curveLegend').innerHTML=lines.map(l=>`<span><i class="sw" style="background:${BITCOL(l[0])};${l[3]?'opacity:.5':''}"></i>${l[2]}${l[3]?'（虛線）':''}</span>`).join('')+'<span>x＝丟掉的 frame 數</span>';
+  cv.onmousemove=e=>{const r=cv.getBoundingClientRect(); const i=Math.max(0,Math.min(ks.length-1,Math.round((e.clientX-r.left-L)/(w-L-R)*(ks.length-1))));
+    $('curveTip').textContent=`丟掉 ${ks[i]} 個 frame：`+BITS.map(b=>`${b}-bit 含被夾 ${db(cur['b'+b].all[i])} dB／不含 ${db(cur['b'+b].typ[i])} dB`).join('；')+`；有值被夾的 frame ${pct(cur.frames_clip[i])}`;};
 }
 
-// ---- segments table
-function renderSegs(){
-  if(!hasSeg){$('segSection').style.display='none';return;}
-  $('segnote').textContent=D.meta.segments_note+(D.meta.segments_reliable?'':' — treat source names as unavailable.');
-  const rank=new Int32Array(segs.length); D.unit_order.forEach((u,i)=>rank[u]=i+1);
-  let h='<tr><th>seg</th><th>source</th><th>start</th><th>frames</th><th>extremeness (×median)</th><th>rank</th><th>drop</th></tr>';
-  segs.forEach((s,i)=>{h+=`<tr><td>${i}</td><td>${esc(s.source||'–')}</td><td>${s.start}</td><td>${s.frames}</td><td>${D.unit_score[i].toFixed(2)}</td><td>${rank[i]}</td><td><input type="checkbox" data-seg="${i}"></td></tr>`;});
-  $('stab').innerHTML=h;
-  $('stab').querySelectorAll('input').forEach(cb=>cb.addEventListener('change',()=>{setUnit(+cb.dataset.seg,cb.checked?1:0);refresh(false);}));
+// ---- recommendation
+function recRows(tab,label,cls){
+  return tab.rows.map((r,i)=>{ const wst=r.worst||null;
+    const cell=(k,f)=>wst&&wst[k]!==undefined?`${f(r[k])} <span class="sub">(最差 ${f(wst[k])})</span>`:f(r[k]);
+    return `<tr class="${i?'':cls}"><td class="l">${i?'':esc(label)}</td><td class="l">${esc(r.tensor)}</td><td>${fmt(r.lo)} … ${fmt(r.hi)}</td>`
+      +`<td>${cell('clip_pct',v=>v.toFixed(4)+'%')}</td><td>${cell('frames_clip_pct',v=>v.toFixed(2)+'%')}</td>`
+      +BITS.map(b=>`<td>${cell('sqnr'+b+'_all',db)}</td><td>${cell('sqnr'+b+'_typ',db)}</td>`).join('')+'</tr>'; }).join('');
 }
-function syncSegChecks(){ if(!hasSeg)return;
-  $('stab').querySelectorAll('input').forEach(cb=>{const [a]=unitFrames(+cb.dataset.seg);cb.checked=!!dropped[a];}); }
-
-function refresh(syncK=true){
-  let kept=0;for(let f=0;f<N;f++)if(!dropped[f])kept++;
-  $('live').textContent=`${kept} of ${N} frames kept (${N-kept} dropped)`;
-  renderTable(); names.forEach(drawChart); drawCurve(); syncSegChecks();
-}
-$('k').addEventListener('input',()=>{const k=+$('k').value;$('kval').textContent=k;dropped.fill(0);
-  for(let i=0;i<k;i++)setUnit(D.unit_order[i],1);refresh();});
-$('reset').onclick=()=>{dropped.fill(0);$('k').value=0;$('kval').textContent=0;refresh();};
-$('log').onchange=refresh; sel.onchange=drawCurve; window.addEventListener('resize',refresh);
-$('dl').onclick=()=>{
-  const keep=[];for(let f=0;f<N;f++)if(!dropped[f])keep.push(f);
-  const blob=new Blob([JSON.stringify({artifact:D.meta.path,keep_frames:keep},null,1)],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='keep.json';a.click();};
 function renderRec(){
-  const r=D.recommend; if(!r)return;
+  const r=D.recommend; if(!r) return;
   $('recSection').style.display='';
-  $('recNote').textContent=` ${r.keep_frames.length} of ${N} frames · clip budget ${r.max_clip_pct}%`+(r.notes.length?' · '+r.notes.join('; '):'');
-  let t='<tr><th>subset</th><th>tensor</th><th>range</th><th>clipped %</th><th>SQNR typical (dB)</th><th>SQNR all (dB)</th></tr>';
-  for(const tab of [r.all,r.selected]) tab.rows.forEach((row,i)=>{
-    t+=`<tr><td>${i?'':esc(tab.label)+' ('+tab.frames+')'}</td><td>${esc(row.tensor)}</td><td>${fmt(row.lo)}… ${fmt(row.hi)}</td><td>${row.clip_pct.toFixed(3)}</td><td>${row.sqnr_typical.toFixed(2)}</td><td>${row.sqnr_all.toFixed(2)}</td></tr>`;});
+  $('recNote').textContent=`挑出 ${r.keep_frames.length} / ${N} 個 frame · clip 預算 ${r.max_clip_pct}%（丟掉 ${r.k_budget} 個）`+(r.notes.length?' · '+r.notes.join('；'):'');
+  let t='<tr><th class="l">組別</th><th class="l">tensor</th><th>range</th><th>被夾的值</th><th>有值被夾的 frame</th>'+BITS.map(b=>`<th>${b}-bit SQNR 含被夾</th><th>${b}-bit 不含被夾</th>`).join('')+'</tr>';
+  t+=recRows(r.all,`全部 ${r.all.frames} 個`,'grp');
+  t+=recRows(r.selected,`建議 ${r.selected.frames} 個`,'grp');
+  if(r.random) t+=recRows(r.random,`隨機 ${r.random.frames} 個（中位數）`,'grp');
+  if(r.alternative) t+=recRows(r.alternative,`對照：丟極端值 ${r.alternative.max_clip_pct}%（丟 ${r.alternative.k_budget} 個）`,'grp');
   $('rtab').innerHTML=t;
   $('recBtn').onclick=()=>{dropped.fill(1);for(const f of r.keep_frames)dropped[f]=0;
     $('k').value=0;$('kval').textContent=0;refresh();};
 }
-renderSegs(); renderRec(); refresh();
+
+// ---- sources
+function renderSrc(){
+  if(!hasSrc){ $('srcOff').style.display=''; $('srcOff').textContent=`來源資訊不可用：${SRC.note}。`; return; }
+  $('srcOn').style.display='';
+  let h='<tr><th>#</th><th class="l">來源</th><th>起始 frame</th><th>frame 數</th><th>建議保留</th><th>極端程度（× 中位數）</th><th>拿掉後 range 縮小</th><th class="l">影響的 tensor</th><th>丟掉</th></tr>';
+  SRC.rows.forEach((s,i)=>{h+=`<tr><td>${i}</td><td class="l">${esc(s.source)}</td><td>${s.start}</td><td>${s.frames}</td><td class="${s.kept===0?'badc':''}">${s.kept===null?'–':s.kept}</td><td>${s.extremeness.toFixed(2)}</td><td class="${s.loso_shrink>0.05?'flag':''}">${(100*s.loso_shrink).toFixed(1)}%</td><td class="l">${esc(s.loso_tensor||'–')}</td><td><input type="checkbox" data-seg="${i}"></td></tr>`;});
+  $('stab').innerHTML=h;
+  $('stab').querySelectorAll('input').forEach(cb=>cb.addEventListener('change',()=>{setSrc(+cb.dataset.seg,cb.checked?1:0);refresh();}));
+}
+function syncSrcChecks(){ if(!hasSrc)return;
+  $('stab').querySelectorAll('input').forEach(cb=>{const [a,b]=srcFrames(+cb.dataset.seg); let all=1; for(let f=a;f<b;f++) if(!dropped[f]){all=0;break;} cb.checked=!!all;}); }
+function drawGrowth(){
+  if(!hasSrc) return;
+  const cv=$('growth'), dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*dpr;cv.height=h*dpr;const c=cv.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
+  const med=SRC.growth.median, p10=SRC.growth.p10, S=med.length;
+  const lo=Math.max(0,Math.min(...p10)*100-5), hi=100;
+  const L=44,B=22,Tp=8,R=8, X=i=>L+(i/(S-1||1))*(w-L-R), Y=v=>Tp+(1-(v-lo)/(hi-lo||1))*(h-Tp-B);
+  c.strokeStyle=css('--line');c.fillStyle=css('--mut');c.font='11px sans-serif';c.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,yy=Y(v);c.beginPath();c.moveTo(L,yy);c.lineTo(w-R,yy);c.stroke();c.fillText(v.toFixed(0)+'%',2,yy+3);}
+  [0,Math.floor((S-1)/2),S-1].forEach(i=>c.fillText(i+1,X(i)-4,h-6));
+  for(const [arr,dash] of [[med,0],[p10,1]]){ c.strokeStyle=css('--acc');c.setLineDash(dash?[4,3]:[]);c.lineWidth=2;c.beginPath();
+    arr.forEach((v,i)=>{const xx=X(i),yy=Y(100*v); i?c.lineTo(xx,yy):c.moveTo(xx,yy);}); c.stroke(); }
+  c.setLineDash([]);
+  cv.onmousemove=e=>{const r=cv.getBoundingClientRect(); const i=Math.max(0,Math.min(S-1,Math.round((e.clientX-r.left-L)/(w-L-R)*(S-1))));
+    $('growthTip').textContent=`加入 ${i+1} / ${S} 個來源：中位數 ${(100*med[i]).toFixed(1)}%，第 10 百分位 ${(100*p10[i]).toFixed(1)}%`;};
+}
+
+function refresh(){
+  let kept=0;for(let f=0;f<N;f++)if(!dropped[f])kept++;
+  $('live').textContent=`保留 ${kept} / ${N} 個 frame（丟掉 ${N-kept} 個）`;
+  renderTable(); names.forEach(drawChart); drawCurve(); syncSrcChecks();
+}
+$('k').max = Math.max(1, Math.floor(N/2));
+$('k').addEventListener('input',()=>{const k=+$('k').value;$('kval').textContent=k;dropped.fill(0);
+  for(let i=0;i<k;i++) dropped[D.frame_order[i]]=1; refresh();});
+$('reset').onclick=()=>{dropped.fill(0);$('k').value=0;$('kval').textContent=0;refresh();};
+$('log').onchange=refresh; sel.onchange=drawCurve;
+window.addEventListener('resize',()=>{refresh();drawGrowth();});
+$('dl').onclick=()=>{
+  const keep=[];for(let f=0;f<N;f++)if(!dropped[f])keep.push(f);
+  const blob=new Blob([JSON.stringify({artifact:D.meta.path,keep_frames:keep},null,1)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='keep.json';a.click();};
+renderSrc(); renderRec(); refresh(); drawGrowth();
 </script>
 </body>
 </html>

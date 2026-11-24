@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### 2026-11-24: `PTQ/calib_analyze.py` scores min/max grids only
+
+- The converter takes each tensor's range from the minimum and maximum of one calibration set shared by the 8x8, 16x8 and 16x16 formats, so the KL, MSE, percentile and EMA estimates are gone. `--bits` (default `8,16`) scores every width side by side.
+- `--count` defaults to 1000 and is an upper bound: a smaller pool is kept whole. `--max-clip-pct` defaults to 0 (was 0.1) and drops nothing at that value; the budget counts every recorded value exactly. The kept frames hold each input tensor's minimum and maximum, and k-means thins the rest.
+- `--scheme asym|sym|pow2`. Under `asym`, the recurrent-state inputs (first frame all zero) are scored on the symmetric grid. `pow2` rounds the symmetric bound up to a power of two, the scale of a fixed-point input; frames the budget drops that lie inside the final grid come back.
+- `select` prints the selection next to random subsets of the same size and the frames kept per source. `analyze` adds, at budget 0, a 0.1 % budget for comparison, the range lost without each source and how the range grows as sources are added; its HTML report is in Chinese with generated conclusions.
+- New `coverage` subcommand: scores the ranges of an artifact (or of a `--keep` selection) on a held-out artifact of the same graph, refuses one from another checkpoint, grid, N or lookahead, and warns when the two share source file names.
+- A `drop_frames` entry outside the artifact is refused (it used to be ignored), and `select --output` checks the name against the format before it writes the keep file.
+- `inference.py calib` is unchanged: it captures from the start of each file in seeded file order until `--frames`, so capture a large pool (`--frames` well above 1000) and let `select` keep the count.
+
 ### 2026-11-22: DFN2 libraries read no file; the sample passes the ERB tables and opens the graph file
 
 - `AinrConfig` is `{ sr, fft, hop_in, erb_fwd, erb_inv, n_erb }`: the grid's ERB tables (`erb_fwd` bin-major `[n_bins][n_erb]`, `erb_inv` band-major `[n_erb][n_bins]`), borrowed for the context's life, with their band count `n_erb` (the `n_erb` out-parameter of `graph_io_dfn2_erb_file()`; `ainr_init[_freq]` returns `AINR_ERR_ERB_TABLES` before the pool is written when it is not the grid's, so a zero-initialised config that sets only the two pointers is refused). The sample loads `fb_<sr>_<n_erb>.bin` (format unchanged, still produced by `DeepFilterNet2/export_erb_matrix.py --format bin`) with the header-only `stream/ainr/dfn2_erb_file.h` (`dfn2_erb_file_load()`, default directory `SAMPLE_ERB_DIR` = `/mnt/sd/dfn2_blobs`).

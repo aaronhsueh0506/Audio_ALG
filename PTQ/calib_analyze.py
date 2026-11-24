@@ -1,37 +1,46 @@
 #!/usr/bin/env python3
-r"""Analyse a PTQ calibration artifact and help choose which patterns to keep.
+r"""Choose the calibration patterns a min/max PTQ converter sees.
 
-A calibration artifact is what ``inference.py calib`` writes: one array per
-graph input whose leading axis is the captured invocation ("frame"), either a
-``.npz`` (+ sibling ``.calib.json``) or a per-frame ``.bin`` directory
-(+ ``manifest.json``).  A range-based quantizer sets each tensor's scale from
-the extremes it sees, so a handful of frames holding an outlier can stretch the
-range and cost every other frame resolution.  This tool shows where that
-happens and what dropping those frames would buy.
+A calibration artifact is what a model's ``inference.py calib`` writes: one
+array per graph input whose leading axis is the captured invocation ("frame"),
+either a ``.npz`` (+ sibling ``.calib.json``) or a per-frame ``.bin`` directory
+(+ ``manifest.json``).  The converter sets each tensor's range from the
+minimum and maximum it sees, one range for the 8x8, 16x8 and 16x16 formats
+alike.  A frame holding an outlier stretches the range for every other frame;
+a frame left out has its values clipped on the device.  The tool reads the
+recorded input tensors only and works for any model.
 
-    # interactive HTML report (open it in a browser, no server needed)
-    python3 PTQ/calib_analyze.py analyze calib/dfn2 --out calib_report.html
+Consecutive audio frames are near copies of each other, so capturing exactly
+the pattern count (``--frames 1000``) covers one or two recordings.  Capture a
+large pool from many recordings and let ``select`` keep the count:
 
-    # let the tool choose N patterns (clip budget + coverage)
-    python3 PTQ/calib_analyze.py select calib/dfn2 --count 512 \
-        --output calib/dfn2_512
+    python3 AINR/DeepFilterNet2/inference.py calib --model ckpt.pth \
+        --wav-dir wavs/ --frames 30000 --output calib/pool.npz
+    python3 PTQ/calib_analyze.py analyze calib/pool.npz --out report.html
+    python3 PTQ/calib_analyze.py select calib/pool.npz --output calib/pool_1000.npz
+    python3 PTQ/calib_analyze.py coverage calib/pool.npz --keep keep.json \
+        --against calib/heldout.npz
+    python3 PTQ/calib_analyze.py apply calib/pool.npz --keep keep.json \
+        --output calib/pool_pruned.npz
 
-    # write a reduced artifact from the keep list the report exports
-    python3 PTQ/calib_analyze.py apply calib/dfn2 --keep keep.json \
-        --output calib/dfn2_pruned
+``select`` keeps at most ``--count`` frames (default 1000): every tensor's
+extreme frames, then k-means over per-frame statistics so the rest still
+covers the pool.  With ``--max-clip-pct`` above 0 it first drops the most
+extreme frames while at most that percent of each tensor's recorded values
+falls outside the kept range (counted exactly).  SQNR is reported for every
+``--bits`` width.  ``coverage`` scores a selection against a held-out artifact
+of the same graph.
 
-Per tensor the report gives min / max / percentiles / tail ratio, how fixed
-the outlier position is along the channel and feature axes (a fixed band means
-the problem is feature scaling, not pattern choice), each frame's leave-one-out
-range shrink, and a simulated 8-bit quantisation error (SQNR) against how many
-of the most extreme patterns are dropped.  Patterns are grouped into source
-segments when the state resets (all-zero initial state) reveal them.
-
-Selection caveats: this is a statistic over the recorded INPUT tensors, not
-over the activations inside the graph; frames are streaming snapshots, so a
-pruned set keeps each frame's own recorded state but is no longer one
-continuous stream.  Models that need one contiguous stream are refused, and so
-is an Align-ULCNet artifact whose AEC front-end stamp is missing or retired.
+The statistics cover the graph INPUT tensors, not the activations inside the
+graph; how a choice suits the internal layers shows only in the quantised
+model's output.  Recurrent-state inputs (a tensor whose first frame is all
+zero) are scored on a symmetric grid under ``--scheme asym``, since the
+device needs zero point 0 on them; ``--scheme pow2`` scores every input on a
+symmetric grid whose bound is rounded up to a power of two, the scale of a
+fixed-point input format.  Frames are streaming snapshots, so a pruned set keeps each frame's own
+recorded state but is no longer one stream: models that need one contiguous
+stream are refused, and so is an Align-ULCNet artifact whose AEC front-end
+stamp is missing or retired.
 """
 
 from __future__ import annotations
@@ -50,11 +59,18 @@ if _AINR_DIR not in sys.path:
 
 from calibration_io import (  # noqa: E402
     calibration_report_path,
+    resolve_calibration_format,
     write_calibration_artifact,
 )
 
-SAMPLE_CAP = 2_000_000       # elements per tensor used for percentiles / SQNR
+SAMPLE_CAP = 2_000_000       # values per tensor behind the SQNR estimates
 EPS = 1e-12
+DEFAULT_COUNT = 1000         # the converter's recommended pattern cap
+DEFAULT_BITS = (8, 16)       # activation widths of the 8x8 / 16x8 / 16x16 formats
+ALT_CLIP_PCT = 0.1           # budget the report prices next to "keep everything"
+RANDOM_DRAWS = 10
+GROWTH_ORDERS = 20
+FIXED_BAND_RATIO = 8.0
 
 
 # --------------------------------------------------------------------------
@@ -81,6 +97,15 @@ class Artifact:
             else:
                 self.names.append(name)
         self.contiguous = report.get('contiguous_state_frames') is not None
+        # A fresh source starts from the all-zero initial state.
+        self.state = [name for name in self.names
+                      if not np.any(arrays[name][0])]
+
+    def schemes(self, scheme):
+        """Grid per tensor: ``scheme``, but state inputs need zero point 0, so
+        they take the symmetric grid when ``scheme`` is asymmetric."""
+        return {name: 'sym' if name in self.state and scheme == 'asym'
+                else scheme for name in self.names}
 
 
 def _read_json(path):
@@ -177,33 +202,31 @@ def load_artifact(path):
 # Per-tensor statistics
 # --------------------------------------------------------------------------
 
-def _sample(flat, per_frame, rng):
-    """Up to SAMPLE_CAP elements of ``flat [N, per_frame]`` + their frame ids."""
-    total = flat.size
-    if total <= SAMPLE_CAP:
-        values = flat.ravel()
-        frame_ids = np.repeat(np.arange(flat.shape[0]), per_frame)
-        return values, frame_ids
-    index = np.sort(rng.choice(total, SAMPLE_CAP, replace=False))
-    return flat.ravel()[index], index // per_frame
+def _sample(values, rng):
+    """Up to SAMPLE_CAP of ``values`` (flattened), drawn uniformly with
+    replacement (an unbiased SQNR estimate; only the sample is copied)."""
+    values = values.ravel()
+    if values.size <= SAMPLE_CAP:
+        return values
+    return values[np.sort(rng.integers(0, values.size, SAMPLE_CAP))]
 
 
-def _loo_extreme(per_frame, take_max):
-    """Global max (or min) with each frame removed, via the top-2 trick."""
-    order = np.argsort(per_frame)
+def _loo_extreme(per_unit, take_max):
+    """Global max (or min) with each unit removed, via the top-2 trick."""
+    order = np.argsort(per_unit)
     if take_max:
         best, second = order[-1], order[-2] if len(order) > 1 else order[-1]
     else:
         best, second = order[0], order[1] if len(order) > 1 else order[0]
-    out = np.full(per_frame.shape, per_frame[best], dtype=np.float64)
-    out[best] = per_frame[second]
+    out = np.full(per_unit.shape, per_unit[best], dtype=np.float64)
+    out[best] = per_unit[second]
     return out
 
 
 def _axis_concentration(x, axis):
     """How much a single index along ``axis`` dominates the absolute maximum."""
-    other = tuple(a for a in range(1, x.ndim) if a != axis % x.ndim)
-    peak = np.abs(x).max(axis=(0,) + other).astype(np.float64)
+    other = (0,) + tuple(a for a in range(1, x.ndim) if a != axis % x.ndim)
+    peak = np.maximum(x.max(axis=other), -x.min(axis=other)).astype(np.float64)
     return {
         'size': int(peak.size),
         'argmax': int(peak.argmax()),
@@ -215,47 +238,21 @@ def _axis_concentration(x, axis):
 def tensor_stats(x, rng):
     n = x.shape[0]
     flat = x.reshape(n, -1)
-    per_frame = flat.shape[1]
     fmin = flat.min(axis=1).astype(np.float64)
     fmax = flat.max(axis=1).astype(np.float64)
-    fabs = np.maximum(np.abs(fmin), np.abs(fmax))
     gmin, gmax = float(fmin.min()), float(fmax.max())
     span = gmax - gmin
     loo_span = _loo_extreme(fmax, True) - _loo_extreme(fmin, False)
     shrink = (span - loo_span) / span if span > 0 else np.zeros(n)
 
-    sample, frame_ids = _sample(flat, per_frame, rng)
-    sample64 = sample.astype(np.float64)
-    pct = np.percentile(sample64, [0.1, 1, 50, 99, 99.9])
-    abs_p999 = float(np.percentile(np.abs(sample64), 99.9))
-    mean, std = float(sample64.mean()), float(sample64.std())
-    kurt = (float(np.mean((sample64 - mean) ** 4) / (std ** 4 + EPS) - 3.0)
+    sample = _sample(flat, rng)
+    s64 = sample.astype(np.float64)
+    p001, p999 = (float(v) for v in np.percentile(s64, [0.1, 99.9]))
+    abs_p999 = float(np.percentile(np.abs(s64), 99.9))
+    mean, std = float(s64.mean()), float(s64.std())
+    kurt = (float(np.mean((s64 - mean) ** 4) / (std ** 4 + EPS) - 3.0)
             if std > 0 else 0.0)
     absmax = max(abs(gmin), abs(gmax))
-
-    # What a quantiser toolchain derives from the same data.
-    scale_asym = (gmax - gmin) / 255.0
-    p_lo, p_hi, p9999 = np.percentile(sample64, [0.1, 99.9, 99.99])
-    mse_lo, mse_hi, mse_alpha = _mse_range(sample, gmin, gmax, 'asym')
-    # EMA of per-frame extremes (PyTorch MovingAverageMinMax, constant 0.01).
-    ema_lo, ema_hi = float(fmin[0]), float(fmax[0])
-    for lo_f, hi_f in zip(fmin[1:], fmax[1:]):
-        ema_lo += 0.01 * (lo_f - ema_lo)
-        ema_hi += 0.01 * (hi_f - ema_hi)
-    quant = {
-        'scale_sym': absmax / 127.0,
-        'scale_asym': scale_asym,
-        'zero_point_asym': (int(np.clip(round(-gmin / scale_asym), 0, 255))
-                            if scale_asym > 0 else 0),
-        'levels_p998': float((p_hi - p_lo) / scale_asym) if scale_asym > 0
-        else 0.0,
-        'zero_frac': float(np.mean(sample == 0)),
-        'p9999': float(p9999),
-        'kl_threshold': kl_threshold(np.abs(sample64)),
-        'mse_lo': float(mse_lo), 'mse_hi': float(mse_hi),
-        'mse_alpha': mse_alpha,
-        'ema_min': ema_lo, 'ema_max': ema_hi,
-    }
 
     conc = {}
     if x.ndim >= 4 and x.shape[2] > 1:
@@ -268,18 +265,22 @@ def tensor_stats(x, rng):
         'global': {
             'min': gmin, 'max': gmax, 'absmax': absmax,
             'mean': mean, 'std': std, 'excess_kurtosis': kurt,
-            'p001': float(pct[0]), 'p01': float(pct[1]),
-            'p50': float(pct[2]), 'p99': float(pct[3]), 'p999': float(pct[4]),
-            'abs_p999': abs_p999,
+            'p001': p001, 'p999': p999, 'abs_p999': abs_p999,
             'tail_ratio': absmax / (abs_p999 + EPS),
+            # Share of the range the central 99.8 % of the values occupies.
+            'core_frac': (p999 - p001) / span if span > 0 else 1.0,
+            'zero_frac': float(np.mean(sample == 0)),
             'sampled': bool(sample.size < flat.size),
-            **quant,
         },
         'concentration': conc,
-        'frame_min': fmin, 'frame_max': fmax, 'frame_absmax': fabs,
-        'frame_shrink': shrink,
-        '_sample': sample, '_sample_frames': frame_ids,
+        'frame_min': fmin, 'frame_max': fmax, 'frame_shrink': shrink,
+        '_flat': flat, '_sample': sample,
     }
+
+
+def all_stats(art, seed=0):
+    rng = np.random.default_rng(seed)
+    return {name: tensor_stats(art.arrays[name], rng) for name in art.names}
 
 
 # --------------------------------------------------------------------------
@@ -289,18 +290,15 @@ def tensor_stats(x, rng):
 def detect_segments(art):
     """Frame indices where a new source file began, plus a reliability flag.
 
-    A fresh source starts from the all-zero initial state.  Tensors whose first
-    frame is exactly zero are treated as state; a boundary is a frame where
-    every one of them is exactly zero again.  Trusted only if the count equals
-    the number of recorded source files.
+    A tensor whose first frame is exactly zero is treated as state; a boundary
+    is a frame where every one of them is exactly zero again.  Trusted only if
+    the count equals the number of recorded source files.
     """
     n = art.frames
-    state = [name for name in art.names
-             if not np.any(art.arrays[name][0])]
-    if not state:
+    if not art.state:
         return [0], False, 'no tensor starts from an all-zero state'
     zero = np.ones(n, dtype=bool)
-    for name in state:
+    for name in art.state:
         zero &= ~art.arrays[name].reshape(n, -1).any(axis=1)
     starts = [int(i) for i in np.flatnonzero(zero)]
     if not starts or starts[0] != 0:
@@ -309,197 +307,205 @@ def detect_segments(art):
     reliable = len(starts) == len(sources)
     note = ('%d state resets match %d source files' % (len(starts), len(sources))
             if reliable else
-            '%d state resets but %d source files: segments are a guess'
-            % (len(starts), len(sources)))
+            '%d state resets but %d source files' % (len(starts), len(sources)))
     return starts, reliable, note
 
 
 # --------------------------------------------------------------------------
-# Simulated 8-bit quantisation
+# Min/max grids
 # --------------------------------------------------------------------------
 
-def _qdq(values, lo, hi, scheme):
-    values = values.astype(np.float32, copy=False)
-    if scheme == 'sym':
-        top = max(abs(lo), abs(hi))
-        if top <= 0:
-            return values.copy()
-        scale = np.float32(top / 127.0)
-        return np.clip(np.rint(values / scale), -127, 127) * scale
-    if hi <= lo:
+SCHEMES = ('asym', 'sym', 'pow2')
+
+
+def pow2_bound(top):
+    """2^ceil(log2(top)) for top > 0, else 0 (an all-zero tensor)."""
+    top = np.asarray(top, dtype=np.float64)
+    safe = np.where(top > 0, top, 1.0)
+    bound = np.where(top > 0, np.exp2(np.ceil(np.log2(safe))), 0.0)
+    return bound if bound.ndim else float(bound)
+
+
+def grid_range(lo, hi, scheme):
+    """What a min/max grid covers.
+
+    Asymmetric: [lo, hi] widened to include 0, as min/max observers do so that
+    0 is exact.  Symmetric: +-max(|lo|, |hi|).  Power of two: the symmetric
+    bound rounded up to a power of two (a fixed-point scale).
+    """
+    if scheme == 'asym':
+        return np.minimum(lo, 0.0), np.maximum(hi, 0.0)
+    top = np.maximum(np.abs(lo), np.abs(hi))
+    if scheme == 'pow2':
+        top = pow2_bound(top)
+    elif scheme != 'sym':
+        raise ValueError('unknown scheme %r' % scheme)
+    return -top, top
+
+
+def quantize(values, lo, hi, bits, scheme):
+    """Quantise-dequantise ``values`` on the min/max grid over [lo, hi].
+
+    Asymmetric: 2^bits levels, integer zero point (0 is exact).  Symmetric:
+    levels -(2^(bits-1)-1) .. 2^(bits-1)-1, zero point 0.  Power of two:
+    levels -2^(bits-1) .. 2^(bits-1)-1 with scale hi / 2^(bits-1), hi being a
+    power of two.  [lo, hi] comes from grid_range, so it holds 0.
+    """
+    if scheme in ('sym', 'pow2'):
+        top = 2 ** (bits - 1) - 1
+        low = top if scheme == 'sym' else top + 1
+        scale = hi / low
+        if scale <= 0:
+            return np.zeros_like(values)
+        return np.clip(np.rint(values / scale), -low, top) * scale
+    if scheme != 'asym':
+        raise ValueError('unknown scheme %r' % scheme)
+    top = 2 ** bits - 1
+    scale = (hi - lo) / top
+    if scale <= 0:
         return np.full_like(values, lo)
-    scale = np.float32((hi - lo) / 255.0)
-    return np.clip(np.rint((values - lo) / scale), 0, 255) * scale + lo
+    zero = np.clip(np.rint(-lo / scale), 0, top)
+    return (np.clip(np.rint(values / scale) + zero, 0, top) - zero) * scale
 
 
-def _mse_range(values, lo, hi, scheme):
-    """Clip [lo, hi] by the factor that minimises quantisation MSE.
+class GridError:
+    """SQNR of a min/max grid, measured by quantising a value sample."""
 
-    ``values`` is a (sub)sample; the search shrinks the observed range toward
-    zero, the usual MSE-observer behaviour.
+    def __init__(self, values, scheme='asym'):
+        self.scheme = scheme
+        self.v = np.asarray(values, dtype=np.float64).ravel()
+        self.sq = self.v * self.v
+        self.signal = float(self.sq.sum())
+        # Tables, random draws and curve points often share a range.
+        self._memo = {}
+
+    def _one(self, lo, hi, bits):
+        key = (lo, hi, bits)
+        if key not in self._memo:
+            err = (quantize(self.v, lo, hi, bits, self.scheme) - self.v) ** 2
+            inside = (self.v >= lo) & (self.v <= hi)
+            self._memo[key] = (
+                _db(self.signal, float(err.sum())),
+                _db(float(self.sq[inside].sum()), float(err[inside].sum())))
+        return self._memo[key]
+
+    def evaluate(self, lo, hi, bits):
+        """SQNR (dB) of the ``bits``-wide grid over [lo, hi] (from grid_range).
+
+        ``sqnr_all`` counts clipped values at their full error;
+        ``sqnr_typical`` looks only at the values inside the range.  ``lo`` and
+        ``hi`` may be arrays of ranges.
+        """
+        if np.ndim(lo) == 0:
+            full, typical = self._one(float(lo), float(hi), bits)
+            return {'sqnr_all': full, 'sqnr_typical': typical}
+        pairs = [self._one(float(a), float(b), bits) for a, b in zip(lo, hi)]
+        return {'sqnr_all': [p[0] for p in pairs],
+                'sqnr_typical': [p[1] for p in pairs]}
+
+
+def _db(signal, error):
+    return float(10 * np.log10((signal + EPS) / (error + EPS)))
+
+
+def outside_count(stats, frames, lo, hi, limit=None):
+    """Values of ``frames`` outside [lo, hi], counted exactly.
+
+    A frame whose own min and max lie inside is skipped without reading its
+    data; with ``limit`` the count stops once it is exceeded.
     """
-    if values.size > 200_000:
-        values = values[:: values.size // 200_000 + 1]
-    best, best_err = (lo, hi, 1.0), np.inf
-    for alpha in np.linspace(0.2, 1.0, 41):
-        err = float(np.mean((_qdq(values, lo * alpha, hi * alpha, scheme)
-                             - values).astype(np.float64) ** 2))
-        if err < best_err:
-            best, best_err = (lo * alpha, hi * alpha, float(alpha)), err
-    return best
+    fmin, fmax, flat = stats['frame_min'], stats['frame_max'], stats['_flat']
+    frames = np.asarray(frames, dtype=np.int64)
+    hot = np.sort(frames[(fmin[frames] < lo) | (fmax[frames] > hi)])
+    total = 0
+    for start in range(0, hot.size, 512):
+        block = flat[hot[start:start + 512]]
+        total += int(np.count_nonzero((block < lo) | (block > hi)))
+        if limit is not None and total > limit:
+            break
+    return total
 
 
-def kl_threshold(absvalues, bins=2048, target=128):
-    """Symmetric clip threshold minimising KL(reference || 128-level quantised).
+def frame_order(stats):
+    """Frames most extreme first.
 
-    The entropy (KL) calibration; ``absvalues`` is |x|.
-    """
-    top = float(absvalues.max())
-    if top <= 0:
-        return 0.0
-    hist, edges = np.histogram(absvalues, bins=bins, range=(0.0, top))
-    hist = hist.astype(np.float64)
-    best_div, best_i = np.inf, bins
-    for i in range(target, bins + 1, 8):
-        ref = hist[:i].copy()
-        ref[-1] += hist[i:].sum()
-        if ref.sum() == 0:
-            continue
-        groups = np.array_split(hist[:i], target)
-        quant = np.concatenate([
-            np.where(g > 0, g.sum() / max((g > 0).sum(), 1), 0.0)
-            for g in groups])
-        mask = (ref > 0) & (quant > 0)
-        p, q = ref[mask] / ref.sum(), quant[mask] / quant.sum()
-        div = float(np.sum(p * np.log(p / q)))
-        if div < best_div:
-            best_div, best_i = div, i
-    return float(edges[best_i])
-
-
-def quant_eval(stats, kept, mode, scheme):
-    """SQNR (dB) of an 8-bit grid fixed by the kept frames.
-
-    ``full`` scores every recorded value (dropped frames get clipped, which is
-    the honest cost); ``kept`` scores only what the grid was built from.
-    """
-    sample, frame_ids = stats['_sample'], stats['_sample_frames']
-    keep_elem = kept[frame_ids]
-    if not keep_elem.any():
-        return None
-    if mode in ('minmax', 'mse'):
-        lo = float(stats['frame_min'][kept].min())
-        hi = float(stats['frame_max'][kept].max())
-        if mode == 'mse':
-            lo, hi, _ = _mse_range(sample[keep_elem], lo, hi, scheme)
-    else:
-        lo, hi = (float(v) for v in
-                  np.percentile(sample[keep_elem].astype(np.float64),
-                                [0.1, 99.9]))
-    deq = _qdq(sample, lo, hi, scheme)
-    err = (deq - sample).astype(np.float64) ** 2
-    sig = sample.astype(np.float64) ** 2
-
-    def db(mask):
-        s, e = sig[mask].sum(), err[mask].sum()
-        return float(10 * np.log10((s + EPS) / (e + EPS)))
-
-    clipped = float(((sample < lo) | (sample > hi))[~keep_elem].mean()
-                    if (~keep_elem).any() else 0.0)
-    return {'sqnr_full': db(np.ones_like(keep_elem)), 'sqnr_kept': db(keep_elem),
-            'lo': lo, 'hi': hi, 'dropped_clip': clipped}
-
-
-def _drop_grid(units):
-    cap = max(1, units // 2)
-    grid = {0}
-    value = 1.0
-    while value <= cap:
-        grid.add(int(round(value)))
-        value *= 1.35
-    grid.add(cap)
-    return sorted(g for g in grid if g <= cap)
-
-
-def unit_order(stats_by_name, units):
-    """Units (frame-index arrays) ordered most extreme first.
-
-    Score = worst-case ratio of the unit's abs-max to the median unit abs-max
-    across tensors, so the ranking is comparable between tensors of different
+    Score = worst ratio, over tensors, of the frame's abs-max to the median
+    frame abs-max, so the ranking is comparable between tensors of different
     scale.
     """
-    score = np.zeros(len(units))
-    for stats in stats_by_name.values():
-        peak = np.array([stats['frame_absmax'][u].max() for u in units])
-        score = np.maximum(score, peak / (np.median(peak) + EPS))
+    score = None
+    for st in stats.values():
+        peak = np.maximum(np.abs(st['frame_min']), np.abs(st['frame_max']))
+        ratio = peak / (np.median(peak) + EPS)
+        score = ratio if score is None else np.maximum(score, ratio)
     return np.argsort(-score, kind='stable'), score
 
 
-def build_curves(stats_by_name, units, order, n_frames, scheme):
-    grid = _drop_grid(len(units))
-    curves = {name: {'minmax': [], 'pct': [], 'mse': []}
-              for name in stats_by_name}
-    for k in grid:
-        kept = np.ones(n_frames, dtype=bool)
-        for u in order[:k]:
-            kept[units[u]] = False
-        for name, stats in stats_by_name.items():
-            for mode in ('minmax', 'pct', 'mse'):
-                curves[name][mode].append(quant_eval(stats, kept, mode, scheme))
-    return {'k': grid, 'tensors': curves}
+def _suffix_ranges(stats, schemes, order):
+    """Per tensor: the grid range left after dropping order[:k], for every k."""
+    out = {}
+    for name, st in stats.items():
+        lo = np.minimum.accumulate(st['frame_min'][order][::-1])[::-1]
+        hi = np.maximum.accumulate(st['frame_max'][order][::-1])[::-1]
+        out[name] = grid_range(lo, hi, schemes[name])
+    return out
 
 
+def drop_budget(stats, schemes, order, max_clip_pct):
+    """How many of the most extreme frames may go.
 
-# --------------------------------------------------------------------------
-# Selection: pick N patterns
-# --------------------------------------------------------------------------
-
-class RangeModel:
-    """Analytic 8-bit error of a clip range, evaluated against every value.
-
-    Built from the sorted value sample and its running sums, so scoring a
-    range is a binary search instead of a pass over the data.  Error =
-    rounding (step^2/12 inside the range) + clipping (squared distance of every
-    value outside it).  Approximates ``quant_eval`` to a fraction of a dB.
+    The largest k for which dropping order[:k] leaves every tensor with at
+    most ``max_clip_pct`` percent of all its recorded values outside the kept
+    range.  Only dropped frames can hold such values, and the count grows with
+    k, so a binary search over exact counts finds it.  A budget of 0 drops
+    nothing.
     """
+    n = order.size
+    if max_clip_pct <= 0 or n < 2:
+        return 0
+    suffix = _suffix_ranges(stats, schemes, order)
 
-    def __init__(self, stats, scheme='asym'):
-        self.scheme = scheme
-        self.s = np.sort(stats['_sample'].astype(np.float64))
-        self.c1 = np.concatenate([[0.0], np.cumsum(self.s)])
-        self.c2 = np.concatenate([[0.0], np.cumsum(self.s * self.s)])
-        self.n = self.s.size
+    def fits(k):
+        for name, st in stats.items():
+            limit = max_clip_pct / 100.0 * st['_flat'].size
+            lo, hi = suffix[name][0][k], suffix[name][1][k]
+            if outside_count(st, order[:k], lo, hi, limit) > limit:
+                return False
+        return True
 
-    def evaluate(self, lo, hi):
-        """Arrays of kept-set extremes -> clip fraction and two SQNRs (dB).
-
-        ``sqnr_all`` counts clipped values at their full error; ``sqnr_typical``
-        looks only at the values inside the range (the resolution the bulk of
-        the data gets).
-        """
-        lo = np.asarray(lo, dtype=np.float64)
-        hi = np.asarray(hi, dtype=np.float64)
-        if self.scheme == 'sym':
-            top = np.maximum(np.abs(lo), np.abs(hi))
-            lo, hi = -top, top
-            step = top / 127.0
+    good, bad = 0, n            # k = 0 always fits; k = n keeps nothing
+    while bad - good > 1:
+        mid = (good + bad) // 2
+        if fits(mid):
+            good = mid
         else:
-            step = (hi - lo) / 255.0
-        s, c1, c2, n = self.s, self.c1, self.c2, self.n
-        i = np.searchsorted(s, lo, side='left')
-        j = np.searchsorted(s, hi, side='right')
-        below = i * lo * lo - 2 * lo * c1[i] + c2[i]
-        above = (c2[n] - c2[j]) - 2 * hi * (c1[n] - c1[j]) + (n - j) * hi * hi
-        inner = (j - i) * step * step / 12.0
-        sig_in = c2[j] - c2[i]
-        db = lambda a, b: 10 * np.log10((a + EPS) / (b + EPS))
-        return {
-            'clip': (i + n - j) / n,
-            'sqnr_all': db(c2[n], inner + np.maximum(below, 0)
-                           + np.maximum(above, 0)),
-            'sqnr_typical': db(sig_in, inner),
-        }
+            bad = mid
+    return good
 
+
+def budget_pool(stats, schemes, order, max_clip_pct):
+    """Frames left after the clip budget, and how many it drops.
+
+    The ``drop_budget`` prefix of the ranking goes, except the frames that lie
+    inside the grid the rest leave for every tensor: they clip nothing (a
+    power-of-two bound can sit well above the kept range) and taking them back
+    leaves every grid as it is.
+    """
+    k = drop_budget(stats, schemes, order, max_clip_pct)
+    if k == 0:
+        return np.sort(order), 0
+    rest, dropped = order[k:], order[:k]
+    inside = np.ones(k, dtype=bool)
+    for name, st in stats.items():
+        lo, hi = grid_range(float(st['frame_min'][rest].min()),
+                            float(st['frame_max'][rest].max()), schemes[name])
+        inside &= (st['frame_min'][dropped] >= lo) & (st['frame_max'][dropped] <= hi)
+    return np.sort(np.concatenate([rest, dropped[inside]])), int(k - inside.sum())
+
+
+# --------------------------------------------------------------------------
+# Selection: pick the patterns
+# --------------------------------------------------------------------------
 
 def frame_features(art, names):
     """Per-frame mean, std and abs-max of every tensor, z-scored later."""
@@ -524,30 +530,31 @@ def _kmeans_pick(features, k, rng, iters=12):
     if k >= n:
         return np.arange(n)
     z = (features - features.mean(0)) / (features.std(0) + EPS)
+    zz = (z * z).sum(1)
 
     def nearest(centres):
-        dist = np.empty(n)
+        cc = (centres * centres).sum(1)
         arg = np.empty(n, dtype=np.int64)
-        for a in range(0, n, 2048):
-            d = ((z[a:a + 2048, None, :] - centres[None, :, :]) ** 2).sum(-1)
-            arg[a:a + 2048] = d.argmin(1)
-            dist[a:a + 2048] = d.min(1)
-        return arg, dist
+        for a in range(0, n, 4096):
+            d = zz[a:a + 4096, None] - 2 * z[a:a + 4096] @ centres.T + cc
+            arg[a:a + 4096] = d.argmin(1)
+        return arg
 
     # Seeding by uniform sampling keeps the picks proportional to density, so a
     # large regime is thinned rather than kept whole (k-means++ would favour
     # far-away points).
     centres = z[rng.choice(n, k, replace=False)].copy()
     for _ in range(iters):
-        arg, _ = nearest(centres)
-        for c in range(k):
-            members = z[arg == c]
-            if members.size:
-                centres[c] = members.mean(0)
+        arg = nearest(centres)
+        counts = np.bincount(arg, minlength=k)
+        used = counts > 0
+        for col in range(z.shape[1]):
+            sums = np.bincount(arg, weights=z[:, col], minlength=k)
+            centres[used, col] = sums[used] / counts[used]
     chosen = []
     taken = np.zeros(n, dtype=bool)
     for c in range(k):
-        d = ((z - centres[c]) ** 2).sum(1)
+        d = zz - 2 * z @ centres[c] + centres[c] @ centres[c]
         d[taken] = np.inf
         index = int(d.argmin())
         taken[index] = True
@@ -555,56 +562,39 @@ def _kmeans_pick(features, k, rng, iters=12):
     return np.array(chosen)
 
 
-def select_patterns(art, count=None, max_clip_pct=0.1, scheme='asym', seed=0):
+def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
+                    seed=0):
     """Choose which frames to calibrate with.
 
-    1. Rank frames most extreme first (same score the report uses).
-    2. Drop extremes while every tensor would still have at most
-       ``max_clip_pct`` percent of ALL recorded values outside the kept range.
-       This is the explicit trade: those few values get clipped in exchange for
-       finer resolution for the rest.
-    3. If more than ``count`` frames remain, thin them with k-means so the
-       survivors still cover the distribution, always keeping the frames that
-       define each tensor's extremes (otherwise the range would shrink past
-       the budget).  If fewer remain, the least extreme dropped frames return.
+    1. Rank frames most extreme first (``frame_order``).
+    2. Drop the first ``drop_budget`` of them (none at a budget of 0): those
+       values get clipped in exchange for finer steps for the rest.  Dropped
+       frames that clip nothing come back (``budget_pool``).
+    3. If more than ``count`` frames remain, keep the frames that hold each
+       tensor's minimum and maximum (otherwise the range would shrink past the
+       budget) and thin the rest with k-means so the survivors still cover the
+       distribution.  ``count`` is a cap: a smaller pool is kept whole.
     """
-    n = art.frames
-    if count is not None and not 0 < count <= n:
-        raise ValueError('--count must be within 1..%d' % n)
+    if count < 1:
+        raise ValueError('--count must be at least 1')
     rng = np.random.default_rng(seed)
-    stats = {name: tensor_stats(art.arrays[name], rng) for name in art.names}
-    models = {name: RangeModel(stats[name], scheme) for name in art.names}
-    units = [np.array([i]) for i in range(n)]
-    order, _ = unit_order(stats, units)
-
-    ok = np.ones(n, dtype=bool)                 # budget holds after k drops
-    for name, st in stats.items():
-        fmin, fmax = st['frame_min'][order], st['frame_max'][order]
-        lo = np.minimum.accumulate(fmin[::-1])[::-1]
-        hi = np.maximum.accumulate(fmax[::-1])[::-1]
-        ok &= models[name].evaluate(lo, hi)['clip'] <= max_clip_pct / 100.0
-    ok[0] = True
-    k_budget = int(np.flatnonzero(np.logical_and.accumulate(ok))[-1])
-    pool = np.sort(order[k_budget:])
-    dropped_by_extremeness = order[:k_budget][::-1]       # least extreme first
-
+    order, _ = frame_order(stats)
+    pool, k_budget = budget_pool(stats, schemes, order, max_clip_pct)
     notes = []
-    if count is None or count == pool.size:
+    must = np.array([], dtype=np.int64)
+    if count >= pool.size:
         keep = pool
-    elif count > pool.size:
-        keep = np.sort(np.concatenate(
-            [pool, dropped_by_extremeness[:count - pool.size]]))
-        notes.append('clip budget alone leaves %d frames, %d short of --count; '
-                     'the least extreme dropped frames were added back'
-                     % (pool.size, count - pool.size))
+        if count > pool.size:
+            notes.append('only %d frames remain, fewer than --count %d; all '
+                         'are kept' % (pool.size, count))
     else:
-        must = set()
-        for name, st in stats.items():
-            must.add(int(pool[np.argmin(st['frame_min'][pool])]))
-            must.add(int(pool[np.argmax(st['frame_max'][pool])]))
-        must = np.array(sorted(must))
+        holders = set()
+        for st in stats.values():
+            holders.add(int(pool[np.argmin(st['frame_min'][pool])]))
+            holders.add(int(pool[np.argmax(st['frame_max'][pool])]))
+        must = np.array(sorted(holders), dtype=np.int64)
         if must.size > count:
-            keep = np.sort(must[:count])
+            keep = must[:count]
             notes.append('%d range-defining frames exceed --count %d; the '
                          'range will be narrower than the budget allows'
                          % (must.size, count))
@@ -613,140 +603,528 @@ def select_patterns(art, count=None, max_clip_pct=0.1, scheme='asym', seed=0):
             features = frame_features(art, art.names)[rest]
             picked = rest[_kmeans_pick(features, count - must.size, rng)]
             keep = np.sort(np.concatenate([must, picked]))
-    return keep, k_budget, stats, models, notes
+    return {'keep': keep, 'k_budget': k_budget, 'must': int(must.size),
+            'notes': notes}
 
 
-def subset_table(art, stats, models, keep, label):
-    """One row per tensor for ``keep``: range, clip %, SQNR, vs all frames."""
-    kept = np.zeros(art.frames, dtype=bool)
+def frames_outside_pct(st, lo, hi, part=slice(None)):
+    """Percent of the frames in ``part`` with a value outside [lo, hi]."""
+    return 100.0 * float(np.mean((st['frame_min'][part] < lo)
+                                 | (st['frame_max'][part] > hi)))
+
+
+def score_row(name, st, model, lo, hi, frames, bits):
+    """One tensor's row for the range [lo, hi].
+
+    ``clip_pct`` is the percent of all recorded values outside the range
+    (counted over ``frames``, the only ones that can hold such values),
+    ``frames_clip_pct`` the percent of frames with at least one, then the
+    SQNR per width.
+    """
+    row = {'tensor': name, 'lo': float(lo), 'hi': float(hi),
+           'clip_pct': 100.0 * outside_count(st, frames, lo, hi)
+           / st['_flat'].size,
+           'frames_clip_pct': frames_outside_pct(st, lo, hi)}
+    for b in bits:
+        m = model.evaluate(lo, hi, b)
+        row['sqnr%d_all' % b] = float(m['sqnr_all'])
+        row['sqnr%d_typ' % b] = float(m['sqnr_typical'])
+    return row
+
+
+def subset_table(stats, schemes, models, keep, n, label, bits):
+    """Per tensor for ``keep``: grid range, exact clip shares, SQNR per width."""
+    kept = np.zeros(n, dtype=bool)
     kept[keep] = True
+    others = np.flatnonzero(~kept)
     rows = []
-    for name in art.names:
-        st = stats[name]
-        lo = st['frame_min'][kept].min()
-        hi = st['frame_max'][kept].max()
-        m = models[name].evaluate(lo, hi)
-        rows.append({'tensor': name, 'lo': float(lo), 'hi': float(hi),
-                     'clip_pct': 100 * float(m['clip']),
-                     'sqnr_all': float(m['sqnr_all']),
-                     'sqnr_typical': float(m['sqnr_typical'])})
+    for name, st in stats.items():
+        lo, hi = grid_range(float(st['frame_min'][kept].min()),
+                            float(st['frame_max'][kept].max()), schemes[name])
+        rows.append(score_row(name, st, models[name], lo, hi, others, bits))
     return {'label': label, 'frames': int(kept.sum()), 'rows': rows}
 
 
-def random_baseline(art, stats, models, count, draws=30, seed=1):
-    """Mean of ``draws`` uniformly random subsets of ``count`` frames."""
+def random_baseline(stats, schemes, models, n, count, bits, draws=RANDOM_DRAWS,
+                    seed=1):
+    """Median (and worst) of ``draws`` uniformly random subsets of ``count``."""
     rng = np.random.default_rng(seed)
-    acc = None
-    for _ in range(draws):
-        keep = rng.choice(art.frames, count, replace=False)
-        table = subset_table(art, stats, models, keep, 'random')
-        if acc is None:
-            acc = table
-            continue
-        for a, b in zip(acc['rows'], table['rows']):
-            for key in ('lo', 'hi', 'clip_pct', 'sqnr_all', 'sqnr_typical'):
-                a[key] += b[key]
-    for row in acc['rows']:
-        for key in ('lo', 'hi', 'clip_pct', 'sqnr_all', 'sqnr_typical'):
-            row[key] /= draws
-    acc['label'] = 'random (mean of %d)' % draws
-    return acc
+    tables = [subset_table(stats, schemes, models,
+                           rng.choice(n, count, replace=False), n, '', bits)
+              for _ in range(draws)]
+    rows = []
+    for index, first in enumerate(tables[0]['rows']):
+        row = {'tensor': first['tensor'], 'worst': {}}
+        for key in first:
+            if key == 'tensor':
+                continue
+            values = np.array([t['rows'][index][key] for t in tables])
+            row[key] = float(np.median(values))
+            if key.startswith('sqnr'):
+                row['worst'][key] = float(values.min())
+            elif 'clip' in key:
+                row['worst'][key] = float(values.max())
+        rows.append(row)
+    return {'label': 'random %d (median of %d)' % (count, draws),
+            'frames': int(count), 'rows': rows}
 
 
-def print_tables(tables):
-    print('%-22s %-16s %-20s %9s %12s %10s' % (
-        'subset', 'tensor', 'range', 'clipped%', 'SQNR typ(dB)',
-        'SQNR all(dB)'))
+def print_tables(tables, bits):
+    head = '%-30s %-16s %-22s %9s %8s' % ('subset', 'tensor', 'range',
+                                         'clip%', 'frames%')
+    for b in bits:
+        head += ' %9s %9s' % ('typ%d' % b, 'all%d' % b)
+    print(head)
     for table in tables:
         for index, row in enumerate(table['rows']):
-            head = ('%s (%d)' % (table['label'], table['frames'])
-                    if index == 0 else '')
-            print('%-22s %-16s [%8.3g,%8.3g] %9.3f %12.2f %10.2f' % (
-                head, row['tensor'], row['lo'], row['hi'], row['clip_pct'],
-                row['sqnr_typical'], row['sqnr_all']))
+            label = ('%s (%d)' % (table['label'], table['frames'])
+                     if index == 0 else '')
+            line = '%-30s %-16s [%9.3g,%9.3g] %9.4f %8.2f' % (
+                label[:30], row['tensor'][:16], row['lo'], row['hi'],
+                row['clip_pct'], row['frames_clip_pct'])
+            for b in bits:
+                line += ' %9.2f %9.2f' % (row['sqnr%d_typ' % b],
+                                          row['sqnr%d_all' % b])
+            print(line)
 
 
-def segment_counts(art, keep):
+# --------------------------------------------------------------------------
+# Sources: per-file contribution and range growth
+# --------------------------------------------------------------------------
+
+def source_report(art, stats, keep, score, seed=0):
+    """Per source: frames, kept, extremeness, leave-one-source-out shrink.
+
+    Only when the state resets match the recorded source files; otherwise the
+    section reports why it is unavailable instead of guessing.
+    """
     starts, reliable, _ = detect_segments(art)
-    if len(starts) < 2:
-        return None
-    bounds = starts + [art.frames]
+    recorded = len(art.report.get('source_files') or [])
+    if not art.state:
+        note = '沒有任何 tensor 的第一個 frame 全為 0，無法用 state 重置切出來源'
+    elif not reliable:
+        note = '偵測到 %d 次 state 重置，但報告記錄了 %d 個來源檔' % (
+            len(starts), recorded)
+    else:
+        note = '%d 次 state 重置對上 %d 個來源檔' % (len(starts), recorded)
+    if not reliable or len(starts) < 2:
+        return {'available': False, 'note': note, 'single': reliable}
+    n = art.frames
+    bounds = np.array(starts + [n])
     sources = art.report.get('source_files') or []
-    out = []
-    for i in range(len(starts)):
-        kept = int(((keep >= bounds[i]) & (keep < bounds[i + 1])).sum())
-        out.append((sources[i] if reliable else 'segment %d' % i,
-                    kept, bounds[i + 1] - bounds[i]))
-    return out
+    seg_of_keep = (np.searchsorted(bounds, keep, side='right') - 1
+                   if keep is not None else None)
+    kept = (np.bincount(seg_of_keep, minlength=len(starts))
+            if keep is not None else None)
+    seg_score = np.maximum.reduceat(score, starts)
+    shrink = np.zeros(len(starts))
+    shrink_tensor = [''] * len(starts)
+    seg_min, seg_max = {}, {}
+    for name, st in stats.items():
+        lo = np.minimum.reduceat(st['frame_min'], starts)
+        hi = np.maximum.reduceat(st['frame_max'], starts)
+        seg_min[name], seg_max[name] = lo, hi
+        span = hi.max() - lo.min()
+        if span <= 0:
+            continue
+        loo = _loo_extreme(hi, True) - _loo_extreme(lo, False)
+        part = (span - loo) / span
+        for i in np.flatnonzero(part > shrink):
+            shrink[i], shrink_tensor[i] = part[i], name
+    rows = [{'id': i, 'source': sources[i], 'start': int(starts[i]),
+             'frames': int(bounds[i + 1] - bounds[i]),
+             'kept': int(kept[i]) if kept is not None else None,
+             'extremeness': float(seg_score[i]),
+             'loso_shrink': float(shrink[i]), 'loso_tensor': shrink_tensor[i]}
+            for i in range(len(starts))]
+
+    # Range growth: sources added in random orders, the least-converged
+    # tensor's share of its final span after each addition.
+    rng = np.random.default_rng(seed)
+    count = len(starts)
+    curves = np.ones((GROWTH_ORDERS, count))
+    for p in range(GROWTH_ORDERS):
+        perm = rng.permutation(count)
+        share = np.ones(count)
+        for name in stats:
+            lo = np.minimum.accumulate(seg_min[name][perm])
+            hi = np.maximum.accumulate(seg_max[name][perm])
+            span = hi[-1] - lo[-1]
+            if span > 0:
+                share = np.minimum(share, (hi - lo) / span)
+        curves[p] = share
+    return {'available': True, 'note': note, 'rows': rows,
+            'growth': {'median': np.median(curves, 0),
+                       'p10': np.percentile(curves, 10, axis=0)}}
 
 
 # --------------------------------------------------------------------------
 # Analysis
 # --------------------------------------------------------------------------
 
-def _round(value):
-    if isinstance(value, dict):
-        return {k: _round(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_round(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return [_round(float(v)) for v in value]
-    if isinstance(value, (float, np.floating)):
-        return float('%.6g' % value)
-    return value
+def _drop_grid(units):
+    cap = units // 2
+    grid = {0}
+    value = 1.0
+    while value <= cap:
+        grid.add(int(round(value)))
+        value *= 1.35
+    grid.add(cap)
+    return sorted(g for g in grid if g <= cap)
 
 
-def analyze(art, scheme='asym', seed=0, count=None, max_clip_pct=0.1):
-    rng = np.random.default_rng(seed)
-    stats = {name: tensor_stats(art.arrays[name], rng) for name in art.names}
-    starts, reliable, note = detect_segments(art)
-    bounds = starts + [art.frames]
-    segments = [np.arange(bounds[i], bounds[i + 1])
-                for i in range(len(starts))]
-    use_segments = len(segments) > 1
-    units = segments if use_segments else [np.array([i])
-                                           for i in range(art.frames)]
-    order, score = unit_order(stats, units)
-    curves = build_curves(stats, units, order, art.frames, scheme)
+def build_curves(stats, schemes, models, order, bits):
+    """SQNR and frames-with-clipping against frames dropped, most extreme first."""
+    grid = _drop_grid(order.size)
+    suffix = _suffix_ranges(stats, schemes, order)
+    out = {'k': grid, 'tensors': {}}
+    for name, st in stats.items():
+        lo, hi = suffix[name][0][grid], suffix[name][1][grid]
+        entry = {'frames_clip': [frames_outside_pct(st, a, b)
+                                 for a, b in zip(lo, hi)]}
+        for b in bits:
+            m = models[name].evaluate(lo, hi, b)
+            entry['b%d' % b] = {'all': m['sqnr_all'], 'typ': m['sqnr_typical']}
+        out['tensors'][name] = entry
+    return out
 
-    sources = art.report.get('source_files') or []
-    seg_rows = []
-    for i, seg in enumerate(segments):
-        seg_rows.append({
-            'id': i, 'start': int(seg[0]), 'frames': int(seg.size),
-            'source': sources[i] if reliable and i < len(sources) else None,
-        })
 
+def _signed(value):
+    """'+1.2' / '-0.4' / '+0.0' (never '-0.0')."""
+    return '%+.1f' % (round(value, 1) + 0.0)
+
+
+def _worst_delta(base, other, key):
+    """Min over tensors of other - base for ``key`` (rows in the same order)."""
+    return min(o[key] - b[key] for b, o in zip(base['rows'], other['rows']))
+
+
+SCHEME_NAMES = {'asym': '非對稱', 'sym': '對稱', 'pow2': ' 2 的冪次'}
+
+
+def _pow2_lines(stats, schemes, bits, n):
+    """Each power-of-two tensor's bound, and what moving it down costs."""
+    out, parts = [], []
+    edge = 2.0 ** -(min(bits) - 1)
+    for name, st in stats.items():
+        if schemes[name] != 'pow2':
+            continue
+        peak = np.maximum(np.abs(st['frame_min']), np.abs(st['frame_max']))
+        top = float(peak.max())
+        bound = pow2_bound(top)
+        if bound <= 0:
+            parts.append('%s 全為 0' % name)
+            continue
+        over = int(np.count_nonzero(peak > bound / 2))
+        parts.append('%s ±%g（降到 ±%g 要丟 %d 個 frame，%.2f%%）' % (
+            name, bound, bound / 2, over, 100.0 * over / n))
+        if top > bound * (1 - edge):
+            out.append(('warn', '%s 的絕對值最大 %.6g，離 ±%g 不到 %d-bit 的一個 step：'
+                        '若 converter 是把 scale（而不是範圍）取到 2 的冪次，上限會變成 '
+                        '±%g，差 6 dB。請用 converter 實際輸出的 scale 確認。' % (
+                            name, top, bound, min(bits), 2 * bound)))
+    if parts:
+        out.insert(0, ('info', '2 的冪次 grid 的上限（整池）：' + '；'.join(parts)
+                       + '。range 要跨過下一個 2 的冪次，step 才會變細；沒跨過時，'
+                       '丟極值或隨機挑選得到的輸入 grid 和保留極值完全相同。'))
+    return out
+
+
+def conclusions(art, stats, schemes, recommend, sources, bits, count):
+    """What the numbers say, as (level, text) pairs in the report language."""
+    out = []
+    n = art.frames
+    if art.contiguous:
+        out.append(('warn', '%s 需要一段不中斷的串流，不能挑選或刪減 frame。'
+                    % art.report.get('model_family')))
+    if sources['available']:
+        rows = sources['rows']
+        frames = np.array([r['frames'] for r in rows])
+        out.append(('info', '%d 個 frame 來自 %d 個來源（每個來源 %d–%d 個 frame，'
+                    '最大的一個佔 %.1f%%）。' % (
+                        n, len(rows), frames.min(), frames.max(),
+                        100.0 * frames.max() / n)))
+        if len(rows) <= 3:
+            out.append(('warn', '只有 %d 個來源。相鄰 frame 幾乎相同，來源太少時'
+                        '涵蓋的情境很有限；建議從更多錄音擷取大池再挑選。'
+                        % len(rows)))
+        top = sorted(rows, key=lambda r: -r['loso_shrink'])[:3]
+        top = [r for r in top if r['loso_shrink'] > 0]
+        if top:
+            out.append(('info', 'range 由少數來源撐起：' + '；'.join(
+                '拿掉「%s」，%s 的 range 縮小 %.1f%%' % (
+                    r['source'], r['loso_tensor'], 100 * r['loso_shrink'])
+                for r in top) + '。值得去聽這些來源，確認是真實會遇到的情境'
+                '還是壞資料。'))
+        growth = sources['growth']['median']
+        at90 = growth[max(0, int(np.ceil(0.9 * len(rows))) - 1)]
+        out.append(('info', '依隨機順序加入來源（%d 種順序的中位數），加入最後 10%% '
+                    '的來源時，最不穩定的 tensor 的 range 仍擴大了 %.1f%%。數字越大，'
+                    '代表再多錄一些資料，可能還會出現新的極值；這個數字沒有驗證過的門檻。'
+                    % (GROWTH_ORDERS, 100 * (1 - at90))))
+    elif sources.get('single'):
+        out.append(('warn', '所有 %d 個 frame 都來自同一個來源。相鄰 frame 幾乎相同，'
+                    '涵蓋的情境很有限；建議從多個錄音擷取大池再挑選。' % n))
+    else:
+        out.append(('warn', '來源資訊不可用（%s）：無法看每個來源的貢獻，也無法判斷 '
+                    'range 是否已經收斂。' % sources['note']))
+    if recommend and n <= count:
+        out.append(('warn', '整份校正檔只有 %d 個 frame，不超過要挑的 %d 個，等於沒有挑選。'
+                    '直接擷取目標數量只會涵蓋少數錄音；請先擷取數萬個 frame 的大池，'
+                    '再用 select 挑。' % (n, count)))
+    for name, st in stats.items():
+        for axis, label in (('channel', 'channel'), ('last', '最後一軸的位置')):
+            c = st['concentration'].get(axis)
+            if c and c['ratio'] > FIXED_BAND_RATIO:
+                out.append(('warn', '%s 的極端值固定落在第 %d 個%s（%.1f 倍中位數）：'
+                            '這是特徵縮放的問題，刪 frame 解決不了。' % (
+                                name, c['argmax'], label, c['ratio'])))
+    if art.state:
+        grid = schemes[art.state[0]]
+        out.append(('info', '%s 被視為 recurrent state（第一個 frame 全為 0），'
+                    '以%s grid 評分：板端 state port 的 zero point 必須是 0。'
+                    % ('、'.join(art.state), SCHEME_NAMES[grid])))
+    out += _pow2_lines(stats, schemes, bits, n)
+    if recommend:
+        sel = recommend['selected']
+        if recommend['k_budget'] == 0 and recommend['must'] > sel['frames']:
+            out.append(('warn', '保住每個輸入 tensor 的最小值和最大值需要 %d 個 frame，'
+                        '超過 --count %d：挑出的 frame 的輸入 range 比整池窄。'
+                        % (recommend['must'], count)))
+        elif recommend['k_budget'] == 0 and recommend['must']:
+            out.append(('info', '挑出的 %d 個 frame 保有整池每個輸入 tensor 的最小值和'
+                        '最大值，所以輸入 range 和整池相同。保住這些極值至少需要 %d 個 '
+                        'frame，但這只對輸入成立；graph 內部各層的 range，這個工具看不到。'
+                        % (sel['frames'], recommend['must'])))
+        elif recommend['k_budget'] == 0:
+            out.append(('info', '全部 %d 個 frame 都保留，輸入 range 和整池相同。'
+                        % sel['frames']))
+        else:
+            out.append(('info', '依 %.3g%% 預算丟了 %d 個最極端的 frame，再挑出 %d 個。'
+                        % (recommend['max_clip_pct'], recommend['k_budget'],
+                           sel['frames'])))
+        alt = recommend.get('alternative')
+        if alt:
+            base = recommend['all']
+            deltas = '；'.join(
+                '%d-bit 含被夾 %s～%s dB、不含被夾最多 %s dB' % (
+                    b, _signed(_worst_delta(base, alt, 'sqnr%d_all' % b)),
+                    _signed(-_worst_delta(alt, base, 'sqnr%d_all' % b)),
+                    _signed(-_worst_delta(alt, base, 'sqnr%d_typ' % b)))
+                for b in bits)
+            worst_frames = max(r['frames_clip_pct'] for r in alt['rows'])
+            out.append(('info', '若改成丟極端值（預算 %.3g%%）：會丟 %d 個 frame（%.1f%%）；'
+                        'SQNR 變化（各 tensor 的範圍）%s；有值被夾的 frame 最多 %.2f%%。'
+                        '三種格式共用同一份資料時，8-bit 的收益要和 16-bit 的損失一起看；'
+                        '只有 8x8 要夾極值時，也可以考慮 converter 自己的校正模式（逐 tensor 夾，'
+                        '包含 graph 內部各層；用前先確認它對偏斜特徵怎麼夾），不必從共用資料丟 frame。'
+                        % (ALT_CLIP_PCT, alt['k_budget'],
+                           100.0 * alt['k_budget'] / n, deltas, worst_frames)))
+        rnd = recommend.get('random')
+        if rnd:
+            parts = []
+            for b in bits:
+                key = 'sqnr%d_all' % b
+                med = min(r[key] - s[key] for r, s in zip(rnd['rows'], sel['rows']))
+                worst = min(r['worst'][key] - s[key]
+                            for r, s in zip(rnd['rows'], sel['rows']))
+                parts.append('%d-bit 中位數 %s dB、最差 %s dB' % (
+                    b, _signed(med), _signed(worst)))
+            out.append(('info', '對照：隨機挑 %d 個（%d 次）相對於建議選法，含被夾值的 '
+                        'SQNR 在最受影響的 tensor 上為 %s。' % (
+                            rnd['frames'], RANDOM_DRAWS, '；'.join(parts))))
+        if alt or rnd:
+            out.append(('info', '上面兩組對照都用整池本身評分：整池的極值就在評分資料裡，'
+                        '所以會高估丟掉極值的代價。不偏的數字請用 coverage 子命令，'
+                        '對另一份沒看過的錄音評估。'))
+    return out
+
+
+def prepare(art, scheme, seed=0):
+    """Per-tensor statistics, grid names and SQNR models of ``art``."""
+    stats = all_stats(art, seed)
+    schemes = art.schemes(scheme)
+    models = {name: GridError(stats[name]['_sample'], schemes[name])
+              for name in art.names}
+    return stats, schemes, models
+
+
+def analyze(art, scheme='asym', seed=0, count=DEFAULT_COUNT, max_clip_pct=0.0,
+            bits=DEFAULT_BITS):
+    stats, schemes, models = prepare(art, scheme, seed)
+    order, score = frame_order(stats)
+    n = art.frames
     recommend = None
+    keep = None
     if not art.contiguous:
-        keep, k_budget, sel_stats, models, notes = select_patterns(
-            art, count, max_clip_pct, scheme, seed)
+        sel = select_patterns(art, stats, schemes, count, max_clip_pct, seed)
+        keep = sel['keep']
         recommend = {
-            'keep_frames': [int(i) for i in keep], 'count': count,
-            'max_clip_pct': max_clip_pct, 'notes': notes,
-            'all': subset_table(art, sel_stats, models,
-                                np.arange(art.frames), 'all frames'),
-            'selected': subset_table(art, sel_stats, models, keep, 'selected'),
+            'keep_frames': keep, 'count': count, 'max_clip_pct': max_clip_pct,
+            'k_budget': sel['k_budget'], 'must': sel['must'],
+            'notes': sel['notes'],
+            'all': subset_table(stats, schemes, models, np.arange(n), n,
+                                'all frames', bits),
+            'selected': subset_table(stats, schemes, models, keep, n,
+                                     'selected', bits),
         }
+        if keep.size < n:
+            recommend['random'] = random_baseline(stats, schemes, models, n,
+                                                  int(keep.size), bits)
+        if max_clip_pct <= 0:
+            alt_pool, k_alt = budget_pool(stats, schemes, order, ALT_CLIP_PCT)
+            alt = subset_table(stats, schemes, models, alt_pool, n,
+                               'drop extremes %.3g%%' % ALT_CLIP_PCT, bits)
+            alt['k_budget'] = k_alt
+            alt['max_clip_pct'] = ALT_CLIP_PCT
+            recommend['alternative'] = alt
+    sources = source_report(art, stats, keep, score, seed)
     return {
-        'recommend': recommend,
         'meta': {
-            'path': art.path, 'format': art.fmt, 'frames': art.frames,
+            'path': art.path, 'format': art.fmt, 'frames': n,
             'model_family': art.report.get('model_family'),
-            'scheme': scheme, 'contiguous': art.contiguous,
-            'skipped': art.skipped, 'segments_note': note,
-            'segments_reliable': reliable,
-            'unit': 'segment' if use_segments else 'frame',
+            'scheme': scheme, 'schemes': schemes, 'bits': list(bits),
+            'contiguous': art.contiguous, 'skipped': art.skipped,
+            'state': art.state, 'sample_cap': SAMPLE_CAP,
+            'fixed_band_ratio': FIXED_BAND_RATIO,
         },
-        'segments': seg_rows if use_segments else [],
-        'unit_order': [int(u) for u in order],
-        'unit_score': score,
-        'curves': curves,
+        'conclusions': [{'level': level, 'text': text} for level, text in
+                        conclusions(art, stats, schemes, recommend, sources,
+                                    bits, count)],
+        'recommend': recommend,
+        'sources': sources,
+        'frame_order': order,
+        'frame_score': score,
+        'curves': build_curves(stats, schemes, models, order, bits),
         'tensors': {
             name: {k: v for k, v in s.items() if not k.startswith('_')}
             for name, s in stats.items()
         },
     }
+
+
+# --------------------------------------------------------------------------
+# coverage: score a selection on a held-out artifact
+# --------------------------------------------------------------------------
+
+# Report fields two artifacts of one graph share; ``frames_per_call`` and
+# ``variant`` are written only when they differ from 1 / the full model.
+_PAIR_KEYS = ('model_family', 'checkpoint_sha256', 'state_layout_version',
+              'sample_rate', 'n_fft', 'win_len', 'hop_len',
+              'input_feature_frames', 'frames_per_call', 'mask_lookahead',
+              'df_lookahead', 'variant', 'max_delay_frames',
+              'linear_aec_contract_version', 'aec_behavior_hash')
+_PAIR_DEFAULTS = {'frames_per_call': 1, 'variant': 'full'}
+
+
+def check_pair(cal, held):
+    """Refuse a held-out artifact of another graph; return warnings."""
+    if cal.names != held.names:
+        raise ValueError('tensor names differ: %s vs %s' % (cal.names,
+                                                            held.names))
+    for name in cal.names:
+        if cal.arrays[name].shape[1:] != held.arrays[name].shape[1:]:
+            raise ValueError('%s frame shape differs: %s vs %s' % (
+                name, cal.arrays[name].shape[1:], held.arrays[name].shape[1:]))
+    problems, unknown = [], []
+    for key in _PAIR_KEYS:
+        a = cal.report.get(key, _PAIR_DEFAULTS.get(key))
+        b = held.report.get(key, _PAIR_DEFAULTS.get(key))
+        if a is None and b is None:
+            continue
+        if a is None or b is None:
+            unknown.append(key)
+        elif a != b:
+            problems.append('%s %r vs %r' % (key, a, b))
+    if problems:
+        raise ValueError('the held-out artifact comes from another graph or '
+                         'capture setup: ' + '; '.join(problems))
+    warnings = []
+    if 'checkpoint_sha256' not in cal.report or 'checkpoint_sha256' not in \
+            held.report:
+        warnings.append('no checkpoint_sha256 on both reports: cannot confirm '
+                        'the two come from one checkpoint (state inputs depend '
+                        'on the weights)')
+    if unknown:
+        warnings.append('recorded on one report only, not compared: '
+                        + ', '.join(unknown))
+    names = {os.path.basename(p) for p in cal.report.get('source_files') or []}
+    shared = names & {os.path.basename(p)
+                      for p in held.report.get('source_files') or []}
+    if shared:
+        warnings.append('%d source file name(s) appear in both, so the '
+                        'held-out set is not fully unseen (e.g. %s)'
+                        % (len(shared), sorted(shared)[0]))
+    return warnings
+
+
+def coverage(cal, held, keep=None, scheme='asym', bits=DEFAULT_BITS, seed=0):
+    """Ranges from ``cal`` (all frames or ``keep``) scored on ``held``."""
+    warnings = check_pair(cal, held)
+    schemes = cal.schemes(scheme)
+    frames = np.arange(cal.frames) if keep is None else keep
+    hstats = all_stats(held, seed)
+    starts, reliable, note = detect_segments(held)
+    bounds = starts + [held.frames]
+    sources = held.report.get('source_files') or []
+    per_source = reliable and len(starts) > 1
+    if reliable and not per_source:
+        note = 'a single source'
+    rows = []
+    for name in cal.names:
+        flat = cal.arrays[name].reshape(cal.frames, -1)
+        if keep is not None:
+            flat = flat[keep]
+        lo, hi = grid_range(float(flat.min()), float(flat.max()),
+                            schemes[name])
+        st = hstats[name]
+        row = score_row(name, st, GridError(st['_sample'], schemes[name]),
+                        lo, hi, np.arange(held.frames), bits)
+        if per_source:
+            # (value, source); a frames-clipped entry stays (0, None) when no
+            # source has a clipped frame.
+            worst = {'frames_clip_pct': (0.0, None)}
+            for i in range(len(starts)):
+                a, z = bounds[i], bounds[i + 1]
+                seg = st['_flat'][a:z]
+                seg_model = GridError(_sample(seg, np.random.default_rng(i)),
+                                      schemes[name])
+                frac = frames_outside_pct(st, lo, hi, slice(a, z))
+                if frac > worst['frames_clip_pct'][0]:
+                    worst['frames_clip_pct'] = (frac, sources[i])
+                for b in bits:
+                    value = float(seg_model.evaluate(lo, hi, b)['sqnr_all'])
+                    key = 'sqnr%d_all' % b
+                    if value < worst.get(key, (np.inf, None))[0]:
+                        worst[key] = (value, sources[i])
+            row['worst_source'] = worst
+        rows.append(row)
+    return {'calibration': cal.path, 'held_out': held.path,
+            'frames': int(len(frames)), 'held_out_frames': held.frames,
+            'warnings': warnings,
+            'segments': None if per_source else note, 'rows': rows}
+
+
+def print_coverage(result, bits):
+    for warning in result['warnings']:
+        print('warning: ' + warning)
+    print('ranges from %d frames of %s, scored on %d held-out frames' % (
+        result['frames'], result['calibration'], result['held_out_frames']))
+    print_tables([{'label': 'held-out', 'frames': result['held_out_frames'],
+                   'rows': result['rows']}], bits)
+    if result['segments']:
+        print('per-source worst case unavailable: ' + result['segments'])
+        return
+    for row in result['rows']:
+        worst = row['worst_source']
+        frac, src = worst['frames_clip_pct']
+        line = '%-16s worst source: %s' % (
+            row['tensor'], 'frames clipped %.2f%% (%s)' % (frac, src)
+            if src else 'no clipped frame in any source')
+        for b in bits:
+            value, src = worst['sqnr%d_all' % b]
+            line += '; SQNR%d all %.1f dB (%s)' % (b, value, src)
+        print(line)
 
 
 # --------------------------------------------------------------------------
@@ -767,13 +1145,15 @@ def _range_report(arrays, policy):
     return out
 
 
-def keep_indices(art, spec, analysis_segments=None):
+def keep_indices(art, spec):
     n = art.frames
     if 'keep_frames' in spec:
         keep = np.unique(np.asarray(spec['keep_frames'], dtype=np.int64))
     elif 'drop_frames' in spec:
-        keep = np.setdiff1d(np.arange(n), np.asarray(spec['drop_frames'],
-                                                     dtype=np.int64))
+        drop = np.asarray(spec['drop_frames'], dtype=np.int64)
+        if drop.size and (drop.min() < 0 or drop.max() >= n):
+            raise ValueError('drop list is outside 0..%d' % (n - 1))
+        keep = np.setdiff1d(np.arange(n), drop)
     else:
         raise ValueError('keep file needs keep_frames or drop_frames')
     if keep.size == 0 or keep.min() < 0 or keep.max() >= n:
@@ -781,13 +1161,17 @@ def keep_indices(art, spec, analysis_segments=None):
     return keep
 
 
-def apply_selection(art, keep, output, fmt):
-    require_current_frontend(art.report, art.path)
+def require_selectable(art):
     if art.contiguous:
         raise SystemExit(
             '%s needs one uninterrupted stream; its cumulative state ranges '
-            'are meaningless on a pruned set. Regenerate with a different '
-            'source instead.' % art.report.get('model_family'))
+            'are meaningless on a selected or pruned set. Regenerate with a '
+            'different source instead.' % art.report.get('model_family'))
+
+
+def apply_selection(art, keep, output, fmt):
+    require_current_frontend(art.report, art.path)
+    require_selectable(art)
     arrays = {name: value[keep] for name, value in art.arrays.items()}
     report = dict(art.report)
     starts, reliable, _ = detect_segments(art)
@@ -796,6 +1180,10 @@ def apply_selection(art, keep, output, fmt):
         bounds = starts + [art.frames]
         alive = [i for i in range(len(starts))
                  if ((keep >= bounds[i]) & (keep < bounds[i + 1])).any()]
+        gone = [sources[i] for i in range(len(starts)) if i not in alive]
+        if gone:
+            print('note: %d source(s) have no frame left and leave '
+                  'source_files: %s' % (len(gone), ', '.join(gone)))
         report['source_files'] = [sources[i] for i in alive]
     report['frames'] = int(keep.size)
     report['inputs'] = _range_report(
@@ -813,41 +1201,78 @@ def apply_selection(art, keep, output, fmt):
     return write_calibration_artifact(output, arrays, report, fmt)
 
 
-def print_before_after(art, keep):
-    kept = np.zeros(art.frames, dtype=bool)
-    kept[keep] = True
-    rng = np.random.default_rng(0)
-    print('%-18s %-22s %-22s %7s %9s %8s %8s' %
-          ('tensor', 'range before', 'range after', 'shrink', 'sqnr(dB)',
-           'KL thr', 'KL thr'))
-    print('%-18s %-22s %-22s %7s %9s %8s %8s' %
-          ('', '', '', '', 'minmax', 'before', 'after'))
-    for name in art.names:
-        s = tensor_stats(art.arrays[name], rng)
-        lo0, hi0 = s['frame_min'].min(), s['frame_max'].max()
-        lo1, hi1 = s['frame_min'][kept].min(), s['frame_max'][kept].max()
-        shrink = 1 - (hi1 - lo1) / (hi0 - lo0 + EPS)
-        q = quant_eval(s, kept, 'minmax', 'asym')
-        kept_abs = np.abs(art.arrays[name][kept]).ravel().astype(np.float64)
-        if kept_abs.size > SAMPLE_CAP:
-            kept_abs = kept_abs[:: kept_abs.size // SAMPLE_CAP + 1]
-        print('%-18s [%8.3g,%8.3g]   [%8.3g,%8.3g]   %6.1f%% %9.2f %8.3g %8.3g' %
-              (name, lo0, hi0, lo1, hi1, 100 * shrink, q['sqnr_full'],
-               s['global']['kl_threshold'], kl_threshold(kept_abs)))
-
-
 # --------------------------------------------------------------------------
 # HTML report
 # --------------------------------------------------------------------------
 
+def _round(value):
+    if isinstance(value, dict):
+        return {k: _round(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_round(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_round(v) for v in value.tolist()]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        return float('%.6g' % value) if np.isfinite(value) else None
+    return value
+
+
 def write_report(analysis, out_path):
+    """The HTML page for ``analysis`` (already passed through ``_round``)."""
     template_path = os.path.join(_HERE, 'calib_analyze_report.html')
     with open(template_path, encoding='utf-8') as stream:
         template = stream.read()
-    data = json.dumps(_round(analysis), separators=(',', ':'))
+    data = json.dumps(analysis, separators=(',', ':'), ensure_ascii=False)
     data = data.replace('</', '<\\/')
     with open(out_path, 'w', encoding='utf-8') as stream:
         stream.write(template.replace('/*__DATA__*/null', data))
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _bits(text):
+    try:
+        values = tuple(int(v) for v in text.split(','))
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected widths like 8,16')
+    if not values or any(not 2 <= v <= 32 for v in values):
+        raise argparse.ArgumentTypeError('widths must be within 2..32')
+    return values
+
+
+def _add_common(parser, count=True):
+    parser.add_argument('--scheme', choices=SCHEMES, default='asym',
+                        help='input grid: asym (state inputs then take sym), '
+                             'sym, or pow2 (symmetric, power-of-two scale, '
+                             'as a fixed-point input format uses)')
+    parser.add_argument('--bits', type=_bits, default=DEFAULT_BITS,
+                        help='activation widths to score, e.g. 8,16 '
+                             '(default: %(default)s)')
+    if count:
+        parser.add_argument('--count', type=int, default=DEFAULT_COUNT,
+                            help='keep at most this many frames (default '
+                                 '%(default)s, the converter\'s pattern cap)')
+        parser.add_argument('--max-clip-pct', type=float, default=0.0,
+                            help='percent of each tensor\'s recorded values '
+                                 'allowed outside the kept range; 0 (default) '
+                                 'keeps every extreme frame')
+
+
+def _load_keep(art, path):
+    with open(path, encoding='utf-8') as stream:
+        return keep_indices(art, json.load(stream))
+
+
+def _dump_json(value, path):
+    with open(path, 'w', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False)
 
 
 def main(argv=None):
@@ -858,26 +1283,24 @@ def main(argv=None):
     p_an.add_argument('artifact')
     p_an.add_argument('--out', default='calib_report.html')
     p_an.add_argument('--json', default=None, help='also dump the raw analysis')
-    p_an.add_argument('--scheme', choices=('asym', 'sym'), default='asym',
-                      help='8-bit grid used by the SQNR simulation')
-    p_an.add_argument('--count', type=int, default=None,
-                      help='also embed a recommended selection of this size')
-    p_an.add_argument('--max-clip-pct', type=float, default=0.1,
-                      help='clip budget used for the recommendation')
+    _add_common(p_an)
     p_se = sub.add_parser('select', help='pick which patterns to keep')
     p_se.add_argument('artifact')
-    p_se.add_argument('--count', type=int, default=None,
-                      help='number of frames to keep (default: as many as the '
-                           'clip budget leaves)')
-    p_se.add_argument('--max-clip-pct', type=float, default=0.1,
-                      help='at most this percent of all recorded values may '
-                           'fall outside any tensor\'s kept range')
-    p_se.add_argument('--scheme', choices=('asym', 'sym'), default='asym')
+    _add_common(p_se)
     p_se.add_argument('--keep-out', default='keep.json',
                       help='where to write the selection (for apply)')
     p_se.add_argument('--output', default=None,
                       help='also write the reduced artifact here')
     p_se.add_argument('--format', choices=('bin', 'npz'), default=None)
+    p_co = sub.add_parser('coverage',
+                          help='score a selection on a held-out artifact')
+    p_co.add_argument('artifact')
+    p_co.add_argument('--against', required=True,
+                      help='held-out artifact of the same graph')
+    p_co.add_argument('--keep', default=None,
+                      help='JSON with keep_frames or drop_frames (default: all)')
+    p_co.add_argument('--json', default=None)
+    _add_common(p_co, count=False)
     p_ap = sub.add_parser('apply', help='write a reduced calibration artifact')
     p_ap.add_argument('artifact')
     p_ap.add_argument('--keep', required=True,
@@ -885,63 +1308,93 @@ def main(argv=None):
     p_ap.add_argument('--output', required=True)
     p_ap.add_argument('--format', choices=('bin', 'npz'), default=None,
                       help='defaults to the input artifact format')
+    _add_common(p_ap, count=False)
     args = parser.parse_args(argv)
 
     art = load_artifact(args.artifact)
+    if getattr(args, 'output', None):
+        # Refuse a bad output name before select writes the keep file.
+        args.format = args.format or art.fmt
+        try:
+            resolve_calibration_format(args.output, args.format)
+        except ValueError as error:
+            parser.error(str(error))
     print('%s: %d frames, %d quantisable tensors%s' % (
         art.path, art.frames, len(art.names),
         (', skipped: ' + ', '.join(art.skipped)) if art.skipped else ''))
 
     if args.cmd == 'analyze':
-        analysis = analyze(art, args.scheme, count=args.count,
-                           max_clip_pct=args.max_clip_pct)
+        analysis = _round(analyze(art, args.scheme, count=args.count,
+                                  max_clip_pct=args.max_clip_pct,
+                                  bits=args.bits))
         write_report(analysis, args.out)
         if args.json:
-            with open(args.json, 'w', encoding='utf-8') as stream:
-                json.dump(_round(analysis), stream)
-        print('segments: %s' % analysis['meta']['segments_note'])
+            _dump_json(analysis, args.json)
+        for item in analysis['conclusions']:
+            print('[%s] %s' % (item['level'], item['text']))
         print('report: %s' % os.path.abspath(args.out))
         return 0
 
+    if args.cmd == 'coverage':
+        held = load_artifact(args.against)
+        keep = _load_keep(art, args.keep) if args.keep else None
+        result = coverage(art, held, keep, args.scheme, args.bits)
+        print_coverage(result, args.bits)
+        if args.json:
+            _dump_json(_round(result), args.json)
+        return 0
+
+    stats, schemes, models = prepare(art, args.scheme)
+    n = art.frames
+
     if args.cmd == 'select':
-        if art.contiguous:
-            raise SystemExit('%s needs one uninterrupted stream; patterns '
-                             'cannot be selected from it.'
-                             % art.report.get('model_family'))
-        keep, k_budget, stats, models, notes = select_patterns(
-            art, args.count, args.max_clip_pct, args.scheme)
-        print('clip budget %.3g%%: up to %d of %d frames can be dropped '
-              '-> %d kept; selected %d' % (args.max_clip_pct, k_budget,
-                                          art.frames, art.frames - k_budget,
-                                          keep.size))
-        for note in notes:
+        require_selectable(art)
+        sel = select_patterns(art, stats, schemes, args.count,
+                              args.max_clip_pct)
+        keep = sel['keep']
+        print('clip budget %.3g%%: %d of %d frames dropped; selected %d '
+              '(%d hold a tensor extreme)' % (args.max_clip_pct, sel['k_budget'],
+                                             n, keep.size, sel['must']))
+        for note in sel['notes']:
             print('note: ' + note)
-        tables = [subset_table(art, stats, models, np.arange(art.frames),
-                               'all frames'),
-                  subset_table(art, stats, models, keep, 'selected')]
-        if keep.size < art.frames:
-            tables.append(random_baseline(art, stats, models, keep.size))
-        print_tables(tables)
-        counts = segment_counts(art, keep)
-        if counts:
-            print('per source: ' + ', '.join(
-                '%s %d/%d' % c for c in counts))
+        tables = [subset_table(stats, schemes, models, np.arange(n), n,
+                               'all frames', args.bits),
+                  subset_table(stats, schemes, models, keep, n, 'selected',
+                               args.bits)]
+        if keep.size < n:
+            tables.append(random_baseline(stats, schemes, models, n,
+                                          int(keep.size), args.bits))
+        print_tables(tables, args.bits)
+        _, score = frame_order(stats)
+        sources = source_report(art, stats, keep, score)
+        if sources['available']:
+            empty = [r['source'] for r in sources['rows'] if not r['kept']]
+            print('per source kept: ' + ', '.join(
+                '%s %d/%d' % (r['source'], r['kept'], r['frames'])
+                for r in sources['rows']))
+            if empty:
+                print('note: %d source(s) keep no frame' % len(empty))
+        else:
+            print('per-source counts unavailable: ' + sources['note'])
         with open(args.keep_out, 'w', encoding='utf-8') as stream:
             json.dump({'artifact': art.path,
                        'keep_frames': [int(i) for i in keep],
+                       'count': args.count,
                        'max_clip_pct': args.max_clip_pct}, stream)
         print('selection: %s' % os.path.abspath(args.keep_out))
         if args.output:
             path = apply_selection(art, keep, args.output,
                                    args.format or art.fmt)
-            print('wrote %d/%d frames -> %s' % (keep.size, art.frames, path))
+            print('wrote %d/%d frames -> %s' % (keep.size, n, path))
         return 0
 
-    with open(args.keep, encoding='utf-8') as stream:
-        keep = keep_indices(art, json.load(stream))
-    print_before_after(art, keep)
+    keep = _load_keep(art, args.keep)
+    print_tables([subset_table(stats, schemes, models, np.arange(n), n,
+                               'all frames', args.bits),
+                  subset_table(stats, schemes, models, keep, n, 'kept',
+                               args.bits)], args.bits)
     path = apply_selection(art, keep, args.output, args.format or art.fmt)
-    print('wrote %d/%d frames -> %s' % (keep.size, art.frames, path))
+    print('wrote %d/%d frames -> %s' % (keep.size, n, path))
     print('the paired .onnx is unchanged; copy/symlink it beside the new '
           'artifact if the quantiser expects them together')
     return 0
