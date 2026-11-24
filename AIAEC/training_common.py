@@ -566,6 +566,15 @@ def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'chec
         return None if ok else (path, got, want)
 
     mismatch = compare(saved, expected, 'contract')
+    if mismatch is None and isinstance(saved, dict):
+        # An optional constructor key is written only away from its default,
+        # so one the running config lacks means the checkpoint was built
+        # otherwise; an activation change shows in no weight shape.
+        extra = sorted(key for key in saved
+                       if key.startswith('ctor_') and key not in expected)
+        if extra:
+            mismatch = (f"contract.{extra[0]}", saved[extra[0]],
+                        '<constructor default>')
     if mismatch is not None:
         path, got, want = mismatch
         if isinstance(got, list):

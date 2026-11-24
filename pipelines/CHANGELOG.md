@@ -3,6 +3,12 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-24 — DeepVQE-S and Align-ULCNet: `[model] activation`
+
+- **Training option.** `activation` (default `elu`, the previous behaviour) selects `elu`, `relu`, `leaky_relu` or `prelu` for every block the paper gives ELU: DeepVQE-S the six encoder convs, the three upsample and two residual blocks (the last upsample `ccm_up` stays bare); Align-ULCNet the four encoder convs and the two joint convs (`mask_act` and `stage2_act` keep PReLU). It is an `optional_contract_kwargs` entry: a default run writes the same contract as before, `ctor_activation` is recorded otherwise and a resume across activations is refused in both directions. With the option unset, weights and forward of all four AIAEC models are bit-identical to before. Graph ports, state shapes, `graph_io` rows and layout versions do not change; the exported graph carries `Relu` / `LeakyRelu` / `PRelu` in place of `Elu`. The six per-grid configs list the key commented out.
+- **Shared blocks (`AIAEC/aiaec_common.py`).** `CausalConvBlock`, `SeparableCausalConv` and `FreqUpsample` build their activation through one `make_activation()` over the `ACTIVATIONS` table (`DEFAULT_ACTIVATION` = `elu`); an unknown name now raises (`SeparableCausalConv` used to turn any name other than `elu` / `prelu` into no activation, and `CausalConvBlock` accepted `"none"`). `FreqUpsample(activation=...)` takes a name, `None` for none (was a bool); no other block or model takes `None`.
+- **Resume check (`AIAEC/training_common.py` `require_checkpoint_contract`).** A checkpoint whose contract carries a `ctor_*` key the running config lacks is refused: an optional option is written only away from its default, so the checkpoint was built otherwise. Before, only the reverse was refused, and a `score_kernel` 9,5 checkpoint resumed under the default failed later, at `load_state_dict`.
+
 ## [Unreleased] — 2026-11-22 — No library reads a file: the sample owns graph files and the ERB file
 
 Layering: the libraries do the pre/post processing and the stream does the call flow; deployment data (file paths, the quantization folder, reading files) is the board sample's.

@@ -17,6 +17,7 @@ from AIAEC.aiaec_common import (
     AecOutput,
     CausalConv2d,
     CausalConvBlock,
+    DEFAULT_ACTIVATION,
     DEFAULT_SCORE_KERNEL,
     FrameDelayAttention,
     FreqUpsample,
@@ -24,6 +25,7 @@ from AIAEC.aiaec_common import (
     apply_causal_tf_filter,
     compressed_ri_feature,
     fit_frequency,
+    make_activation,
     require_complex_btf,
     three_vector_complex,
 )
@@ -42,11 +44,11 @@ def _half(n: int) -> int:
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, activation: str):
         super().__init__()
         self.conv = CausalConv2d(channels, channels, (4, 3), bias=False)
         self.norm = nn.BatchNorm2d(channels)
-        self.act = nn.ELU()
+        self.act = make_activation(activation, channels)
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.act(self.norm(self.conv(x)))
@@ -113,29 +115,35 @@ class DeepVQES(nn.Module):
     # emits each enhanced frame in the invocation that consumed its inputs.
     stream_output_delay = 0
     # Recorded in a checkpoint contract only when set away from the default.
-    optional_contract_kwargs = ('score_kernel',)
+    optional_contract_kwargs = ('score_kernel', 'activation')
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  similarity_channels: int = 4, gru_hidden: int = 192,
                  compression_exponent: float = 0.3,
-                 score_kernel=DEFAULT_SCORE_KERNEL):
+                 score_kernel=DEFAULT_SCORE_KERNEL,
+                 activation: str = DEFAULT_ACTIVATION):
         super().__init__()
         self.grid = grid
         self.compression_exponent = compression_exponent
         self.max_delay_frames = grid.delay_frames(max_delay_seconds)
 
         # DeepVQE-S schedules from the paper. All encoder residual blocks are
-        # intentionally absent in the S variant.
-        self.mic1 = CausalConvBlock(2, 16, (4, 3), (1, 2))
-        self.mic2 = CausalConvBlock(16, 40, (4, 3), (1, 2))
-        self.far1 = CausalConvBlock(2, 8, (4, 3), (1, 2))
-        self.far2 = CausalConvBlock(8, 24, (4, 3), (1, 2))
+        # intentionally absent in the S variant. `activation` replaces the
+        # paper's ELU in every encoder, upsample and residual block.
+        def encoder(in_channels, out_channels):
+            return CausalConvBlock(in_channels, out_channels, (4, 3), (1, 2),
+                                   activation=activation)
+
+        self.mic1 = encoder(2, 16)
+        self.mic2 = encoder(16, 40)
+        self.far1 = encoder(2, 8)
+        self.far2 = encoder(8, 24)
         self.align = FrameDelayAttention(
             40, 24, 24, similarity_channels, self.max_delay_frames,
             score_kernel=score_kernel,
         )
-        self.mic3 = CausalConvBlock(40 + 24, 56, (4, 3), (1, 2))
-        self.mic4 = CausalConvBlock(56, 24, (4, 3), (1, 2))
+        self.mic3 = encoder(40 + 24, 56)
+        self.mic4 = encoder(56, 24)
 
         f1 = _half(grid.n_freqs)
         f2, f3, f4 = _half(f1), _half(_half(f1)), _half(_half(_half(f1)))
@@ -144,18 +152,19 @@ class DeepVQES(nn.Module):
         self.gru_out = nn.Linear(gru_hidden, bottleneck_size)
 
         self.skip4 = nn.Conv2d(24, 24, 1)
-        self.up3 = FreqUpsample(24, 40)  # first decoder block: no residual
+        # First decoder block: no residual.
+        self.up3 = FreqUpsample(24, 40, activation=activation)
         self.skip3 = nn.Conv2d(56, 40, 1)
-        self.res3 = ResidualBlock(40)
-        self.up2 = FreqUpsample(40, 32)
+        self.res3 = ResidualBlock(40, activation)
+        self.up2 = FreqUpsample(40, 32, activation=activation)
         self.skip2 = nn.Conv2d(40, 32, 1)
-        self.res2 = ResidualBlock(32)
-        self.up1 = FreqUpsample(32, 32)
+        self.res2 = ResidualBlock(32, activation)
+        self.up1 = FreqUpsample(32, 32, activation=activation)
         self.skip1 = nn.Conv2d(16, 32, 1)
         # Last S decoder block: no residual, BN or activation; 27 channels are
         # 3 time taps * 3 frequency taps * DeepVQE's 3-vector representation.
         self.ccm_up = FreqUpsample(
-            32, 27, activation=False, normalization=False,
+            32, 27, activation=None, normalization=False,
         )
         self.time_order = 3
         self.freq_radius = 1

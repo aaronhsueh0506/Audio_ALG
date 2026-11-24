@@ -124,25 +124,37 @@ class CausalConv2d(nn.Module):
         return self.conv(F.pad(x, (freq_left, freq_right, time_left, 0)))
 
 
+#: The names a model's ``activation`` option accepts, each with its builder
+#: for a block of ``channels`` outputs (``prelu``: one slope per channel).
+ACTIVATIONS = {
+    "elu": lambda channels: nn.ELU(),
+    "relu": lambda channels: nn.ReLU(),
+    "leaky_relu": lambda channels: nn.LeakyReLU(),
+    "prelu": nn.PReLU,
+}
+DEFAULT_ACTIVATION = "elu"
+
+
+def make_activation(name: str, channels: int) -> nn.Module:
+    """The :data:`ACTIVATIONS` entry ``name``."""
+    if name not in ACTIVATIONS:
+        raise ValueError(f"activation must be one of "
+                         f"{', '.join(ACTIVATIONS)}, got {name!r}")
+    return ACTIVATIONS[name](channels)
+
+
 class CausalConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int,
                  kernel_size=(4, 3), stride=(1, 2),
                  dilation=(1, 1), groups: int = 1,
-                 activation: str = "elu"):
+                 activation: str = DEFAULT_ACTIVATION):
         super().__init__()
         self.conv = CausalConv2d(
             in_channels, out_channels, kernel_size, stride, dilation, groups,
             bias=False,
         )
         self.norm = nn.BatchNorm2d(out_channels)
-        if activation == "elu":
-            self.activation = nn.ELU()
-        elif activation == "prelu":
-            self.activation = nn.PReLU(out_channels)
-        elif activation == "none":
-            self.activation = nn.Identity()
-        else:
-            raise ValueError(f"unknown activation {activation}")
+        self.activation = make_activation(activation, out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.activation(self.norm(self.conv(x)))
@@ -159,8 +171,7 @@ class SeparableCausalConv(nn.Module):
         )
         self.point = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.norm = nn.BatchNorm2d(out_channels)
-        self.act = (nn.PReLU(out_channels) if activation == "prelu"
-                    else nn.ELU() if activation == "elu" else nn.Identity())
+        self.act = make_activation(activation, out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.act(self.norm(self.point(self.depth(x))))
@@ -170,7 +181,8 @@ class FreqUpsample(nn.Module):
     """Causal convolution followed by a frequency-only sub-pixel shuffle."""
 
     def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size=(4, 3), activation: bool = True,
+                 kernel_size=(4, 3),
+                 activation: Optional[str] = DEFAULT_ACTIVATION,
                  normalization: bool = True):
         super().__init__()
         self.out_channels = out_channels
@@ -179,7 +191,9 @@ class FreqUpsample(nn.Module):
         )
         self.norm = (nn.BatchNorm2d(out_channels) if normalization
                      else nn.Identity())
-        self.act = nn.ELU() if activation else nn.Identity()
+        # None: no activation (DeepVQE-S's last upsample).
+        self.act = (nn.Identity() if activation is None
+                    else make_activation(activation, out_channels))
 
     def forward(self, x: Tensor, target_freq: Optional[int] = None) -> Tensor:
         x = self.conv(x)

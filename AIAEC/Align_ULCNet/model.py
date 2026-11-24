@@ -16,10 +16,12 @@ from torch import Tensor, nn
 from AIAEC.aiaec_common import (
     AecOutput,
     CausalConv2d,
+    DEFAULT_ACTIVATION,
     DEFAULT_SCORE_KERNEL,
     FrameDelayAttention,
     SeparableCausalConv,
     SignalGrid,
+    make_activation,
     require_complex_btf,
 )
 from AIAEC.aiaec_streaming import (
@@ -95,10 +97,11 @@ class ChannelSampledReorientation(nn.Module):
 class StreamEncoder(nn.Module):
     """The two 32-filter separable layers and 2x max-pool in each stream."""
 
-    def __init__(self, gamma: int):
+    def __init__(self, gamma: int, activation: str):
         super().__init__()
-        self.conv1 = SeparableCausalConv(gamma, 32, (1, 5), activation="elu")
-        self.conv2 = SeparableCausalConv(32, 32, (1, 3), activation="elu")
+        self.conv1 = SeparableCausalConv(gamma, 32, (1, 5),
+                                         activation=activation)
+        self.conv2 = SeparableCausalConv(32, 32, (1, 3), activation=activation)
         self.pool = nn.MaxPool2d((1, 2), stride=(1, 2), ceil_mode=True)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -109,14 +112,14 @@ class JointConvBlock(nn.Module):
     """The paper's ordinary (not depthwise-separable) joint Conv layer."""
 
     def __init__(self, in_channels: int, out_channels: int,
-                 frequency_stride: int = 2):
+                 activation: str, frequency_stride: int = 2):
         super().__init__()
         self.conv = CausalConv2d(
             in_channels, out_channels, (1, 3), stride=(1, frequency_stride),
             bias=False,
         )
         self.norm = nn.BatchNorm2d(out_channels)
-        self.act = nn.ELU()
+        self.act = make_activation(activation, out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.act(self.norm(self.conv(x)))
@@ -161,13 +164,14 @@ class AlignULCNet(nn.Module):
     # forward_stream emits the enhanced frame for its own input frame.
     stream_output_delay = 0
     # Recorded in a checkpoint contract only when set away from the default.
-    optional_contract_kwargs = ('score_kernel', 'joint2_stride')
+    optional_contract_kwargs = ('score_kernel', 'joint2_stride', 'activation')
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  gamma: int = 5, subband_bins: int = 2,
                  compression_exponent: float = 0.3,
                  max_delay_frames: int | None = None,
-                 score_kernel=DEFAULT_SCORE_KERNEL, joint2_stride: int = 2):
+                 score_kernel=DEFAULT_SCORE_KERNEL, joint2_stride: int = 2,
+                 activation: str = DEFAULT_ACTIVATION):
         super().__init__()
         if not 0.0 < compression_exponent <= 1.0:
             raise ValueError("compression_exponent must be in (0,1]")
@@ -179,8 +183,10 @@ class AlignULCNet(nn.Module):
         self.reorient = ChannelSampledReorientation(
             grid.n_freqs, gamma, subband_bins,
         )
-        self.error_encoder = StreamEncoder(gamma)
-        self.far_encoder = StreamEncoder(gamma)
+        # `activation` replaces the paper's ELU in the encoders and the joint
+        # convs; the mask head and stage 2 keep their PReLU.
+        self.error_encoder = StreamEncoder(gamma, activation)
+        self.far_encoder = StreamEncoder(gamma, activation)
         if max_delay_frames is None:
             # The paper fixes Dmax=64 at its 16 kHz/256-hop grid.
             max_delay_frames = (64 if (grid.sample_rate, grid.n_fft) == (16000, 512)
@@ -189,10 +195,11 @@ class AlignULCNet(nn.Module):
         self.align = FrameDelayAttention(
             32, 32, 32, 32, self.max_delay_frames, score_kernel=score_kernel,
         )
-        self.joint1 = JointConvBlock(64, 64)
+        self.joint1 = JointConvBlock(64, 64, activation)
         # 1 keeps joint1's width: on the 256-point grid that is the bottleneck
         # of the 512-point grid (7 positions, subband GRU inputs 256/192).
-        self.joint2 = JointConvBlock(64, 96, frequency_stride=joint2_stride)
+        self.joint2 = JointConvBlock(64, 96, activation,
+                                     frequency_stride=joint2_stride)
         self.fgru = FrequencyGRU(96)
 
         # Encoder output width and the width of every K/V entry the alignment

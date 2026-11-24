@@ -5,6 +5,7 @@ Every option defaults to the existing behaviour; the default path itself is
 pinned by the existing model, streaming, export and trainer tests.
 """
 
+import collections
 import configparser
 import contextlib
 import importlib
@@ -20,7 +21,14 @@ import torch
 
 import AIAEC.training_common as training_common
 from AIAEC._streaming_export import _build, export_graph as generic_export_graph
-from AIAEC.aiaec_common import DEFAULT_SCORE_KERNEL, SignalGrid
+from AIAEC.aiaec_common import (
+    ACTIVATIONS,
+    DEFAULT_SCORE_KERNEL,
+    CausalConvBlock,
+    FreqUpsample,
+    SeparableCausalConv,
+    SignalGrid,
+)
 from AIAEC.Align_ULCNet import export_onnx as ulcnet_export
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC.dataset_gen import stft
@@ -73,12 +81,24 @@ def _without_options(model_cls, kwargs):
             if name not in model_cls.optional_contract_kwargs}
 
 
+def _distinct_prelu_slopes(model):
+    """Give every PReLU channel its own slope: the 0.25 init would hide a
+    slope applied on the wrong axis."""
+    generator = torch.Generator().manual_seed(11)
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, torch.nn.PReLU):
+                module.weight.copy_(
+                    torch.rand(module.weight.shape, generator=generator) - 0.5)
+
+
 def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs,
-                       grid=GRID256):
+                       grid=GRID256, distinct_prelu=False):
     """Build ``model_name`` on ``grid`` (16 kHz/256 unless given) from
     ``[model] max_delay_seconds = 0.5`` plus ``ctor`` and save it under the
     contract the trainer writes, recording ``recorded(model_cls, kwargs)``;
-    returns ``(model, contract)``."""
+    returns ``(model, contract)``. ``distinct_prelu`` applies
+    ``_distinct_prelu_slopes`` before the save."""
     model_cls = CLASSES[model_name]
     cfg = _cfg('[model]\nmax_delay_seconds = 0.5\n' + ''.join(
         '%s = %s\n' % (key, ','.join(map(str, value))
@@ -87,6 +107,8 @@ def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs,
     kwargs = read_model_kwargs(cfg, model_cls)
     torch.manual_seed(2)
     model = model_cls(grid, **kwargs).eval()
+    if distinct_prelu:
+        _distinct_prelu_slopes(model)
     linear = make_linear_aec_contract(grid.sample_rate, frame_size=grid.n_fft)
     contract = make_checkpoint_contract(
         model_name=model_name, task=model_cls.task, grid=grid,
@@ -100,10 +122,15 @@ def _option_checkpoint(model_name, ctor, path, recorded=contract_model_kwargs,
 
 # ---- models ----------------------------------------------------------------
 
-def test_deepvqe_options_stream_like_the_offline_forward():
+# relu and leaky_relu are parameterless point-wise ops like elu; prelu carries
+# a per-channel weight.
+@pytest.mark.parametrize('activation', ['elu', 'prelu'])
+def test_deepvqe_options_stream_like_the_offline_forward(activation):
     torch.manual_seed(0)
     model = DeepVQES(GRID256, max_delay_seconds=0.5, similarity_channels=8,
-                     gru_hidden=256, score_kernel=(9, 5)).eval()
+                     gru_hidden=256, score_kernel=(9, 5),
+                     activation=activation).eval()
+    _distinct_prelu_slopes(model)
     assert model.align.score.conv.kernel_size == (9, 5)
     assert model.align.query.out_channels == 8
     assert model.gru.hidden_size == 256
@@ -121,11 +148,15 @@ def test_deepvqe_options_stream_like_the_offline_forward():
                                        rtol=0)
 
 
-@pytest.mark.parametrize('score_kernel', [(5, 5), (9, 5)])
-def test_align_ulcnet_options_stream_like_the_offline_forward(score_kernel):
+@pytest.mark.parametrize('score_kernel,activation', [
+    ((5, 5), 'elu'), ((9, 5), 'elu'), ((9, 5), 'prelu')])
+def test_align_ulcnet_options_stream_like_the_offline_forward(
+        score_kernel, activation):
     torch.manual_seed(0)
     model = AlignULCNet(GRID256, max_delay_seconds=0.5,
-                        score_kernel=score_kernel, joint2_stride=1).eval()
+                        score_kernel=score_kernel, joint2_stride=1,
+                        activation=activation).eval()
+    _distinct_prelu_slopes(model)
     error, far = _spectrum(32, 129, 3), _spectrum(32, 129, 4)
     with torch.no_grad():
         offline = model(linear_error=error, far_end=far).enhanced
@@ -169,6 +200,74 @@ def test_score_kernel_is_validated(kernel):
         DeepVQES(GRID256, score_kernel=kernel)
 
 
+# activation -> (module type, exported ONNX op)
+ACTIVATION_OPS = {'elu': (torch.nn.ELU, 'Elu'),
+                  'relu': (torch.nn.ReLU, 'Relu'),
+                  'leaky_relu': (torch.nn.LeakyReLU, 'LeakyRelu'),
+                  'prelu': (torch.nn.PReLU, 'PRelu')}
+NAMES = list(ACTIVATIONS)
+# The blocks the paper gives ELU: DeepVQE-S six encoder blocks, three
+# upsample and two residual blocks; Align-ULCNet four encoder and two joint
+# convs.
+ELU_SITES = {'DeepVQE_S': 11, 'Align_ULCNet': 6}
+ULCNET_PRELU = ('mask_act', 'stage2_act')
+
+
+def _count(model, kind):
+    return sum(type(module) is kind for module in model.modules())
+
+
+def _sites(model, kind):
+    """The modules of type ``kind``, without Align-ULCNet's fixed PReLUs."""
+    return [name for name, module in model.named_modules()
+            if type(module) is kind and name not in ULCNET_PRELU]
+
+
+@pytest.mark.parametrize('activation', NAMES)
+@pytest.mark.parametrize('model_name', sorted(CLASSES))
+def test_activation_option_replaces_every_elu(model_name, activation):
+    model_cls = CLASSES[model_name]
+    kwargs = read_model_kwargs(_cfg('[model]\nactivation = %s\n' % activation),
+                               model_cls)
+    assert kwargs['activation'] == activation
+    model = model_cls(GRID256, **kwargs)
+    sites = _sites(model, ACTIVATION_OPS[activation][0])
+    assert len(sites) == ELU_SITES[model_name], sites
+    assert activation == 'elu' or _count(model, torch.nn.ELU) == 0
+    if model_name == 'DeepVQE_S':
+        assert type(model.ccm_up.act) is torch.nn.Identity
+    else:
+        assert all(type(getattr(model, name)) is torch.nn.PReLU
+                   for name in ULCNET_PRELU)
+    if activation == 'prelu':       # one slope per channel
+        site, width = ((model.mic1.activation, 16) if model_name == 'DeepVQE_S'
+                       else (model.joint2.act, 96))
+        assert site.weight.shape == (width,)
+
+
+@pytest.mark.parametrize('build', [
+    lambda name: DeepVQES(GRID256, activation=name),
+    lambda name: AlignULCNet(GRID256, activation=name),
+    lambda name: CausalConvBlock(2, 4, activation=name),
+    lambda name: SeparableCausalConv(2, 4, activation=name),
+    lambda name: FreqUpsample(2, 4, activation=name),
+], ids=('deepvqe', 'ulcnet', 'conv_block', 'separable', 'upsample'))
+@pytest.mark.parametrize('name', ['gelu', 'relu6', 'ELU', 'none', ''])
+def test_unknown_activation_is_refused(build, name):
+    with pytest.raises(ValueError, match='activation must be one of'):
+        build(name)
+
+
+def test_none_is_no_activation_only_for_the_bare_upsample():
+    assert type(FreqUpsample(2, 4, activation=None).act) is torch.nn.Identity
+    for build in (DeepVQES, AlignULCNet):
+        with pytest.raises(ValueError, match='activation must be one of'):
+            build(GRID256, activation=None)
+    for block in (CausalConvBlock, SeparableCausalConv):
+        with pytest.raises(ValueError, match='activation must be one of'):
+            block(2, 4, activation=None)
+
+
 # ---- contract --------------------------------------------------------------
 
 def test_model_section_parses_tuple_options():
@@ -198,12 +297,19 @@ def test_contract_records_an_option_only_when_it_is_set(model_name):
                                 model_cls)
     assert contract_model_kwargs(model_cls, changed)['score_kernel'] == (9, 5)
 
+    assert contract_model_kwargs(model_cls, read_model_kwargs(
+        _cfg('[model]\nactivation = elu\n'), model_cls)) == recorded
+    relu = read_model_kwargs(_cfg('[model]\nactivation = relu\n'), model_cls)
+    assert contract_model_kwargs(model_cls, relu)['activation'] == 'relu'
+
 
 @pytest.mark.parametrize('model_name', sorted(CLASSES))
 def test_a_checkpoint_without_the_option_keys_resumes_and_loads(
         model_name, tmp_path):
     """A contract written before the options existed (no score_kernel /
-    joint2_stride key) passes the resume check and loads through inference."""
+    joint2_stride / activation key) passes the resume check and loads through
+    inference; a changed option refuses the resume both ways, and inference
+    rebuilds the checkpoint's activation."""
     path = tmp_path / 'old.pth'
     _, old = _option_checkpoint(model_name, {}, path,
                                 recorded=_without_options)
@@ -217,11 +323,26 @@ def test_a_checkpoint_without_the_option_keys_resumes_and_loads(
     with contextlib.redirect_stdout(io.StringIO()):
         model = inference.load_model(str(path), 'cpu')[0]
     assert model.align.score.conv.kernel_size == DEFAULT_SCORE_KERNEL
+    assert _count(model, torch.nn.ELU) == ELU_SITES[model_name]
 
-    _, changed = _option_checkpoint(model_name, {'score_kernel': (9, 5)},
-                                    tmp_path / 'changed.pth')
-    with pytest.raises(ValueError, match='ctor_score_kernel'):
-        require_checkpoint_contract(saved, changed)
+    for option, value in (('score_kernel', (9, 5)), ('activation', 'relu'),
+                          ('activation', 'prelu')):
+        changed_path = tmp_path / 'changed.pth'
+        built, changed = _option_checkpoint(
+            model_name, {option: value}, changed_path, distinct_prelu=True)
+        with pytest.raises(ValueError, match='ctor_' + option):
+            require_checkpoint_contract(saved, changed)
+        with pytest.raises(ValueError, match='ctor_' + option):
+            require_checkpoint_contract(
+                torch.load(changed_path, weights_only=False), current)
+        if option == 'activation':
+            with contextlib.redirect_stdout(io.StringIO()):
+                reloaded = inference.load_model(str(changed_path), 'cpu')[0]
+            assert len(_sites(reloaded, ACTIVATION_OPS[value][0])) == (
+                ELU_SITES[model_name])
+            want = built.state_dict()
+            assert all(torch.equal(tensor, want[key])
+                       for key, tensor in reloaded.state_dict().items())
 
 
 # ---- export ----------------------------------------------------------------
@@ -311,6 +432,47 @@ def test_deepvqe_options_export_and_verify(tmp_path):
         assert descriptor['gru_hidden'] == 256
         assert metadata['input_schema']['state_align_key_ring'] == [
             1, 8, 63, 33]
+
+
+# The smallest checkpoint each exporter takes at 16 kHz / FFT 256 (the
+# Align-ULCNet export needs the grid's logit window of 9).
+EXPORT_CTOR = {'DeepVQE_S': {},
+               'Align_ULCNet': {'max_delay_frames': 8, 'score_kernel': (9, 5)}}
+
+
+def _export(model_name, model, checkpoint, path, frames_per_call, verify):
+    if model_name == 'DeepVQE_S':
+        built = _build(model_name, model, frames_per_call)
+        generic_export_graph(AEC256, built, str(checkpoint), path, 63,
+                             verify=verify, frames_per_call=frames_per_call)
+    else:
+        ulcnet_export.export_graph(model, str(checkpoint), path, verify=verify,
+                                   frames_per_call=frames_per_call)
+
+
+@pytest.mark.parametrize('activation,frames_per_call', [
+    ('relu', 1), ('leaky_relu', 1), ('prelu', 1), ('prelu', 8)])
+@pytest.mark.parametrize('model_name', sorted(CLASSES))
+def test_activation_exports_and_verifies(model_name, activation,
+                                         frames_per_call, tmp_path):
+    """The exported graph replays the model (prelu slopes distinct per
+    channel), and each Elu of the default graph becomes the chosen op."""
+    onnx = pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    counts = {}
+    for name in ('elu', activation):
+        checkpoint = tmp_path / (name + '.pth')
+        path = str(tmp_path / (name + '.onnx'))
+        model, _ = _option_checkpoint(
+            model_name, dict(EXPORT_CTOR[model_name], activation=name),
+            checkpoint, distinct_prelu=True)
+        _export(model_name, model, checkpoint, path, frames_per_call,
+                verify=name != 'elu')
+        counts[name] = collections.Counter(
+            node.op_type for node in onnx.load(path).graph.node)
+    op = ACTIVATION_OPS[activation][1]
+    assert counts['elu']['Elu'] > 0 and counts[activation]['Elu'] == 0
+    assert counts[activation][op] - counts['elu'][op] == counts['elu']['Elu']
 
 
 CLIP = 16000 + 37 * 3 + 5       # 126 frames at hop 128, not a multiple of 8
@@ -559,7 +721,7 @@ def test_each_shipped_grid_config_is_self_contained(
 
     ctor, lr, aux = SHIPPED_RECIPE[model_name][grid]
     for key in ('ctor_gru_hidden', 'ctor_similarity_channels',
-                'ctor_score_kernel', 'ctor_joint2_stride'):
+                'ctor_score_kernel', 'ctor_joint2_stride', 'ctor_activation'):
         if key in ctor:
             value = ctor[key]
             got = contract[key]

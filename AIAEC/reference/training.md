@@ -156,10 +156,20 @@ Constructor options (defaults as listed):
 |---|---|---|---|
 | DeepVQE-S, Align-ULCNet | `score_kernel` | `5,3` | (time, delay) of the delay-attention score conv |
 | Align-ULCNet | `joint2_stride` | `2` | frequency stride of the second joint conv; `1` at FFT 256 keeps the 512-grid bottleneck |
+| DeepVQE-S, Align-ULCNet | `activation` | `elu` | `elu`, `relu`, `leaky_relu` (slope 0.01) or `prelu` (one slope per channel) in every block the paper gives ELU: DeepVQE-S the six encoder convs and the upsample and residual blocks (the last upsample stays bare), Align-ULCNet the four encoder convs and the two joint convs (the mask head and stage 2 keep their PReLU) |
 
-A checkpoint contract records `ctor_score_kernel` / `ctor_joint2_stride` only
-when they differ from the default, so a default run writes the same contract as
-before and an older checkpoint loads with the defaults.
+A checkpoint contract records `ctor_score_kernel` / `ctor_joint2_stride` /
+`ctor_activation` only when they differ from the default, so a default run
+writes the same contract as before and an older checkpoint loads with the
+defaults. The resume check refuses a mismatch either way, including a
+checkpoint whose contract records an option the running config leaves at its
+default. ELU, ReLU and LeakyReLU carry no weights, so the contract is what
+refuses to resume a checkpoint under another activation: a new activation is a
+new run,
+in its own `output_dir` (a run without `--resume` writes over the checkpoints
+there).
+The activation changes no graph port or state shape; only the activation op of
+the exported graph differs.
 
 The board rows follow the shipped configs: the 16 kHz / FFT 256 rows of
 `stream/aiaec/graph_io_deepvqes.h` and `graph_io_alignulcnet.h` take the
