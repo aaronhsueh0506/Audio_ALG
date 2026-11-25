@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### 2026-11-25: `PTQ/calib_analyze.py --onnx` follows the tensors inside the graph
+
+- The converter takes a minimum and maximum for every tensor, and a frame whose inputs look ordinary can hold the extreme of a tensor inside the graph. `--onnx [PATH]` (default: the graph the calibration run wrote beside the artifact) replays every frame through the float graph with onnxruntime, one frame per invocation with its own recorded state, and records each internal tensor's minimum and maximum per frame. Without the option nothing changes, and neither `onnx` nor `onnxruntime` is imported.
+- `select --onnx` also keeps the frames holding those extremes: chosen greedily (a rectifier's 0 or a saturated gate is reached on most frames, so one frame per end would waste the count), after the input ones, and most important first when `--count` cannot take them all. With `--max-clip-pct` above 0 they are taken from the frames the budget leaves; the budget still ranks frames by the inputs, so the selection is then also compared against every frame. The keep file records the graph, and `select --onnx` prints what a choice from the inputs alone would have lost.
+- New `layers` subcommand: compares a selection (`--keep keep.json`) with the pool, tensor by tensor: the share of each range kept and the percent of frames holding a value outside it. `analyze --onnx` adds the same comparison to the HTML report and its conclusions.
+- The graph is refused when its input names, shapes or element types are not the artifact's, or when both it and the report record a `checkpoint_sha256` or a `state_layout_version` and they differ; a non-finite internal value is refused. `analyze --onnx` skips the replay for a model that needs one contiguous stream (no selection is made for it). Write `--onnx` after the artifact, or as `--onnx=PATH`. The ranges are those of the float ONNX tensors: a converter's later range passes and the gates inside a recurrent operator are not modelled.
+- About 2 ms per frame for DeepVQE-S at 16 kHz / 256 on a desktop core. A DeepVQE-S frame is about 0.3 MB (the alignment rings), and an artifact is loaded whole, so size the pool to the machine's memory.
+
 ### 2026-11-24: `PTQ/calib_analyze.py` scores min/max grids only
 
 - The converter takes each tensor's range from the minimum and maximum of one calibration set shared by the 8x8, 16x8 and 16x16 formats, so the KL, MSE, percentile and EMA estimates are gone. `--bits` (default `8,16`) scores every width side by side.

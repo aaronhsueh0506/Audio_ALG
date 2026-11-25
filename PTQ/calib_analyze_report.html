@@ -42,7 +42,7 @@ dl.gloss{margin:0}dl.gloss dt{font-weight:600;margin-top:8px}dl.gloss dd{margin:
 
 <h2>結論</h2>
 <div class="card"><ul class="concl" id="concl"></ul>
-<div class="sub" style="margin-top:8px">這份報告只看 graph 的<b>輸入</b> tensor。挑選對 graph 內部各層是否合適，要用量化後模型的輸出來判斷。</div></div>
+<div class="sub" style="margin-top:8px" id="scopeNote">這份報告只看 graph 的<b>輸入</b> tensor。挑選對 graph 內部各層是否合適，要用量化後模型的輸出來判斷。</div></div>
 
 <div id="recSection" style="display:none">
 <h2>建議挑選</h2>
@@ -51,6 +51,15 @@ dl.gloss{margin:0}dl.gloss dt{font-weight:600;margin-top:8px}dl.gloss dd{margin:
     <button id="recBtn" class="pri">套用建議到下方互動區</button></div>
   <div class="scroll"><table id="rtab"></table></div>
   <div class="sub" style="margin-top:6px">「被夾的值」＝落在 range 外、上板後會被夾到邊界的值佔全部的比例；「有值被夾的 frame」＝至少有一個值被夾的 frame 比例，兩者都是精確計數。SQNR 是在每個 tensor 最多 <span id="sampleCap"></span> 個抽樣值上實際量化再反量化算出來的；「含被夾」把被夾的值算進誤差，「不含被夾」只看 range 內的值（也就是解析度）。三種格式共用同一份資料：8x8 看 8-bit 欄，16x8 和 16x16 看 16-bit 欄。range 一律包含 0（min/max 量化讓 0 可以被精確表示）。<br>「隨機」和「丟極端值」兩組對照是用整池本身評分的：整池的極值就在評分資料裡，所以會高估丟掉極值的代價；不偏的數字請用 <code>coverage</code> 子命令對另一份沒看過的錄音評估。</div>
+</div>
+</div>
+
+<div id="laySection" style="display:none">
+<h2>graph 內部的 tensor</h2>
+<div class="card">
+  <div class="sub" id="layNote"></div>
+  <div class="scroll segtable"><table id="ltab"></table></div>
+  <div class="sub" style="margin-top:6px">每個 frame 各自帶著錄下來的 state，逐一用 FP32 graph 重跑，記錄每個 ONNX tensor 的最小值和最大值（只重排資料的 op 不列）。「保留」＝挑出的 frame 涵蓋基準 range 的比例；「超出的 frame」＝基準裡有值落在挑出的 range 之外的 frame 比例，上板後這些值會被夾。基準是套用 clip 預算後剩下的 frame。range 變窄的列排在前面。</div>
 </div>
 </div>
 
@@ -99,10 +108,11 @@ dl.gloss{margin:0}dl.gloss dt{font-weight:600;margin-top:8px}dl.gloss dd{margin:
 <h2>名詞說明</h2>
 <div class="card"><dl class="gloss">
 <dt>min/max 校正</dt><dd>converter 用每個 tensor 在校正資料裡的最小值和最大值決定 range。多一個極端 frame，range 就變寬、step 變粗；少一個，上板遇到那種值就會被夾。</dd>
-<dt>為什麼數量本身不重要</dt><dd>只要挑出的 frame 包含每個 tensor 的最小值和最大值，輸入的 range 就和整池相同。數量影響的是 graph 內部各層，這份報告看不到。音訊相鄰 frame 幾乎一樣，所以重點是從多少錄音、多少情境裡挑，而不是挑幾個。</dd>
+<dt>為什麼數量本身不重要</dt><dd>只要挑出的 frame 包含每個 tensor 的最小值和最大值，輸入的 range 就和整池相同。數量影響的是 graph 內部各層；不加 <code>--onnx</code> 時這份報告看不到。音訊相鄰 frame 幾乎一樣，所以重點是從多少錄音、多少情境裡挑，而不是挑幾個。</dd>
 <dt>8-bit 和 16-bit 的取捨</dt><dd>16-bit 比 8-bit 多約 48 dB 的解析度，range 寬一點幾乎無感，被夾掉的代價比較大；8-bit 剛好相反。三種格式共用同一份資料時，要同時看兩欄。</dd>
 <dt>grid</dt><dd>這份報告的輸入 grid：<span id="glossScheme"></span>。非對稱＝range 包含 0、整數 zero point；對稱＝±絕對值最大；2 的冪次＝對稱、上限取到 2 的冪次（定點格式輸入的 scale）。第一個 frame 全為 0 的 tensor 視為 recurrent state：板端 state port 的 zero point 必須是 0，所以非對稱時 state 改用對稱 grid 評分。</dd>
-<dt>限制</dt><dd>只看輸入 tensor；SQNR 是抽樣估計；「丟掉的 frame」是依輸入的極端程度排序，不代表它在 graph 內部也最極端。</dd>
+<dt>graph 內部的 tensor</dt><dd>輸入看起來普通的 frame，也可能讓 graph 裡某一層出現最大值；只看輸入來挑，這種 frame 可能被丟掉，那一層的 range 就會變窄。加上 <code>--onnx</code>（預設用校正時一起匯出的 graph）會把每個 frame 用 FP32 graph 重跑一次，連內部 tensor 的極值 frame 一起保留，並在上面列出比較。互動挑選區仍然只依輸入計算。</dd>
+<dt>限制</dt><dd>不加 <code>--onnx</code> 時只看輸入 tensor；SQNR 是抽樣估計；「丟掉的 frame」是依輸入的極端程度排序，不代表它在 graph 內部也最極端。</dd>
 </dl></div>
 </main>
 <script>
@@ -259,6 +269,22 @@ function renderRec(){
     $('k').value=0;$('kval').textContent=0;refresh();};
 }
 
+// ---- tensors inside the graph
+function renderLayers(){
+  const L=D.recommend&&D.recommend.layers; if(!L) return;
+  $('laySection').style.display='';
+  $('scopeNote').innerHTML='這份報告除了 graph 的輸入，也用 FP32 graph 重跑每個 frame、記錄了<b>內部</b> tensor 的 range（見「graph 內部的 tensor」）。量化後的精度仍然要用量化後模型的輸出來判斷。';
+  const s=L.selected, p=L.input_only;
+  $('layNote').textContent=`${L.graph.split('/').pop()} · ${s.tensors} 個內部 tensor · 基準 ${s.base_frames} 個 frame · 加 graph 挑的 ${s.frames} 個：${s.narrowed} 個變窄 · 只看輸入挑的 ${p.frames} 個：${p.narrowed} 個變窄`;
+  const idx=s.rows.map((_,i)=>i).sort((a,b)=>(p.rows[a].kept-p.rows[b].kept)||(s.rows[a].kept-s.rows[b].kept));
+  const cells=r=>{const c=r.frames_outside_pct>0?' class="badc"':'';
+    return `<td>${fmt(r.keep_lo)} … ${fmt(r.keep_hi)}</td><td${c}>${(100*r.kept).toFixed(1)}%</td><td${c}>${pct(r.frames_outside_pct)}</td>`;};
+  let t='<tr><th class="l">tensor</th><th class="l">op</th><th>基準 range</th><th>只看輸入挑：range</th><th>保留</th><th>超出的 frame</th><th>加 graph 挑：range</th><th>保留</th><th>超出的 frame</th></tr>';
+  for(const i of idx){ const r=s.rows[i];
+    t+=`<tr><td class="l">${esc(r.tensor)}</td><td class="l">${esc(r.op)}</td><td>${fmt(r.lo)} … ${fmt(r.hi)}</td>${cells(p.rows[i])}${cells(r)}</tr>`; }
+  $('ltab').innerHTML=t;
+}
+
 // ---- sources
 function renderSrc(){
   if(!hasSrc){ $('srcOff').style.display=''; $('srcOff').textContent=`來源資訊不可用：${SRC.note}。`; return; }
@@ -302,7 +328,7 @@ $('dl').onclick=()=>{
   const keep=[];for(let f=0;f<N;f++)if(!dropped[f])keep.push(f);
   const blob=new Blob([JSON.stringify({artifact:D.meta.path,keep_frames:keep},null,1)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='keep.json';a.click();};
-renderSrc(); renderRec(); refresh(); drawGrowth();
+renderSrc(); renderRec(); renderLayers(); refresh(); drawGrowth();
 </script>
 </body>
 </html>

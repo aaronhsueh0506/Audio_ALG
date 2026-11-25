@@ -8,7 +8,8 @@ either a ``.npz`` (+ sibling ``.calib.json``) or a per-frame ``.bin`` directory
 minimum and maximum it sees, one range for the 8x8, 16x8 and 16x16 formats
 alike.  A frame holding an outlier stretches the range for every other frame;
 a frame left out has its values clipped on the device.  The tool reads the
-recorded input tensors only and works for any model.
+recorded input tensors and works for any model; with ``--onnx`` it also runs
+the graph the tensors bind to, so the tensors inside the graph count too.
 
 Consecutive audio frames are near copies of each other, so capturing exactly
 the pattern count (``--frames 1000``) covers one or two recordings.  Capture a
@@ -22,6 +23,10 @@ large pool from many recordings and let ``select`` keep the count:
         --against calib/heldout.npz
     python3 PTQ/calib_analyze.py apply calib/pool.npz --keep keep.json \
         --output calib/pool_pruned.npz
+    # with the graph: keep the extremes of the tensors inside it as well
+    python3 PTQ/calib_analyze.py select calib/pool.npz --onnx \
+        --output calib/pool_1000.npz
+    python3 PTQ/calib_analyze.py layers calib/pool.npz --keep keep.json
 
 ``select`` keeps at most ``--count`` frames (default 1000): every tensor's
 extreme frames, then k-means over per-frame statistics so the rest still
@@ -31,9 +36,18 @@ falls outside the kept range (counted exactly).  SQNR is reported for every
 ``--bits`` width.  ``coverage`` scores a selection against a held-out artifact
 of the same graph.
 
-The statistics cover the graph INPUT tensors, not the activations inside the
-graph; how a choice suits the internal layers shows only in the quantised
-model's output.  Recurrent-state inputs (a tensor whose first frame is all
+Without ``--onnx`` the statistics cover the graph INPUT tensors only: a frame
+whose inputs look ordinary can still hold the largest value of a tensor inside
+the graph, and leaving it out narrows that tensor's range.  ``--onnx [PATH]``
+(default: the graph the calibration run wrote beside the artifact) replays
+every frame through the float graph with onnxruntime and records each internal
+tensor's minimum and maximum per frame; ``select`` then keeps the frames that
+hold those extremes too and prints what a choice from the inputs alone would
+have lost, ``analyze`` reports the same, and ``layers`` compares a given
+selection with the pool, tensor by tensor.  These are the float ranges of the
+ONNX tensors: what a converter does to a range afterwards (merged operators,
+table-based functions, tensors sharing one scale) is not modelled, and the
+gates inside a recurrent operator are not visible.  Recurrent-state inputs (a tensor whose first frame is all
 zero) are scored on a symmetric grid under ``--scheme asym``, since the
 device needs zero point 0 on them; ``--scheme pow2`` scores every input on a
 symmetric grid whose bound is rounded up to a power of two, the scale of a
@@ -60,6 +74,7 @@ if _AINR_DIR not in sys.path:
 from calibration_io import (  # noqa: E402
     calibration_report_path,
     resolve_calibration_format,
+    sibling_onnx_path,
     write_calibration_artifact,
 )
 
@@ -100,6 +115,7 @@ class Artifact:
         # A fresh source starts from the all-zero initial state.
         self.state = [name for name in self.names
                       if not np.any(arrays[name][0])]
+        self.features = None        # frame_features() fills it on first use
 
     def schemes(self, scheme):
         """Grid per tensor: ``scheme``, but state inputs need zero point 0, so
@@ -312,6 +328,234 @@ def detect_segments(art):
 
 
 # --------------------------------------------------------------------------
+# Graph replay: the tensors inside the graph
+# --------------------------------------------------------------------------
+
+# Operators whose output is not followed: a layout-only one repeats its
+# input, a Constant never changes.
+UNFOLLOWED_OPS = frozenset(('Reshape', 'Transpose', 'Squeeze', 'Unsqueeze',
+                            'Flatten', 'Identity', 'Constant'))
+REPLAY_CHECK_FRAMES = 3      # frames compared against the unchanged graph
+
+
+def graph_path(art, override=None):
+    """The graph ``art`` binds to: ``override``, else the one its calibration
+    run exported beside it (named in the report, or ``<stem>.onnx``)."""
+    if override:
+        path = override
+    else:
+        named = art.report.get('graph')
+        beside = os.path.dirname(art.path.rstrip(os.sep))
+        path = (os.path.join(beside, os.path.basename(named)) if named
+                else sibling_onnx_path(art.path))
+    if not os.path.isfile(path):
+        raise ValueError('no graph at %s; pass --onnx PATH' % path)
+    return os.path.abspath(path)
+
+
+# Recorded by the exporter in the graph and by the capture in the report.
+_GRAPH_PAIR_KEYS = ('checkpoint_sha256', 'state_layout_version')
+
+
+def _check_graph_inputs(art, model, path):
+    """Refuse a graph whose inputs are not the artifact's tensors."""
+    from onnx import helper
+
+    graph = model.graph
+    constant = {init.name for init in graph.initializer}
+    inputs = [value for value in graph.input if value.name not in constant]
+    names = [value.name for value in inputs]
+    if sorted(names) != sorted(art.arrays):
+        raise ValueError('%s takes inputs %s but the artifact holds %s' % (
+            path, sorted(names), sorted(art.arrays)))
+    for value in inputs:
+        dims = [dim.dim_value if dim.HasField('dim_value') else None
+                for dim in value.type.tensor_type.shape.dim]
+        have = art.arrays[value.name].shape[1:]
+        if len(dims) != len(have) or any(
+                want is not None and want != got
+                for want, got in zip(dims, have)):
+            raise ValueError('%s input %s is %s but the artifact holds %s per '
+                             'frame' % (path, value.name, dims, list(have)))
+        dtype = helper.tensor_dtype_to_np_dtype(value.type.tensor_type.elem_type)
+        if dtype != art.arrays[value.name].dtype:
+            raise ValueError('%s input %s is %s but the artifact holds %s' % (
+                path, value.name, dtype, art.arrays[value.name].dtype))
+    props = {prop.key: prop.value for prop in model.metadata_props}
+    for key in _GRAPH_PAIR_KEYS:
+        want, have = props.get(key), art.report.get(key)
+        if want and have is not None and str(want) != str(have):
+            raise ValueError('%s records %s %s, the artifact %s' % (
+                path, key, str(want)[:12], str(have)[:12]))
+    return names, bool(props.get('checkpoint_sha256')
+                       and art.report.get('checkpoint_sha256'))
+
+
+def layer_stats(art, path, progress=None):
+    """Per-frame minimum and maximum of every tensor inside the graph.
+
+    Each frame carries its own recorded state inputs, so one frame is one
+    complete invocation and is replayed on its own, as the converter does with
+    each pattern.  A tensor is the float output of a node outside
+    ``UNFOLLOWED_OPS``.  The first, middle and last frame are also run through
+    the unchanged graph, whose outputs must match.
+    """
+    import onnx
+    import onnxruntime as ort
+
+    try:
+        model = onnx.load(path)
+    except Exception as error:      # protobuf raises its own decode error
+        raise ValueError('cannot read the graph %s: %s' % (path, error))
+    names, confirmed = _check_graph_inputs(art, model, path)
+    graph = model.graph
+    heads = [value.name for value in graph.output]
+    ops = {name: node.op_type for node in graph.node
+           if node.op_type not in UNFOLLOWED_OPS
+           for name in node.output if name}
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.intra_op_num_threads = 1
+    options.log_severity_level = 3
+
+    def session(proto):
+        return ort.InferenceSession(proto.SerializeToString(), options,
+                                    providers=['CPUExecutionProvider'])
+
+    def feed(index):
+        return {name: art.arrays[name][index] for name in names}
+
+    probe = onnx.ModelProto()
+    probe.CopyFrom(model)
+    probe.graph.output.extend(onnx.ValueInfoProto(name=name) for name in ops
+                              if name not in heads)
+    plain, run = session(model), session(probe)
+    first = run.run(list(ops), feed(0))
+    tensors = [name for name, value in zip(ops, first)
+               if isinstance(value, np.ndarray) and value.size
+               and np.issubdtype(value.dtype, np.floating)]
+    if not tensors:
+        raise ValueError('%s has no float tensor to follow' % path)
+    # Every head is fetched, followed or not, for the comparison below.
+    fetch = tensors + [name for name in heads if name not in tensors]
+    head_at = [fetch.index(name) for name in heads]
+
+    n = art.frames
+    fmin = np.empty((n, len(tensors)), dtype=np.float32)
+    fmax = np.empty((n, len(tensors)), dtype=np.float32)
+    check = set(np.linspace(0, n - 1, min(n, REPLAY_CHECK_FRAMES)).astype(int))
+    for index in range(n):
+        values = run.run(fetch, feed(index))
+        for col in range(len(tensors)):
+            fmin[index, col] = values[col].min()
+            fmax[index, col] = values[col].max()
+        if index in check:
+            for at, want in zip(head_at, plain.run(heads, feed(index))):
+                if not np.allclose(values[at], want, rtol=1e-5, atol=1e-6,
+                                   equal_nan=True):
+                    raise RuntimeError(
+                        '%s: following the internal tensors changed output %s '
+                        'at frame %d' % (path, fetch[at], index))
+        if progress and (index + 1) % 5000 == 0:
+            progress(index + 1, n)
+    bad = ~(np.isfinite(fmin).all(axis=0) & np.isfinite(fmax).all(axis=0))
+    if bad.any():
+        raise ValueError('%s: non-finite values in %s' % (
+            path, ', '.join(np.array(tensors)[bad][:5])))
+    return {'graph': path, 'checkpoint_confirmed': confirmed,
+            'names': tensors, 'ops': [ops[name] for name in tensors],
+            'frame_min': fmin, 'frame_max': fmax}
+
+
+def _rows(matrix, frames):
+    """``matrix[frames]``, without the copy when ``frames`` is every row."""
+    return matrix if len(frames) == matrix.shape[0] else matrix[frames]
+
+
+def _share(part, span):
+    """``part / span`` per tensor; 1 for a tensor whose span is 0."""
+    return np.where(span > 0, part / np.where(span > 0, span, 1.0), 1.0)
+
+
+def layer_holders(layers, pool, have):
+    """Frames of ``pool``, beyond ``have``, that hold the internal extremes.
+
+    Many tensors reach an end on most frames (a rectifier's 0, a saturated
+    gate), so one frame per end would waste the pattern count.  The frames are
+    chosen greedily instead: the frame reaching the most ends no chosen frame
+    reaches yet, until every tensor's minimum and maximum over ``pool`` is
+    held.  Returned most important first: by the largest share of a tensor's
+    range that would go if that frame alone were left out.  ``pool`` is sorted
+    and holds at least two frames.
+    """
+    fmin = _rows(layers['frame_min'], pool)
+    fmax = _rows(layers['frame_max'], pool)
+    low, high = fmin.min(axis=0), fmax.max(axis=0)
+    reach = np.concatenate([fmin == low, fmax == high], axis=1)
+    done = reach[np.isin(pool, have)].any(axis=0)
+    gain = reach[:, ~done].sum(axis=1)
+    rows = []
+    while not done.all():
+        row = int(gain.argmax())
+        rows.append(row)
+        new = reach[row] & ~done
+        gain -= reach[:, new].sum(axis=1)
+        done |= new
+    rows = np.array(rows, dtype=np.int64)
+    low2 = np.partition(fmin, 1, axis=0)[1]
+    high2 = np.partition(fmax, -2, axis=0)[-2]
+    left = (np.where(fmax[rows] == high, high2, high).astype(np.float64)
+            - np.where(fmin[rows] == low, low2, low))
+    loss = 1.0 - _share(left, (high - low).astype(np.float64))
+    return pool[rows[np.argsort(-loss.max(axis=1), kind='stable')]]
+
+
+def layer_table(layers, keep, base=None):
+    """Each internal tensor's range over ``keep`` against ``base`` (default:
+    every frame): the share of the range kept and the percent of ``base``
+    frames holding a value outside it."""
+    fmin, fmax = layers['frame_min'], layers['frame_max']
+    base = np.arange(fmin.shape[0]) if base is None else base
+    bmin, bmax = _rows(fmin, base), _rows(fmax, base)
+    low, high = bmin.min(axis=0), bmax.max(axis=0)
+    klow, khigh = fmin[keep].min(axis=0), fmax[keep].max(axis=0)
+    kept = _share(khigh.astype(np.float64) - klow,
+                  (high - low).astype(np.float64))
+    outside = 100.0 * np.mean((bmin < klow) | (bmax > khigh), axis=0)
+    rows = [{'tensor': name, 'op': op, 'lo': float(low[i]),
+             'hi': float(high[i]), 'keep_lo': float(klow[i]),
+             'keep_hi': float(khigh[i]), 'kept': float(kept[i]),
+             'frames_outside_pct': float(outside[i])}
+            for i, (name, op) in enumerate(zip(layers['names'],
+                                               layers['ops']))]
+    narrowed = [row for row in rows if row['frames_outside_pct'] > 0]
+    return {'frames': int(len(keep)), 'base_frames': int(len(base)),
+            'tensors': len(rows), 'narrowed': len(narrowed),
+            'worst': (min(narrowed, key=lambda row: row['kept'])
+                      if narrowed else None),
+            'frames_outside_max': max(
+                (row['frames_outside_pct'] for row in rows), default=0.0),
+            'rows': rows}
+
+
+def print_layer_table(table, label, top=10):
+    print('%s (%d of %d frames): %d of %d internal tensors narrower' % (
+        label, table['frames'], table['base_frames'], table['narrowed'],
+        table['tensors']))
+    rows = sorted((row for row in table['rows']
+                   if row['frames_outside_pct'] > 0),
+                  key=lambda row: row['kept'])
+    for row in rows[:top]:
+        print('  %-40s %-10s [%9.3g,%9.3g] -> [%9.3g,%9.3g] keeps %5.1f%%, '
+              '%.2f%% of frames outside' % (
+                  row['tensor'][:40], row['op'][:10], row['lo'], row['hi'],
+                  row['keep_lo'], row['keep_hi'], 100 * row['kept'],
+                  row['frames_outside_pct']))
+    if len(rows) > top:
+        print('  ... %d more' % (len(rows) - top))
+
+
+# --------------------------------------------------------------------------
 # Min/max grids
 # --------------------------------------------------------------------------
 
@@ -507,10 +751,13 @@ def budget_pool(stats, schemes, order, max_clip_pct):
 # Selection: pick the patterns
 # --------------------------------------------------------------------------
 
-def frame_features(art, names):
-    """Per-frame mean, std and abs-max of every tensor, z-scored later."""
+def frame_features(art):
+    """Per-frame mean, std and abs-max of every tensor, z-scored later.
+    Computed once per artifact."""
+    if art.features is not None:
+        return art.features
     cols = []
-    for name in names:
+    for name in art.names:
         flat = art.arrays[name].reshape(art.frames, -1)
         mean = np.empty(art.frames)
         std = np.empty(art.frames)
@@ -521,7 +768,8 @@ def frame_features(art, names):
             std[a:a + 256] = block.std(axis=1)
             peak[a:a + 256] = np.abs(block).max(axis=1)
         cols += [mean, std, peak]
-    return np.stack(cols, axis=1)
+    art.features = np.stack(cols, axis=1)
+    return art.features
 
 
 def _kmeans_pick(features, k, rng, iters=12):
@@ -563,7 +811,7 @@ def _kmeans_pick(features, k, rng, iters=12):
 
 
 def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
-                    seed=0):
+                    seed=0, layers=None):
     """Choose which frames to calibrate with.
 
     1. Rank frames most extreme first (``frame_order``).
@@ -574,6 +822,13 @@ def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
        tensor's minimum and maximum (otherwise the range would shrink past the
        budget) and thin the rest with k-means so the survivors still cover the
        distribution.  ``count`` is a cap: a smaller pool is kept whole.
+
+    With ``layers`` (``layer_stats``) step 3 also keeps the frames holding the
+    minimum and maximum of every tensor inside the graph (``layer_holders``),
+    after the input ones and most important first when ``count`` cannot take
+    them all.  ``must`` counts the range-defining frames found, ``must_layers``
+    those found for the internal tensors only and ``kept_layers`` how many of
+    the latter are kept.
     """
     if count < 1:
         raise ValueError('--count must be at least 1')
@@ -582,6 +837,7 @@ def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
     pool, k_budget = budget_pool(stats, schemes, order, max_clip_pct)
     notes = []
     must = np.array([], dtype=np.int64)
+    must_layers = kept_layers = 0
     if count >= pool.size:
         keep = pool
         if count > pool.size:
@@ -593,19 +849,26 @@ def select_patterns(art, stats, schemes, count=DEFAULT_COUNT, max_clip_pct=0.0,
             holders.add(int(pool[np.argmin(st['frame_min'][pool])]))
             holders.add(int(pool[np.argmax(st['frame_max'][pool])]))
         must = np.array(sorted(holders), dtype=np.int64)
+        if layers is not None:
+            inner = layer_holders(layers, pool, must)
+            must_layers = int(inner.size)
+            must = np.concatenate([must, inner])
+            # The internal holders come last, so a short count cuts them first.
+            kept_layers = max(0, min(count, must.size) - (must.size - must_layers))
         if must.size >= count:
-            keep = must[:count]
+            keep = np.sort(must[:count])
             if must.size > count:
                 notes.append('%d range-defining frames exceed --count %d; '
                              'the range will be narrower than the budget '
                              'allows' % (must.size, count))
         else:
             rest = np.setdiff1d(pool, must)
-            features = frame_features(art, art.names)[rest]
+            features = frame_features(art)[rest]
             picked = rest[_kmeans_pick(features, count - must.size, rng)]
             keep = np.sort(np.concatenate([must, picked]))
     return {'keep': keep, 'k_budget': k_budget, 'must': int(must.size),
-            'notes': notes}
+            'notes': notes, 'pool': pool, 'must_layers': must_layers,
+            'kept_layers': kept_layers}
 
 
 def frames_outside_pct(st, lo, hi, part=slice(None)):
@@ -831,6 +1094,56 @@ def _pow2_lines(stats, schemes, bits, n):
     return out
 
 
+def _narrowed_text(table):
+    """How far ``table`` (``layer_table``) falls short of its base frames."""
+    if not table['narrowed']:
+        return '%d 個內部 tensor 的 range 都和基準相同' % table['tensors']
+    worst = table['worst']
+    return ('%d 個內部 tensor 中有 %d 個的 range 變窄；最窄的是 %s（%s），只剩 '
+            '%.1f%%；有值超出的 frame 最多佔 %.2f%%' % (
+                table['tensors'], table['narrowed'], worst['tensor'],
+                worst['op'], 100 * worst['kept'], table['frames_outside_max']))
+
+
+def _level(table):
+    return 'warn' if table['narrowed'] else 'info'
+
+
+def _layer_lines(inner, must):
+    """Conclusions about the tensors inside the graph."""
+    selected, plain = inner['selected'], inner['input_only']
+    frames = selected['frames']
+    out = [('info', '已用 %s 把 %d 個 frame 逐一重跑（FP32），記錄 graph 內部 %d 個 '
+            'tensor 每個 frame 的最小值和最大值。%s' % (
+                os.path.basename(inner['graph']), inner['replayed'],
+                selected['tensors'],
+                '' if inner['checkpoint_confirmed'] else
+                'graph 和校正檔沒有都記錄 checkpoint，無法確認兩者出自同一個 checkpoint。'))]
+    text = '挑出的 %d 個 frame：%s。' % (frames, _narrowed_text(selected))
+    if must:
+        held = min(must, frames)
+        text += ('保住輸入和內部的極值共用了 %d 個 frame（為內部 tensor 多留的有 %d 個），'
+                 '佔 %.0f%%；其餘才是依分布抽樣。佔比高時，這份資料會偏向極端值：'
+                 '純 min/max 不受影響，但 converter 依直方圖的校正模式（只作用在 8-bit）'
+                 '會受影響。' % (held, inner['kept_layers'],
+                              100.0 * held / frames))
+    out.append((_level(selected), text))
+    out.append((_level(plain), '對照：只看輸入來挑（不加 --onnx）的 %d 個 frame：%s。'
+                % (plain['frames'], _narrowed_text(plain))))
+    whole = inner.get('all_frames')
+    if whole:
+        out.append((_level(whole), '上面兩項的基準是套用 clip 預算後剩下的 %d 個 frame。'
+                    '預算只依輸入丟 frame，被丟的 frame 也可能帶著內部 tensor 的極值；'
+                    '以全部 %d 個 frame 為基準：%s。' % (
+                        selected['base_frames'], whole['base_frames'],
+                        _narrowed_text(whole))))
+    out.append(('info', '內部的 range 是 FP32 graph 每個 ONNX tensor 的最小值和最大值。'
+                'converter 之後還會調整（合併 op、查表類函數夾範圍、多個 tensor 共用 scale），'
+                '遞迴 op 內部的 gate 也看不到，所以這裡只保證「挑選後和整池看到的極值相同」，'
+                '不代表量化後的精度。'))
+    return out
+
+
 def conclusions(art, stats, schemes, recommend, sources, bits, count):
     """What the numbers say, as (level, text) pairs in the report language."""
     out = []
@@ -888,15 +1201,26 @@ def conclusions(art, stats, schemes, recommend, sources, bits, count):
     out += _pow2_lines(stats, schemes, bits, n)
     if recommend:
         sel = recommend['selected']
-        if recommend['k_budget'] == 0 and recommend['must'] > sel['frames']:
+        inner = recommend.get('layers')
+        must_inputs = recommend['must'] - (inner['must_layers'] if inner else 0)
+        if recommend['k_budget'] == 0 and must_inputs > sel['frames']:
             out.append(('warn', '保住每個輸入 tensor 的最小值和最大值需要 %d 個 frame，'
                         '超過 --count %d：挑出的 frame 的輸入 range 比整池窄。'
-                        % (recommend['must'], count)))
+                        % (must_inputs, count)))
+        elif recommend['k_budget'] == 0 and recommend['must'] > sel['frames']:
+            out.append(('warn', '保住輸入和內部每個 tensor 的最小值和最大值需要 %d 個 '
+                        'frame，超過 --count %d：輸入的 %d 個都保留，內部的 %d 個依影響'
+                        '大小只保留了 %d 個。' % (
+                            recommend['must'], count, must_inputs,
+                            inner['must_layers'], inner['kept_layers'])))
         elif recommend['k_budget'] == 0 and recommend['must']:
-            out.append(('info', '挑出的 %d 個 frame 保有整池每個輸入 tensor 的最小值和'
-                        '最大值，所以輸入 range 和整池相同。保住這些極值至少需要 %d 個 '
-                        'frame，但這只對輸入成立；graph 內部各層的 range，這個工具看不到。'
-                        % (sel['frames'], recommend['must'])))
+            text = ('挑出的 %d 個 frame 保有整池每個輸入 tensor 的最小值和'
+                    '最大值，所以輸入 range 和整池相同。' % sel['frames'])
+            if not inner:
+                text += ('保住這些極值至少需要 %d 個 frame，但這只對輸入成立；'
+                         'graph 內部各層的 range，這個工具看不到。'
+                         % recommend['must'])
+            out.append(('info', text))
         elif recommend['k_budget'] == 0:
             out.append(('info', '全部 %d 個 frame 都保留，輸入 range 和整池相同。'
                         % sel['frames']))
@@ -904,6 +1228,8 @@ def conclusions(art, stats, schemes, recommend, sources, bits, count):
             out.append(('info', '依 %.3g%% 預算丟了 %d 個最極端的 frame，再挑出 %d 個。'
                         % (recommend['max_clip_pct'], recommend['k_budget'],
                            sel['frames'])))
+        if inner:
+            out += _layer_lines(inner, recommend['must'])
         alt = recommend.get('alternative')
         if alt:
             base = recommend['all']
@@ -950,15 +1276,41 @@ def prepare(art, scheme, seed=0):
     return stats, schemes, models
 
 
+def layer_comparison(art, stats, schemes, layers, sel, count, max_clip_pct,
+                     seed=0):
+    """``sel`` (chosen with ``layers``) and the input-only choice, each against
+    the frames left after the clip budget; when the budget dropped frames,
+    ``sel`` against every frame too, since the budget ranks by the inputs."""
+    plain = select_patterns(art, stats, schemes, count, max_clip_pct, seed)
+    out = {'graph': layers['graph'],
+           'checkpoint_confirmed': layers['checkpoint_confirmed'],
+           'replayed': art.frames, 'must_layers': sel['must_layers'],
+           'kept_layers': sel['kept_layers'],
+           'selected': layer_table(layers, sel['keep'], sel['pool']),
+           'input_only': layer_table(layers, plain['keep'], sel['pool'])}
+    if sel['k_budget']:
+        out['all_frames'] = layer_table(layers, sel['keep'])
+    return out
+
+
+def print_layer_comparison(inner):
+    print_layer_table(inner['input_only'], 'selected from the inputs only')
+    print_layer_table(inner['selected'], 'selected with the graph')
+    if 'all_frames' in inner:
+        print_layer_table(inner['all_frames'],
+                          'selected with the graph, against every frame')
+
+
 def analyze(art, scheme='asym', seed=0, count=DEFAULT_COUNT, max_clip_pct=0.0,
-            bits=DEFAULT_BITS):
+            bits=DEFAULT_BITS, layers=None):
     stats, schemes, models = prepare(art, scheme, seed)
     order, score = frame_order(stats)
     n = art.frames
     recommend = None
     keep = None
     if not art.contiguous:
-        sel = select_patterns(art, stats, schemes, count, max_clip_pct, seed)
+        sel = select_patterns(art, stats, schemes, count, max_clip_pct, seed,
+                              layers)
         keep = sel['keep']
         recommend = {
             'keep_frames': keep, 'count': count, 'max_clip_pct': max_clip_pct,
@@ -979,6 +1331,9 @@ def analyze(art, scheme='asym', seed=0, count=DEFAULT_COUNT, max_clip_pct=0.0,
             alt['k_budget'] = k_alt
             alt['max_clip_pct'] = ALT_CLIP_PCT
             recommend['alternative'] = alt
+        if layers is not None:
+            recommend['layers'] = layer_comparison(
+                art, stats, schemes, layers, sel, count, max_clip_pct, seed)
     sources = source_report(art, stats, keep, score, seed)
     return {
         'meta': {
@@ -1248,6 +1603,29 @@ def _bits(text):
     return values
 
 
+def _add_onnx(parser, default=None):
+    parser.add_argument('--onnx', nargs='?', const='', default=default,
+                        metavar='PATH',
+                        help='also follow the tensors inside the graph '
+                             '(needs onnx and onnxruntime); without PATH, the '
+                             'graph the calibration run wrote beside the '
+                             'artifact. Put it after the artifact, or write '
+                             '--onnx=PATH')
+
+
+def load_layers(art, override):
+    """``layer_stats`` of the graph ``art`` binds to, with progress lines."""
+    path = graph_path(art, override)
+    print('replaying %d frames through %s' % (art.frames, path))
+    layers = layer_stats(art, path, lambda done, total: print(
+        '  %d/%d frames' % (done, total), flush=True))
+    print('%d internal tensors followed' % len(layers['names']))
+    if not layers['checkpoint_confirmed']:
+        print('warning: no checkpoint_sha256 on both the graph and the '
+              'report: cannot confirm they come from one checkpoint')
+    return layers
+
+
 def _add_common(parser, count=True):
     parser.add_argument('--scheme', choices=SCHEMES, default='asym',
                         help='input grid: asym (state inputs then take sym), '
@@ -1285,6 +1663,7 @@ def main(argv=None):
     p_an.add_argument('--out', default='calib_report.html')
     p_an.add_argument('--json', default=None, help='also dump the raw analysis')
     _add_common(p_an)
+    _add_onnx(p_an)
     p_se = sub.add_parser('select', help='pick which patterns to keep')
     p_se.add_argument('artifact')
     _add_common(p_se)
@@ -1293,6 +1672,15 @@ def main(argv=None):
     p_se.add_argument('--output', default=None,
                       help='also write the reduced artifact here')
     p_se.add_argument('--format', choices=('bin', 'npz'), default=None)
+    _add_onnx(p_se)
+    p_la = sub.add_parser(
+        'layers', help='compare a selection with the pool, tensor by tensor '
+                       'inside the graph')
+    p_la.add_argument('artifact')
+    p_la.add_argument('--keep', required=True,
+                      help='JSON with keep_frames or drop_frames')
+    p_la.add_argument('--json', default=None)
+    _add_onnx(p_la, default='')     # the graph is this command's subject
     p_co = sub.add_parser('coverage',
                           help='score a selection on a held-out artifact')
     p_co.add_argument('artifact')
@@ -1324,10 +1712,35 @@ def main(argv=None):
         art.path, art.frames, len(art.names),
         (', skipped: ' + ', '.join(art.skipped)) if art.skipped else ''))
 
+    layers = None
+    if args.cmd in ('select', 'layers'):
+        require_selectable(art)     # before the replay, which takes minutes
+    if getattr(args, 'onnx', None) is not None and art.contiguous:
+        print('note: --onnx is ignored: no selection is made for %s'
+              % art.report.get('model_family'))
+    elif getattr(args, 'onnx', None) is not None:
+        try:
+            if args.cmd == 'layers':
+                keep = _load_keep(art, args.keep)
+            layers = load_layers(art, args.onnx)
+        except ImportError as error:
+            parser.error('following the tensors inside the graph needs the '
+                         'onnx and onnxruntime packages (%s)' % error)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
+    if args.cmd == 'layers':
+        table = layer_table(layers, keep)
+        print_layer_table(table, 'kept')
+        if args.json:
+            _dump_json(_round({'graph': layers['graph'], 'kept': table}),
+                       args.json)
+        return 0
+
     if args.cmd == 'analyze':
         analysis = _round(analyze(art, args.scheme, count=args.count,
                                   max_clip_pct=args.max_clip_pct,
-                                  bits=args.bits))
+                                  bits=args.bits, layers=layers))
         write_report(analysis, args.out)
         if args.json:
             _dump_json(analysis, args.json)
@@ -1349,9 +1762,8 @@ def main(argv=None):
     n = art.frames
 
     if args.cmd == 'select':
-        require_selectable(art)
         sel = select_patterns(art, stats, schemes, args.count,
-                              args.max_clip_pct)
+                              args.max_clip_pct, layers=layers)
         keep = sel['keep']
         print('clip budget %.3g%%: %d of %d frames dropped; selected %d '
               '(%d hold a tensor extreme)' % (args.max_clip_pct, sel['k_budget'],
@@ -1366,6 +1778,13 @@ def main(argv=None):
             tables.append(random_baseline(stats, schemes, models, n,
                                           int(keep.size), args.bits))
         print_tables(tables, args.bits)
+        if layers is not None:
+            inner = layer_comparison(art, stats, schemes, layers, sel,
+                                     args.count, args.max_clip_pct)
+            print('%d frames hold an extreme of a tensor inside the graph '
+                  'only; %d of them are kept' % (sel['must_layers'],
+                                                 sel['kept_layers']))
+            print_layer_comparison(inner)
         _, score = frame_order(stats)
         sources = source_report(art, stats, keep, score)
         if sources['available']:
@@ -1377,11 +1796,14 @@ def main(argv=None):
                 print('note: %d source(s) keep no frame' % len(empty))
         else:
             print('per-source counts unavailable: ' + sources['note'])
+        record = {'artifact': art.path,
+                  'keep_frames': [int(i) for i in keep],
+                  'count': args.count,
+                  'max_clip_pct': args.max_clip_pct}
+        if layers is not None:
+            record['graph'] = layers['graph']
         with open(args.keep_out, 'w', encoding='utf-8') as stream:
-            json.dump({'artifact': art.path,
-                       'keep_frames': [int(i) for i in keep],
-                       'count': args.count,
-                       'max_clip_pct': args.max_clip_pct}, stream)
+            json.dump(record, stream)
         print('selection: %s' % os.path.abspath(args.keep_out))
         if args.output:
             path = apply_selection(art, keep, args.output,
