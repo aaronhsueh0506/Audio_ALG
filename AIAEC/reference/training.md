@@ -35,6 +35,8 @@ Every retained model directory owns these user-facing files:
   grid)
 - inference.py
 - export_onnx.py
+- equalize.py (DeepVQE-S only: cross-layer equalization before PTQ, see
+  `export.md`)
 
 Shared training/checkpoint and signal utilities remain under AIAEC/; modules
 whose filename starts with an underscore are implementation details, not

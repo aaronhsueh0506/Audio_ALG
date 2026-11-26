@@ -3,6 +3,19 @@
 `Audio_ALG/pipelines`（含它建置的 `AINR`、`AIAEC` C 程式）的重要改動記錄在此，格式依
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)。README 只寫現況，改動經過寫在這裡。
 
+## [Unreleased] — 2026-11-26 — DeepVQE-S: cross-layer equalization before PTQ
+
+- **New tool (`AIAEC/DeepVQE_S/equalize.py`, solver `AIAEC/_equalize.py`).** `python3 equalize.py checkpoint.pth -o checkpoint_cle.pth` rescales channels between consecutive layers so that the channels of each 8-bit weight tensor span similar ranges (Nagel et al. 2019, arXiv 1906.04721). It covers skip convs, residual sums, the encoder concatenation, the delay attention (value, and query against key) and the GRU input columns, with ranges taken on the weights as the graph carries them (BatchNorm and the three-vector map folded). It refuses ELU, holds every channel's total scale to 1/16..16 (`MAX_SCALE`; a near-dead channel, tiny gain and real bias, would otherwise grow its activation and state about a thousandfold), and checks that the FP32 output is unchanged to 1e-4 of its peak before it writes a checkpoint (contract and weights, no optimizer state; nothing is written if the source file changed while it was read). On a random input it prints the output SNR with 8-bit weights before and after, for one scale per tensor and per channel, and the internal tensors whose peak grew most (a channel scaled up raises its activation and its state, bias included).
+- **Use.** Export and calibrate from the written checkpoint: the state inputs carry the rescaled channels, so a calibration set of the original checkpoint does not fit the equalized graph. Export, `inference.py calib`, graph ports, state shapes and layout versions are unchanged. `_streaming_export.batch_norm_gain()` is the BatchNorm gain both the exporter's upsample fold and the tool use. Another model takes part by adding its channel table to `_equalize.py`.
+- **Tests.** `AIAEC/tests/test_equalize.py`, on random weights only (no trained checkpoint was run). It checks relu, leaky_relu and prelu:
+  - output unchanged and ranges matched at the four grid configurations;
+  - streaming unchanged at 16 kHz / 256;
+  - folds equal to the exporter's;
+  - an outlier channel that improves one-scale-per-tensor SNR, and a near-dead channel held at the scale bound;
+  - the refusals;
+  - the written checkpoint exports to an ONNX head equal to the original's.
+- **Docs.** The DeepVQE-S README, `AIAEC/reference/{export,training}.md` and the CLI table of the DeepVQE-S core reference.
+
 ## [Unreleased] — 2026-11-24 — AIAEC end-to-end models train on any corpus of their sample rate
 
 - **Training corpus grid (`AIAEC/training_common.py` `build_plain_loaders`).** The linear-AEC grid of the corpus must equal `[signal]` only for a model that reads `linear_error` (Align-ULCNet; `reads_linear_error()` in `dataset_gen/model_views.py`, which `_calibration_common.LINEAR_ERROR_MODELS` now derives from): DeepVQE-S, Align-CRUSE and CAGCRN train at either 16 kHz grid on a corpus of either, for example the 16 kHz / 256 corpus at FFT 512, and the checkpoint records the corpus's `linear_aec` as it was. Kept for every model: the corpus's sample rate and contract checks of `PackedAecDataset`; `[signal]` must be a grid of `SUPPORTED_FRAME_HOP_BY_SR` (before, only the corpus comparison implied it) and the corpus chunk whole hops of it (refused otherwise, since the STFT-consistent loss resynthesizes whole hops). `build_plain_loaders` takes a required `model_name` and refuses an unknown one, and an unsupported grid, before loading the corpus.

@@ -40,6 +40,12 @@ which keeps it zero-completed.
       --checkpoint checkpoint.pth \
       --output output/model.onnx --verify
 
+DeepVQE-S also has `equalize.py`, an optional cross-layer equalization of
+the checkpoint for 8-bit weights. Export and calibrate from the checkpoint it
+writes, since its state inputs carry the rescaled channels. See
+`DeepVQE_S/README.md`. Another model takes part by adding its channel table
+to `AIAEC/_equalize.py`.
+
 For Align-ULCNet, --primary-dir contains materialized linear-error WAVs (see
 "Align-ULCNet linear-error provenance" below), or, with --primary-is-mic, RAW
 microphone WAVs. For the end-to-end models it contains microphone WAVs.

@@ -45,6 +45,56 @@ python3 inference.py calib --checkpoint checkpoint.pth \
   --frames 2048 --frames-per-call 4 --format bin --output calib/deepvqe_s_n4
 ```
 
+### Cross-layer equalization (optional, before PTQ)
+
+`equalize.py` rescales channels between consecutive layers so that the
+channels of each weight tensor span similar ranges (cross-layer equalization,
+Nagel et al. 2019), for a converter that quantizes weights to 8 bits. The FP32
+output does not change; the tool checks that before it writes anything. Run
+`export_onnx.py` and `inference.py calib` on the written checkpoint as usual:
+
+```bash
+python3 equalize.py checkpoint.pth -o checkpoint_cle.pth
+python3 inference.py calib --checkpoint checkpoint_cle.pth \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 8192 --format bin --output calib/deepvqe_s_cle
+```
+
+- Only `activation = relu`, `leaky_relu` or `prelu` checkpoints are accepted;
+  ELU does not commute with a channel scale and is refused.
+- The state inputs carry the rescaled channels, so the graph and its
+  calibration data must both come from the equalized checkpoint. A
+  calibration set captured from the original checkpoint does not fit the
+  equalized graph.
+- The tool prints the output SNR with 8-bit weights before and after, with one
+  scale per tensor and with one scale per channel, on a random input.
+  - CLE helps a converter with one weight scale per tensor when some channels
+    are far larger than the rest.
+  - Otherwise the change can go either way. On random test weights, one scale
+    per channel moved by −6 to +4 dB.
+  - Keep the equalized checkpoint only if the row that matches the
+    converter's weight scaling improves, and turn the converter's own CLE off
+    when you compare.
+- A channel that is scaled up raises its activation, and the state that
+  holds it, by the same factor, bias included.
+  - The largest case is a channel with a near-zero gain but a real bias,
+    which would grow about a thousandfold.
+  - Every channel's total scale is therefore held to 1/16..16 (`MAX_SCALE`).
+    The tool reports how many channels stopped at that bound.
+  - It also prints the three internal tensors whose peak grew most on its
+    random input.
+  - With 16-bit activations a factor of 16 at most costs little.
+  - To see the real ranges, compare both graphs with
+    `PTQ/calib_analyze.py analyze --onnx`.
+- The written file holds the contract and the weights, without optimizer
+  state. It is meant for export and calibration, not for further training.
+  - Its `cross_layer_equalization` entry records the source checkpoint's
+    SHA-256.
+  - If the source file changes while the tool reads it (a training run
+    saving over it), nothing is written.
+- The GRU's recurrent weights (`W_hh`) and the attention score conv are
+  outside every group and do not change.
+
 ## Graph port order
 
 The exported graph lists inputs as the signal inputs (`mic`, `far`) followed by the 16 state inputs, and outputs as the head

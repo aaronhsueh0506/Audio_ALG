@@ -485,6 +485,11 @@ def _fold_three_vector_conv(conv: nn.Conv2d, pairs: int) -> nn.Conv2d:
     return out
 
 
+def batch_norm_gain(norm: nn.BatchNorm2d) -> Tensor:
+    """Per-channel weight scale an eval-mode BatchNorm folds into its conv."""
+    return norm.weight.detach() / (norm.running_var + norm.eps).sqrt()
+
+
 def _fold_batch_norm_into_upsample_conv(conv: nn.Conv2d,
                                         norm: nn.BatchNorm2d) -> nn.Conv2d:
     """Fold an eval-mode BatchNorm that follows a sub-pixel shuffle into the
@@ -501,7 +506,7 @@ def _fold_batch_norm_into_upsample_conv(conv: nn.Conv2d,
     channels = norm.num_features
     if conv.out_channels != 2 * channels:
         raise ValueError('upsample conv is not the 2 x C sub-pixel layout')
-    gain = norm.weight.detach() / (norm.running_var + norm.eps).sqrt()
+    gain = batch_norm_gain(norm)
     shift = norm.bias.detach() - norm.running_mean * gain
     gain = gain.repeat_interleave(2)
     shift = shift.repeat_interleave(2)
