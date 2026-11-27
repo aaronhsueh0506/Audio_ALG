@@ -416,8 +416,6 @@ def main(model_name: str) -> None:
     args = parser.parse_args()
     args.model_name = model_name
     check_selection_arguments(parser, args)
-    if args.frames is not None and args.frames <= 0:
-        parser.error('--frames must be positive')
     if args.select is not None and requires_contiguous_calibration(model_name):
         parser.error('%s needs one uninterrupted stream; --select picks frames '
                      'from many' % model_name)
@@ -562,7 +560,10 @@ def main(model_name: str) -> None:
         # A 0/1 control input is not an activation: no range, no integer PTQ.
         policy['frame_reset'] = 'binary_control_no_ptq'
     frames = CalibrationFrames(
-        args, input_names, onnx_path, policy, args.model_name,
+        args, input_names, onnx_path,
+        {'model_family': args.model_name,
+         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
+         'state_precision_policy': policy},
         command=[sys.executable, os.path.join(
             os.path.dirname(os.path.abspath(__file__)), args.model_name,
             'inference.py'), 'calib'],
@@ -624,35 +625,25 @@ def main(model_name: str) -> None:
                 source_files.append(relative)
             if frames.full(args.frames):
                 break
-    if not len(frames) and requires_contiguous_calibration(args.model_name):
+    if frames.empty() and requires_contiguous_calibration(args.model_name):
         raise RuntimeError(
             '%s calibration requires one uninterrupted source with at least '
             '%d frames; cumulative state ranges must not be assembled from '
             'state-reset clips' % (args.model_name, args.frames)
         )
-    if not len(frames):
+    if frames.empty():
         raise RuntimeError('no calibration frames were produced')
 
-    # The frames written: every one captured, stacked with the floating
-    # tensors normalised to fp32 (Align-CRUSE's absolute frame counter is an
-    # int64 graph input, kept exact), or the --select choice.
-    written = {}
-
-    def make_report(arrays):
-        report = written['report'] = _report(arrays)
-        return report
-
-    def _report(arrays):
-        return _calibration_report(args, arrays, policy, graph_metadata,
-                                   onnx_path, grid, model, linear_error_stamp,
-                                   state_layout_version, source_files,
-                                   frontend_stamp, event_frames)
-
-    frames.write(args.output, artifact_format, make_report,
-                 limit=args.frames,
-                 source_names=[relative for relative, _, _ in pairs])
+    # The frames written: every one captured, or the --select choice.
+    report = frames.write(
+        args.output, artifact_format,
+        lambda arrays: _calibration_report(
+            args, arrays, policy, graph_metadata, onnx_path, grid, model,
+            linear_error_stamp, state_layout_version, source_files,
+            frontend_stamp, event_frames),
+        limit=args.frames, source_names=[relative for relative, _, _ in pairs])
     print('%s: %d streaming frames, graph %s' %
-          (args.output, written['report']['frames'], onnx_path))
+          (args.output, report['frames'], onnx_path))
 
 
 def _calibration_report(args, arrays, policy, graph_metadata, onnx_path, grid,

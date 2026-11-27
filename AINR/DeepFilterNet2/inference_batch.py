@@ -181,8 +181,7 @@ def _capture_fixed_batches(model, params, files, batch_wrapper, batches,
             if frames.full(batches):
                 break
 
-    produced = len(frames)
-    if produced == 0:
+    if frames.empty():
         raise RuntimeError(
             'not enough source frames to form one batch of %d' %
             batch_wrapper.batch_size
@@ -234,32 +233,28 @@ def calibration_main(args):
         verify=True,
     )
     # A batch's lanes come from adjacent recordings: no one source per frame.
-    frames = CalibrationFrames(args, wrapper.input_names, onnx_path,
-                               family='DeepFilterNet2')
+    frames = CalibrationFrames(
+        args, wrapper.input_names, onnx_path,
+        {'model_family': 'DeepFilterNet2',
+         'checkpoint_sha256': graph_metadata['checkpoint_sha256']})
     source_paths, discarded = _capture_fixed_batches(
         model, params, files, wrapper, args.batches, frames
     )
-    written = {}
-
-    def make_report(arrays):
-        # The frames written: every invocation captured (stacked as fp32) or
-        # the --select choice.
-        produced = int(next(iter(arrays.values())).shape[0])
-        report = written['report'] = _batch_report(
-            args, arrays, produced, discarded, source_paths, graph_metadata,
-            params, onnx_path, wrapper)
-        return report
-
-    frames.write(args.output, artifact_format, make_report,
-                 limit=args.batches)
+    # The frames written: every invocation captured, or the --select choice.
+    report = frames.write(
+        args.output, artifact_format,
+        lambda arrays: _batch_report(args, arrays, discarded, source_paths,
+                                     graph_metadata, params, onnx_path,
+                                     wrapper),
+        limit=args.batches)
     print('%s: %d invocations x batch %d, graph %s' % (
-        args.output, written['report']['batch_invocations'], args.batch_size,
-        onnx_path
+        args.output, report['batch_invocations'], args.batch_size, onnx_path
     ))
 
 
-def _batch_report(args, arrays, produced, discarded, source_paths,
-                  graph_metadata, params, onnx_path, wrapper):
+def _batch_report(args, arrays, discarded, source_paths, graph_metadata,
+                  params, onnx_path, wrapper):
+    produced = int(next(iter(arrays.values())).shape[0])
     report = {
         'schema': 'dfn2-fixed-batch-stream-calibration-v2',
         'state_layout_version': graph_metadata['state_layout_version'],

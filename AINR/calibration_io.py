@@ -205,10 +205,13 @@ SELECT_HELP = (
     'holding each tensor\'s minimum and maximum, inside the graph too, then '
     'k-means picks (PTQ/calib_analyze.py). The frames are not all held in '
     'memory, and an analysis page is written beside the output')
+DEFAULT_FRAMES = 256        # invocations a capture takes without --select
 
 
 def add_selection_arguments(parser, jobs=True):
-    """``--select``, ``--report`` and (``jobs``) ``--jobs`` of a capture."""
+    """``--select`` and ``--report`` of a capture and, when it may split its
+    recordings between processes (``jobs``), ``--jobs`` and the hidden
+    ``--shard`` those processes run with."""
     import argparse
 
     parser.add_argument('--select', type=int, default=None, metavar='COUNT',
@@ -221,20 +224,21 @@ def add_selection_arguments(parser, jobs=True):
                             help='with --select: scan N recordings at a time, '
                                  'each in its own process; the result does '
                                  'not depend on N')
-    # Set on the processes a --jobs run starts: K/N:FOLDER.
-    parser.add_argument('--shard', default=None, help=argparse.SUPPRESS)
+        # Set on the processes a --jobs run starts: K/N:FOLDER.
+        parser.add_argument('--shard', default=None, help=argparse.SUPPRESS)
 
 
-def check_selection_arguments(parser, args, attr='frames', default=256,
-                              flag='--frames'):
+def check_selection_arguments(parser, args, attr='frames', flag='--frames'):
     """Refuse a bad combination; without --select, ``args.<attr>`` falls
-    back to ``default``."""
+    back to ``DEFAULT_FRAMES`` and must be positive."""
     jobs = getattr(args, 'jobs', 1)
     if args.select is None:
         if jobs != 1 or args.report:
             parser.error('--jobs and --report go with --select')
         if getattr(args, attr) is None:
-            setattr(args, attr, default)
+            setattr(args, attr, DEFAULT_FRAMES)
+        if getattr(args, attr) <= 0:
+            parser.error('%s must be positive' % flag)
         return
     if args.select < 1:
         parser.error('--select must be at least 1')
@@ -247,22 +251,38 @@ def check_selection_arguments(parser, args, attr='frames', default=256,
 def _report_path(output, report):
     if report:
         return report
-    base = str(output)
-    return (base[:-4] if base.endswith('.npz') else base.rstrip(os.sep)) \
-        + '.report.html'
+    graph = sibling_onnx_path(str(output).rstrip(os.sep))
+    return graph[:-len('.onnx')] + '.report.html'
+
+
+def _stored(value):
+    """A captured tensor as it is written: floating tensors as float32, the
+    others (Align-CRUSE's int64 frame counter) exact."""
+    return (value.astype(np.float32, copy=False)
+            if np.issubdtype(value.dtype, np.floating) else value)
 
 
 def _without(argv, flags, valued):
     """``argv`` without the options ``flags`` (with their value when the flag
-    is in ``valued``)."""
+    is in ``valued``). An abbreviation argparse accepted is a prefix of one
+    option only, so a prefix of one of ``flags`` is that flag."""
+    def flag_of(item):
+        name = item.split('=', 1)[0]
+        if name in flags:
+            return name
+        hits = [flag for flag in flags
+                if name.startswith('--') and len(name) > 2
+                and flag.startswith(name)]
+        return hits[0] if len(hits) == 1 else None
+
     out, skip = [], False
     for item in argv:
         if skip:
             skip = False
             continue
-        name = item.split('=', 1)[0]
-        if name in flags:
-            skip = name in valued and '=' not in item
+        flag = flag_of(item)
+        if flag:
+            skip = flag in valued and '=' not in item
             continue
         out.append(item)
     return out
@@ -275,27 +295,28 @@ class CalibrationFrames:
     them as captures always have. With it each frame goes to a
     ``calib_analyze.Scan`` over the graph, which keeps only the frames a
     selection can pick; ``write`` chooses ``--select`` of them, writes them
-    and the analysis page. With ``--jobs N`` the recordings are dealt to N
-    processes running ``command`` (this capture, given ``argv`` with the
-    options ``rewrite`` replaces) on their share (``sources``), whose scans
-    are merged in recording order."""
+    and the analysis page. ``facts`` is what the analysis knows of the run
+    (``model_family``, ``checkpoint_sha256``, ``state_precision_policy``).
+    With ``--jobs N`` the recordings are dealt to N processes running
+    ``command`` (this capture, given ``argv`` with the options ``rewrite``
+    replaces and the flags ``drop`` removes) on their share (``sources``),
+    whose scans are merged in recording order."""
 
-    def __init__(self, args, names, graph, policy=None, family=None,
-                 command=None, argv=None, rewrite=None, drop=()):
+    def __init__(self, args, names, graph, facts=None, command=None,
+                 argv=None, rewrite=None, drop=()):
         self.names = list(names)
         self.output = args.output
         self.select = args.select
         self.jobs = getattr(args, 'jobs', 1)
         self.page = args.report
         self.graph = graph
-        self.policy = dict(policy or {})
-        self.family = family
+        self.facts = dict(facts or {})
         self.command = command
         self.argv = list(argv or [])
         self.rewrite = dict(rewrite or {})
         self.drop = tuple(drop)
         self.shard = None
-        if args.shard:
+        if getattr(args, 'shard', None):
             share, folder = args.shard.split(':', 1)
             k, total = (int(v) for v in share.split('/'))
             self.shard = (k, total, folder)
@@ -305,6 +326,7 @@ class CalibrationFrames:
         self.parts = None
         self.source = 0
         self.produced = 0
+        self._folder = None
 
     def sources(self, items):
         """``items`` (the recordings, in order) this process captures. A
@@ -325,21 +347,21 @@ class CalibrationFrames:
         if self.values is not None:
             capture_calibration_inputs(self.values, self.names, tensors)
             return
-        captured = {}
-        capture_calibration_inputs(captured, self.names, tensors)
-        frame = {}
-        for name in self.names:
-            value = captured[name][0]
-            frame[name] = (value.astype(np.float32, copy=False)
-                           if np.issubdtype(value.dtype, np.floating)
-                           else value)
+        if len(tensors) != len(self.names):
+            raise ValueError('calibration input names/tensors length mismatch')
+        # The scan copies each frame into its block and checks it is finite.
+        frame = {name: _stored(tensor.detach().cpu().numpy()
+                               if hasattr(tensor, 'detach')
+                               else np.asarray(tensor))
+                 for name, tensor in zip(self.names, tensors)}
         if self.scan is None:
-            self.scan = self._analyze().Scan(
+            analyze = self._analyze()
+            self.scan = analyze.Scan(
                 [(name, value.shape, value.dtype)
                  for name, value in frame.items()],
-                self.policy, None, self.graph, retain=True,
-                reserve=self._analyze().fill_reserve(self.select),
-                progress=self._analyze().progress_line)
+                self.facts.get('state_precision_policy'), self.facts,
+                self.graph, reserve=analyze.fill_reserve(self.select),
+                progress=analyze.progress_line)
         self.scan.add(frame, self.source)
         self.produced += 1
 
@@ -354,6 +376,12 @@ class CalibrationFrames:
         """Whether ``limit`` invocations are captured (never with --select:
         every recording is scanned)."""
         return self.values is not None and len(self) >= limit
+
+    def empty(self):
+        """Whether the run captured nothing. A --jobs process whose share
+        gave no frame is not empty: it hands back nothing, and the merged
+        run is checked."""
+        return self.shard is None and not len(self)
 
     @staticmethod
     def _analyze():
@@ -375,17 +403,15 @@ class CalibrationFrames:
         valued = ('--jobs', '--report', '--output', '--onnx', '--shard') \
             + tuple(self.rewrite)
         base = _without(self.argv, valued + self.drop, valued)
-        extra = []
         for flag, value in self.rewrite.items():
-            if value is not None:
-                extra += [flag, str(value)]
+            base += [flag, str(value)]
         env = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
         running = []
         for k in range(jobs):
             folder = os.path.join(self._folder, 'part%d' % k)
             os.makedirs(folder)
             log = open(os.path.join(folder, 'log.txt'), 'w')
-            argv = base + extra + [
+            argv = base + [
                 '--output', os.path.join(folder, 'frames.npz'),
                 '--onnx', os.path.join(folder, 'graph.onnx'),
                 '--shard', '%d/%d:%s' % (k, jobs, os.path.join(folder, 'part'))]
@@ -408,19 +434,15 @@ class CalibrationFrames:
                 if os.path.isdir(os.path.join(folder, 'part'))]
 
     def write(self, output, fmt, make_report, limit=None, source_names=None):
-        """Write the artifact; ``make_report(arrays)`` gives its report and
-        ``source_names`` names each recording ``sources`` was given. Returns
-        the report's path. A --jobs process hands its scan back and exits
-        here."""
+        """Write the artifact and return its report; ``make_report(arrays)``
+        gives the report and ``source_names`` names each recording ``sources``
+        was given. A --jobs process hands its scan back and exits here."""
         if self.values is not None:
-            arrays = {}
-            for name, values in self.values.items():
-                value = np.stack(values[:limit])
-                if np.issubdtype(value.dtype, np.floating):
-                    value = value.astype(np.float32, copy=False)
-                arrays[name] = value
-            return write_calibration_artifact(output, arrays,
-                                              make_report(arrays), fmt)
+            arrays = {name: _stored(np.stack(values[:limit]))
+                      for name, values in self.values.items()}
+            report = make_report(arrays)
+            write_calibration_artifact(output, arrays, report, fmt)
+            return report
         analyze = self._analyze()
         if self.shard is not None:
             if self.scan is not None:
@@ -429,23 +451,25 @@ class CalibrationFrames:
         try:
             parts = self.parts if self.parts is not None else (
                 [self.scan.part()] if self.scan is not None else [])
+            self.parts = self.scan = None
             if not parts:
                 raise RuntimeError('no calibration frames were produced')
             pool = analyze.assemble(
-                parts, None, {'model_family': self.family}, str(output), fmt,
-                self.policy, source_names, 'recorded by the capture',
+                parts, self.facts, str(output), fmt, graph=self.graph,
+                source_names=source_names,
+                source_note='recorded by the capture',
                 reserve=analyze.fill_reserve(self.select))
+            del parts
             analysis = analyze.report_analysis(
                 pool, self.select, 'asym', analyze.DEFAULT_BITS,
                 _report_path(output, self.page))
             keep = np.asarray(analysis['recommend']['keep_frames'],
                               dtype=np.int64)
-            path = analyze.write_selection(pool, keep, str(output), fmt,
-                                           make_report)
+            report = analyze.write_selection(pool, keep, str(output), fmt,
+                                             make_report)
             print('chose %d of %d frames from %d recordings' % (
                 keep.size, pool.count, len(pool.sources['starts'])))
-            return path
+            return report
         finally:
-            folder = getattr(self, '_folder', None)
-            if folder:
-                shutil.rmtree(folder, ignore_errors=True)
+            if self._folder:
+                shutil.rmtree(self._folder, ignore_errors=True)

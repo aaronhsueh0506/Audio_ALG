@@ -132,13 +132,14 @@ def _schemes(names, state, scheme):
             for name in names}
 
 
-_UNCHECKED = ('模型種類（Align-ULCNet 的前端 stamp、是否需要連續串流）', '來源檔',
-              '哪些輸入不量化')
+def _contiguous(report):
+    """Whether the model needs one uninterrupted stream (no selection)."""
+    return report.get('contiguous_state_frames') is not None
 
 
-def _unchecked(report):
-    """What a missing report leaves unchecked."""
-    return [] if report else list(_UNCHECKED)
+def _starts_at_zero(low, high):
+    """A tensor whose first frame is all zero: a recurrent state, fresh."""
+    return low == 0 and high == 0
 
 
 class Artifact:
@@ -154,13 +155,12 @@ class Artifact:
                       for name, value in arrays.items()]
         self.names, self.skipped = _quantisable(
             self.specs, report.get('state_precision_policy') or {})
-        self.contiguous = report.get('contiguous_state_frames') is not None
+        self.contiguous = _contiguous(report)
         recorded = report.get('state_inputs')
-        # A fresh source starts from the all-zero initial state.
         self.state = ([name for name in self.names if name in recorded]
                       if recorded is not None else
-                      [name for name in self.names
-                       if not np.any(arrays[name][0])])
+                      [name for name in self.names if _starts_at_zero(
+                          arrays[name][0].min(), arrays[name][0].max())])
 
     def schemes(self, scheme):
         return _schemes(self.names, self.state, scheme)
@@ -418,8 +418,15 @@ def _frame_peaks(peaks):
     top = peaks.max(axis=1)
     ratio = np.full(top.shape, np.nan)
     live = top > 0
-    nonzero = np.where(peaks[live] > 0, peaks[live], np.nan)
-    ratio[live] = top[live] / (np.nanmedian(nonzero, axis=1) + EPS)
+    if live.any():
+        # Peaks are absolute values, so a sorted row starts with its zeros.
+        rows = np.sort(peaks[live], axis=1)
+        zeros = np.count_nonzero(rows <= 0, axis=1)
+        count = rows.shape[1] - zeros
+        at = np.arange(len(rows))
+        median = 0.5 * (rows[at, zeros + (count - 1) // 2]
+                        + rows[at, zeros + count // 2])
+        ratio[live] = top[live] / (median + EPS)
     return ratio, peaks.argmax(axis=1)
 
 
@@ -449,26 +456,29 @@ def _concentration(peak, frame_ratio, frame_top):
         'frame_share': float(shares[mode]) if tops.size else 0.0,
         'top_shares': [[int(i), float(shares[i])] for i in leaders
                        if shares[i] > 0],
-        'profile': [float(v) for v in peak],
     }
 
 
 class _Bands:
     """``_concentration`` per axis of ``_band_axes(shape)``, gathered a block
-    of frames at a time."""
+    of frames at a time. Each frame keeps its ratio (float32) and largest
+    index (the smallest integer type that holds it): a pool of a million
+    frames keeps a few bytes per frame and axis."""
 
     def __init__(self, shape):
         self.axes = _band_axes(shape)
         self.peak = {key: np.zeros(shape[axis])
                      for key, axis in self.axes.items()}
+        self.index = {key: np.min_scalar_type(shape[axis])
+                      for key, axis in self.axes.items()}
         self.ratio = {key: [] for key in self.axes}
         self.top = {key: [] for key in self.axes}
 
     def add_peaks(self, key, peaks):
         np.maximum(self.peak[key], peaks.max(axis=0), out=self.peak[key])
         ratio, top = _frame_peaks(peaks)
-        self.ratio[key].append(ratio)
-        self.top[key].append(top)
+        self.ratio[key].append(ratio.astype(np.float32))
+        self.top[key].append(top.astype(self.index[key]))
 
     def add(self, block):
         for key, axis in self.axes.items():
@@ -477,18 +487,18 @@ class _Bands:
     def state(self):
         return {key: {'peak': self.peak[key],
                       'ratio': np.concatenate(self.ratio[key]),
-                      'top': np.concatenate(self.top[key]).astype(np.int64)}
+                      'top': np.concatenate(self.top[key])}
                 for key in self.axes}
 
 
-def _merged_bands(states, order):
-    """``_concentration`` per axis of per-part ``_Bands.state()`` lists,
-    the frames put in ``order``."""
+def _merged_bands(states):
+    """``_concentration`` per axis of per-part ``_Bands.state()`` lists (it
+    does not depend on the frames' order)."""
     out = {}
     for key in states[0]:
         peak = np.max([s[key]['peak'] for s in states], axis=0)
-        ratio = np.concatenate([s[key]['ratio'] for s in states])[order]
-        top = np.concatenate([s[key]['top'] for s in states])[order]
+        ratio = np.concatenate([s[key]['ratio'] for s in states])
+        top = np.concatenate([s[key]['top'] for s in states]).astype(np.int64)
         out[key] = _concentration(peak, ratio, top)
     return out
 
@@ -602,20 +612,21 @@ class _Replay:
             proto, options, providers=['CPUExecutionProvider'])
             for proto in (model.SerializeToString(), probe.SerializeToString())]
         self.threads = max(1, threads)
-        self._sessions = []
+        self._plain = None          # the unchanged graph, for the comparison
+        self._sessions = []         # one probe session per thread
         self.bands = bands
         self.tensors = None
         self.seen = 0
         self._last = None
         self._fmin, self._fmax = [], []
 
-    def _pair(self, k):
+    def _probe(self, k):
         while len(self._sessions) <= k:
-            self._sessions.append((self._make[0](), self._make[1]()))
+            self._sessions.append(self._make[1]())
         return self._sessions[k]
 
     def _start(self, feed):
-        first = self._pair(0)[1].run(list(self.ops), feed)
+        first = self._probe(0).run(list(self.ops), feed)
         self.tensors = [name for name, value in zip(self.ops, first)
                         if isinstance(value, np.ndarray) and value.size
                         and np.issubdtype(value.dtype, np.floating)]
@@ -631,10 +642,18 @@ class _Replay:
             if self.bands else {}
         self.band = [(col, key, axis) for col, bands in self._bands.items()
                      for key, axis in bands.axes.items()]
+        # Per tensor: (band row, the axes its peaks reduce); the first gives
+        # the tensor's minimum and maximum too.
+        self._reduce = {}
+        for i, (col, _, axis) in enumerate(self.band):
+            rank = len(self._shape[self.tensors[col]])
+            self._reduce.setdefault(col, []).append(
+                (i, tuple(a for a in range(rank) if a != axis)))
 
     def _compare(self, feed, values, index):
-        plain = self._pair(0)[0]
-        for at, want in zip(self.head_at, plain.run(self.heads, feed)):
+        if self._plain is None:
+            self._plain = self._make[0]()
+        for at, want in zip(self.head_at, self._plain.run(self.heads, feed)):
             if not np.allclose(values[at], want, rtol=1e-5, atol=1e-6,
                                equal_nan=True):
                 raise RuntimeError(
@@ -656,14 +675,22 @@ class _Replay:
         last = [None]
 
         def work(k, rows):
-            run = self._pair(k)[1]
+            run = self._probe(k)
             for j in rows:
                 values = run.run(self.fetch, feeds[j])
                 for col in range(width):
-                    fmin[j, col] = values[col].min()
-                    fmax[j, col] = values[col].max()
-                for i, (col, _, axis) in enumerate(self.band):
-                    peaks[i][j] = _index_peaks(values[col][None], axis + 1)[0]
+                    value = values[col]
+                    reduce = self._reduce.get(col)
+                    if not reduce:
+                        fmin[j, col] = value.min()
+                        fmax[j, col] = value.max()
+                        continue
+                    for count, (i, other) in enumerate(reduce):
+                        high, low = value.max(axis=other), value.min(axis=other)
+                        peaks[i][j] = np.maximum(high, -low)
+                        if not count:
+                            fmin[j, col] = low.min()
+                            fmax[j, col] = high.max()
                 if _check_at(self.seen + j):
                     self._compare(feeds[j], values, self.seen + j)
                 if j == n - 1:
@@ -674,7 +701,7 @@ class _Replay:
             work(0, range(n))
         else:
             for k in range(threads):
-                self._pair(k)        # sessions are made here, not in threads
+                self._probe(k)       # sessions are made here, not in threads
             bounds = np.linspace(0, n, threads + 1).astype(int)
             with concurrent.futures.ThreadPoolExecutor(threads) as pool:
                 list(pool.map(lambda k: work(k, range(bounds[k],
@@ -695,6 +722,7 @@ class _Replay:
         if not _check_at(index):
             self._compare(feed, heads, index)
         fmin, fmax = np.concatenate(self._fmin), np.concatenate(self._fmax)
+        self._fmin = self._fmax = None
         bad = ~(np.isfinite(fmin).all(axis=0) & np.isfinite(fmax).all(axis=0))
         if bad.any():
             raise ValueError('%s: non-finite values in %s' % (
@@ -757,20 +785,18 @@ class Scan:
     sessions. A frame's place is (source, frame within the source): frames
     are added in that order, and ``assemble`` sorts the parts of separate
     scans by it, so scans of separate sources merge into the scan of all.
-    ``retain`` keeps the frames a selection can pick (each tensor's extreme
-    frame and the ``reserve`` frames of smallest key) for a caller whose
-    frames do not stay addressable."""
+    ``reserve`` > 0 keeps the frames a selection can pick (each tensor's
+    extreme frame and the ``reserve`` frames of smallest key) for a caller
+    whose frames do not stay addressable."""
 
     def __init__(self, specs, policy=None, report=None, graph=None,
-                 bands=True, retain=False, reserve=0, seed=0, threads=1,
-                 progress=None):
+                 bands=True, reserve=0, seed=0, threads=1, progress=None):
         self.specs = [(name, tuple(shape), np.dtype(dtype))
                       for name, shape, dtype in specs]
         self.names, self.skipped = _quantisable(self.specs, policy or {})
         if not self.names:
             raise ValueError('no float input to calibrate')
         self.bands = bands
-        self.retain = retain
         self.reserve = reserve
         self.seed = seed
         self.progress = progress
@@ -784,7 +810,9 @@ class Scan:
                        if name in self.names} if bands else {}
         # Every value while a tensor's total fits SAMPLE_CAP.
         self._values = {name: [] for name in self.names}
-        self._buffer = []
+        self._block = None          # the frames ``add`` has not processed
+        self._fill = 0
+        self._block_at = np.empty((BLOCK, 2), dtype=np.int64)
         self._next = {}
         self._hold = None
         self._kept = {}
@@ -792,22 +820,26 @@ class Scan:
         self._reserve_at = np.empty((0, 2), dtype=np.int64)
 
     def add(self, frame, source=0):
-        """One invocation's arrays (name -> one-frame array) of ``source``."""
+        """One invocation's arrays (name -> one-frame array) of ``source``,
+        copied into the current block."""
+        if self._block is None:
+            self._block = {name: np.empty((BLOCK,) + shape, dtype=dtype)
+                           for name, shape, dtype in self.specs}
         local = self._next.get(source, 0)
         self._next[source] = local + 1
-        self._buffer.append((frame, source, local))
-        if len(self._buffer) >= BLOCK:
+        for name, value in self._block.items():
+            value[self._fill] = frame[name]
+        self._block_at[self._fill] = source, local
+        self._fill += 1
+        if self._fill == BLOCK:
             self.flush()
 
     def flush(self):
-        if not self._buffer:
-            return
-        frames, src, local = zip(*self._buffer)
-        self._buffer = []
-        block = {name: np.stack([frame[name] for frame in frames])
-                 for name, _, _ in self.specs}
-        self.process(block, np.array(src, dtype=np.int64),
-                     np.array(local, dtype=np.int64))
+        n, self._fill = self._fill, 0
+        if n:
+            at = self._block_at[:n].copy()
+            self.process({name: value[:n] for name, value in self._block.items()},
+                         at[:, 0], at[:, 1])
 
     def process(self, block, src, local):
         """The frames of ``block`` (name -> [frames, ...]), whose places are
@@ -816,22 +848,27 @@ class Scan:
         low, high = [], []
         for name in self.names:
             flat = block[name].reshape(n, -1)
-            rows = self._rows[name]
+            lo = flat.min(axis=1).astype(np.float64)
+            hi = flat.max(axis=1).astype(np.float64)
+            if not (np.isfinite(lo).all() and np.isfinite(hi).all()):
+                raise ValueError('non-finite calibration input in %s' % name)
             wide = flat.astype(np.float64)
-            low.append(flat.min(axis=1).astype(np.float64))
-            high.append(flat.max(axis=1).astype(np.float64))
-            rows['fmin'].append(low[-1])
-            rows['fmax'].append(high[-1])
+            rows = self._rows[name]
+            rows['fmin'].append(lo)
+            rows['fmax'].append(hi)
             rows['mean'].append(wide.mean(axis=1))
             rows['std'].append(wide.std(axis=1))
-            rows['peak'].append(np.abs(wide).max(axis=1))
+            rows['peak'].append(np.maximum(-lo, hi))
+            low.append(lo)
+            high.append(hi)
             if self.bands:
                 self._bands[name].add(block[name])
             values = self._values[name]
             if values is not None:
-                values.append(np.array(flat))
                 if (self.count + n) * flat.shape[1] > SAMPLE_CAP:
                     self._values[name] = None
+                else:
+                    values.append(np.array(flat))
         if self.replay is not None:
             lmin, lmax = self.replay.run(block, n)
             low.extend(lmin.T.astype(np.float64))
@@ -840,7 +877,7 @@ class Scan:
         self._src.append(src)
         self._local.append(local)
         self._keys.append(keys)
-        if self.retain:
+        if self.reserve > 0:
             self._keep(np.stack(low, axis=1), np.stack(high, axis=1), src,
                        local, keys, block)
         done = self.count
@@ -875,18 +912,20 @@ class Scan:
         for j in range(n):
             place = (int(src[j]), int(local[j]))
             if place in need and place not in self._kept:
+                # Copied: the block's storage is reused.
                 self._kept[place] = {name: np.array(block[name][j])
                                      for name in block}
         for place in [p for p in self._kept if p not in need]:
             del self._kept[place]
 
     def part(self):
-        """This scan's frames and statistics, for ``assemble``."""
+        """This scan's frames and statistics, for ``assemble``; the scan
+        hands them over and keeps none."""
         self.flush()
         if not self.count:
             raise ValueError('no calibration frame was scanned')
         kept = sorted(self._kept)
-        return {
+        part = {
             'specs': self.specs,
             'src': np.concatenate(self._src),
             'local': np.concatenate(self._local),
@@ -900,9 +939,15 @@ class Scan:
                        else None for name, values in self._values.items()},
             'layers': self.replay.finish() if self.replay else None,
             'kept_at': np.array(kept, dtype=np.int64).reshape(-1, 2),
-            'kept': {name: np.stack([self._kept[p][name] for p in kept])
+            # Each input's frames leave the dict as they are stacked.
+            'kept': {name: np.stack([self._kept[p].pop(name) for p in kept])
                      if kept else None for name, _, _ in self.specs},
         }
+        self._kept = {}
+        self._src = self._local = self._keys = self._rows = None
+        self._values = self._block = None
+        self._bands = {}
+        return part
 
 
 _PART_SCALARS = ('graph', 'checkpoint_confirmed', 'names', 'ops', 'operands',
@@ -1052,41 +1097,52 @@ def _value_sample(frames, name, sample, size, keys):
     return np.concatenate(out)
 
 
-def assemble(parts, specs, report=None, path='', fmt='npz', policy=None,
+def assemble(parts, report=None, path='', fmt='npz', graph=None,
              source_names=None, source_note='', state=None, frames=None,
              reserve=SAMPLE_FRAMES):
     """The ``Pool`` of the frames ``parts`` (``Scan.part``) scanned, in
-    (source, frame) order. ``frames(indices, name)`` reads frames back by
-    their index in that order; without it they come from the parts' kept
-    frames. ``specs`` defaults to the parts'. ``source_names`` names each
-    source index (sources unknown without it); ``state`` names the state
-    inputs (default: the inputs whose first frame is all zero)."""
+    (source, frame) order. ``report`` gives the inputs left unquantised and
+    the model family; ``graph`` names the graph replayed. ``frames(indices,
+    name)`` reads frames back by their index in that order; without it they
+    come from the parts' kept frames. ``source_names`` names each source
+    index (sources unknown without it); ``state`` names the state inputs
+    (default: the inputs whose first frame is all zero)."""
     report = report or {}
-    specs = [(name, tuple(shape), np.dtype(dtype))
-             for name, shape, dtype in (specs or parts[0]['specs'])]
-    names, skipped = _quantisable(specs, policy or {})
+    specs = parts[0]['specs']
+    names, skipped = _quantisable(specs,
+                                  report.get('state_precision_policy') or {})
     src = np.concatenate([p['src'] for p in parts])
     local = np.concatenate([p['local'] for p in parts])
     order = np.lexsort((local, src))
-    src, local = src[order], local[order]
-    keys = np.concatenate([p['keys'] for p in parts])[order]
     n = order.size
+    in_order = bool(np.all(order[1:] > order[:-1]))
+
+    def merged(arrays):
+        """``arrays`` (one per part) as one array in (source, frame) order;
+        a single scan's is used as it is."""
+        if len(arrays) == 1 and in_order:
+            return arrays[0]
+        joined = np.concatenate(arrays)
+        return joined if in_order else joined[order]
+
+    if not in_order:
+        src, local = src[order], local[order]
+    keys = merged([p['keys'] for p in parts])
 
     if frames is None:
+        kept = [p['kept'] for p in parts]
         where = {}
         for k, p in enumerate(parts):
-            for row, (s, l) in enumerate(p['kept_at'].tolist()):
-                where[(s, l)] = (k, row)
+            for row, place in enumerate(p['kept_at'].tolist()):
+                where[tuple(place)] = (k, row)
 
         def frames(indices, name):
             places = [where[(int(src[i]), int(local[i]))]
                       for i in np.atleast_1d(indices)]
-            return np.stack([parts[k]['kept'][name][row]
-                             for k, row in places])
+            return np.stack([kept[k][name][row] for k, row in places])
 
-    rows = {name: {field: np.concatenate(
-        [p['rows'][name][field] for p in parts])[order]
-        for field in _FRAME_FIELDS} for name in names}
+    rows = {name: {field: merged([p['rows'][name][field] for p in parts])
+                   for field in _FRAME_FIELDS} for name in names}
     ranked = np.argsort(keys, kind='stable')
     sample = np.sort(ranked[:SAMPLE_FRAMES])
     fill = np.sort(ranked[:reserve])
@@ -1094,30 +1150,29 @@ def assemble(parts, specs, report=None, path='', fmt='npz', policy=None,
     stats = {}
     for name in names:
         size = int(np.prod(shapes[name]))
-        conc = (_merged_bands([p['bands'][name] for p in parts], order)
+        conc = (_merged_bands([p['bands'][name] for p in parts])
                 if parts[0]['bands'] else {})
         every = [p['values'][name] for p in parts]
         if n * size <= SAMPLE_CAP and all(v is not None for v in every):
-            values = np.concatenate(every)[order].reshape(-1)
+            values = merged(every).reshape(-1)
         else:
             values = _value_sample(frames, name, sample, size, keys)
         stats[name] = _tensor_stats(shapes[name], rows[name], values,
                                     n * size, conc)
-    features = np.stack([rows[name][field] for name in names
-                         for field in ('mean', 'std', 'peak')], axis=1)
     layers = None
     if parts[0]['layers'] is not None:
         first = parts[0]['layers']
         if any(p['layers']['names'] != first['names'] for p in parts):
             raise ValueError('the scans followed different tensors')
         layers = {key: first[key] for key in _PART_SCALARS}
+        if graph:
+            layers['graph'] = graph
         layers['checkpoint_confirmed'] = all(
             p['layers']['checkpoint_confirmed'] for p in parts)
         for key in ('frame_min', 'frame_max'):
-            layers[key] = np.concatenate([p['layers'][key]
-                                          for p in parts])[order]
+            layers[key] = merged([p['layers'][key] for p in parts])
         layers['bands'] = ({name: _merged_bands(
-            [p['layers']['bands'][name] for p in parts], order)
+            [p['layers']['bands'][name] for p in parts])
             for name in first['names']} if first['bands'] is not None else None)
     holders = []
     for name in names:
@@ -1127,6 +1182,9 @@ def assemble(parts, specs, report=None, path='', fmt='npz', policy=None,
         holders += list(layers['frame_min'].argmin(axis=0))
         holders += list(layers['frame_max'].argmax(axis=0))
     candidates = np.union1d(np.asarray(holders, dtype=np.int64), fill)
+    # The k-means features, of the candidates only (rows of ``candidates``).
+    features = np.stack([rows[name][field][candidates] for name in names
+                         for field in ('mean', 'std', 'peak')], axis=1)
     starts = np.flatnonzero(np.r_[True, src[1:] != src[:-1]])
     known = source_names is not None
     sources = {
@@ -1137,13 +1195,12 @@ def assemble(parts, specs, report=None, path='', fmt='npz', policy=None,
         'note': source_note,
     }
     if state is None:
-        state = [name for name in names
-                 if rows[name]['fmin'][0] == 0 and rows[name]['fmax'][0] == 0]
+        state = [name for name in names if _starts_at_zero(
+            rows[name]['fmin'][0], rows[name]['fmax'][0])]
     return Pool(path=path, fmt=fmt, report=report, specs=specs, names=names,
                 skipped=skipped, state=[name for name in names
                                         if name in state],
-                contiguous=report.get('contiguous_state_frames') is not None,
-                unchecked=_unchecked(report), frames=frames, count=n,
+                contiguous=_contiguous(report), frames=frames, count=n,
                 stats=stats, features=features, layers=layers,
                 sources=sources, candidates=candidates)
 
@@ -1165,11 +1222,12 @@ def scan_artifact(art, graph=None, bands=True, threads=1, progress=None,
         z = min(a + BLOCK, art.frames)
         scan.process({name: value[a:z] for name, value in art.arrays.items()},
                      src[a:z], local[a:z])
+    arrays = art.arrays
     return assemble(
-        [scan.part()], art.specs, art.report, art.path, art.fmt,
-        art.report.get('state_precision_policy'),
-        art.report.get('source_files') if reliable else None, note,
-        art.state, lambda indices, name: art.arrays[name][indices], reserve)
+        [scan.part()], art.report, art.path, art.fmt, graph=graph,
+        source_names=art.report.get('source_files') if reliable else None,
+        source_note=note, state=art.state,
+        frames=lambda indices, name: arrays[name][indices], reserve=reserve)
 
 
 # --------------------------------------------------------------------------
@@ -1273,19 +1331,17 @@ def _db(signal, error):
 # Selection: pick the patterns
 # --------------------------------------------------------------------------
 
-def frame_order(stats):
-    """Frames most extreme first.
-
-    Score = worst ratio, over tensors, of the frame's abs-max to the median
-    frame abs-max, so the ranking is comparable between tensors of different
-    scale.
+def frame_score(stats):
+    """How extreme each frame is: the worst ratio, over tensors, of the
+    frame's abs-max to the median frame abs-max, so tensors of different
+    scale compare.
     """
     score = None
     for st in stats.values():
         peak = np.maximum(np.abs(st['frame_min']), np.abs(st['frame_max']))
         ratio = peak / (np.median(peak) + EPS)
         score = ratio if score is None else np.maximum(score, ratio)
-    return np.argsort(-score, kind='stable'), score
+    return score
 
 
 def _kmeans_pick(features, k, rng, iters=12):
@@ -1419,8 +1475,8 @@ def select_patterns(pool, count=DEFAULT_COUNT, seed=0, graph=True):
                              % (must.size, count))
         else:
             rest = np.setdiff1d(pool.candidates, must)
-            picked = rest[_kmeans_pick(pool.features[rest],
-                                       count - must.size, rng)]
+            features = pool.features[np.searchsorted(pool.candidates, rest)]
+            picked = rest[_kmeans_pick(features, count - must.size, rng)]
             keep = np.sort(np.concatenate([must, picked]))
     return {'keep': keep, 'must': int(must.size), 'notes': notes,
             'must_layers': must_layers, 'kept_layers': kept_layers}
@@ -1663,7 +1719,7 @@ def source_report(pool, keep, score, schemes, seed=0):
                          'step_without': float(_step(loo_lo[i], loo_hi[i],
                                                      schemes[name])),
                          'frames': ends}
-    rows = [{'id': i, 'source': files[i], 'start': int(starts[i]),
+    rows = [{'source': files[i], 'start': int(starts[i]),
              'frames': int(bounds[i + 1] - bounds[i]),
              'kept': int(kept[i]) if kept is not None else None,
              'extremeness': float(seg_score[i]),
@@ -1706,7 +1762,8 @@ def source_folds(pool, schemes, folds=FOLDS, seed=0):
     """Each group of sources in turn left out: how far the values of the
     group go past the grid the other groups set (``schemes`` for the inputs,
     ``LAYER_SCHEME`` inside the graph), per tensor, the source that goes
-    furthest, and the largest percent of a group's frames past it."""
+    furthest, and the largest percent of a group's frames past it. The
+    per-frame tables are read a source at a time, never copied whole."""
     bounds = _source_bounds(pool)
     if bounds is None:
         return {'available': False}
@@ -1715,23 +1772,27 @@ def source_folds(pool, schemes, folds=FOLDS, seed=0):
     group = np.empty(count, dtype=np.int64)
     group[np.random.default_rng(seed).permutation(count)] = np.arange(count) % k
     files = pool.sources['files']
-    columns = [(name, 'input', st['frame_min'], st['frame_max'], schemes[name])
-               for name, st in pool.stats.items()]
+    names = list(pool.stats)
+    ops = ['input'] * len(names)
+    grids = [schemes[name] for name in names]
+    tables = [(np.stack([pool.stats[name]['frame_min'] for name in names],
+                        axis=1),
+               np.stack([pool.stats[name]['frame_max'] for name in names],
+                        axis=1))]
     layers = pool.layers
     if layers is not None:
-        columns += [(name, op, layers['frame_min'][:, i],
-                     layers['frame_max'][:, i], LAYER_SCHEME)
-                    for i, (name, op) in enumerate(zip(layers['names'],
-                                                       layers['ops']))]
-    grids = [c[4] for c in columns]
+        names += layers['names']
+        ops += layers['ops']
+        grids += [LAYER_SCHEME] * len(layers['names'])
+        tables.append((layers['frame_min'], layers['frame_max']))
     softmax = set(layers.get('softmax') or ()) if layers else set()
-    low = np.stack([c[2] for c in columns], axis=1).astype(np.float64)
-    high = np.stack([c[3] for c in columns], axis=1).astype(np.float64)
     starts = bounds[:-1]
-    src_lo = np.minimum.reduceat(low, starts, axis=0)      # [sources, tensors]
-    src_hi = np.maximum.reduceat(high, starts, axis=0)
-    frame_group = np.repeat(group, np.diff(bounds))
-    width = len(columns)
+    # Per source and tensor, the extremes: [sources, tensors].
+    src_lo = np.hstack([np.minimum.reduceat(low, starts, axis=0)
+                        for low, _ in tables]).astype(np.float64)
+    src_hi = np.hstack([np.maximum.reduceat(high, starts, axis=0)
+                        for _, high in tables]).astype(np.float64)
+    width = len(names)
     worst = np.zeros(width)
     worst_src = np.full(width, -1)
     past_pct = np.zeros(width)
@@ -1745,14 +1806,23 @@ def source_folds(pool, schemes, folds=FOLDS, seed=0):
         up = value > worst
         worst[up] = value[up]
         worst_src[up] = np.flatnonzero(mine)[best[up]]
-        rows = frame_group == g
-        past_pct = np.maximum(past_pct, 100.0 * np.mean(
-            (low[rows] < olo) | (high[rows] > ohi), axis=0))
+        past = np.zeros(width, dtype=np.int64)
+        frames = 0
+        for source in np.flatnonzero(mine):
+            a, z = bounds[source], bounds[source + 1]
+            column = 0
+            for low, high in tables:
+                cols = slice(column, column + low.shape[1])
+                past[cols] += np.count_nonzero(
+                    (low[a:z] < olo[cols]) | (high[a:z] > ohi[cols]), axis=0)
+                column += low.shape[1]
+            frames += z - a
+        past_pct = np.maximum(past_pct, 100.0 * past / frames)
     rows = [{'tensor': name, 'op': op, 'overshoot': float(worst[i]),
              'frames_past_pct': float(past_pct[i]),
              'source': files[worst_src[i]] if worst_src[i] >= 0 else None,
              'softmax': name in softmax}
-            for i, (name, op, _, _, _) in enumerate(columns)]
+            for i, (name, op) in enumerate(zip(names, ops))]
     rows.sort(key=lambda row: -row['overshoot'])
     return {'available': True, 'groups': k, 'sources': count,
             'outside': sum(row['overshoot'] > 0 for row in rows),
@@ -1954,9 +2024,10 @@ def conclusions(pool, schemes, recommend, sources, folds, bits, count):
     """What the numbers say, as (level, text) pairs in the report language."""
     out = []
     n = pool.count
-    if pool.unchecked:
-        out.append(('warn', '沒有校正報告（manifest.json／.calib.json）：無法檢查%s；'
-                    '這些檢查都略過了。' % '、'.join(pool.unchecked)))
+    if not pool.report:
+        out.append(('warn', '沒有校正報告（manifest.json／.calib.json）：無法檢查'
+                    '模型種類（Align-ULCNet 的前端 stamp、是否需要連續串流）、來源檔，'
+                    '以及哪些輸入不量化；這些檢查都略過了。'))
     if pool.contiguous:
         out.append(('warn', '%s 需要一段不中斷的串流，不能挑選或刪減 frame。'
                     % pool.report.get('model_family')))
@@ -2072,7 +2143,7 @@ def analyze(pool, scheme='asym', seed=0, count=DEFAULT_COUNT,
     schemes = pool.schemes(scheme)
     models = {name: GridError(pool.stats[name]['_sample'], schemes[name])
               for name in pool.names}
-    _, score = frame_order(pool.stats)
+    score = frame_score(pool.stats)
     n = pool.count
     recommend = None
     keep = None
@@ -2145,7 +2216,8 @@ def require_selectable(source):
 
 
 def write_selection(pool, keep, output, fmt, make_report=None):
-    """Write the frames ``keep`` of ``pool`` as a calibration artifact.
+    """Write the frames ``keep`` of ``pool`` as a calibration artifact and
+    return its report.
 
     The report is ``make_report(arrays)`` (a capture run's own) or the pool's
     with its input ranges redone; either way it records the state inputs, the
@@ -2182,7 +2254,8 @@ def write_selection(pool, keep, output, fmt, make_report=None):
     for key in ('binary_tensors', 'artifact_format', 'binary_file_pattern',
                 'binary_byte_order', 'binary_frame_index_base'):
         report.pop(key, None)
-    return write_calibration_artifact(output, arrays, report, fmt)
+    write_calibration_artifact(output, arrays, report, fmt)
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -2557,12 +2630,11 @@ def print_graph_note(pool):
               'report: cannot confirm they come from one checkpoint')
 
 
-def _scan(art, graph, args, bands):
+def _scan(art, graph, jobs, bands, reserve=SAMPLE_FRAMES):
     if graph:
         print('replaying %d frames of %s through %s' % (art.frames, art.path,
                                                         graph))
-    pool = scan_artifact(art, graph, bands, args.jobs, progress_line,
-                         fill_reserve(getattr(args, 'count', DEFAULT_COUNT)))
+    pool = scan_artifact(art, graph, bands, jobs, progress_line, reserve)
     print_graph_note(pool)
     return pool
 
@@ -2624,10 +2696,10 @@ def main(argv=None):
         if args.cmd == 'coverage':
             held = load_artifact(args.against, graph or args.onnx, args.jobs)
             check_pair(art, held)       # before the replays, which take minutes
-            cal_pool = _scan(art, graph, args, False)
-            held_pool = _scan(held, graph, args, False)
+            cal_pool = _scan(art, graph, args.jobs, False)
+            held_pool = _scan(held, graph, args.jobs, False)
         else:
-            pool = _scan(art, graph, args, True)
+            pool = _scan(art, graph, args.jobs, True, fill_reserve(args.count))
 
     if args.cmd == 'coverage':
         result = coverage(cal_pool, held_pool, args.scheme, args.bits)
@@ -2643,8 +2715,10 @@ def main(argv=None):
                                args.out, args.json)
     if args.output and analysis['recommend']:
         keep = np.asarray(analysis['recommend']['keep_frames'], dtype=np.int64)
-        path = write_selection(pool, keep, args.output, args.format)
-        print('wrote %d/%d frames -> %s' % (keep.size, pool.count, path))
+        write_selection(pool, keep, args.output, args.format)
+        print('wrote %d/%d frames -> %s' % (
+            keep.size, pool.count,
+            calibration_report_path(args.output, args.format)))
         print('the paired .onnx is unchanged; copy/symlink it beside the new '
               'artifact if the quantiser expects them together')
     return 0

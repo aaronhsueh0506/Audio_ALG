@@ -529,12 +529,11 @@ def _sources():
                                              np.ones(N - SPLIT, int)]
 
 
-def _stream(arrays, src, path, select=None, retain=True, reserve=0):
+def _stream(arrays, src, path, select=None, reserve=0):
     """A Scan fed one frame at a time, as a capture run feeds it."""
     specs = [(name, value.shape[1:], value.dtype)
              for name, value in arrays.items()]
-    scan = calib_analyze.Scan(specs, graph=path, retain=retain,
-                              reserve=reserve)
+    scan = calib_analyze.Scan(specs, graph=path, reserve=reserve)
     for index in range(len(src)) if select is None else select:
         scan.add({name: value[index] for name, value in arrays.items()},
                  int(src[index]))
@@ -580,7 +579,7 @@ def test_a_stream_scanned_frame_by_frame_selects_what_the_stored_pool_does(
     scan, specs = _stream(arrays, src, path, reserve=reserve)
     part = scan.part()
     assert len(part['kept_at']) < N            # the bounded path ran
-    streamed = calib_analyze.assemble([part], specs, source_names=names,
+    streamed = calib_analyze.assemble([part], source_names=names,
                                       reserve=reserve)
     _assert_same_pool(stored, streamed)
     keep = calib_analyze.select_patterns(streamed, count)['keep']
@@ -606,7 +605,7 @@ def test_scans_of_separate_sources_merge_into_the_scan_of_all(tmp_path):
     path = _graph(tmp_path / 'pool.onnx')
     reserve = 50
     whole, specs = _stream(arrays, src, path, reserve=reserve)
-    one = calib_analyze.assemble([whole.part()], specs, source_names=names,
+    one = calib_analyze.assemble([whole.part()], source_names=names,
                                  reserve=reserve)
     parts = []
     for k, frames in enumerate((np.flatnonzero(src == 1),
@@ -615,7 +614,7 @@ def test_scans_of_separate_sources_merge_into_the_scan_of_all(tmp_path):
         folder = tmp_path / ('part%d' % k)
         calib_analyze.save_part(scan.part(), str(folder))
         parts.append(calib_analyze.load_part(str(folder)))
-    merged = calib_analyze.assemble(parts, specs, source_names=names,
+    merged = calib_analyze.assemble(parts, source_names=names,
                                     reserve=reserve)
     _assert_same_pool(one, merged)
     keep = calib_analyze.select_patterns(merged, 12)['keep']
@@ -816,3 +815,23 @@ def test_channels_at_zero_do_not_make_a_band_fixed():
     dead = calib_analyze._concentration(np.zeros(4),
                                         *calib_analyze._frame_peaks(np.zeros((3, 4))))
     assert dead['ratio'] == 0.0 and dead['typical'] == 0.0
+
+
+def test_the_per_frame_median_is_the_median_of_the_non_zero_indices():
+    """The per-frame ratio divides by the median of the non-zero indices; it
+    is computed by sorting, and must equal the plain NaN-median of them for
+    odd and even counts of non-zero indices alike."""
+    rng = np.random.default_rng(8)
+    peaks = rng.uniform(0.0, 5.0, (200, 9))
+    peaks[rng.uniform(size=peaks.shape) < 0.4] = 0.0     # rectified indices
+    peaks[:3] = 0.0                                       # fresh states
+    ratio, top = calib_analyze._frame_peaks(peaks)
+    live = peaks.max(axis=1) > 0
+    nonzero = np.where(peaks[live] > 0, peaks[live], np.nan)
+    want = peaks[live].max(axis=1) / (np.nanmedian(nonzero, axis=1)
+                                      + calib_analyze.EPS)
+    assert np.isnan(ratio[~live]).all()
+    np.testing.assert_array_equal(ratio[live], want)
+    np.testing.assert_array_equal(top, peaks.argmax(axis=1))
+    counts = np.count_nonzero(peaks[live] > 0, axis=1)
+    assert (counts % 2 == 0).any() and (counts % 2 == 1).any()

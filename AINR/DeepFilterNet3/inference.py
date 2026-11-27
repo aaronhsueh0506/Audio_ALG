@@ -254,8 +254,6 @@ def calibration_main():
     add_selection_arguments(parser)
     args = parser.parse_args()
     check_selection_arguments(parser, args)
-    if args.frames is not None and args.frames <= 0:
-        parser.error('--frames must be positive')
     try:
         artifact_format = resolve_calibration_format(args.output, args.format)
     except ValueError as error:
@@ -287,7 +285,9 @@ def calibration_main():
     window = torch.hann_window(params['WIN_LEN']).sqrt()
     input_names = wrapper.input_names
     frames = CalibrationFrames(
-        args, input_names, onnx_path, family='DeepFilterNet3',
+        args, input_names, onnx_path,
+        {'model_family': 'DeepFilterNet3',
+         'checkpoint_sha256': graph_metadata['checkpoint_sha256']},
         command=[sys.executable, os.path.abspath(__file__), 'calib'],
         argv=sys.argv[1:])
     source_files = []
@@ -325,9 +325,8 @@ def calibration_main():
                 source_files.append(os.path.relpath(path, args.wav_dir))
             if frames.full(args.frames):
                 break
-    if not len(frames):
+    if frames.empty():
         raise RuntimeError('no calibration frames were produced')
-    written = {}
 
     def make_report(arrays):
         # The frames written: every one captured (stacked as fp32) or the
@@ -371,14 +370,12 @@ def calibration_main():
         report['gru_state_slices'] = gru_state_slice_report(
             arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
         )
-        written['report'] = report
         return report
 
-    frames.write(args.output, artifact_format, make_report,
-                 limit=args.frames,
-                 source_names=[os.path.relpath(path, args.wav_dir)
-                               for path in files])
-    report = written['report']
+    report = frames.write(args.output, artifact_format, make_report,
+                          limit=args.frames,
+                          source_names=[os.path.relpath(path, args.wav_dir)
+                                        for path in files])
     print('%s: %d streaming frames, graph %s' %
           (args.output, report['frames'], onnx_path))
     worst = report['gru_state_slices']['worst_bits_lost']

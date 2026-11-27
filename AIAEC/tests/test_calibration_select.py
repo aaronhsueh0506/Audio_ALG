@@ -88,7 +88,11 @@ def test_jobs_split_the_recordings_and_change_nothing(work):
     two = _calib(work, ['--select', str(COUNT), '--jobs', '2',
                         '--report', str(work / 'two.html')], 'two.npz')
     assert _same(one, two)
-    assert (work / 'two.html').exists()
+    # The page names this run's graph, not a process's temporary one.
+    page = (work / 'two.html').read_text(encoding='utf-8')
+    assert '"graph":"%s"' % (work / 'two.onnx') in page
+    assert '.calib-jobs' not in page and 'part0' not in page
+    assert '無法確認兩者出自同一個 checkpoint' not in page
     assert not [path for path in work.iterdir()
                 if path.name.startswith('.calib-jobs')]
 

@@ -186,7 +186,7 @@ def test_source_report_finds_the_source_that_holds_the_range():
     arrays['feat'] = np.clip(arrays['feat'], -3, 3)
     arrays['feat'][starts[1] + 7, 0, 2] = 40.0
     pool = _pool(arrays, {'source_files': ['s0.wav', 's1.wav', 's2.wav']})
-    _, score = calib_analyze.frame_order(pool.stats)
+    score = calib_analyze.frame_score(pool.stats)
     keep = np.arange(0, 150, 3)
     src = calib_analyze.source_report(pool, keep, score, pool.schemes('asym'))
     assert src['available']
@@ -218,7 +218,7 @@ def test_a_source_that_moves_the_minimum_but_not_the_symmetric_bound_buys_nothin
     feat[starts[2] + 3, 0, 1] = 4.0
     arrays['feat'] = feat
     pool = _pool(arrays, {'source_files': ['a.wav', 'b.wav', 'c.wav']})
-    _, score = calib_analyze.frame_order(pool.stats)
+    score = calib_analyze.frame_score(pool.stats)
     sym = calib_analyze.source_report(pool, None, score, {'feat': 'sym',
                                                           'h': 'sym'})
     b = sym['rows'][1]
