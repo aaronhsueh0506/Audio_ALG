@@ -45,6 +45,12 @@ python3 inference.py calib --checkpoint checkpoint.pth \
   --frames 2048 --frames-per-call 4 --format bin --output calib/deepvqe_s_n4
 ```
 
+To let the capture choose the patterns from every recording instead of taking
+the first `--frames` calls, give `--select COUNT` (and `--jobs N` to scan N
+recordings at a time; the result is the same): it writes the COUNT calls a
+selection keeps and an analysis page, as `PTQ/calib_analyze.py analyze` would
+choose them from a capture of every call (see `AIAEC/reference/export.md`).
+
 ### Cross-layer equalization (optional, before PTQ)
 
 `equalize.py` rescales channels between consecutive layers so that the

@@ -28,6 +28,10 @@
 <pre>python3 export_onnx.py --model checkpoint.pth --output output/model.onnx --verify
 python3 inference.py calib --model checkpoint.pth ... --format bin --output calib/model</pre>
 
+<p>加 <code>--select COUNT</code>（可再加 <code>--jobs N</code>）時，擷取會掃過所有錄音、只寫出挑好的 COUNT 個
+pattern 和一份分析頁；已擷取的校正檔用 <code>PTQ/calib_analyze.py analyze ARTIFACT --output SELECTED</code> 挑。
+擷取的分析排程和板端串流相同（AcStft center 0：每段錄音第一幀前半為零，最後不滿一 hop 的部分補零後也送入）。</p>
+
 <p><code>inference.py calib</code> 會在同一 process、同一 model instance 一併匯出並
 parity-check calibration tensors 所綁定的 graph（預設 <code>&lt;output&gt;.onnx</code>，
 <code>--onnx</code> 可改路徑），兩個部署產物不可能 drift；<code>export_onnx.py</code>

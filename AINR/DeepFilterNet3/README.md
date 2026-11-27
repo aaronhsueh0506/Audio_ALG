@@ -112,7 +112,13 @@ Optional ONNX dependencies are in `../requirements-export.txt`. Calibration
 exports and verifies the graph from the same model instance as its tensors.
 `inference_batch.py calib` also supports independent fixed-batch streaming lanes;
 use its `--help` for the batch-specific options. A batch-N graph and its
-calibration tensors are not the single-stream C API's graph.
+calibration tensors are not the single-stream C API's graph. `--select COUNT`
+(both captures; `--jobs N` for `inference.py calib`) scans every recording and
+writes only the COUNT invocations a selection keeps, with an analysis page, as
+`PTQ/calib_analyze.py analyze` would choose them; `--frames` is refused with
+it. The captures frame each recording as the deployed stream does (audiolib
+`AcStft` at center 0: the first frame's left half is zeros, the last partial
+hop is completed with zeros).
 
 ## Accelerator and C streaming boundary
 

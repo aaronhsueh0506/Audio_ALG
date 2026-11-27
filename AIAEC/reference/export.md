@@ -34,6 +34,26 @@ N = 1 and 4 at 16 kHz / FFT 512 and N = 1 and 2 at 48 kHz / FFT 1024
 A file's short last block is dropped, except for Align-ULCNet with --events,
 which keeps it zero-completed.
 
+`--select COUNT` makes the capture scan every recording and write only the
+COUNT invocations a selection keeps (each tensor's extreme frames, inside the
+graph too, then k-means picks), with an analysis page beside the output
+(`--report`); memory does not grow with the number of recordings, and
+`--frames` is refused with it. `--jobs N` deals the recordings to N
+processes and gives the same frames as one:
+
+    python3 inference.py calib \
+      --checkpoint checkpoint.pth \
+      --primary-dir /path/to/primary_wavs \
+      --far-dir /path/to/far_wavs \
+      --select 1000 --jobs 8 --format bin \
+      --output calib/model
+
+An artifact captured without it is analysed and reduced with
+`PTQ/calib_analyze.py analyze ARTIFACT --output SELECTED`. The capture frames
+each recording as the deployed stream does (audiolib `AcStft` at center 0: the
+first frame's left half is zeros, the last partial hop is completed with
+zeros), not with the training's centred `torch.stft`.
+
 `export_onnx.py` remains available for a graph-only export:
 
     python3 export_onnx.py \
