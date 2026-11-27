@@ -56,10 +56,11 @@ try:
     )
     from ..calibration_io import (
         CALIBRATION_FORMATS,
-        capture_calibration_inputs,
+        CalibrationFrames,
+        add_selection_arguments,
+        check_selection_arguments,
         resolve_calibration_format,
         sibling_onnx_path,
-        write_calibration_artifact,
     )
 except ImportError:  # direct ``python inference_batch.py`` execution
     from inference import load_model
@@ -75,10 +76,11 @@ except ImportError:  # direct ``python inference_batch.py`` execution
     )
     from calibration_io import (
         CALIBRATION_FORMATS,
-        capture_calibration_inputs,
+        CalibrationFrames,
+        add_selection_arguments,
+        check_selection_arguments,
         resolve_calibration_format,
         sibling_onnx_path,
-        write_calibration_artifact,
     )
 
 
@@ -145,16 +147,17 @@ def _wav_feature_stream(path, model, params):
     return erb, spec
 
 
-def _capture_fixed_batches(model, params, files, batch_wrapper, batches):
-    """Capture valid state snapshots, then pack them into independent lanes."""
+def _capture_fixed_batches(model, params, files, batch_wrapper, batches,
+                           frames):
+    """Capture valid state snapshots, then pack them into independent lanes
+    (``frames``, a ``CalibrationFrames``)."""
     single = StatelessDFN3Heads(model, batch_size=1).eval()
     names = batch_wrapper.input_names
-    captured = {name: [] for name in names}
     pending = []
     source_files = []
 
     with torch.no_grad():
-        for path in files:
+        for path in frames.sources(files):
             erb, spec = _wav_feature_stream(path, model, params)
             state = single.initial_inputs()[2:]
             used = False
@@ -172,22 +175,22 @@ def _capture_fixed_batches(model, params, files, batch_wrapper, batches):
                 used = True
                 if len(pending) == batch_wrapper.batch_size:
                     merged = _merge_independent_samples(names, pending)
-                    capture_calibration_inputs(captured, names, merged)
+                    frames.add(merged)
                     pending = []
-                    if len(captured[names[0]]) >= batches:
+                    if frames.full(batches):
                         break
             if used:
                 source_files.append(path)
-            if len(captured[names[0]]) >= batches:
+            if frames.full(batches):
                 break
 
-    produced = len(captured[names[0]])
+    produced = len(frames)
     if produced == 0:
         raise RuntimeError(
             'not enough source frames to form one batch of %d' %
             batch_wrapper.batch_size
         )
-    return captured, source_files, produced, len(pending)
+    return source_files, len(pending)
 
 
 def _load(args):
@@ -233,15 +236,33 @@ def calibration_main(args):
         opset=args.opset,
         verify=True,
     )
-    captured, source_paths, produced, discarded = _capture_fixed_batches(
-        model, params, files, wrapper, args.batches
+    # A batch's lanes come from adjacent recordings: no one source per frame.
+    frames = CalibrationFrames(args, wrapper.input_names, onnx_path,
+                               family='DeepFilterNet3')
+    source_paths, discarded = _capture_fixed_batches(
+        model, params, files, wrapper, args.batches, frames
     )
-    arrays = {
-        name: np.stack(values[:args.batches]).astype(
-            np.float32, copy=False
-        )
-        for name, values in captured.items()
-    }
+    written = {}
+
+    def make_report(arrays):
+        # The frames written: every invocation captured (stacked as fp32) or
+        # the --select choice.
+        produced = int(next(iter(arrays.values())).shape[0])
+        report = written['report'] = _batch_report(
+            args, arrays, produced, discarded, source_paths, graph_metadata,
+            params, onnx_path, wrapper)
+        return report
+
+    frames.write(args.output, artifact_format, make_report,
+                 limit=args.batches)
+    print('%s: %d invocations x batch %d, graph %s' % (
+        args.output, written['report']['batch_invocations'], args.batch_size,
+        onnx_path
+    ))
+
+
+def _batch_report(args, arrays, produced, discarded, source_paths,
+                  graph_metadata, params, onnx_path, wrapper):
     report = {
         'schema': 'dfn3-fixed-batch-stream-calibration-v2',
         'state_layout_version': graph_metadata['state_layout_version'],
@@ -274,12 +295,7 @@ def calibration_main(args):
     report['gru_state_slices'] = gru_state_slice_report(
         arrays[GRU_STATE_NAME], _tensor_stats, wrapper.gru_state_slices,
     )
-    write_calibration_artifact(
-        args.output, arrays, report, artifact_format
-    )
-    print('%s: %d invocations x batch %d, graph %s' % (
-        args.output, produced, args.batch_size, onnx_path
-    ))
+    return report
 
 
 def _common_parser(parser):
@@ -313,18 +329,23 @@ def cli():
                               default=None)
     calib_parser.add_argument(
         '--batches', '--frames', dest='batches', type=_positive_int,
-        default=256,
+        default=None,
         help='number of NPU invocations to capture; each contains '
-             '--batch-size independent frame/state snapshots (default: 256)',
+             '--batch-size independent frame/state snapshots (default: 256; '
+             'not with --select, which scans every recording)',
     )
     calib_parser.add_argument('--seed', type=int, default=42)
     calib_parser.add_argument(
         '--onnx', default=None,
         help='graph path (default: <output>.onnx)',
     )
+    add_selection_arguments(calib_parser, jobs=False)
     calib_parser.set_defaults(run=calibration_main)
 
     args = parser.parse_args()
+    if args.command == 'calib':
+        check_selection_arguments(calib_parser, args, attr='batches',
+                                  flag='--batches')
     args.run(args)
 
 

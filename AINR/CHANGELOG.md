@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### 2026-11-27: calibration captures choose their own frames (`--select`, `--jobs`)
+
+- `inference.py calib` of DeepVQE-S, Align-ULCNet, DeepFilterNet2 and DeepFilterNet3, and `inference_batch.py calib` of both DeepFilterNets, take `--select COUNT`: the capture scans every recording, keeps only the frames a selection can pick (each tensor's extreme frames, inside the graph too, and a fixed set of fill candidates), and writes the COUNT chosen frames with an analysis page (`--report`, default `<output>.report.html`). Memory no longer grows with the number of recordings. The frames written are the ones `PTQ/calib_analyze.py analyze` chooses from a capture of every frame.
+- `--jobs N` (not the batch captures, whose invocations mix adjacent recordings) deals the recordings to N processes running the same command on their share; the scans merge in recording order, so the frames written do not depend on N.
+- Without `--select` a capture writes the same bytes as before. `--frames` (`--batches`) still defaults to 256 there and is refused with `--select`; `--jobs` and `--report` need `--select`; Align-CRUSE, which needs one uninterrupted stream, refuses `--select`; Align-ULCNet refuses `--events` with `--jobs`. With `--primary-is-mic` and `--jobs`, the parent derives the linear-error stems once and the processes read them.
+- The shared code is `CalibrationFrames` in `AINR/calibration_io.py`; GTCRN and RNNoise-ERB keep their captures as they were.
+
 ### 2026-11-27: `PTQ/calib_analyze.py`: `analyze` writes the selection, every tensor inside the graph counts by default
 
 - `analyze` chooses the frames and, with `--output`, writes them; `select`, `apply` and `layers` are gone (their output is in `analyze`'s printout, page and `--json`), and so is `--max-clip-pct` with everything it priced (the drop budget, the "drop the extremes" comparison, the SQNR-versus-frames-dropped curve, the value share clipped). The page is a report now: the frame dropping, the drop slider and the `keep.json` download are gone, and its per-frame charts hold at most 2000 bars, so a large pool no longer makes a huge page. `coverage` scores the artifact it is given (the selection that is converted) and lost `--keep`.

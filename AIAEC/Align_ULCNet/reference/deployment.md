@@ -286,7 +286,10 @@ stamped with `linear_aec_contract_version`, `aec_behavior_hash`,
 (origin `sidecar`, `corpus_ledger`, `derived_in_process` or
 `unstamped_override`). `PTQ/calib_analyze.py` refuses an artifact whose stamp is
 missing, from another contract version, or retired, both on load and when
-writing a pruned selection; regenerate it with `inference.py calib`. Export
+writing a selection (`calib --select` checks the same on its own report);
+regenerate it with `inference.py calib`. A BIN directory without its
+`manifest.json` names no model family, so this check cannot run there and the
+analysis page says so. Export
 and inference also refuse a checkpoint recorded under a retired behaviour hash;
 `9963b6d7...` (before the 80 ms shadow-copy streak minimum) is one, so a
 checkpoint, graph sidecar or calibration file recorded at it is regenerated, not

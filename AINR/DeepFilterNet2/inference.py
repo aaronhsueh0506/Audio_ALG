@@ -295,10 +295,11 @@ def calibration_main():
 
     from calibration_io import (
         CALIBRATION_FORMATS,
-        capture_calibration_inputs,
+        CalibrationFrames,
+        add_selection_arguments,
+        check_selection_arguments,
         resolve_calibration_format,
         sibling_onnx_path,
-        write_calibration_artifact,
     )
     try:
         from .export_onnx import (
@@ -328,7 +329,9 @@ def calibration_main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--format', choices=CALIBRATION_FORMATS, default=None,
                         help='bin or npz; inferred from --output when omitted')
-    parser.add_argument('--frames', type=int, default=256)
+    parser.add_argument('--frames', type=int, default=None,
+                        help='invocations to capture (default 256; not with '
+                             '--select, which scans every recording)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
@@ -341,8 +344,10 @@ def calibration_main():
                         help='calibrate the stage-1-only graph (export_onnx.py '
                              '--mask-only): erb, spec and h_gru, no '
                              'df_convp_history')
+    add_selection_arguments(parser)
     args = parser.parse_args()
-    if args.frames <= 0:
+    check_selection_arguments(parser, args)
+    if args.frames is not None and args.frames <= 0:
         parser.error('--frames must be positive')
     if not 1 <= args.frames_per_call <= MAX_FRAMES_PER_CALL:
         parser.error('--frames-per-call must be in [1, %d]'
@@ -379,10 +384,13 @@ def calibration_main():
 
     window = torch.hann_window(params['WIN_LEN']).sqrt()
     input_names = wrapper.input_names
-    captured = {name: [] for name in input_names}
+    frames = CalibrationFrames(
+        args, input_names, onnx_path, family='DeepFilterNet2',
+        command=[sys.executable, os.path.abspath(__file__), 'calib'],
+        argv=sys.argv[1:])
     source_files = []
     with torch.no_grad():
-        for path in files:
+        for path in frames.sources(files):
             wave, source_rate = sf.read(
                 path, dtype='float32', always_2d=True
             )
@@ -412,69 +420,74 @@ def calibration_main():
                                       args.frames_per_call))
             for erb_window, spec_window in windows:
                 inputs = (erb_window, spec_window) + state
-                capture_calibration_inputs(captured, input_names, inputs)
+                frames.add(inputs)
                 outputs = wrapper(*inputs)
                 state = tuple(outputs[len(wrapper.head_output_names):])
                 used = True
-                if len(captured['erb']) >= args.frames:
+                if frames.full(args.frames):
                     break
             if used:
                 source_files.append(os.path.relpath(path, args.wav_dir))
-            if len(captured['erb']) >= args.frames:
+            if frames.full(args.frames):
                 break
-    if not captured['erb']:
+    if not len(frames):
         raise RuntimeError('no calibration frames were produced')
-    arrays = {
-        name: np.stack(values[:args.frames]).astype(np.float32, copy=False)
-        for name, values in captured.items()
-    }
-    def _stats(value):
-        # One percentile call for both quantiles: np.percentile copies and
-        # partitions per call, so two calls do that work twice for the same
-        # numbers (measured 2x on the captured shapes).
-        low, high = np.percentile(value, [0.1, 99.9])
-        return {
-            'shape': list(value.shape),
-            'dtype': str(value.dtype),
-            'min': float(value.min()),
-            'max': float(value.max()),
-            'p001': float(low),
-            'p999': float(high),
+    written = {}
+
+    def make_report(arrays):
+        # The frames written: every one captured (stacked as fp32) or the
+        # --select choice.
+        def _stats(value):
+            # One percentile call for both quantiles: np.percentile copies and
+            # partitions per call, so two calls do that work twice for the same
+            # numbers (measured 2x on the captured shapes).
+            low, high = np.percentile(value, [0.1, 99.9])
+            return {
+                'shape': list(value.shape),
+                'dtype': str(value.dtype),
+                'min': float(value.min()),
+                'max': float(value.max()),
+                'p001': float(low),
+                'p999': float(high),
+            }
+
+        report = {
+            # The report FORMAT version, deliberately not the graph's state
+            # layout version; the layout is published on its own line below.
+            'schema': 'dfn2-stateless-stream-calibration-v4',
+            'state_layout_version': graph_metadata['state_layout_version'],
+            'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
+            'graph': os.path.basename(onnx_path),
+            'sample_rate': params['SR'],
+            'n_fft': params['N_FFT'],
+            'win_len': params['WIN_LEN'],
+            'hop_len': params['HOP_LEN'],
+            'input_feature_frames': wrapper.input_frames,
+            # The pair the windows below were captured for (the graph's metadata
+            # carries it too): a calibration artifact is only valid for a host
+            # built with the same pair.
+            'mask_lookahead': graph_metadata['mask_lookahead'],
+            'df_lookahead': graph_metadata['df_lookahead'],
+            'frames': int(arrays['erb'].shape[0]),
+            'seed': args.seed,
+            'source_files': source_files,
+            'inputs': {name: _stats(value) for name, value in arrays.items()},
         }
+        if args.frames_per_call != 1:
+            report['frames_per_call'] = args.frames_per_call
+        if args.mask_only:
+            report['variant'] = 'mask_only'
+        report['gru_state_slices'] = gru_state_slice_report(
+            arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
+        )
+        written['report'] = report
+        return report
 
-    report = {
-        # The report FORMAT version, deliberately not the graph's state
-        # layout version; the layout is published on its own line below.
-        'schema': 'dfn2-stateless-stream-calibration-v4',
-        'state_layout_version': graph_metadata['state_layout_version'],
-        'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
-        'graph': os.path.basename(onnx_path),
-        'sample_rate': params['SR'],
-        'n_fft': params['N_FFT'],
-        'win_len': params['WIN_LEN'],
-        'hop_len': params['HOP_LEN'],
-        'input_feature_frames': wrapper.input_frames,
-        # The pair the windows below were captured for (the graph's metadata
-        # carries it too): a calibration artifact is only valid for a host
-        # built with the same pair.
-        'mask_lookahead': graph_metadata['mask_lookahead'],
-        'df_lookahead': graph_metadata['df_lookahead'],
-        'frames': int(arrays['erb'].shape[0]),
-        'seed': args.seed,
-        'source_files': source_files,
-        'inputs': {name: _stats(value) for name, value in arrays.items()},
-    }
-    if args.frames_per_call != 1:
-        report['frames_per_call'] = args.frames_per_call
-    if args.mask_only:
-        report['variant'] = 'mask_only'
-    report['gru_state_slices'] = gru_state_slice_report(
-        arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
-    )
-
-    write_calibration_artifact(
-        args.output, arrays, report, artifact_format
-    )
+    frames.write(args.output, artifact_format, make_report,
+                 limit=args.frames,
+                 source_names=[os.path.relpath(path, args.wav_dir)
+                               for path in files])
+    report = written['report']
     print('%s: %d streaming frames, graph %s' %
           (args.output, report['frames'], onnx_path))
     worst = report['gru_state_slices']['worst_bits_lost']

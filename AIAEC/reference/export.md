@@ -107,8 +107,10 @@ stamped as well: `linear_aec_contract_version`, `aec_behavior_hash`,
 (origin `sidecar`, `corpus_ledger`, `derived_in_process` or
 `unstamped_override`). `PTQ/calib_analyze.py` refuses an Align-ULCNet artifact
 with no stamp, a contract version other than the current one, or a retired
-behaviour hash, both when loading it and when writing a pruned selection;
-regenerate such an artifact with `inference.py calib`. Export
+behaviour hash, both when loading it and when writing a selection (`calib
+--select` checks the same on its own report); regenerate such an artifact with
+`inference.py calib`. A BIN directory without its `manifest.json` names no
+model family, so this check cannot run there and the analysis page says so. Export
 (`export_onnx.py`) and `inference.py` refuse a checkpoint whose recorded
 behaviour hash is retired; `--input-is-linear-error` is an evaluation-only
 bypass that does not look at the supplied WAV's origin. None of this is

@@ -78,10 +78,11 @@ if _AINR_DIR not in sys.path:
 
 from calibration_io import (  # noqa: E402
     CALIBRATION_FORMATS,
-    capture_calibration_inputs,
+    CalibrationFrames,
+    add_selection_arguments,
+    check_selection_arguments,
     resolve_calibration_format,
     sibling_onnx_path,
-    write_calibration_artifact,
 )
 
 from AIAEC._calibration_common import (
@@ -379,8 +380,10 @@ def main(model_name: str) -> None:
     parser.add_argument('--output', required=True)
     parser.add_argument('--format', choices=CALIBRATION_FORMATS, default=None,
                         help='bin or npz; inferred from --output when omitted')
-    parser.add_argument('--frames', type=int, default=256,
-                        help='number of streaming invocations to capture')
+    parser.add_argument('--frames', type=int, default=None,
+                        help='number of streaming invocations to capture '
+                             '(default 256; not with --select, which scans '
+                             'every recording)')
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--frames-per-call', type=int, default=1, metavar='N',
                         help='STFT frames per streaming invocation (default 1): '
@@ -409,10 +412,18 @@ def main(model_name: str) -> None:
                              'stamp (no linear_error.contract.json, no '
                              'corpus ledger). Without it such a directory is '
                              'refused; the report records the override')
+    add_selection_arguments(parser)
     args = parser.parse_args()
     args.model_name = model_name
-    if args.frames <= 0:
+    check_selection_arguments(parser, args)
+    if args.frames is not None and args.frames <= 0:
         parser.error('--frames must be positive')
+    if args.select is not None and requires_contiguous_calibration(model_name):
+        parser.error('%s needs one uninterrupted stream; --select picks frames '
+                     'from many' % model_name)
+    if args.events and args.jobs > 1:
+        parser.error('--events counts the replayed events in one process; '
+                     'leave out --jobs')
     try:
         require_frames_per_call(args.model_name, args.frames_per_call)
     except ValueError as error:
@@ -458,6 +469,7 @@ def main(model_name: str) -> None:
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     frontend_stamp = {}
     linear_error_stamp = None
+    rewrite, drop = {}, ()
     if args.model_name == 'Align_ULCNet':
         model, grid, linear_contract = load_ulcnet_model(
             args.checkpoint, 'cpu',
@@ -514,10 +526,13 @@ def main(model_name: str) -> None:
         def advance_state(state, outputs):
             return ulcnet_next_state(outputs)
 
-        if args.primary_is_mic:
-            pairs, _ = _materialize_linear_error(
+        if args.primary_is_mic and args.shard is None:
+            pairs, derived = _materialize_linear_error(
                 pairs, linear_contract, grid, args.output
             )
+            # The --jobs processes read the stems derived here.
+            rewrite['--primary-dir'] = derived
+            drop = ('--primary-is-mic',)
     else:
         model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
         checkpoint_depth = alignment_depth(model)
@@ -542,11 +557,20 @@ def main(model_name: str) -> None:
             return tuple(outputs[split.head_outputs:])
     feature_config = None
 
-    captured = {}
+    policy = dict(state_precision_policy(args.model_name))
+    if args.model_name == 'Align_ULCNet' and args.frames_per_call != 1:
+        # A 0/1 control input is not an activation: no range, no integer PTQ.
+        policy['frame_reset'] = 'binary_control_no_ptq'
+    frames = CalibrationFrames(
+        args, input_names, onnx_path, policy, args.model_name,
+        command=[sys.executable, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), args.model_name,
+            'inference.py'), 'calib'],
+        argv=sys.argv[1:], rewrite=rewrite, drop=drop)
     source_files = []
     event_frames = 0
     with torch.no_grad():
-        for relative, primary_path, far_path in pairs:
+        for relative, primary_path, far_path in frames.sources(pairs):
             # With --events the short last packet is kept and zero-completed
             # (its padding slots carry frame_reset 0); without it only whole
             # packets are captured, as before.
@@ -590,37 +614,50 @@ def main(model_name: str) -> None:
                     )
                     continue
                 inputs = make_signal(block, control) + state
-                capture_calibration_inputs(captured, input_names, inputs)
+                frames.add(inputs)
                 outputs = wrapper(*inputs)
                 state = advance_state(state, outputs)
                 used = True
-                if len(next(iter(captured.values()))) >= args.frames:
+                if frames.full(args.frames):
                     break
             if used:
                 source_files.append(relative)
-            if captured and len(next(iter(captured.values()))) >= args.frames:
+            if frames.full(args.frames):
                 break
-    if not captured and requires_contiguous_calibration(args.model_name):
+    if not len(frames) and requires_contiguous_calibration(args.model_name):
         raise RuntimeError(
             '%s calibration requires one uninterrupted source with at least '
             '%d frames; cumulative state ranges must not be assembled from '
             'state-reset clips' % (args.model_name, args.frames)
         )
-    if not captured:
+    if not len(frames):
         raise RuntimeError('no calibration frames were produced')
 
-    arrays = {}
-    for name, values in captured.items():
-        value = np.stack(values[:args.frames])
-        # Align-CRUSE's absolute frame counter is an int64 graph input. Keep
-        # state dtypes exact; only floating tensors are normalised to fp32.
-        if np.issubdtype(value.dtype, np.floating):
-            value = value.astype(np.float32, copy=False)
-        arrays[name] = value
-    policy = dict(state_precision_policy(args.model_name))
-    if args.model_name == 'Align_ULCNet' and args.frames_per_call != 1:
-        # A 0/1 control input is not an activation: no range, no integer PTQ.
-        policy['frame_reset'] = 'binary_control_no_ptq'
+    # The frames written: every one captured, stacked with the floating
+    # tensors normalised to fp32 (Align-CRUSE's absolute frame counter is an
+    # int64 graph input, kept exact), or the --select choice.
+    written = {}
+
+    def make_report(arrays):
+        report = written['report'] = _report(arrays)
+        return report
+
+    def _report(arrays):
+        return _calibration_report(args, arrays, policy, graph_metadata,
+                                   onnx_path, grid, model, linear_error_stamp,
+                                   state_layout_version, source_files,
+                                   frontend_stamp, event_frames)
+
+    frames.write(args.output, artifact_format, make_report,
+                 limit=args.frames,
+                 source_names=[relative for relative, _, _ in pairs])
+    print('%s: %d streaming frames, graph %s' %
+          (args.output, written['report']['frames'], onnx_path))
+
+
+def _calibration_report(args, arrays, policy, graph_metadata, onnx_path, grid,
+                        model, linear_error_stamp, state_layout_version,
+                        source_files, frontend_stamp, event_frames):
     report = {
         'schema': 'aiaec-stateless-stream-calibration-v1',
         'model_family': args.model_name,
@@ -672,8 +709,4 @@ def main(model_name: str) -> None:
             # N = 1: event hops that restarted the state and were not captured.
             'event_frames_replayed': int(event_frames),
         }
-    write_calibration_artifact(
-        args.output, arrays, report, artifact_format
-    )
-    print('%s: %d streaming frames, graph %s' %
-          (args.output, report['frames'], onnx_path))
+    return report
