@@ -85,7 +85,8 @@ python3 inference.py calib --checkpoint checkpoint_cle.pth \
     random input.
   - With 16-bit activations a factor of 16 at most costs little.
   - To see the real ranges, compare both graphs with
-    `PTQ/calib_analyze.py analyze --onnx`.
+    `PTQ/calib_analyze.py analyze` (it replays the graph beside the
+    artifact).
 - The written file holds the contract and the weights, without optimizer
   state. It is meant for export and calibration, not for further training.
   - Its `cross_layer_equalization` entry records the source checkpoint's

@@ -1,4 +1,4 @@
-"""``PTQ/calib_analyze.py`` selection, exact clip counts, sources and coverage."""
+"""``PTQ/calib_analyze.py`` selection, grids, sources and coverage."""
 
 import json
 import os
@@ -38,6 +38,11 @@ def _with_sources(rng, lengths, width=16, state_width=8):
     return {'feat': _heavy(rng, n, width), 'h': state}, list(starts)
 
 
+def _pool(arrays, report=None):
+    return calib_analyze.scan_artifact(
+        calib_analyze.Artifact('x', 'npz', arrays, report or {}))
+
+
 def _pow2_up(top):
     """Smallest power of two >= top, by doubling/halving (0 for 0)."""
     if top <= 0:
@@ -59,84 +64,25 @@ def _grid(lo, hi, scheme):
     return -top, top
 
 
-def _brute(x, keep, scheme):
-    flat = x.reshape(len(x), -1).astype(np.float64)
-    lo, hi = _grid(flat[keep].min(), flat[keep].max(), scheme)
-    out = (flat < lo) | (flat > hi)
-    return out.sum(), 100.0 * out.mean(), 100.0 * out.any(axis=1).mean()
-
-
-def test_zero_budget_keeps_a_unique_extreme_even_when_it_is_not_sampled(
-        tmp_path, monkeypatch):
-    # The old budget test ran on a value sample; with the extreme element
-    # outside the sample it saw no clipping and dropped the frame.
-    rng = np.random.default_rng(0)
-    feat = rng.standard_normal((200, 1, 20)).astype(np.float32)
-    feat[37, 0, 5] = 50.0
-    path = _write(tmp_path, {'feat': feat})
-    monkeypatch.setattr(calib_analyze, 'SAMPLE_CAP', 50)
-    keep_out = tmp_path / 'keep.json'
-    calib_analyze.main(['select', path, '--max-clip-pct', '0',
-                        '--count', '1000', '--keep-out', str(keep_out)])
-    keep = json.loads(keep_out.read_text())['keep_frames']
-    assert len(keep) == 200 and 37 in keep
-
-
 @pytest.mark.parametrize('scheme', ['asym', 'sym', 'pow2'])
-@pytest.mark.parametrize('pct', [0.05, 0.5, 2.0, 10.0])
-def test_drop_budget_matches_brute_force(scheme, pct, monkeypatch):
-    rng = np.random.default_rng(1)
-    feat = _heavy(rng, 120, 12)
-    art = calib_analyze.Artifact('x', 'npz', {'feat': feat}, {})
-    monkeypatch.setattr(calib_analyze, 'SAMPLE_CAP', 64)
-    stats = calib_analyze.all_stats(art)
-    schemes = {'feat': scheme}
-    order, _ = calib_analyze.frame_order(stats)
-    got = calib_analyze.drop_budget(stats, schemes, order, pct)
-    limit = pct / 100.0 * feat.size
-    expected = 0
-    for k in range(1, 120):
-        if _brute(feat, order[k:], scheme)[0] > limit:
-            break
-        expected = k
-    assert got == expected
-    if limit >= 1:              # 0.05 % of 1440 values allows none
-        assert got > 0
-
-
-def test_budget_takes_back_frames_that_clip_nothing_on_a_power_of_two_grid():
-    rng = np.random.default_rng(12)
-    feat = _heavy(rng, 200, 8)
-    art = calib_analyze.Artifact('x', 'npz', {'feat': feat}, {})
-    stats = calib_analyze.all_stats(art)
-    schemes = {'feat': 'pow2'}
-    order, _ = calib_analyze.frame_order(stats)
-    k = calib_analyze.drop_budget(stats, schemes, order, 5.0)
-    pool, dropped = calib_analyze.budget_pool(stats, schemes, order, 5.0)
-    flat = feat.reshape(200, -1).astype(np.float64)
-    lo, hi = _grid(flat[order[k:]].min(), flat[order[k:]].max(), 'pow2')
-    assert _grid(flat[pool].min(), flat[pool].max(), 'pow2') == (lo, hi)
-    out = np.setdiff1d(np.arange(200), pool)
-    assert out.size == dropped < k
-    assert all(((flat[f] < lo) | (flat[f] > hi)).any() for f in out)
-
-
-@pytest.mark.parametrize('scheme', ['asym', 'sym', 'pow2'])
-def test_subset_table_clip_shares_match_brute_force(scheme):
+def test_subset_table_frame_shares_match_brute_force(scheme):
     rng = np.random.default_rng(2)
     feat = _heavy(rng, 150, 10)
-    art = calib_analyze.Artifact('x', 'npz', {'feat': feat}, {})
-    stats = calib_analyze.all_stats(art)
+    pool = _pool({'feat': feat})
     schemes = {'feat': scheme}
-    models = {'feat': calib_analyze.GridError(stats['feat']['_sample'], scheme)}
+    models = {'feat': calib_analyze.GridError(pool.stats['feat']['_sample'],
+                                              scheme)}
+    flat = feat.reshape(150, -1).astype(np.float64)
     for draw in range(5):
         keep = rng.choice(150, 30, replace=False)
-        row = calib_analyze.subset_table(stats, schemes, models, keep, 150, '',
+        row = calib_analyze.subset_table(pool.stats, schemes, models, keep, '',
                                          (8, 16))['rows'][0]
-        _, clip_pct, frames_pct = _brute(feat, keep, scheme)
-        assert row['clip_pct'] == pytest.approx(clip_pct, abs=1e-12)
-        assert row['frames_clip_pct'] == pytest.approx(frames_pct, abs=1e-12)
+        lo, hi = _grid(flat[keep].min(), flat[keep].max(), scheme)
+        outside = ((flat < lo) | (flat > hi)).any(axis=1)
+        assert row['frames_clip_pct'] == pytest.approx(100.0 * outside.mean(),
+                                                       abs=1e-12)
         assert row['sqnr16_typ'] > row['sqnr8_typ']
+        assert 'clip_pct' not in row
 
 
 def test_quantize_puts_zero_on_the_grid_and_saturates_outside():
@@ -175,8 +121,7 @@ def test_power_of_two_report_counts_frames_per_bound_and_flags_the_edge():
     a[[3, 50, 77], 0, 2] = [2.5, -2.2, 3.0]     # bound 4, three frames past 2
     b = rng.uniform(-1.0, 1.0, (100, 1, 6)).astype(np.float32)
     b[10, 0, 0] = 3.99                          # within one 8-bit step of 4
-    art = calib_analyze.Artifact('x', 'npz', {'a': a, 'b': b}, {})
-    result = calib_analyze.analyze(art, 'pow2', count=40)
+    result = calib_analyze.analyze(_pool({'a': a, 'b': b}), 'pow2', count=40)
     texts = [c['text'] for c in result['conclusions']]
     bound = next(t for t in texts if t.startswith('2 的冪次 grid'))
     assert 'a ±4（降到 ±2 要丟 3 個 frame' in bound
@@ -199,17 +144,15 @@ def test_asymmetric_grid_holds_zero_for_an_all_positive_tensor():
 def test_count_is_a_cap_and_keeps_every_extreme_holder():
     rng = np.random.default_rng(3)
     arrays = {'a': _heavy(rng, 300, 8), 'b': _heavy(rng, 300, 4)}
-    art = calib_analyze.Artifact('x', 'npz', arrays, {})
-    stats = calib_analyze.all_stats(art)
-    schemes = art.schemes('asym')
-    sel = calib_analyze.select_patterns(art, stats, schemes, 40)
+    pool = _pool(arrays)
+    sel = calib_analyze.select_patterns(pool, 40)
     keep = sel['keep']
-    assert keep.size == 40 and sel['k_budget'] == 0
+    assert keep.size == 40
     for name, x in arrays.items():
         flat = x.reshape(300, -1)
         assert flat[keep].min() == flat.min()
         assert flat[keep].max() == flat.max()
-    whole = calib_analyze.select_patterns(art, stats, schemes, 1000)
+    whole = calib_analyze.select_patterns(pool, 1000)
     assert whole['keep'].size == 300 and whole['notes']
 
 
@@ -221,14 +164,19 @@ def test_state_inputs_are_scored_on_a_symmetric_grid():
     assert art.schemes('asym') == {'feat': 'asym', 'h': 'sym'}
     # sym and pow2 already put 0 at zero point 0; state keeps the input grid.
     assert art.schemes('pow2') == {'feat': 'pow2', 'h': 'pow2'}
+    # A selection need not start on a fresh state: the report names it.
+    arrays['h'][0] = 1.0
+    named = calib_analyze.Artifact('x', 'npz', arrays, {'state_inputs': ['h']})
+    assert named.state == ['h']
+    assert calib_analyze.Artifact('x', 'npz', arrays, {}).state == []
 
 
 def test_sources_unavailable_without_recorded_source_files():
     rng = np.random.default_rng(5)
     arrays, _ = _with_sources(rng, [40, 40, 40])
-    art = calib_analyze.Artifact('x', 'npz', arrays, {})
-    analysis = calib_analyze.analyze(art, count=50)
+    analysis = calib_analyze.analyze(_pool(arrays), count=50)
     assert analysis['sources']['available'] is False
+    assert analysis['folds'] == {'available': False}
     assert any('來源資訊不可用' in c['text'] for c in analysis['conclusions'])
 
 
@@ -237,76 +185,131 @@ def test_source_report_finds_the_source_that_holds_the_range():
     arrays, starts = _with_sources(rng, [40, 50, 60])
     arrays['feat'] = np.clip(arrays['feat'], -3, 3)
     arrays['feat'][starts[1] + 7, 0, 2] = 40.0
-    report = {'source_files': ['s0.wav', 's1.wav', 's2.wav']}
-    art = calib_analyze.Artifact('x', 'npz', arrays, report)
-    stats = calib_analyze.all_stats(art)
-    _, score = calib_analyze.frame_order(stats)
+    pool = _pool(arrays, {'source_files': ['s0.wav', 's1.wav', 's2.wav']})
+    _, score = calib_analyze.frame_order(pool.stats)
     keep = np.arange(0, 150, 3)
-    src = calib_analyze.source_report(art, stats, keep, score)
+    src = calib_analyze.source_report(pool, keep, score, pool.schemes('asym'))
     assert src['available']
     rows = src['rows']
     assert [r['frames'] for r in rows] == [40, 50, 60]
     assert [r['kept'] for r in rows] == [
         int(((keep >= a) & (keep < a + r['frames'])).sum())
         for a, r in zip(starts, rows)]
-    assert max(rows, key=lambda r: r['loso_shrink'])['source'] == 's1.wav'
-    assert rows[1]['loso_shrink'] > 0.8 and rows[1]['loso_tensor'] == 'feat'
+    top = max(rows, key=lambda r: r['loso_shrink'])
+    assert top['source'] == 's1.wav' and top['loso_tensor'] == 'feat'
+    # The asymmetric grid [-3, 40] becomes [-3, 3].
+    assert top['loso_shrink'] == pytest.approx(1 - 6 / 43, rel=1e-6)
+    assert top['loso']['frames'] == [7]
+    assert top['loso']['step'] == pytest.approx(43 / 65535)
+    assert top['loso']['step_without'] == pytest.approx(6 / 65535)
     assert src['growth']['median'][-1] == pytest.approx(1.0)
+
+
+def test_a_source_that_moves_the_minimum_but_not_the_symmetric_bound_buys_nothing():
+    """[-10, 6] -> [-10, 4] narrows the span; on a symmetric grid the bound is
+    10 either way, so the step does not change."""
+    rng = np.random.default_rng(13)
+    arrays, starts = _with_sources(rng, [30, 30, 30], width=4)
+    arrays['h'][:] = 0.01             # the same range in every source
+    arrays['h'][starts] = 0.0
+    feat = (0.1 * rng.standard_normal((90, 1, 4))).astype(np.float32)
+    feat[5, 0, 0] = -10.0
+    feat[starts[1] + 3, 0, 1] = 6.0
+    feat[starts[2] + 3, 0, 1] = 4.0
+    arrays['feat'] = feat
+    pool = _pool(arrays, {'source_files': ['a.wav', 'b.wav', 'c.wav']})
+    _, score = calib_analyze.frame_order(pool.stats)
+    sym = calib_analyze.source_report(pool, None, score, {'feat': 'sym',
+                                                          'h': 'sym'})
+    b = sym['rows'][1]
+    assert b['loso_tensor'] != 'feat' or b['loso_shrink'] == 0.0
+    asym = calib_analyze.source_report(pool, None, score, pool.schemes('asym'))
+    assert asym['rows'][1]['loso_tensor'] == 'feat'
+    assert asym['rows'][1]['loso_shrink'] == pytest.approx(1 - 14 / 16)
+
+
+def test_groups_left_out_in_turn_find_the_source_the_others_do_not_cover():
+    rng = np.random.default_rng(14)
+    lengths = [30] * 6
+    arrays, starts = _with_sources(rng, lengths, width=4)
+    arrays['feat'] = np.clip(arrays['feat'], -2, 2)
+    arrays['feat'][starts[4] + 2, 0, 1] = 12.0       # only e.wav goes this far
+    # An all-positive input: b.wav goes below the others' minimum but stays
+    # inside their grid, which holds 0, so nothing of it is clipped.
+    arrays['mag'] = rng.uniform(1.0, 2.0, (180, 1, 3)).astype(np.float32)
+    arrays['mag'][np.asarray(starts) + 1, 0, 1] = 2.0    # one top in every source
+    arrays['mag'][starts[1] + 4, 0, 0] = 0.5
+    names = ['%s.wav' % c for c in 'abcdef']
+    pool = _pool(arrays, {'source_files': names})
+    folds = calib_analyze.source_folds(pool, pool.schemes('asym'))
+    assert {row['tensor']: row for row in folds['rows']}['mag']['overshoot'] == 0
+    assert folds['available'] and folds['sources'] == 6
+    assert folds['groups'] == calib_analyze.FOLDS
+    row = folds['rows'][0]
+    assert row['tensor'] == 'feat' and row['source'] == 'e.wav'
+    others = np.delete(arrays['feat'].reshape(180, -1),
+                       np.arange(starts[4], starts[4] + 30), axis=0)
+    assert row['overshoot'] >= (12.0 - others.max()) / (others.max()
+                                                         - min(others.min(), 0))
+    assert row['frames_past_pct'] > 0
+    texts = [c['text'] for c in calib_analyze.analyze(
+        pool, count=40)['conclusions']]
+    assert any('輪流拿掉一組' in t and 'e.wav' in t for t in texts)
+
+
+def _cal_and_held(tmp_path, a, b, report_a, report_b):
+    cal = calib_analyze.load_artifact(_write(tmp_path, a, report_a, 'cal.npz'))
+    held = calib_analyze.load_artifact(_write(tmp_path, b, report_b,
+                                              'held.npz'))
+    return (cal, calib_analyze.scan_artifact(cal),
+            calib_analyze.scan_artifact(held))
 
 
 def test_coverage_refuses_another_graph_and_warns_on_shared_sources(tmp_path):
     rng = np.random.default_rng(7)
     a, _ = _with_sources(rng, [30, 30])
     b, _ = _with_sources(rng, [25, 35])
-    cal = calib_analyze.load_artifact(_write(
-        tmp_path, a, {'checkpoint_sha256': 'x', 'source_files': ['p.wav', 'q.wav']},
-        'cal.npz'))
-    other = calib_analyze.load_artifact(_write(
-        tmp_path, b, {'checkpoint_sha256': 'y', 'source_files': ['r.wav', 's.wav']},
-        'other.npz'))
+    _, cal, other = _cal_and_held(
+        tmp_path, a, b,
+        {'checkpoint_sha256': 'x', 'source_files': ['p.wav', 'q.wav']},
+        {'checkpoint_sha256': 'y', 'source_files': ['r.wav', 's.wav']})
     with pytest.raises(ValueError, match='checkpoint_sha256'):
         calib_analyze.coverage(cal, other)
-    held = calib_analyze.load_artifact(_write(
-        tmp_path, b, {'checkpoint_sha256': 'x', 'source_files': ['q.wav', 's.wav']},
-        'held.npz'))
-    keep = np.arange(0, 60, 4)
-    result = calib_analyze.coverage(cal, held, keep)
+    _, cal, held = _cal_and_held(
+        tmp_path, a, b,
+        {'checkpoint_sha256': 'x', 'source_files': ['p.wav', 'q.wav']},
+        {'checkpoint_sha256': 'x', 'source_files': ['q.wav', 's.wav']})
+    result = calib_analyze.coverage(cal, held)
     assert any('appear in both' in w for w in result['warnings'])
     for row in result['rows']:
-        x_cal = a[row['tensor']].reshape(60, -1)[keep].astype(np.float64)
-        lo, hi = x_cal.min(), x_cal.max()
-        if row['tensor'] == 'h':
-            top = max(abs(lo), abs(hi))
-            lo, hi = -top, top
+        x_cal = a[row['tensor']].reshape(60, -1).astype(np.float64)
+        lo, hi = _grid(x_cal.min(), x_cal.max(),
+                       'sym' if row['tensor'] == 'h' else 'asym')
         x = b[row['tensor']].reshape(60, -1)
         outside = (x < lo) | (x > hi)
-        assert row['clip_pct'] == pytest.approx(100.0 * outside.mean())
         assert row['frames_clip_pct'] == pytest.approx(
             100.0 * outside.any(axis=1).mean())
-        assert set(row['worst_source']) == {'frames_clip_pct', 'sqnr8_all',
-                                            'sqnr16_all'}
+        assert set(row['worst_source']) == {'frames_clip_pct'}
 
 
-def test_coverage_counts_exactly_on_the_power_of_two_grid(tmp_path):
+def test_coverage_counts_frames_on_the_power_of_two_grid(tmp_path):
     rng = np.random.default_rng(11)
     a, _ = _with_sources(rng, [40, 40])
     b, _ = _with_sources(rng, [30, 50])
-    cal = calib_analyze.load_artifact(_write(tmp_path, a, {}, 'cal.npz'))
-    held = calib_analyze.load_artifact(_write(tmp_path, b, {}, 'held.npz'))
-    keep = np.arange(1, 80, 5)
-    result = calib_analyze.coverage(cal, held, keep, 'pow2')
+    _, cal, held = _cal_and_held(tmp_path, a, b, {}, {})
+    result = calib_analyze.coverage(cal, held, 'pow2')
     for row in result['rows']:
-        x_cal = a[row['tensor']].reshape(80, -1)[keep].astype(np.float64)
+        x_cal = a[row['tensor']].reshape(80, -1).astype(np.float64)
         lo, hi = _grid(x_cal.min(), x_cal.max(), 'pow2')
         assert (row['lo'], row['hi']) == (lo, hi)
         x = b[row['tensor']].reshape(80, -1)
         outside = (x < lo) | (x > hi)
-        assert row['clip_pct'] == pytest.approx(100.0 * outside.mean())
         assert row['frames_clip_pct'] == pytest.approx(
             100.0 * outside.any(axis=1).mean())
 
 
-def test_cli_analyze_select_coverage_apply(tmp_path):
+def test_cli_analyze_writes_the_selection_and_coverage_scores_it(tmp_path,
+                                                                 capsys):
     rng = np.random.default_rng(8)
     arrays, _ = _with_sources(rng, [70, 80, 90])
     report = {'source_files': ['a.wav', 'b.wav', 'c.wav']}
@@ -314,38 +317,38 @@ def test_cli_analyze_select_coverage_apply(tmp_path):
     held = _write(tmp_path, _with_sources(rng, [60, 60])[0],
                   {'source_files': ['d.wav', 'e.wav']}, 'held.npz')
     html = tmp_path / 'r.html'
+    out = tmp_path / 'sel.npz'
     assert calib_analyze.main(['analyze', path, '--out', str(html),
-                               '--count', '100']) == 0
+                               '--count', '100', '--output', str(out)]) == 0
     page = html.read_text(encoding='utf-8')
     assert '/*__DATA__*/null' not in page and '"conclusions":' in page
-    keep = tmp_path / 'keep.json'
-    out = tmp_path / 'sel.npz'
-    assert calib_analyze.main(['select', path, '--count', '100',
-                               '--keep-out', str(keep),
-                               '--output', str(out)]) == 0
-    assert calib_analyze.load_artifact(str(out)).frames == 100
-    assert calib_analyze.main(['coverage', path, '--keep', str(keep),
-                               '--against', held,
+    assert 'no graph beside the artifact' in capsys.readouterr().out
+    sel = calib_analyze.load_artifact(str(out))
+    assert sel.frames == 100
+    assert sel.report['state_inputs'] == ['h']
+    assert sel.report['selection']['parent_frames'] == 240
+    for name, value in arrays.items():
+        assert sel.arrays[name].min() == value.min()
+        assert sel.arrays[name].max() == value.max()
+    assert calib_analyze.main(['coverage', str(out), '--against', held,
                                '--json', str(tmp_path / 'c.json')]) == 0
     assert json.loads((tmp_path / 'c.json').read_text())['frames'] == 100
-    assert calib_analyze.main(['apply', path, '--keep', str(keep),
-                               '--output', str(tmp_path / 'ap.npz')]) == 0
 
 
-def test_bits_option_rejects_out_of_range_widths():
+def test_bits_and_jobs_options_reject_out_of_range_values(tmp_path):
     with pytest.raises(SystemExit):
         calib_analyze.main(['analyze', 'x.npz', '--bits', '1'])
+    with pytest.raises(SystemExit):
+        calib_analyze.main(['analyze', 'x.npz', '--jobs', '0'])
 
 
 def test_one_source_and_too_few_frames_are_both_flagged():
     rng = np.random.default_rng(10)
     arrays, _ = _with_sources(rng, [120])
-    art = calib_analyze.Artifact('x', 'npz', arrays,
-                                 {'source_files': ['only.wav']})
-    texts = [c['text'] for c in
-             calib_analyze.analyze(art, count=1000)['conclusions']]
+    texts = [c['text'] for c in calib_analyze.analyze(
+        _pool(arrays, {'source_files': ['only.wav']}), count=1000)['conclusions']]
     assert any('同一個來源' in t for t in texts)
-    assert any('等於沒有挑選' in t for t in texts)
+    assert any('等於沒有挑選' in t and '--select' in t for t in texts)
 
 
 def test_conclusion_matches_whether_the_extremes_fit_the_count():
@@ -354,11 +357,11 @@ def test_conclusion_matches_whether_the_extremes_fit_the_count():
     for index, name in enumerate(arrays):
         arrays[name][10 * index] = 50.0       # max in frame 0, 10, 20
         arrays[name][10 * index + 5] = -50.0  # min in frame 5, 15, 25
-    art = calib_analyze.Artifact('x', 'npz', arrays, {})
+    pool = _pool(arrays)
 
     def texts(count):
         return [c['text'] for c in
-                calib_analyze.analyze(art, count=count)['conclusions']]
+                calib_analyze.analyze(pool, count=count)['conclusions']]
 
     short = texts(4)
     assert any('超過 --count 4' in t and '比整池窄' in t for t in short)
@@ -372,36 +375,46 @@ def test_conclusion_matches_whether_the_extremes_fit_the_count():
 
 def test_one_frame_artifact_is_analyzed():
     feat = np.arange(8, dtype=np.float32).reshape(1, 1, 8)
-    art = calib_analyze.Artifact('x', 'npz', {'feat': feat}, {})
-    assert calib_analyze.analyze(art)['curves']['k'] == [0]
+    analysis = calib_analyze.analyze(_pool({'feat': feat}))
+    assert list(analysis['recommend']['keep_frames']) == [0]
+    assert analysis['tensors']['feat']['chart']['start'].tolist() == [0]
 
 
-def test_drop_list_outside_the_artifact_is_refused():
-    art = calib_analyze.Artifact(
-        'x', 'npz', {'feat': np.ones((5, 1, 4), dtype=np.float32)}, {})
-    assert list(calib_analyze.keep_indices(art, {'drop_frames': [4]})) == [
-        0, 1, 2, 3]
-    for bad in ([5], [-1]):
-        with pytest.raises(ValueError):
-            calib_analyze.keep_indices(art, {'drop_frames': bad})
-
-
-def test_bad_output_name_is_refused_before_the_keep_file(tmp_path):
+def test_bad_output_name_is_refused_before_the_scan(tmp_path, monkeypatch):
     rng = np.random.default_rng(13)
     path = _write(tmp_path, {'feat': _heavy(rng, 50, 8)})
-    keep = tmp_path / 'keep.json'
+    monkeypatch.setattr(calib_analyze, 'scan_artifact', lambda *args: 1 / 0)
     with pytest.raises(SystemExit):
-        calib_analyze.main(['select', path, '--count', '10',
-                            '--keep-out', str(keep),
+        calib_analyze.main(['analyze', path, '--count', '10',
+                            '--out', str(tmp_path / 'r.html'),
                             '--output', str(tmp_path / 'pool_10')])
-    assert not keep.exists()
+    assert not (tmp_path / 'r.html').exists()
 
 
-def test_contiguous_artifact_gets_no_recommendation():
+def test_contiguous_artifact_gets_no_recommendation(tmp_path):
     rng = np.random.default_rng(11)
     arrays, _ = _with_sources(rng, [80])
-    art = calib_analyze.Artifact('x', 'npz', arrays, {
-        'model_family': 'Align_CRUSE', 'contiguous_state_frames': 80})
-    analysis = calib_analyze.analyze(art, count=20)
+    report = {'model_family': 'Align_CRUSE', 'contiguous_state_frames': 80}
+    analysis = calib_analyze.analyze(_pool(arrays, report), count=20)
     assert analysis['recommend'] is None
     assert any('不中斷' in c['text'] for c in analysis['conclusions'])
+    path = _write(tmp_path, arrays, report)
+    with pytest.raises(SystemExit, match='uninterrupted'):
+        calib_analyze.main(['analyze', path, '--output',
+                            str(tmp_path / 'o.npz')])
+
+
+def test_a_tensor_whose_values_fit_is_sampled_whole_past_the_frame_sample(
+        monkeypatch):
+    """Every value enters the SQNR estimate while the total fits SAMPLE_CAP,
+    however many frames hold them; a larger tensor is drawn from the frames
+    of smallest key."""
+    monkeypatch.setattr(calib_analyze, 'SAMPLE_FRAMES', 10)
+    rng = np.random.default_rng(15)
+    small = _heavy(rng, 40, 4)
+    monkeypatch.setattr(calib_analyze, 'SAMPLE_CAP', 200)
+    pool = _pool({'small': small, 'big': _heavy(rng, 40, 8)})
+    assert np.array_equal(pool.stats['small']['_sample'], small.reshape(-1))
+    assert not pool.stats['small']['global']['sampled']
+    big = pool.stats['big']
+    assert big['global']['sampled'] and big['_sample'].size == 10 * 8
