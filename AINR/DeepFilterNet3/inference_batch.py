@@ -61,6 +61,7 @@ try:
         check_selection_arguments,
         resolve_calibration_format,
         sibling_onnx_path,
+        stream_stft,
     )
 except ImportError:  # direct ``python inference_batch.py`` execution
     from inference import load_model
@@ -81,6 +82,7 @@ except ImportError:  # direct ``python inference_batch.py`` execution
         check_selection_arguments,
         resolve_calibration_format,
         sibling_onnx_path,
+        stream_stft,
     )
 
 
@@ -129,15 +131,10 @@ def _wav_feature_stream(path, model, params):
             wave, source_rate, params['SR']
         )
     window = torch.hann_window(params['WIN_LEN']).sqrt()
-    spectrum = torch.stft(
-        wave.unsqueeze(0),
-        params['N_FFT'],
-        params['HOP_LEN'],
-        params['WIN_LEN'],
-        window=window,
-        normalized=True,
-        return_complex=True,
-    )
+    # The board's framing (AcStft, center 0), not the training's centred one.
+    spectrum = stream_stft(wave.unsqueeze(0), params['N_FFT'],
+                           params['HOP_LEN'], params['WIN_LEN'], window,
+                           normalized=True)
     _, erb, spec, _ = extract_dfn3_features(
         spectrum,
         model.erb_fb,

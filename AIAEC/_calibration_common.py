@@ -24,7 +24,12 @@ _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from AIAEC.dataset_gen import MODEL_TASKS, reads_linear_error, stft
+_AINR_DIR = os.path.join(_REPO_ROOT, 'AINR')     # home of calibration_io
+if _AINR_DIR not in sys.path:
+    sys.path.insert(0, _AINR_DIR)
+
+from calibration_io import stream_stft  # noqa: E402
+from AIAEC.dataset_gen import MODEL_TASKS, reads_linear_error
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
 from AIAEC.training_common import (
     CALIBRATION_ONLY_FAR_INPUT_MODE,
@@ -131,10 +136,17 @@ def iter_blocks(model_name, model, grid, primary_path, far_path,
     loader = (load_linear_error_far if model_name in LINEAR_ERROR_MODELS
               else load_mic_far)
     primary, far, _ = loader(str(primary_path), str(far_path), grid.sr)
+
+    def frames_of(wave):
+        # The board's framing, not the training's centred one.
+        return _ri(stream_stft(wave, grid.n_fft, grid.hop_len, grid.win_len,
+                               grid.window(device=wave.device,
+                                           dtype=wave.dtype)))
+
     tensors = {
         ('error' if model_name in LINEAR_ERROR_MODELS
-         else 'mic'): _ri(stft(primary, grid)),
-        'far': _ri(stft(far, grid)),
+         else 'mic'): frames_of(primary),
+        'far': frames_of(far),
     }
     time_axis = {name: 1 for name in tensors}
     total = tensors[next(iter(tensors))].shape[time_axis[next(iter(tensors))]]

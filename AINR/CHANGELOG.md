@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 2026-11-27: calibration captures frame audio as the deployed streams do
+
+- The DeepVQE-S, Align-ULCNet and DeepFilterNet2/3 captures (`inference.py calib`, `inference_batch.py calib`) analysed each recording with `torch.stft(center=True)`: the first frame's left half was the start reflected, and a recording of a whole number of hops got one frame more at its end. The deployed streams use audiolib's `AcStft` at its default (center 0): the first frame's left half is zeros. The captures now frame as the streams do (`calibration_io.stream_stft`: zeros in front, then `center=False`; `center=False` alone would start a hop late), and push a recording's last partial hop completed with zeros, so a recording of S samples gives ceil(S / hop) frames, the hops the Align-ULCNet event records count. Training keeps its framing.
+- Only each recording's first frame changes, and the last one (completed with zeros, not reflected); for a recording of a whole number of hops the extra last frame is gone. Artifacts captured before differ there, and the states recorded after those frames differ with them; recapture before converting. A C test runs `AcStft` at the streams' configuration on the same audio and compares every frame, the first and last included.
+
 ### 2026-11-27: calibration captures choose their own frames (`--select`, `--jobs`)
 
 - `inference.py calib` of DeepVQE-S, Align-ULCNet, DeepFilterNet2 and DeepFilterNet3, and `inference_batch.py calib` of both DeepFilterNets, take `--select COUNT`: the capture scans every recording, keeps only the frames a selection can pick (each tensor's extreme frames, inside the graph too, and a fixed set of fill candidates), and writes the COUNT chosen frames with an analysis page (`--report`, default `<output>.report.html`). Memory no longer grows with the number of recordings. The frames written are the ones `PTQ/calib_analyze.py analyze` chooses from a capture of every frame.

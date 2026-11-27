@@ -172,6 +172,28 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
     return os.path.join(output_path, 'manifest.json')
 
 
+
+def stream_stft(wave, n_fft, hop, win_len, window, normalized=False):
+    """``torch.stft`` framed as the deployed streams frame it (audiolib
+    ``AcStft`` at its default, center 0): each hop pushed yields the frame
+    over the last ``n_fft`` samples, zeros before the first sample, so the
+    first frame's first ``n_fft - hop`` samples are 0. A file's last partial
+    hop is completed with zeros and pushed, as a host reading the file does,
+    so a file of S samples gives ceil(S / hop) frames. (``torch.stft
+    (center=True)`` reflects the start into the first frame and the end into
+    the last; ``center=False`` alone starts a hop late.) ``wave`` is
+    ``[..., samples]``; the result ``[..., bins, frames]``."""
+    import torch
+
+    lead = wave.shape[:-1]
+    flat = wave.reshape(-1, wave.shape[-1])
+    if not flat.shape[-1]:
+        return torch.zeros(*lead, n_fft // 2 + 1, 0, dtype=torch.complex64)
+    flat = torch.nn.functional.pad(flat, (n_fft - hop, -flat.shape[-1] % hop))
+    spec = torch.stft(flat, n_fft, hop, win_len, window=window, center=False,
+                      normalized=normalized, return_complex=True)
+    return spec.reshape(*lead, *spec.shape[-2:])
+
 # --------------------------------------------------------------------------
 # Where a calibration run's frames go
 # --------------------------------------------------------------------------
