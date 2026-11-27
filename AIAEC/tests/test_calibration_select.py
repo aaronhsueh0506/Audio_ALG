@@ -73,6 +73,8 @@ def test_select_writes_what_analyze_chooses_from_the_whole_capture(work):
     assert selected.frames == COUNT < whole.frames
     assert _same(selected, analyzed)
     assert selected.report['selection']['parent_frames'] == whole.frames
+    assert selected.report['selection']['parent'] == (
+        '3 recordings scanned by the capture')
     assert selected.report['model_family'] == 'DeepVQE_S'
     assert 'state_align_key_ring' in selected.report['state_inputs']
     assert set(selected.report['source_files']) <= set(
@@ -95,6 +97,39 @@ def test_jobs_split_the_recordings_and_change_nothing(work):
     assert '無法確認兩者出自同一個 checkpoint' not in page
     assert not [path for path in work.iterdir()
                 if path.name.startswith('.calib-jobs')]
+    # A BIN artifact in a directory that does not exist yet (the graph goes
+    # elsewhere, so nothing else makes it), its page in another one.
+    stored = _calib(work, ['--select', str(COUNT), '--jobs', '2',
+                           '--format', 'bin',
+                           '--onnx', str(work / 'graphs' / 'bin.onnx'),
+                           '--report', str(work / 'pages' / 'bin.html')],
+                    'fresh/bin')
+    assert stored.fmt == 'bin' and _same(one, stored)
+    assert (work / 'pages' / 'bin.html').exists()
+    assert not [path for path in (work / 'fresh').iterdir()
+                if path.name.startswith('.calib-jobs')]
+
+
+def test_jobs_over_one_recording_name_it(work):
+    for name in ('primary', 'far'):
+        (work / (name + '1')).mkdir(exist_ok=True)
+        (work / (name + '1') / 'w0.wav').write_bytes(
+            (work / name / 'w0.wav').read_bytes())
+    one_dir = ['--primary-dir', str(work / 'primary1'),
+               '--far-dir', str(work / 'far1'), '--select', '30']
+    alone = _calib(work, one_dir, 'alone.npz')
+    shared = _calib(work, one_dir + ['--jobs', '2'], 'alone2.npz')
+    assert _same(alone, shared)
+    assert shared.report['source_files'] == alone.report['source_files']
+    assert len(shared.report['source_files']) == 1
+
+
+def test_jobs_refuse_a_stem_directory_an_earlier_run_left(work, capsys):
+    (work / 'stale.npz_linear_error').mkdir()
+    with pytest.raises(SystemExit):
+        _calib(work, ['--select', '10', '--jobs', '2', '--primary-is-mic'],
+               'stale.npz', 'Align_ULCNet')
+    assert 'stale.npz_linear_error exists' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('extra,model,message', [

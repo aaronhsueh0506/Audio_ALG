@@ -422,6 +422,12 @@ def main(model_name: str) -> None:
     if args.events and args.jobs > 1:
         parser.error('--events counts the replayed events in one process; '
                      'leave out --jobs')
+    if (args.primary_is_mic and args.jobs > 1
+            and os.path.exists(str(args.output) + '_linear_error')):
+        # The --jobs processes list that directory: stems left there by an
+        # earlier run would join this one.
+        parser.error('%s_linear_error exists; move it away or leave out '
+                     '--jobs' % args.output)
     try:
         require_frames_per_call(args.model_name, args.frames_per_call)
     except ValueError as error:

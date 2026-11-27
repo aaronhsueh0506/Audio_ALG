@@ -326,7 +326,15 @@ class CalibrationFrames:
         self.parts = None
         self.source = 0
         self.produced = 0
-        self._folder = None
+        if self.select is not None:
+            # The --jobs processes run torch on one thread; every --select run
+            # does, so the recorded states are the same whatever --jobs is.
+            try:
+                import torch
+            except ImportError:
+                pass
+            else:
+                torch.set_num_threads(1)
 
     def sources(self, items):
         """``items`` (the recordings, in order) this process captures. A
@@ -392,46 +400,53 @@ class CalibrationFrames:
 
     def _run(self, count):
         """Run the --jobs processes; their parts, in recording order once
-        merged."""
+        merged. Their folder is gone when this returns or raises (the kept
+        frames stay memory-mapped)."""
         import subprocess
 
         jobs = min(self.jobs, max(1, count))
         print('scanning %d recordings in %d processes' % (count, jobs),
               flush=True)
         parent = os.path.dirname(os.path.abspath(str(self.output)))
-        self._folder = tempfile.mkdtemp(prefix='.calib-jobs-', dir=parent)
-        valued = ('--jobs', '--report', '--output', '--onnx', '--shard') \
-            + tuple(self.rewrite)
+        os.makedirs(parent, exist_ok=True)
+        root = tempfile.mkdtemp(prefix='.calib-jobs-', dir=parent)
+        # A process writes no artifact; its --output only has to parse.
+        valued = ('--jobs', '--report', '--output', '--onnx', '--shard',
+                  '--format') + tuple(self.rewrite)
         base = _without(self.argv, valued + self.drop, valued)
         for flag, value in self.rewrite.items():
             base += [flag, str(value)]
         env = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
         running = []
-        for k in range(jobs):
-            folder = os.path.join(self._folder, 'part%d' % k)
-            os.makedirs(folder)
-            log = open(os.path.join(folder, 'log.txt'), 'w')
-            argv = base + [
-                '--output', os.path.join(folder, 'frames.npz'),
-                '--onnx', os.path.join(folder, 'graph.onnx'),
-                '--shard', '%d/%d:%s' % (k, jobs, os.path.join(folder, 'part'))]
-            running.append((folder, log, subprocess.Popen(
-                self.command + argv, stdout=log, stderr=subprocess.STDOUT,
-                env=env)))
-        failed = []
-        for folder, log, process in running:
-            process.wait()
-            log.close()
-            if process.returncode:
-                with open(os.path.join(folder, 'log.txt')) as stream:
-                    failed.append(stream.read()[-2000:])
-        if failed:
-            shutil.rmtree(self._folder, ignore_errors=True)
-            raise RuntimeError('a --jobs process failed:\n' + failed[0])
-        analyze = self._analyze()
-        return [analyze.load_part(os.path.join(folder, 'part'))
-                for folder, _, _ in running
-                if os.path.isdir(os.path.join(folder, 'part'))]
+        try:
+            for k in range(jobs):
+                folder = os.path.join(root, 'part%d' % k)
+                os.makedirs(folder)
+                with open(os.path.join(folder, 'log.txt'), 'w') as log:
+                    running.append((folder, subprocess.Popen(
+                        self.command + base + [
+                            '--output', os.path.join(folder, 'frames.npz'),
+                            '--onnx', os.path.join(folder, 'graph.onnx'),
+                            '--shard', '%d/%d:%s' % (
+                                k, jobs, os.path.join(folder, 'part'))],
+                        stdout=log, stderr=subprocess.STDOUT, env=env)))
+            failed = []
+            for folder, process in running:
+                if process.wait():
+                    with open(os.path.join(folder, 'log.txt')) as stream:
+                        failed.append(stream.read()[-2000:])
+            if failed:
+                raise RuntimeError('a --jobs process failed:\n' + failed[0])
+            analyze = self._analyze()
+            return [analyze.load_part(os.path.join(folder, 'part'))
+                    for folder, _ in running
+                    if os.path.isdir(os.path.join(folder, 'part'))]
+        finally:
+            for _, process in running:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            shutil.rmtree(root, ignore_errors=True)
 
     def write(self, output, fmt, make_report, limit=None, source_names=None):
         """Write the artifact and return its report; ``make_report(arrays)``
@@ -448,28 +463,26 @@ class CalibrationFrames:
             if self.scan is not None:
                 analyze.save_part(self.scan.part(), self.shard[2])
             raise SystemExit(0)
-        try:
-            parts = self.parts if self.parts is not None else (
-                [self.scan.part()] if self.scan is not None else [])
-            self.parts = self.scan = None
-            if not parts:
-                raise RuntimeError('no calibration frames were produced')
-            pool = analyze.assemble(
-                parts, self.facts, str(output), fmt, graph=self.graph,
-                source_names=source_names,
-                source_note='recorded by the capture',
-                reserve=analyze.fill_reserve(self.select))
-            del parts
-            analysis = analyze.report_analysis(
-                pool, self.select, 'asym', analyze.DEFAULT_BITS,
-                _report_path(output, self.page))
-            keep = np.asarray(analysis['recommend']['keep_frames'],
-                              dtype=np.int64)
-            report = analyze.write_selection(pool, keep, str(output), fmt,
-                                             make_report)
-            print('chose %d of %d frames from %d recordings' % (
-                keep.size, pool.count, len(pool.sources['starts'])))
-            return report
-        finally:
-            if self._folder:
-                shutil.rmtree(self._folder, ignore_errors=True)
+        parts = self.parts if self.parts is not None else (
+            [self.scan.part()] if self.scan is not None else [])
+        self.parts = self.scan = None
+        if not parts:
+            raise RuntimeError('no calibration frames were produced')
+        pool = analyze.assemble(
+            parts, self.facts, str(output), fmt, graph=self.graph,
+            source_names=source_names, source_note='recorded by the capture',
+            reserve=analyze.fill_reserve(self.select))
+        del parts
+        analysis = analyze.analysis_of(pool, self.select, 'asym',
+                                       analyze.DEFAULT_BITS)
+        keep = np.asarray(analysis['recommend']['keep_frames'],
+                          dtype=np.int64)
+        recordings = len(pool.sources['starts'])
+        # The artifact first: a page that cannot be written loses no scan.
+        report = analyze.write_selection(
+            pool, keep, str(output), fmt, make_report,
+            parent='%d recordings scanned by the capture' % recordings)
+        analyze.report_conclusions(analysis, _report_path(output, self.page))
+        print('chose %d of %d frames from %d recordings' % (
+            keep.size, pool.count, recordings))
+        return report

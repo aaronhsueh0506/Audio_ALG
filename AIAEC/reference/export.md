@@ -37,8 +37,9 @@ which keeps it zero-completed.
 `--select COUNT` makes the capture scan every recording and write only the
 COUNT invocations a selection keeps (each tensor's extreme frames, inside the
 graph too, then k-means picks), with an analysis page beside the output
-(`--report`); memory does not grow with the number of recordings, and
-`--frames` is refused with it. `--jobs N` deals the recordings to N
+(`--report`). Whole frames are held only for the frames a selection can
+pick; every other frame leaves a few numbers per tensor. `--frames` is
+refused with it. `--jobs N` deals the recordings to N
 processes and gives the same frames as one:
 
     python3 inference.py calib \

@@ -118,10 +118,16 @@ def test_a_bin_directory_with_a_manifest_still_reads_it(tmp_path):
 
 
 def test_a_bin_directory_the_graph_does_not_describe_is_refused(tmp_path):
-    out, _ = _bin(tmp_path)
+    out, arrays = _bin(tmp_path)
     os.remove(str(out) + '.onnx')
+    # No graph: the shapes manifest.json records; with neither, a refusal.
+    np.testing.assert_array_equal(
+        calib_analyze.load_artifact(str(out)).arrays['feature'],
+        arrays['feature'])
+    os.rename(out / 'manifest.json', tmp_path / 'manifest.json')
     with pytest.raises(ValueError, match='record no shape.*--onnx PATH'):
         calib_analyze.load_artifact(str(out))
+    os.rename(tmp_path / 'manifest.json', out / 'manifest.json')
     wide = _graph(tmp_path / 'wide.onnx', {
         'feature': ([1, 5], TensorProto.FLOAT), 'step': ([1], TensorProto.INT64)})
     with pytest.raises(ValueError, match='manifest.json records feature'):

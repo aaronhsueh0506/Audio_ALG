@@ -4,13 +4,14 @@ import soundfile as sf
 import torch
 
 from AIAEC.aiaec_common import SignalGrid
-from AIAEC.dataset_gen import AecGrid, stft
+from AIAEC.dataset_gen import AecGrid
 from AIAEC.Align_CRUSE.model import AlignCRUSE
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC.CAGCRN.model import CAGCRN
 from AIAEC.DeepVQE_S.model import DeepVQES
 from AIAEC.CAGCRN.export_erb_matrix import extract_matrices
 from AIAEC._calibration_common import blocks_from_pair
+from calibration_io import stream_stft
 from AIAEC._export_common import (
     alignment_depth,
     dummy_inputs,
@@ -116,9 +117,10 @@ def test_align_ulcnet_calibration_far_is_the_raw_input_waveform(tmp_path):
     block = next(blocks_from_pair(
         'Align_ULCNet', model, AEC_GRID, primary, far, frames=4
     ))
-    expected = torch.view_as_real(
-        stft(far_wave.unsqueeze(0), AEC_GRID).transpose(-2, -1)
-    )[0, :4]
+    # The board's framing (calibration_io.stream_stft), of the raw far.
+    expected = torch.view_as_real(stream_stft(
+        far_wave.unsqueeze(0), AEC_GRID.n_fft, AEC_GRID.hop_len,
+        AEC_GRID.win_len, AEC_GRID.window()).transpose(-2, -1))[0, :4]
     torch.testing.assert_close(
         torch.from_numpy(block['far']), expected,
         rtol=0.0, atol=2e-6,

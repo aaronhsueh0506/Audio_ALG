@@ -418,3 +418,84 @@ def test_a_tensor_whose_values_fit_is_sampled_whole_past_the_frame_sample(
     assert not pool.stats['small']['global']['sampled']
     big = pool.stats['big']
     assert big['global']['sampled'] and big['_sample'].size == 10 * 8
+
+
+def _captured(art, numbers, scans, reserve):
+    """A Pool of ``art`` scanned as a capture does: recording k numbered
+    ``numbers[k]`` and dealt to scan ``k % scans``."""
+    starts, reliable, _ = calib_analyze.detect_segments(art)
+    assert reliable
+    bounds = list(starts) + [art.frames]
+    parts = [calib_analyze.Scan(art.specs, None, art.report, reserve=reserve)
+             for _ in range(scans)]
+    for k, number in enumerate(numbers):
+        for i in range(bounds[k], bounds[k + 1]):
+            parts[k % scans].add({name: value[i] for name, value
+                                  in art.arrays.items()}, number)
+    names = dict(zip(numbers, art.report['source_files']))
+    return calib_analyze.assemble([scan.part() for scan in parts], art.report,
+                                  source_names=names, reserve=reserve)
+
+
+def test_the_fill_candidates_do_not_depend_on_how_recordings_are_numbered():
+    """Frames are keyed by content: a capture numbering its recordings its own
+    way, in one process or several, keeps the candidates a scan of the stored
+    frames finds."""
+    rng = np.random.default_rng(21)
+    arrays, _ = _with_sources(rng, [70, 50, 90, 40])
+    art = calib_analyze.Artifact('x', 'npz', arrays, {
+        'source_files': ['r%d.wav' % k for k in range(4)]})
+    whole = calib_analyze.scan_artifact(art, reserve=60)
+    want = calib_analyze.select_patterns(whole, 20, 0)['keep']
+    for numbers, scans in (([3, 8, 11, 40], 1), ([5, 6, 7, 9], 3)):
+        pool = _captured(art, numbers, scans, 60)
+        assert pool.count == whole.count > 60
+        np.testing.assert_array_equal(pool.candidates, whole.candidates)
+        np.testing.assert_array_equal(pool.features, whole.features)
+        keep = calib_analyze.select_patterns(pool, 20, 0)['keep']
+        np.testing.assert_array_equal(keep, want)
+        for name, value in arrays.items():
+            np.testing.assert_array_equal(pool.frames(keep, name), value[keep])
+
+
+def test_equal_frames_take_one_place_among_the_fill_candidates():
+    rng = np.random.default_rng(22)
+    feat = _heavy(rng, 300, 8)
+    feat[100:250] = 0.0                     # a stretch of digital silence
+    art = calib_analyze.Artifact('x', 'npz', {'feat': feat}, {})
+    flat = feat.reshape(300, -1).astype(np.float64)
+    keys = calib_analyze._frame_keys(0, [flat.min(1), flat.max(1),
+                                         flat.mean(1)])
+    # A reserve the silence's key falls inside, so its repeats would crowd it.
+    distinct = np.unique(keys)
+    reserve = int(np.searchsorted(distinct, keys[100])) + 5
+    silent = np.arange(100, 250)
+    pool = calib_analyze.scan_artifact(art, reserve=reserve)
+    assert np.isin(pool.candidates, silent).sum() == 1
+    assert pool.candidates.size >= reserve
+    # A capture holds the frames it needs; all of them while they fit.
+    scan = calib_analyze.Scan(art.specs, reserve=reserve)
+    for i in range(300):
+        scan.add({'feat': feat[i]})
+    held = calib_analyze.assemble([scan.part()], reserve=reserve)
+    np.testing.assert_array_equal(held.candidates, pool.candidates)
+    np.testing.assert_array_equal(held.frames(held.candidates, 'feat'),
+                                  feat[held.candidates])
+    scan = calib_analyze.Scan(art.specs, reserve=300)
+    for i in range(300):
+        scan.add({'feat': feat[i]})
+    held = calib_analyze.assemble([scan.part()], reserve=300)
+    keep = calib_analyze.select_patterns(held, 300, 0)['keep']
+    np.testing.assert_array_equal(held.frames(keep, 'feat'), feat)
+
+
+def test_a_selection_from_one_recording_still_names_it(tmp_path):
+    rng = np.random.default_rng(23)
+    arrays, _ = _with_sources(rng, [80])
+    path = _write(tmp_path, arrays, {'source_files': ['only.wav']})
+    calib_analyze.main(['analyze', path, '--count', '10',
+                        '--out', str(tmp_path / 'page.html'),
+                        '--output', str(tmp_path / 'o.npz')])
+    report = calib_analyze.load_artifact(str(tmp_path / 'o.npz')).report
+    assert report['source_files'] == ['only.wav']
+    assert report['selection']['parent'] == 'a.npz'

@@ -6,7 +6,8 @@ the captured invocation ("frame"): a ``.npz`` (+ ``<stem>.calib.json``), or a
 BIN directory with one folder per graph input and one little-endian ``.bin``
 file per frame (+ ``manifest.json``).  A BIN file records no shape, so its
 frames are read against the input shapes and types of the graph: the one the
-report names beside the artifact, else ``<dir>.onnx``, or ``--onnx PATH``.
+report names beside the artifact, else ``<dir>.onnx``, or ``--onnx PATH``;
+without a graph, against the shapes ``manifest.json`` records.
 The report is optional; without it the tool cannot check the model family
 (the Align-ULCNet front-end stamp, a model that needs one contiguous stream),
 the source files or which inputs stay unquantised, and says so.
@@ -19,9 +20,10 @@ each other, so what matters is how many recordings and situations the frames
 come from, not how many frames are kept.
 
 A capture run scans every recording itself and writes only the chosen frames
-with ``--select`` (see each model's ``inference.py calib``), so memory stays
-bounded however many recordings it reads; ``--jobs N`` scans N recordings at
-a time and gives the same result.  An artifact already captured is analysed
+with ``--select`` (see each model's ``inference.py calib``): it holds a few
+statistics per frame (a few kB with a graph of a hundred tensors) and the
+frames a selection can pick, not every frame; ``--jobs N`` scans N recordings
+at a time and gives the same result.  An artifact already captured is analysed
 and reduced here:
 
     python3 AIAEC/DeepVQE_S/inference.py calib --checkpoint ckpt.pth \
@@ -271,14 +273,21 @@ def _natural_key(name):
 
 
 def _read_bin(path, report, graph, threads=1):
-    """The frames of a BIN directory, shaped by the inputs of ``graph``."""
-    if not os.path.isfile(graph):
-        raise ValueError('%s is a BIN directory, whose files record no shape; '
-                         'no graph to read the input shapes from at %s: pass '
-                         '--onnx PATH' % (path, graph))
+    """The frames of a BIN directory, shaped by the inputs of ``graph`` or,
+    without one, by what ``manifest.json`` records."""
     recorded = report.get('binary_tensors') or {}
+    if os.path.isfile(graph):
+        inputs = _graph_inputs(_load_graph(graph))
+    elif recorded:
+        inputs = [(name, list(spec['frame_shape']),
+                   np.dtype(spec['dtype']).newbyteorder('='))
+                  for name, spec in recorded.items()]
+    else:
+        raise ValueError('%s is a BIN directory, whose files record no shape, '
+                         'and has no manifest.json; no graph to read the input '
+                         'shapes from at %s: pass --onnx PATH' % (path, graph))
     folders = []
-    for name, dims, dtype in _graph_inputs(_load_graph(graph)):
+    for name, dims, dtype in inputs:
         # The name becomes a path component: reject absolute or ".."-containing
         # names, as the AINR/calibration_io.py writer does.
         if name != os.path.basename(name) or name in ('.', '..'):
@@ -755,22 +764,39 @@ class _Replay:
 # Scan: the statistics of a stream of frames
 # --------------------------------------------------------------------------
 
-def _frame_keys(seed, src, local):
-    """A pseudo-random 64-bit key per frame from (seed, source, frame within
-    the source). The frames of smallest key are the value sample and the
-    k-means candidates, so they do not depend on how the frames were split
-    between processes."""
-    with np.errstate(over='ignore'):
-        x = (np.uint64(seed) * np.uint64(0x9E3779B97F4A7C15)
-             + np.asarray(src).astype(np.uint64) * np.uint64(0xBF58476D1CE4E5B9)
-             + np.asarray(local).astype(np.uint64)
-             * np.uint64(0x94D049BB133111EB))
-        x ^= x >> np.uint64(30)
-        x *= np.uint64(0xBF58476D1CE4E5B9)
-        x ^= x >> np.uint64(27)
-        x *= np.uint64(0x94D049BB133111EB)
-        x ^= x >> np.uint64(31)
+def _mix(x):
+    """The splitmix64 finaliser, on a uint64 array."""
+    x ^= x >> np.uint64(30)
+    x *= np.uint64(0xBF58476D1CE4E5B9)
+    x ^= x >> np.uint64(27)
+    x *= np.uint64(0x94D049BB133111EB)
+    x ^= x >> np.uint64(31)
     return x
+
+
+def _frame_keys(seed, columns):
+    """A pseudo-random 64-bit key per frame from its content (``columns``:
+    per-frame float64 statistics of its inputs). The frames of smallest key
+    are the value sample and the k-means candidates: keyed by content, they
+    are the same however the frames' sources were numbered and the frames
+    split between processes. Equal frames get equal keys (``_distinct``)."""
+    with np.errstate(over='ignore'):
+        x = np.full(len(columns[0]),
+                    _mix(np.array([seed], dtype=np.uint64))[0])
+        for column in columns:
+            x ^= np.ascontiguousarray(column, dtype=np.float64).view(np.uint64)
+            x = _mix(x)
+    return x
+
+
+def _distinct(ranked, keys):
+    """``ranked`` (frame indices, by key) without the frames whose key an
+    earlier one has: equal frames, such as a stretch of digital silence, take
+    one place among the frames of smallest key."""
+    if ranked.size < 2:
+        return ranked
+    ordered = keys[ranked]
+    return ranked[np.concatenate(([True], ordered[1:] != ordered[:-1]))]
 
 
 _FRAME_FIELDS = ('fmin', 'fmax', 'mean', 'std', 'peak')
@@ -845,7 +871,7 @@ class Scan:
         """The frames of ``block`` (name -> [frames, ...]), whose places are
         ``src`` and ``local``."""
         n = len(src)
-        low, high = [], []
+        low, high, content = [], [], []
         for name in self.names:
             flat = block[name].reshape(n, -1)
             lo = flat.min(axis=1).astype(np.float64)
@@ -861,6 +887,7 @@ class Scan:
             rows['peak'].append(np.maximum(-lo, hi))
             low.append(lo)
             high.append(hi)
+            content += [lo, hi, rows['mean'][-1]]
             if self.bands:
                 self._bands[name].add(block[name])
             values = self._values[name]
@@ -873,7 +900,7 @@ class Scan:
             lmin, lmax = self.replay.run(block, n)
             low.extend(lmin.T.astype(np.float64))
             high.extend(lmax.T.astype(np.float64))
-        keys = _frame_keys(self.seed, src, local)
+        keys = _frame_keys(self.seed, content)
         self._src.append(src)
         self._local.append(local)
         self._keys.append(keys)
@@ -905,18 +932,23 @@ class Scan:
         hi_at[better] = at[first[better]]
         every = np.concatenate([self._reserve_keys, keys])
         places = np.concatenate([self._reserve_at, at])
-        take = np.argsort(every, kind='stable')[:self.reserve]
+        take = _distinct(np.argsort(every, kind='stable'),
+                         every)[:self.reserve]
         self._reserve_keys, self._reserve_at = every[take], places[take]
         need = {tuple(p) for p in np.concatenate([lo_at, hi_at,
                                                   self._reserve_at]).tolist()}
+        # While the reserve holds every frame seen, every frame is kept, as
+        # ``assemble`` makes them all candidates then.
+        whole = self.count + n <= self.reserve
         for j in range(n):
             place = (int(src[j]), int(local[j]))
-            if place in need and place not in self._kept:
+            if (whole or place in need) and place not in self._kept:
                 # Copied: the block's storage is reused.
                 self._kept[place] = {name: np.array(block[name][j])
                                      for name in block}
-        for place in [p for p in self._kept if p not in need]:
-            del self._kept[place]
+        if not whole:
+            for place in [p for p in self._kept if p not in need]:
+                del self._kept[place]
 
     def part(self):
         """This scan's frames and statistics, for ``assemble``; the scan
@@ -1143,9 +1175,9 @@ def assemble(parts, report=None, path='', fmt='npz', graph=None,
 
     rows = {name: {field: merged([p['rows'][name][field] for p in parts])
                    for field in _FRAME_FIELDS} for name in names}
-    ranked = np.argsort(keys, kind='stable')
+    ranked = _distinct(np.argsort(keys, kind='stable'), keys)
     sample = np.sort(ranked[:SAMPLE_FRAMES])
-    fill = np.sort(ranked[:reserve])
+    fill = np.arange(n) if n <= reserve else np.sort(ranked[:reserve])
     shapes = {name: shape for name, shape, _ in specs}
     stats = {}
     for name in names:
@@ -2215,7 +2247,7 @@ def require_selectable(source):
             'different source instead.' % source.report.get('model_family'))
 
 
-def write_selection(pool, keep, output, fmt, make_report=None):
+def write_selection(pool, keep, output, fmt, make_report=None, parent=None):
     """Write the frames ``keep`` of ``pool`` as a calibration artifact and
     return its report.
 
@@ -2232,8 +2264,8 @@ def write_selection(pool, keep, output, fmt, make_report=None):
     else:
         report = dict(make_report(arrays))
     require_current_frontend(report, pool.path)
-    bounds = _source_bounds(pool)
-    if bounds is not None:
+    if pool.sources['reliable']:
+        bounds = np.array(pool.sources['starts'] + [pool.count])
         segment = np.searchsorted(bounds, keep, side='right') - 1
         files = pool.sources['files']
         alive = sorted(set(int(s) for s in segment))
@@ -2246,7 +2278,7 @@ def write_selection(pool, keep, output, fmt, make_report=None):
     report['state_inputs'] = list(pool.state)
     report['selection'] = {
         'tool': 'calib_analyze',
-        'parent': os.path.basename(pool.path),
+        'parent': parent or os.path.basename(pool.path),
         'parent_frames': pool.count,
         'kept_frames': int(keep.size),
         'kept_indices': [int(i) for i in keep],
@@ -2533,6 +2565,8 @@ def write_report(analysis, out_path):
         template = stream.read()
     data = json.dumps(analysis, separators=(',', ':'), ensure_ascii=False)
     data = data.replace('</', '<\\/')
+    folder = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(folder, exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as stream:
         stream.write(template.replace('/*__DATA__*/null', data))
 
@@ -2639,9 +2673,9 @@ def _scan(art, graph, jobs, bands, reserve=SAMPLE_FRAMES):
     return pool
 
 
-def report_analysis(pool, count, scheme, bits, out, json_path=None):
-    """Analyse ``pool``, print what it found and write the page (and the
-    raw analysis to ``json_path``); return the rounded analysis."""
+def analysis_of(pool, count, scheme, bits):
+    """Analyse ``pool`` and print the notes and the comparison of the tensors
+    inside the graph; return the analysis rounded for the page."""
     analysis = analyze(pool, scheme, count=count, bits=bits)
     recommend = analysis['recommend']
     if recommend:
@@ -2649,11 +2683,7 @@ def report_analysis(pool, count, scheme, bits, out, json_path=None):
             print('note: ' + note)
         if recommend.get('layers'):
             print_layer_comparison(recommend['layers'])
-    analysis = _round(analysis)
-    report_conclusions(analysis, out)
-    if json_path:
-        _dump_json(analysis, json_path)
-    return analysis
+    return _round(analysis)
 
 
 def main(argv=None):
@@ -2711,8 +2741,10 @@ def main(argv=None):
             _dump_json(_round(result), args.json)
         return 0
 
-    analysis = report_analysis(pool, args.count, args.scheme, args.bits,
-                               args.out, args.json)
+    analysis = analysis_of(pool, args.count, args.scheme, args.bits)
+    report_conclusions(analysis, args.out)
+    if args.json:
+        _dump_json(analysis, args.json)
     if args.output and analysis['recommend']:
         keep = np.asarray(analysis['recommend']['keep_frames'], dtype=np.int64)
         write_selection(pool, keep, args.output, args.format)
