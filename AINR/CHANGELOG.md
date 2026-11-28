@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 2026-11-28: calibration outputs are checked before the run
+
+- A BIN `--output` written with a trailing separator (`calib/x/`) put the graph at `calib/x/.onnx`, which created the directory the final write then refused as existing, after the whole scan. Every calibration writer (`inference.py calib` of DeepVQE-S, Align-ULCNet, DeepFilterNet2/3 and GTCRN, `inference_batch.py calib`, RNNoise-ERB `--dump-calib`, `PTQ/calib_analyze.py analyze --output`) now drops trailing separators and, before any work, refuses a BIN output that exists (a dangling link included) and a file the run also writes (`--onnx`, `--report`; `analyze --out`, `--json`) at the output path or inside a BIN output (`calibration_io.calibration_output`). An NPZ output is still overwritten.
+
 ### 2026-11-27: calibration captures frame audio as the deployed streams do
 
 - The DeepVQE-S, Align-ULCNet and DeepFilterNet2/3 captures (`inference.py calib`, `inference_batch.py calib`) analysed each recording with `torch.stft(center=True)`: the first frame's left half was the start reflected, and a recording of a whole number of hops got one frame more at its end. The deployed streams use audiolib's `AcStft` at its default (center 0): the first frame's left half is zeros. The captures now frame as the streams do (`calibration_io.stream_stft`: zeros in front, then `center=False`; `center=False` alone would start a hop late), and push a recording's last partial hop completed with zeros, so a recording of S samples gives ceil(S / hop) frames, the hops the Align-ULCNet event records count. Training keeps its framing.

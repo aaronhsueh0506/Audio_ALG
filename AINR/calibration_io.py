@@ -54,6 +54,37 @@ def resolve_calibration_format(output_path, requested=None):
     return result
 
 
+def calibration_output(output_path, requested=None, written=()):
+    """``output_path`` without trailing separators, and its format.
+
+    A run checks its output here before any work, instead of failing a write
+    after it: a BIN directory that already exists is refused, and so is a
+    file of ``written`` (the graph, the page: what else the run writes) at
+    the output path or inside a BIN output."""
+    path = _without_trailing_separators(output_path)
+    artifact_format = resolve_calibration_format(path, requested)
+    target = os.path.abspath(path)
+    if artifact_format == 'bin':
+        _refuse_existing_bin(target, ValueError)
+    for other in filter(None, written):
+        other_path = os.path.abspath(other)
+        if other_path == target or (artifact_format == 'bin'
+                                    and other_path.startswith(target + os.sep)):
+            raise ValueError('%s would be written at or inside the '
+                             'calibration output %s' % (other, target))
+    return path, artifact_format
+
+
+def _without_trailing_separators(path):
+    path = str(path)
+    return path.rstrip('/' + os.sep) or path
+
+
+def _refuse_existing_bin(target, error):
+    if os.path.lexists(target):
+        raise error('binary calibration output already exists: %s' % target)
+
+
 def calibration_report_path(output_path, artifact_format):
     """Where the report of a calibration artifact lives.
 
@@ -70,12 +101,13 @@ def calibration_report_path(output_path, artifact_format):
 def sibling_onnx_path(output_path, override=None):
     """Where a calibration run writes the graph its tensors bind to.
 
-    Beside the artifact, dropping a ``.npz`` suffix first, so ``calib/foo``
-    and ``calib/foo.npz`` both pair with ``calib/foo.onnx``.
+    Beside the artifact, dropping trailing separators and a ``.npz`` suffix
+    first, so ``calib/foo``, ``calib/foo/`` and ``calib/foo.npz`` all pair
+    with ``calib/foo.onnx``.
     """
     if override:
         return override
-    output_path = str(output_path)
+    output_path = _without_trailing_separators(output_path)
     base = output_path[:-4] if output_path.endswith('.npz') else output_path
     return base + '.onnx'
 
@@ -126,10 +158,7 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
         return report_path
 
     output_path = os.path.abspath(output_path)
-    if os.path.exists(output_path):
-        raise FileExistsError(
-            'binary calibration output already exists: %s' % output_path
-        )
+    _refuse_existing_bin(output_path, FileExistsError)
     parent = os.path.dirname(output_path)
     os.makedirs(parent, exist_ok=True)
     temporary = tempfile.mkdtemp(
@@ -251,7 +280,7 @@ def check_selection_arguments(parser, args, attr='frames', flag='--frames'):
 def _report_path(output, report):
     if report:
         return report
-    graph = sibling_onnx_path(str(output).rstrip(os.sep))
+    graph = sibling_onnx_path(output)
     return graph[:-len('.onnx')] + '.report.html'
 
 

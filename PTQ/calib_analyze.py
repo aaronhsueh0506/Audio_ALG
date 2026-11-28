@@ -79,8 +79,8 @@ if _AINR_DIR not in sys.path:
     sys.path.insert(0, _AINR_DIR)
 
 from calibration_io import (  # noqa: E402
+    calibration_output,
     calibration_report_path,
-    resolve_calibration_format,
     sibling_onnx_path,
     write_calibration_artifact,
 )
@@ -2719,8 +2719,8 @@ def main(argv=None):
             (', skipped: ' + ', '.join(art.skipped)) if art.skipped else ''))
         if getattr(args, 'output', None):
             # Refuse a bad output before the scan, which takes minutes.
-            args.format = args.format or art.fmt
-            resolve_calibration_format(args.output, args.format)
+            args.output, args.format = calibration_output(
+                args.output, args.format or art.fmt, (args.out, args.json))
             require_selectable(art)
         graph = _replay_graph(art, args)
         if args.cmd == 'coverage':

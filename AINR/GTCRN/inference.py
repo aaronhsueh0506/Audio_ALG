@@ -153,8 +153,8 @@ def calibration_main():
 
     from calibration_io import (
         CALIBRATION_FORMATS,
+        calibration_output,
         capture_calibration_inputs,
-        resolve_calibration_format,
         sibling_onnx_path,
         write_calibration_artifact,
     )
@@ -187,7 +187,8 @@ def calibration_main():
     if args.frames <= 0:
         parser.error('--frames must be positive')
     try:
-        artifact_format = resolve_calibration_format(args.output, args.format)
+        args.output, artifact_format = calibration_output(
+            args.output, args.format, (args.onnx,))
     except ValueError as error:
         parser.error(str(error))
 

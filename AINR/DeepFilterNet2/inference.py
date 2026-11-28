@@ -297,8 +297,8 @@ def calibration_main():
         CALIBRATION_FORMATS,
         CalibrationFrames,
         add_selection_arguments,
+        calibration_output,
         check_selection_arguments,
-        resolve_calibration_format,
         sibling_onnx_path,
         stream_stft,
     )
@@ -352,7 +352,8 @@ def calibration_main():
         parser.error('--frames-per-call must be in [1, %d]'
                      % MAX_FRAMES_PER_CALL)
     try:
-        artifact_format = resolve_calibration_format(args.output, args.format)
+        args.output, artifact_format = calibration_output(
+            args.output, args.format, (args.onnx, args.report))
     except ValueError as error:
         parser.error(str(error))
 

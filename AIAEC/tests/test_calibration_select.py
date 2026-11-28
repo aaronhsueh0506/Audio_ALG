@@ -132,6 +132,34 @@ def test_jobs_refuse_a_stem_directory_an_earlier_run_left(work, capsys):
     assert 'stale.npz_linear_error exists' in capsys.readouterr().err
 
 
+def test_a_trailing_slash_puts_the_graph_beside_the_directory(work):
+    art = _calib(work, ['--select', '10',
+                        '--output', str(work / 'slash') + '/'], 'slash')
+    assert art.frames == 10
+    assert (work / 'slash.onnx').exists()
+    assert (work / 'slash.report.html').exists()
+    assert sorted(p.name for p in (work / 'slash').iterdir()
+                  if p.name.startswith('.')) == []
+
+
+def test_an_existing_output_is_refused_before_the_graph(work, capsys):
+    (work / 'taken').mkdir()
+    with pytest.raises(SystemExit):
+        _calib(work, ['--select', '10'], 'taken')
+    assert 'already exists' in capsys.readouterr().err
+    assert not (work / 'taken.onnx').exists()
+
+
+@pytest.mark.parametrize('flag,name', [('--onnx', 'inside/g.onnx'),
+                                       ('--report', 'inside')])
+def test_a_file_the_run_writes_in_the_output_is_refused(work, capsys, flag,
+                                                         name):
+    with pytest.raises(SystemExit):
+        _calib(work, ['--select', '10', flag, str(work / name)], 'inside')
+    assert 'at or inside' in capsys.readouterr().err
+    assert not (work / 'inside').exists()
+
+
 @pytest.mark.parametrize('extra,model,message', [
     (['--select', '10', '--frames', '5'], 'DeepVQE_S', 'leave out --frames'),
     (['--jobs', '2'], 'DeepVQE_S', 'go with --select'),

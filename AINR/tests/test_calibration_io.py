@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from calibration_io import (
+    calibration_output,
     calibration_report_path,
     capture_calibration_inputs,
     sibling_onnx_path,
@@ -122,6 +123,35 @@ def test_the_options_a_jobs_process_must_not_inherit_are_removed():
             '--select', '9', '--onnx', 'g.onnx']
     assert calibration_io._without(argv, flags, valued) == [
         '--checkpoint', 'c.pth', '--select', '9']
+
+
+def test_the_output_loses_its_trailing_separators(tmp_path):
+    sel = str(tmp_path / 'sel')
+    assert calibration_output(sel + '/') == (sel, 'bin')
+    assert calibration_output(sel + '.npz/') == (sel + '.npz', 'npz')
+    assert sibling_onnx_path(sel + '/') == sel + '.onnx'
+
+
+def test_an_npz_output_is_still_overwritten(tmp_path):
+    (tmp_path / 'old.npz').write_bytes(b'')
+    assert calibration_output(str(tmp_path / 'old.npz'))[1] == 'npz'
+
+
+def test_an_output_the_final_write_would_find_is_refused(tmp_path):
+    sel = str(tmp_path / 'sel')
+    assert calibration_output(sel, None, (sel + '_g.onnx', None)) == \
+        (sel, 'bin')
+    for other in (sel + '/g.onnx', sel):
+        with pytest.raises(ValueError, match='at or inside'):
+            calibration_output(sel + '/', None, (other,))
+    with pytest.raises(ValueError, match='at or inside'):
+        calibration_output(sel + '.npz', None, (sel + '.npz',))
+    (tmp_path / 'sel').mkdir()
+    with pytest.raises(ValueError, match='already exists'):
+        calibration_output(sel + '/')
+    (tmp_path / 'gone').symlink_to(tmp_path / 'missing')
+    with pytest.raises(ValueError, match='already exists'):
+        calibration_output(str(tmp_path / 'gone'))
 
 
 def test_the_report_goes_beside_the_output():

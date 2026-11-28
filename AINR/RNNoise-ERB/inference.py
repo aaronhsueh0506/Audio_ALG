@@ -47,8 +47,8 @@ import tqdm
 
 from calibration_io import (
     CALIBRATION_FORMATS,
+    calibration_output,
     capture_calibration_inputs,
-    resolve_calibration_format,
     sibling_onnx_path,
     write_calibration_artifact,
 )
@@ -248,7 +248,7 @@ def process_file(input_path, output_path, model, params,
         streaming_forward_with_dump(
             model, erb_features.squeeze(0), spec_features.squeeze(0),
             dump_calib, max_frames,
-            resolve_calibration_format(dump_calib, calib_format),
+            calib_format,
             feature_cfg)
 
     pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
@@ -363,7 +363,8 @@ if __name__ == '__main__':
         parser.error('--max-frames must be positive')
     if args.dump_calib:
         try:
-            resolve_calibration_format(args.dump_calib, args.calib_format)
+            args.dump_calib, args.calib_format = calibration_output(
+                args.dump_calib, args.calib_format, (args.onnx,))
         except ValueError as error:
             parser.error(str(error))
         # The graph is exported (and verified) in the same run, against the

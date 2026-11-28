@@ -391,6 +391,25 @@ def test_bad_output_name_is_refused_before_the_scan(tmp_path, monkeypatch):
     assert not (tmp_path / 'r.html').exists()
 
 
+def test_a_bin_output_the_write_would_refuse_is_refused_before_the_scan(
+        tmp_path, monkeypatch, capsys):
+    rng = np.random.default_rng(13)
+    path = _write(tmp_path, {'feat': _heavy(rng, 50, 8)})
+    (tmp_path / 'taken').mkdir()
+    monkeypatch.setattr(calib_analyze, 'scan_artifact', lambda *args: 1 / 0)
+    with pytest.raises(SystemExit):
+        calib_analyze.main(['analyze', path, '--count', '10', '--format',
+                            'bin', '--out', str(tmp_path / 'r.html'),
+                            '--output', str(tmp_path / 'taken') + '/'])
+    assert 'already exists' in capsys.readouterr().err
+    assert not (tmp_path / 'r.html').exists()
+    with pytest.raises(SystemExit):
+        calib_analyze.main(['analyze', path, '--count', '10', '--format',
+                            'bin', '--out', str(tmp_path / 'sel'),
+                            '--output', str(tmp_path / 'sel')])
+    assert 'at or inside' in capsys.readouterr().err
+
+
 def test_contiguous_artifact_gets_no_recommendation(tmp_path):
     rng = np.random.default_rng(11)
     arrays, _ = _with_sources(rng, [80])

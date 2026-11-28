@@ -80,8 +80,8 @@ from calibration_io import (  # noqa: E402
     CALIBRATION_FORMATS,
     CalibrationFrames,
     add_selection_arguments,
+    calibration_output,
     check_selection_arguments,
-    resolve_calibration_format,
     sibling_onnx_path,
 )
 
@@ -422,20 +422,18 @@ def main(model_name: str) -> None:
     if args.events and args.jobs > 1:
         parser.error('--events counts the replayed events in one process; '
                      'leave out --jobs')
+    try:
+        args.output, artifact_format = calibration_output(
+            args.output, args.format, (args.onnx, args.report))
+        require_frames_per_call(args.model_name, args.frames_per_call)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.primary_is_mic and args.jobs > 1
-            and os.path.exists(str(args.output) + '_linear_error')):
+            and os.path.exists(args.output + '_linear_error')):
         # The --jobs processes list that directory: stems left there by an
         # earlier run would join this one.
         parser.error('%s_linear_error exists; move it away or leave out '
                      '--jobs' % args.output)
-    try:
-        require_frames_per_call(args.model_name, args.frames_per_call)
-    except ValueError as error:
-        parser.error(str(error))
-    try:
-        artifact_format = resolve_calibration_format(args.output, args.format)
-    except ValueError as error:
-        parser.error(str(error))
 
     if args.primary_is_mic and args.model_name != 'Align_ULCNet':
         parser.error('--primary-is-mic applies only to Align_ULCNet; the '

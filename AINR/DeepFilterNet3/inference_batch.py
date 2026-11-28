@@ -58,8 +58,8 @@ try:
         CALIBRATION_FORMATS,
         CalibrationFrames,
         add_selection_arguments,
+        calibration_output,
         check_selection_arguments,
-        resolve_calibration_format,
         sibling_onnx_path,
         stream_stft,
     )
@@ -79,8 +79,8 @@ except ImportError:  # direct ``python inference_batch.py`` execution
         CALIBRATION_FORMATS,
         CalibrationFrames,
         add_selection_arguments,
+        calibration_output,
         check_selection_arguments,
-        resolve_calibration_format,
         sibling_onnx_path,
         stream_stft,
     )
@@ -209,8 +209,8 @@ def export_main(args):
 
 def calibration_main(args):
     try:
-        artifact_format = resolve_calibration_format(
-            args.output, args.format
+        args.output, artifact_format = calibration_output(
+            args.output, args.format, (args.onnx, args.report)
         )
     except ValueError as error:
         raise SystemExit(str(error))
